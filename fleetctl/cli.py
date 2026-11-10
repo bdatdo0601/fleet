@@ -450,7 +450,7 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_parser("status", help="public IP vs. what DNS answers").set_defaults(func=cmd_ddns_status)
     s = d.add_parser("policy", help="print the least-privilege IAM policy for the DNS updater")
     s.add_argument("--zone-id", required=True)
-    s.add_argument("--name", required=True, help="e.g. lighthouse.datbdo.com")
+    s.add_argument("--name", required=True, help="e.g. lighthouse.example.com")
     s.set_defaults(func=cmd_ddns_policy)
     sub.add_parser("status", help="show this machine's fleet status").set_defaults(func=cmd_status)
     return p

@@ -1,179 +1,241 @@
 # fleet
 
-A self-hosted [Nebula](https://github.com/slackhq/nebula) network for my machines and phones.
-You register each device once by pasting two short blocks of text. After that, every machine
-gets a fixed mesh IP that works on any network, and admin devices can SSH or screen-share into
-it from anywhere. No third-party servers are involved.
+A self-hosted [Nebula](https://github.com/slackhq/nebula) network for your Macs and phones, run from
+an always-on Mac at home. You register each device once by pasting two short blocks of text. After that,
+every device keeps the same mesh IP on any network, and your admin devices can SSH or screen-share
+into it from anywhere. No third-party servers are involved.
 
 ```
-                         internet: only UDP 443 is forwarded, to the mini
+                         internet: only UDP 443 is forwarded, to the lighthouse
                                          │
  laptop   (admin)   ─┐                   ▼
- office   (managed) ─┼── Nebula ──► Mac mini 10.213.0.1   lighthouse + relay + CA
+ office   (managed) ─┼── Nebula ──► home Mac (lighthouse) 10.213.0.1   relay + CA
  phone    (admin)   ─┘   tunnels   ├─ ~/.fleet/fleet.db  registry (SQLite): devices, IPs, certs, revocations
-                                   └─ fleet serve :7443  API reachable ONLY inside the mesh
- every Mac: `fleet sync` (launchd, every 5 min) pulls its config, cert and revocations from
-            the API, updates this repo's code with `git pull`, and restarts nebula only if something changed
+                                   └─ fleet serve :7443  API reachable only from inside the mesh
+ every Mac: `fleet sync` (launchd, every 5 min) pulls its config, cert and revocations from the
+            API, updates this repo's code with `git pull`, and restarts nebula only if something changed
 ```
 
-- **No IPs to choose and no device files.** The registry assigns the next free mesh IP, signs
-  the certificate, and keeps the revocation list.
-- **Private keys never leave their device.** A join request carries only the public key, and the response
-  only certificates and config, so you can pass both by clipboard, AirDrop or iMessage.
-- **Admin from anywhere.** Admin devices approve, revoke and list devices through the
-  mesh. Signing needs the CA passphrase, which you type on the admin device every time and which is never stored.
-- **Access policy:** `admin` devices can reach every machine on TCP 22 (SSH) and 5900 (Screen Sharing).
-  `managed` machines accept connections from admins but start none. Every device can reach the
-  API to sync. Ping works between all devices. Everything else is dropped.
+- **No IPs to choose and no device files.** The registry assigns the next free IP in `10.213.0.0/16`,
+  signs the certificate, and keeps the revocation list.
+- **Private keys never leave their device.** Join requests and responses contain only public keys,
+  certificates and config. That makes it safe to pass them by clipboard, AirDrop or Messages.
+- **Admin from anywhere.** Admin devices approve, revoke and list devices through the mesh. Signing
+  needs the CA passphrase, which you type each time; it is never stored.
+- **Central policy.** Firewall rules and revocations live on the lighthouse, and every Mac picks up
+  changes within about 5 minutes.
+- **Stdlib only.** Python 3.9+ and the `nebula` / `nebula-cert` binaries from Homebrew. Nothing else to install.
+
+## Contents
+
+[Commands](#commands) · [Setup](#setup) · [Adding devices](#adding-devices) ·
+[Groups and access](#groups-and-access) · [Day to day](#day-to-day) · [Security model](#security-model) ·
+[FAQ](#faq) · [Development](#development)
 
 ## Commands
 
 | Where | Command | What it does |
 |---|---|---|
-| Mac mini, once | `fleet init --host H [--route53-zone Z] [--lan-ip IP]` | Creates the CA, the registry and the Mac mini's cert, and starts nebula, `fleet serve`, `fleet sync` and (with `--route53-zone`) DNS updates |
-| Mac mini | `fleet ddns setup\|status\|policy` | Keeps the public DNS name pointed at home (Route 53) |
+| Lighthouse, once | `fleet init --host H [--route53-zone Z] [--lan-ip IP]` | Creates the CA, the registry and the lighthouse's cert, and starts nebula, the API, sync and (optionally) DNS updates |
+| Lighthouse | `fleet ddns setup\|status\|policy` | Keeps the public DNS name pointed at home (Route 53) |
 | New Mac | `fleet join NAME` | Prints a join request, waits for you to paste the approval, then installs everything |
-| Admin device | `fleet approve [--group admin\|managed]` | Turns a pasted join request into the response to paste back |
+| Admin device | `fleet approve [--group admin\|managed] [--replace]` | Turns a pasted join request into the response to paste back |
 | Admin device | `fleet approve-mobile NAME` | Signs a public key from the Mobile Nebula app |
 | Admin device | `fleet ls` | Lists devices: IP, group, last check-in, cert expiry, status |
 | Admin device | `fleet revoke NAME` | Cuts a device off everywhere within about 5 minutes |
-| Admin device | `fleet set NAME --group G` | Moves a device to another group (its cert is re-signed) |
-| Any Mac | `fleet status` | Shows the services, whether the lighthouse is reachable, and this machine's IP |
+| Admin device | `fleet set NAME --group G` | Moves a device to another group (re-signs its cert, also used to renew one) |
+| Any Mac | `fleet status` | Shows the services, whether the lighthouse is reachable, and this device's IP |
 
-## Set up the Mac mini (lighthouse)
+## Setup
 
-**Before you start**
-1. **Router:** reserve a LAN IP for the Mac mini and forward **UDP 443** to it. Check for CGNAT:
-   the router's WAN IP must equal `curl ifconfig.me`. If it doesn't, port forwarding can't work
-   (the fallback is to host the lighthouse on a VPS).
-2. **DNS:** `fleet` keeps `lighthouse.datbdo.com` pointed at home itself, through Route 53 (see
-   [DNS updates](#dns-updates-route-53) for the one-time AWS setup). Any other DDNS service works too:
-   pass its hostname to `--host` and leave out `--route53-zone`.
-3. **Energy settings:** turn on "Prevent automatic sleeping" and "Start up automatically after a power failure".
-4. **Tools:** Homebrew, `git`, and `python3` 3.9 or newer (Homebrew's, or the Xcode Command Line Tools version).
+### 1. Prerequisites (lighthouse)
 
-**Install the code with a read-only deploy key.** `fleet sync` pulls code updates without
-anyone at the keyboard, so give each machine a key with no passphrase that can only read this repo:
+- **An always-on Mac** with Homebrew, `git` and `python3` 3.9+. Homebrew's Python works, and so does the one in the Xcode Command Line Tools.
+  In Energy settings, turn on "Prevent automatic sleeping" and "Start up automatically after a power failure".
+- **Router:** reserve the Mac's LAN IP and forward **UDP 443** to it. Check for CGNAT: the router's WAN IP must equal
+  `curl ifconfig.me`. If they differ, port forwarding can't work, and the lighthouse has to run somewhere with a public IP.
+- **A DNS name** that points at your home connection, e.g. `lighthouse.example.com`. If your DNS is on Route 53, `fleet`
+  can keep it updated itself ([step 3](#3-dns-updates-route-53-optional)). Otherwise, use your router's DDNS.
+
+### 2. Install
+
 ```bash
-ssh-keygen -t ed25519 -f ~/.ssh/fleet_deploy -N '' -C "fleet@$(scutil --get LocalHostName)"
-cat ~/.ssh/fleet_deploy.pub
-#   → GitHub: bdatdo0601/fleet → Settings → Deploy keys → Add (leave "write access" OFF)
-#     or, from any machine with gh: gh repo deploy-key add fleet_deploy.pub -R bdatdo0601/fleet -t mini
-GIT_SSH_COMMAND="ssh -i ~/.ssh/fleet_deploy -o IdentitiesOnly=yes" \
-  git clone git@github.com:bdatdo0601/fleet.git ~/fleet
-git -C ~/fleet config core.sshCommand "ssh -i ~/.ssh/fleet_deploy -o IdentitiesOnly=yes"
+git clone https://github.com/bdatdo0601/fleet.git ~/fleet
 ln -s ~/fleet/bin/fleet /opt/homebrew/bin/fleet
 ```
+Do the same on every Mac that will join. `fleet sync` updates each clone with `git pull --ff-only` every 5 minutes.
 
-**Create the fleet**
+### 3. DNS updates (Route 53, optional)
+
+`fleet ddns` checks every 5 minutes whether your public IP still matches what the zone's own nameservers answer.
+Only when it differs does it update the A record (TTL 60). After your home IP changes, devices reconnect within
+about 6 minutes, and connections that are already open keep working.
+
+1. **Find the hosted zone ID.** In the console: Route 53 → Hosted zones → your domain → *Hosted zone details*. Or with the CLI:
+   `aws route53 list-hosted-zones-by-name --dns-name example.com --query 'HostedZones[0].Id' --output text`.
+2. **Create an IAM user** `fleet-ddns`: no console access and no managed policies. Give it one **inline policy**, which
+   `fleet ddns policy --zone-id Z… --name lighthouse.example.com` prints for you. The policy allows only an
+   UPSERT of that single A record, so a stolen key can't touch the rest of the zone.
+3. **Create an access key** for that user on its *Security credentials* tab (use case: "Application running outside AWS").
+4. **Configure the lighthouse** with the key:
+   ```bash
+   brew install awscli
+   aws configure --profile fleet-ddns     # paste the key; region us-east-1
+   ```
+
+### 4. Create the fleet
+
 ```bash
-fleet init --host lighthouse.datbdo.com --route53-zone Z0123ABC --lan-ip 192.168.1.50
+fleet init --host lighthouse.example.com --route53-zone Z… --lan-ip 192.168.1.50
 ```
-`init` first checks that the AWS CLI and the `fleet-ddns` profile exist, so nothing is created if they're missing.
-It then asks you to set a CA passphrase (store it in your password manager), asks for sudo, points
-`lighthouse.datbdo.com` at your public IP, and prints the **CA id**.
-Back up `~/.fleet/ca.key` and `~/.fleet/fleet.db`. To confirm it worked:
+`init` first checks the AWS setup (when `--route53-zone` is given), so nothing is created if it's missing.
+Then it:
+1. asks you to set a **CA passphrase**, typed twice. Store it in your password manager; you'll need it for every approval.
+2. asks for sudo.
+3. creates the CA and registry in `~/.fleet`.
+4. installs and starts the services.
+5. points DNS at your public IP.
+6. prints the **CA id**.
+
+Back up `~/.fleet`. To confirm it worked:
 ```bash
 fleet status        # nebula, sync, serve and ddns loaded; lighthouse reachable as 10.213.0.1
 fleet ddns status   # public IP == DNS answer
 fleet ls            # one device: mini
 ```
 
-## DNS updates (Route 53)
+## Adding devices
 
-The `datbdo.com` zone is hosted on Route 53. On the Mac mini, `fleet ddns run` checks every 5 minutes
-whether your public IP still matches what Route 53's own nameservers answer for the record (no cached
-answers). Only when it differs does it update the A record (TTL 60).
-If your home IP changes, devices reconnect within about 6 minutes, and connections that are already open keep working.
-
-One-time AWS setup (from any machine with admin AWS access):
-```bash
-aws route53 list-hosted-zones-by-name --dns-name datbdo.com --query 'HostedZones[0].Id' --output text
-fleet ddns policy --zone-id Z0123ABC --name lighthouse.datbdo.com > fleet-ddns-policy.json
-aws iam create-user --user-name fleet-ddns
-aws iam put-user-policy --user-name fleet-ddns --policy-name fleet-ddns --policy-document file://fleet-ddns-policy.json
-aws iam create-access-key --user-name fleet-ddns     # copy AccessKeyId + SecretAccessKey
-```
-On the Mac mini:
-```bash
-brew install awscli
-aws configure --profile fleet-ddns                   # paste the key; region us-east-1
-```
-The policy allows exactly one change: an UPSERT of the `lighthouse.datbdo.com` A record. If the Mac mini were
-compromised, that key can't touch the rest of the zone (e.g. the `datbdo.com` site).
-
-If you skipped `--route53-zone` during `init`, add DNS updates later with `fleet ddns setup --zone-id Z0123ABC`.
-Errors show up in `~/.fleet/ddns.log`. The updater refuses to publish a CGNAT/private address, because
-port forwarding can't work behind those.
-
-## Register your laptop (first admin, at home)
+### Your first admin device (at home)
 
 ```bash
-# laptop: same deploy-key clone as above (or use your existing checkout), then
+# laptop
 fleet join laptop                    # prints a FLEET JOIN REQUEST block and waits
-# mini:
-fleet approve --group admin          # paste the request; check the request id matches; type the passphrase
+# lighthouse
+fleet approve --group admin          # paste it; check the request id matches; type the passphrase
 # laptop: paste the FLEET JOIN RESPONSE block. Check the CA id matches what init printed.
 ```
-To move the blocks between the two Macs, use Universal Clipboard (same Apple ID), AirDrop, or Messages.
-Now the laptop can run `fleet ls`, `fleet approve` and the rest from any network, and you never need to log in to the Mac mini again.
+To move the blocks between the two Macs, use Universal Clipboard, AirDrop or Messages. From now on the laptop can
+run `fleet approve`, `fleet ls` and the rest from any network. You don't need to log in to the lighthouse again.
 
-## Register more machines later, from anywhere
+### More Macs, from anywhere
 
-On the new Mac, run `fleet join office`. Send the request block to your laptop, which can be on any
-network, run `fleet approve` there (add `--group admin` only if this machine should control other machines),
-and paste the response back. The approval goes through the mesh to the Mac mini, and the new machine joins immediately.
+On the new Mac, run `fleet join office` and send the request block to an admin device. There, run `fleet approve`,
+adding `--group admin` only if this Mac should be able to manage others, and paste the response back.
+The approval travels through the mesh to the lighthouse, and the new Mac joins right away.
 
-To make a machine reachable over SSH: turn on Remote Login in System Settings, run `bin/ssh-harden`
-(key-only logins, accepted only from the mesh), and add your admin devices' SSH public keys to `~/.ssh/authorized_keys`.
-For screen sharing, turn on Screen Sharing and limit it to your user.
+### Phones and tablets
 
-## Register a phone or iPad
-
-1. Install **Mobile Nebula** (by Defined Networking) and add a site. Have it generate a key, then copy the **public key**.
+1. In **Mobile Nebula** (Defined Networking), add a site, have it generate a key, and copy the **public key**.
 2. On an admin Mac, run `fleet approve-mobile phone` and paste the key. It prints a certificate, the CA and the lighthouse address.
-3. In the app, paste the certificate and CA. Add a host: `10.213.0.1`, mark it as a **lighthouse**, with address `lighthouse.datbdo.com:443`.
-4. Add an SSH client (Blink, Termius), create a key, and authorize it on the Macs you'll manage.
+3. Paste the certificate and CA into the app. Add host `10.213.0.1`, marked as a **lighthouse**, with address `lighthouse.example.com:443`.
+4. In an SSH client (Blink, Termius), create a key and authorize it on the Macs you want to reach.
 
-Phone and iPad certs last 1 year. To renew one, run `fleet set phone --group admin` and paste the new certificate into the app.
+### Making a Mac reachable
+
+- **SSH:** turn on System Settings → General → Sharing → **Remote Login**, then run `~/fleet/bin/ssh-harden`.
+  It allows key-only logins, accepted only from mesh addresses. Add your admin devices' public keys to
+  `~/.ssh/authorized_keys`.
+- **Screen sharing:** turn on **Screen Sharing**, limited to your user, and connect a VNC client to `<mesh IP>:5900`.
+  Leave "VNC viewers may control screen with password" off.
+
+## Groups and access
+
+Each certificate carries one group. The CA signs it into the certificate, so a device can't claim a different one.
+
+| From ↓ / To → | lighthouse | admin Mac | managed Mac | phone |
+|---|---|---|---|---|
+| **admin** (laptop, phone) | SSH, VNC, ping, API | SSH, VNC, ping | SSH, VNC, ping | ping¹ |
+| **managed** | ping, API (sync only) | ping | ping | ping¹ |
+| **lighthouse** | — | ping | ping | ping¹ |
+
+¹ Phones use the Mobile Nebula app's own firewall settings.
+
+- Through the API, **admin** devices (and the lighthouse itself) can approve, revoke, list and regroup devices.
+  **managed** devices can only pull their own config.
+- Every other port is dropped. Traffic relayed through the lighthouse is checked by the same rules at the destination.
+- To change the rules, edit [`templates/`](templates/) and push. Every Mac applies the new rules on its next sync.
+- To move a device to another group, run `fleet set NAME --group admin|managed`.
 
 ## Day to day
 
-- `ssh datdo@10.213.0.2`, or connect a VNC client to `10.213.0.2:5900`.
-- Logging in to gcloud from your phone: `source ~/fleet/shell/gauth.zsh` in the target Mac's `~/.zshrc`, then
-  run `gauth` over SSH and follow the URL-and-code prompts.
-- **Lost a device:** run `fleet revoke NAME`, and remove its SSH key from `authorized_keys` on the machines it could reach.
-- **Reinstalled a Mac:** run `fleet join NAME --force` on it, then `fleet approve --replace` (it keeps its IP).
-- **Logs:**
-  - `/var/log/fleet-sync.log` (every Mac)
-  - `~/.fleet/serve.log`, `~/.fleet/ddns.log` (Mac mini)
-  - `/opt/homebrew/var/log/nebula.log`
+- `ssh you@10.213.0.2`, or connect a VNC client to `10.213.0.2:5900`. Run `fleet ls` to see every device's IP.
+- **gcloud login from a phone:** add `source ~/fleet/shell/gauth.zsh` to the target Mac's `~/.zshrc`. Then, over SSH,
+  run `gauth`: open the URL on the phone, sign in, and paste the code back. Running `gauth` again reattaches if the connection drops.
+- **Lost a device:** run `fleet revoke NAME`, and remove its SSH key from `authorized_keys` wherever you added it.
+- **Reinstalled a Mac:** run `fleet join NAME --force` on it, then `fleet approve --replace`. It keeps its IP.
+- **Logs:** `/var/log/fleet-sync.log` (every Mac), `~/.fleet/serve.log` and `~/.fleet/ddns.log` (lighthouse),
+  `/opt/homebrew/var/log/nebula.log`.
 
 ## Security model
 
-- **Internet exposure:** only UDP 443 on the Mac mini. Nebula ignores any packet without a certificate
-  from this CA, so port scans see nothing. SSH and the API are never port-forwarded.
-- **API:** listens on port 7443 but answers only loopback and mesh addresses. Nebula ties a mesh
-  source IP to the sender's certificate, so the API knows which device is calling. Sync is allowed for
-  every active device. Approve, revoke, set and list are allowed only for `admin` devices and the Mac mini.
-- **CA key:** stored on the Mac mini only, and encrypted. The passphrase travels inside the encrypted
-  tunnel for each approval and is used only in memory.
-- **Paste channels:** each request shows a **request id** on both machines, and each response shows the **CA id**. Compare them
-  to detect a block that was swapped in transit.
-- **Code updates:** `fleet sync` runs as root and runs this repo's code. Anyone who can push
-  to `bdatdo0601/fleet`, or any process running as your user on a machine, can therefore get root on it. Keep the
-  repo private and your GitHub account protected with 2FA. Deploy keys are read-only.
+- **Internet exposure:** only UDP 443 on the lighthouse. Nebula drops any packet that isn't from a
+  certificate this CA signed, so port scans see nothing. SSH and the API are never port-forwarded.
+- **API:** answers only loopback and mesh addresses. Nebula ties a mesh source IP to the sender's
+  certificate, which is how the API knows who is calling. A LAN host can't spoof a mesh address,
+  because the replies go into the tunnel and never reach it.
+- **CA key:** lives only on the lighthouse, encrypted. The passphrase travels inside the tunnel for
+  each approval and is used only in memory.
+- **Paste channels:** both ends show a **request id** and a **CA id**. Compare them to detect a block
+  that was swapped in transit.
+- **Code updates run as root.** `fleet sync` runs this repo's code as root, so anyone who can push
+  to the repo (or modify a machine's clone) can get root on every Mac that follows it. If you fork
+  this repo, protect your account with 2FA, and review anything before merging.
 
-## Limits
+## FAQ
 
-- Nebula only uses UDP. Networks that block all UDP can't join. UDP 443 gets through most networks.
-- A machine has to be awake to be reachable.
-- If your home connection is down, devices can't open new connections or sync, but existing connections keep working.
-- macOS only for now (Homebrew + launchd).
+**Do I have to re-register a device when it changes networks?**
+No. A device's identity is its certificate, not its network. It keeps its mesh IP at home, at the office, on hotel
+Wi-Fi or on a hotspot. After a switch, it reports its new address to the lighthouse within about a minute.
+
+**Do certificates renew automatically?**
+No. Signing needs the CA passphrase, and it is never stored.
+- **Phone and tablet certs last 1 year.** Renew with `fleet set phone --group admin`, then paste the new cert into the app.
+  The old cert is revoked immediately, so do both steps together.
+- **Mac certs** last until the CA expires.
+- **The CA lasts 5 years.** After that, re-run setup and re-join every device.
+
+**Can devices in different groups reach each other?**
+Admin devices can reach everything on SSH and VNC. Managed machines can only ping and sync. See [Groups and access](#groups-and-access).
+
+**Does my traffic go through the lighthouse?**
+Only when two devices can't connect directly, for example a phone on cellular reaching a laptop behind a strict NAT.
+Even then it stays end-to-end encrypted, so the lighthouse can't read it. Relayed traffic is limited by your home upload speed.
+
+**What if a network blocks UDP?**
+Nebula only uses UDP. Port 443 gets through most networks, because QUIC/HTTP3 uses it, but a network that blocks all UDP
+can't join. The device reconnects on its own once it's back on a normal network.
+
+**What happens when the lighthouse or my home internet is down?**
+Existing connections keep working. New connections, syncs and approvals wait until the lighthouse is back.
+A Mac has to be awake to be reachable.
+
+**How do I manage the lighthouse without exposing SSH to the internet?**
+Approve one admin device while you're at home. After that, `fleet` commands run from that device over the mesh. If you
+need a shell on the lighthouse, SSH to `10.213.0.1` from an admin device after running `ssh-harden` there.
+
+**I mistyped the CA passphrase.**
+`fleet approve` asks again, up to 3 times. To test the passphrase on the lighthouse without changing anything, sign a
+throwaway key: `nebula-cert sign -ca-key ~/.fleet/ca.key -ca-crt ~/.fleet/ca.crt -name probe -networks 10.213.255.254/16 -in-pub <a .pub from nebula-cert keygen> -out-crt /tmp/probe.crt`.
+
+**I lost the CA passphrase. How do I start over?**
+It can't be recovered. On the lighthouse:
+1. Stop the services: `for s in serve sync ddns; do sudo launchctl bootout system/io.github.bdatdo0601.fleet.$s; done`.
+2. Move the old state aside: `mv ~/.fleet ~/.fleet.old`.
+3. Run `fleet init` again.
+
+Then re-join every device. Macs use `fleet join NAME --force`, which reuses any pending key.
+
+**How many devices can it handle?**
+The `/16` network has room for about 65,000. The lighthouse's own load is tiny. The real limit is relayed traffic
+using your home upload, which doesn't matter for SSH but can slow screen sharing.
+
+**Linux or Windows?**
+Not yet. `fleet join` / `sync` assume macOS (Homebrew and launchd). Phones work through Mobile Nebula.
 
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests      # uses the real nebula/nebula-cert; ~1 min
+python3 -m unittest discover -s tests      # uses the real nebula/nebula-cert binaries; ~1 min
 uvx ruff check . && shellcheck bin/fleet bin/ssh-harden
 ```

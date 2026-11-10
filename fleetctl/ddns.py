@@ -1,4 +1,4 @@
-"""Keep the lighthouse's DNS name (e.g. lighthouse.datbdo.com) pointed at the home
+"""Keep the lighthouse's DNS name (e.g. lighthouse.example.com) pointed at the home
 connection's public IPv4, via an AWS Route 53 A record.
 
 Runs as the admin user (launchd, every 5 minutes). Reads the current answer

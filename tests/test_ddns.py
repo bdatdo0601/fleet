@@ -9,7 +9,7 @@ from unittest import mock
 
 from fleetctl import ddns
 
-CFG = ddns.Route53(name="lighthouse.datbdo.com", zone_id="Z0123ABC", profile="fleet-ddns",
+CFG = ddns.Route53(name="lighthouse.example.com", zone_id="Z0123ABC", profile="fleet-ddns",
                    nameservers=("ns-1.awsdns.com", "ns-2.awsdns.net"))  # fmt: skip
 
 
@@ -58,10 +58,10 @@ class DnsTest(unittest.TestCase):
 
         def dig(*args: str) -> list[str]:
             seen.append(args)
-            return ["ns-2.awsdns.net.", "ns-1.awsdns.com."] if args[0] == "datbdo.com" else []
+            return ["ns-2.awsdns.net.", "ns-1.awsdns.com."] if args[0] == "example.com" else []
 
-        self.assertEqual(ddns.find_nameservers("lighthouse.datbdo.com", dig), ("ns-1.awsdns.com", "ns-2.awsdns.net"))
-        self.assertEqual([a[0] for a in seen], ["lighthouse.datbdo.com", "datbdo.com"])
+        self.assertEqual(ddns.find_nameservers("lighthouse.example.com", dig), ("ns-1.awsdns.com", "ns-2.awsdns.net"))
+        self.assertEqual([a[0] for a in seen], ["lighthouse.example.com", "example.com"])
 
     def test_current_record_asks_authoritative_servers(self) -> None:
         calls = []
@@ -73,7 +73,7 @@ class DnsTest(unittest.TestCase):
             return ["9.9.9.9"]
 
         self.assertEqual(ddns.current_record(CFG, dig), "9.9.9.9")
-        self.assertEqual(calls[-1], ("lighthouse.datbdo.com", "A", "@ns-2.awsdns.net"))
+        self.assertEqual(calls[-1], ("lighthouse.example.com", "A", "@ns-2.awsdns.net"))
         self.assertIsNone(ddns.current_record(CFG, lambda *a: []))
         with self.assertRaisesRegex(ddns.DdnsError, "no authoritative"):
             ddns.current_record(CFG, mock.Mock(side_effect=ddns.DdnsError("x")))
@@ -101,7 +101,7 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--hosted-zone-id") + 1], "Z0123ABC")
         batch = json.loads(cmd[cmd.index("--change-batch") + 1])
         self.assertEqual(batch["Changes"], [{"Action": "UPSERT", "ResourceRecordSet": {
-            "Name": "lighthouse.datbdo.com", "Type": "A", "TTL": 60,
+            "Name": "lighthouse.example.com", "Type": "A", "TTL": 60,
             "ResourceRecords": [{"Value": "1.1.1.9"}]}}])  # fmt: skip
 
     def test_aws_failure_is_reported(self) -> None:
@@ -111,17 +111,17 @@ class SyncTest(unittest.TestCase):
 
 class PolicyTest(unittest.TestCase):
     def test_policy_is_scoped_to_one_record(self) -> None:
-        p = ddns.policy("/hostedzone/Z0123ABC", "Lighthouse.datbdo.com.")
+        p = ddns.policy("/hostedzone/Z0123ABC", "Lighthouse.example.com.")
         stmt = p["Statement"][0]
         self.assertEqual(stmt["Resource"], "arn:aws:route53:::hostedzone/Z0123ABC")
         cond = stmt["Condition"]["ForAllValues:StringEquals"]
-        self.assertEqual(cond["route53:ChangeResourceRecordSetsNormalizedRecordNames"], ["lighthouse.datbdo.com"])
+        self.assertEqual(cond["route53:ChangeResourceRecordSetsNormalizedRecordNames"], ["lighthouse.example.com"])
         self.assertEqual(cond["route53:ChangeResourceRecordSetsRecordTypes"], ["A"])
 
     def test_zone_id_validation(self) -> None:
         self.assertEqual(ddns.normalize_zone_id(" /hostedzone/Z0123ABC "), "Z0123ABC")
         with self.assertRaises(ddns.DdnsError):
-            ddns.normalize_zone_id("datbdo.com")
+            ddns.normalize_zone_id("example.com")
 
 
 if __name__ == "__main__":
