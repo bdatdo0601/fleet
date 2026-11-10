@@ -1,4 +1,4 @@
-# Lighthouse + relay (the always-on home Mac mini). Rendered by bin/apply.
+# Lighthouse + relay (the always-on home Mac mini). Rendered by `fleet serve` from the registry.
 
 pki:
   ca: @NEBULA_ETC@/ca.crt
@@ -55,3 +55,6 @@ firewall:
     - port: 5900 # Screen Sharing (only listens if enabled in System Settings)
       proto: tcp
       group: admin
+    - port: @API_PORT@ # fleet API: sync for every device, admin calls checked by the API
+      proto: tcp
+      host: any

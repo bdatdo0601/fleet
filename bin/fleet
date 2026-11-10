@@ -1,0 +1,8 @@
+#!/bin/bash
+# Launcher for the fleet CLI. Symlink it onto your PATH, e.g.
+#   ln -s ~/workspace/fleet/bin/fleet /opt/homebrew/bin/fleet
+set -euo pipefail
+self="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+repo="$(cd "$(dirname "$self")/.." && pwd)"
+export PYTHONPATH="$repo${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m fleetctl "$@"

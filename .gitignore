@@ -1,4 +1,5 @@
-# Private keys never belong in this repo (the CA key lives in $CA_DIR, host keys in /opt/homebrew/etc/nebula).
+# Device state lives in the lighthouse's SQLite registry (~/.fleet), never in git.
 *.key
-local.env
+*.db
+__pycache__/
 .DS_Store
