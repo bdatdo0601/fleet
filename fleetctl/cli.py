@@ -185,9 +185,21 @@ def cmd_join(a: argparse.Namespace) -> None:
     print("\nJoined. Config and revocations now sync automatically every 5 minutes.")
 
 
+def with_passphrase(path: str, payload: dict, attempts: int = 3) -> dict:
+    """POST a signing request, re-asking for the passphrase if it's wrong
+    (so a typo doesn't mean re-pasting the whole request)."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return call(api(), "POST", path, {**payload, "passphrase": ask_passphrase()})
+        except ApiError as e:
+            if "HTTP 401" not in str(e) or attempt == attempts:
+                raise
+            print("wrong CA passphrase, try again")
+    raise AssertionError("unreachable")
+
+
 def _approve(payload: dict) -> dict:
-    payload["passphrase"] = ask_passphrase()
-    return call(api(), "POST", "/v1/approve", payload)
+    return with_passphrase("/v1/approve", payload)
 
 
 def cmd_approve(a: argparse.Namespace) -> None:
@@ -249,7 +261,7 @@ def cmd_revoke(a: argparse.Namespace) -> None:
 
 
 def cmd_set(a: argparse.Namespace) -> None:
-    resp = call(api(), "POST", "/v1/set-group", {"name": a.name, "group": a.group, "passphrase": ask_passphrase()})
+    resp = with_passphrase("/v1/set-group", {"name": a.name, "group": a.group})
     if resp["kind"] == "mobile":
         print_mobile(resp)
         info("replace the certificate in the app; the old one is now revoked")

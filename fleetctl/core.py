@@ -20,6 +20,8 @@ from .paths import (
 from .registry import Device, Registry
 from .render import render
 
+WRONG_PASSPHRASE = "wrong CA passphrase (the one set during `fleet init`)"  # noqa: S105 - a message
+
 
 class FleetError(Exception):
     """A request the caller got wrong. `status` is the HTTP status to report."""
@@ -100,6 +102,8 @@ class Fleet:
             return pki.sign(ca_key=self.ca_key, ca_crt=self.ca_crt, pubkey=pubkey, name=name, ip=ip,
                             group=group, passphrase=passphrase, hours=hours)  # fmt: skip
         except pki.PkiError as e:
+            if "invalid passphrase" in str(e):
+                raise FleetError(WRONG_PASSPHRASE, 401) from e
             raise FleetError(f"signing failed: {e}") from e
 
     def _mobile_hours(self) -> int:

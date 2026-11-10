@@ -136,8 +136,9 @@ class FleetTest(unittest.TestCase):
 
     def test_wrong_passphrase_and_bad_input_are_rejected(self) -> None:
         _, pub = keypair(self.tmp, "x")
-        with self.assertRaisesRegex(FleetError, "signing failed"):
+        with self.assertRaisesRegex(FleetError, "wrong CA passphrase") as ctx:
             self.fleet.approve(name="x", pubkey=pub, kind="mac", group="admin", passphrase="nope")
+        self.assertEqual(ctx.exception.status, 401)
         self.assertIsNone(self.fleet.registry.get("x"), "failed signing must not register the device")
         for bad in ({"name": "Bad Name"}, {"group": "root"}, {"kind": "server"}, {"pubkey": "garbage"}):
             args = {"name": "ok", "pubkey": pub, "kind": "mac", "group": "admin", "passphrase": PASSPHRASE, **bad}
@@ -201,7 +202,7 @@ class FleetTest(unittest.TestCase):
         self.assertEqual(resp["ip"], "10.213.0.2")
         with self.assertRaisesRegex(ApiError, "HTTP 409"):
             call(api, "POST", "/v1/approve", {"name": "laptop", "pubkey": pub, "passphrase": PASSPHRASE})
-        with self.assertRaisesRegex(ApiError, "signing failed.*HTTP 400"):
+        with self.assertRaisesRegex(ApiError, "wrong CA passphrase.*HTTP 401"):
             call(api, "POST", "/v1/approve", {"name": "other", "pubkey": pub, "passphrase": "nope"})
         names = [d["name"] for d in call(api, "GET", "/v1/devices")["devices"]]
         self.assertEqual(names, ["mini", "laptop"])
@@ -240,6 +241,20 @@ class FleetTest(unittest.TestCase):
         pki.verify(resp["ca"], resp["cert"])
         self.assertEqual((resp["name"], resp["ip"], resp["kind"]), ("laptop", "10.213.0.2", "mac"))
         self.assertEqual(resp["ca_id"], self.fleet.ca_id())
+
+    def test_cli_approve_reasks_for_a_wrong_passphrase(self) -> None:
+        api = self.serve()
+        (self.pki_dir / "fleet.json").write_text(json.dumps({"name": "mini", "api": api}))
+        _, pub = keypair(self.tmp, "laptop")
+        request = codes.encode(codes.REQUEST, {"v": 1, "name": "laptop", "pubkey": pub})
+        asked = mock.Mock(side_effect=["typo", PASSPHRASE])
+        out = io.StringIO()
+        with mock.patch("sys.stdin", io.StringIO(request + "\n")), mock.patch("builtins.input", return_value="y"), \
+                mock.patch.object(cli, "ask_passphrase", asked), redirect_stdout(out):  # fmt: skip
+            self.assertEqual(cli.main(["approve"]), 0)
+        self.assertEqual(asked.call_count, 2)
+        self.assertIn("wrong CA passphrase, try again", out.getvalue())
+        self.assertEqual(codes.decode(codes.RESPONSE, out.getvalue())["name"], "laptop")
 
     def test_cli_reports_errors_without_traceback(self) -> None:
         err = io.StringIO()
