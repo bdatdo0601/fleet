@@ -41,6 +41,19 @@ def nebula_test(config: str, pki_dir: Path, ca: str, cert: str, key: Path) -> su
     return subprocess.run(["nebula", "-test", "-config", str(pki_dir / "config.yml")], capture_output=True, text=True)
 
 
+class NebulaLabelTest(unittest.TestCase):
+    def test_finds_current_and_legacy_homebrew_service_names(self) -> None:
+        from fleetctl import system
+
+        with tempfile.TemporaryDirectory() as d:
+            daemons = Path(d)
+            self.assertIsNone(system.nebula_label(daemons))
+            (daemons / "homebrew.mxcl.nebula.plist").touch()
+            self.assertEqual(system.nebula_label(daemons), "homebrew.mxcl.nebula")
+            (daemons / "sh.brew.nebula.plist").touch()
+            self.assertEqual(system.nebula_label(daemons), "sh.brew.nebula")
+
+
 class CodesTest(unittest.TestCase):
     def test_roundtrip_wraps_lines_for_terminal_paste(self) -> None:
         payload = {"blob": os.urandom(3000).hex()}

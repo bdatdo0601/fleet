@@ -23,7 +23,9 @@ LABEL_PREFIX = "io.github.bdatdo0601.fleet"
 SERVE_LABEL = f"{LABEL_PREFIX}.serve"
 SYNC_LABEL = f"{LABEL_PREFIX}.sync"
 DDNS_LABEL = f"{LABEL_PREFIX}.ddns"
-NEBULA_LABEL = "homebrew.mxcl.nebula"  # created by `sudo brew services start nebula`
+# `sudo brew services start nebula` names the launchd job sh.brew.nebula (Homebrew 7+)
+# or homebrew.mxcl.nebula (older). system.nebula_label() picks whichever is installed.
+NEBULA_LABELS = ("sh.brew.nebula", "homebrew.mxcl.nebula")
 SYNC_INTERVAL_SECONDS = 300
 
 

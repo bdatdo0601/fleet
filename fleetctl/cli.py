@@ -21,7 +21,6 @@ from .core import Fleet, FleetError
 from .paths import (
     DDNS_LABEL,
     LIGHTHOUSE_IP,
-    NEBULA_LABEL,
     SERVE_LABEL,
     SYNC_LABEL,
     api_port,
@@ -297,8 +296,9 @@ def cmd_sync(a: argparse.Namespace) -> None:
         (nebula_etc() / "config.yml", payload["config"]),
     ) if system.write_root_file(p, content)]  # fmt: skip
     system.firewall_allow(shutil.which("nebula"))  # re-apply: brew upgrades move the binary
-    if changed and system.launchd_loaded(NEBULA_LABEL):
-        system.restart(NEBULA_LABEL)
+    label = system.nebula_label()
+    if changed and label and system.launchd_loaded(label):
+        system.restart(label)
     print(f"{stamp} synced {payload['name']}: {'updated ' + ', '.join(changed) if changed else 'no changes'}")
 
 
@@ -312,7 +312,7 @@ def cmd_status(_: argparse.Namespace) -> None:
     node = load_node()
     print(f"device:      {node['name']}")
     print(f"api:         {node['api']}")
-    for label in (NEBULA_LABEL, SYNC_LABEL, SERVE_LABEL, DDNS_LABEL):
+    for label in (system.nebula_label() or "nebula (not installed)", SYNC_LABEL, SERVE_LABEL, DDNS_LABEL):
         if label in (SERVE_LABEL, DDNS_LABEL) and not node["api"].startswith("http://127.0.0.1"):
             continue
         print(f"{label + ':':<44} {'loaded' if system.launchd_loaded(label) else 'NOT loaded'}")

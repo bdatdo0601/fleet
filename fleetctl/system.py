@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .paths import (
     DDNS_LABEL,
-    NEBULA_LABEL,
+    NEBULA_LABELS,
     REPO,
     SERVE_LABEL,
     SYNC_INTERVAL_SECONDS,
@@ -80,11 +80,20 @@ def firewall_allow(*binaries: str | None) -> None:
             sudo(ALF, "--unblockapp", real, check=False)
 
 
+def nebula_label(daemons: Path = LAUNCH_DAEMONS) -> str | None:
+    """The launchd label Homebrew gave the nebula service, or None if not installed."""
+    for label in NEBULA_LABELS:
+        if (daemons / f"{label}.plist").exists():
+            return label
+    return None
+
+
 def start_nebula() -> None:
     """Load the Homebrew root service (first time) or restart it."""
     firewall_allow(shutil.which("nebula"))
-    if launchd_loaded(NEBULA_LABEL):
-        restart(NEBULA_LABEL)
+    label = nebula_label()
+    if label and launchd_loaded(label):
+        restart(label)
     else:
         sudo("brew", "services", "start", "nebula")
 
