@@ -30,7 +30,8 @@ it from anywhere. No third-party servers are involved.
 
 | Where | Command | What it does |
 |---|---|---|
-| Mac mini, once | `fleet init --host H [--lan-ip IP]` | Creates the CA, the registry and the Mac mini's cert, and starts nebula, `fleet serve` and `fleet sync` |
+| Mac mini, once | `fleet init --host H [--route53-zone Z] [--lan-ip IP]` | Creates the CA, the registry and the Mac mini's cert, and starts nebula, `fleet serve`, `fleet sync` and (with `--route53-zone`) DNS updates |
+| Mac mini | `fleet ddns setup\|status\|policy` | Keeps the public DNS name pointed at home (Route 53) |
 | New Mac | `fleet join NAME` | Prints a join request, waits for you to paste the approval, then installs everything |
 | Admin device | `fleet approve [--group admin\|managed]` | Turns a pasted join request into the response to paste back |
 | Admin device | `fleet approve-mobile NAME` | Signs a public key from the Mobile Nebula app |
@@ -45,7 +46,9 @@ it from anywhere. No third-party servers are involved.
 1. **Router:** reserve a LAN IP for the Mac mini and forward **UDP 443** to it. Check for CGNAT:
    the router's WAN IP must equal `curl ifconfig.me`. If it doesn't, port forwarding can't work
    (the fallback is to host the lighthouse on a VPS).
-2. **DDNS:** set up a hostname for your home connection, e.g. `home.example.com`, through router DDNS or the Cloudflare API.
+2. **DNS:** `fleet` keeps `lighthouse.datbdo.com` pointed at home itself, through Route 53 (see
+   [DNS updates](#dns-updates-route-53) for the one-time AWS setup). Any other DDNS service works too:
+   pass its hostname to `--host` and leave out `--route53-zone`.
 3. **Energy settings:** turn on "Prevent automatic sleeping" and "Start up automatically after a power failure".
 4. **Tools:** Homebrew, `git`, and `python3` 3.9 or newer (Homebrew's, or the Xcode Command Line Tools version).
 
@@ -64,14 +67,44 @@ ln -s ~/fleet/bin/fleet /opt/homebrew/bin/fleet
 
 **Create the fleet**
 ```bash
-fleet init --host home.example.com --lan-ip 192.168.1.50
+fleet init --host lighthouse.datbdo.com --route53-zone Z0123ABC --lan-ip 192.168.1.50
 ```
-It asks you to set a CA passphrase (store it in your password manager), then asks for sudo, then prints the **CA id**.
+`init` first checks that the AWS CLI and the `fleet-ddns` profile exist, so nothing is created if they're missing.
+It then asks you to set a CA passphrase (store it in your password manager), asks for sudo, points
+`lighthouse.datbdo.com` at your public IP, and prints the **CA id**.
 Back up `~/.fleet/ca.key` and `~/.fleet/fleet.db`. To confirm it worked:
 ```bash
-fleet status        # nebula, sync and serve loaded; lighthouse reachable as 10.213.0.1
+fleet status        # nebula, sync, serve and ddns loaded; lighthouse reachable as 10.213.0.1
+fleet ddns status   # public IP == DNS answer
 fleet ls            # one device: mini
 ```
+
+## DNS updates (Route 53)
+
+The `datbdo.com` zone is hosted on Route 53. On the Mac mini, `fleet ddns run` checks every 5 minutes
+whether your public IP still matches what Route 53's own nameservers answer for the record (no cached
+answers). Only when it differs does it update the A record (TTL 60).
+If your home IP changes, devices reconnect within about 6 minutes, and connections that are already open keep working.
+
+One-time AWS setup (from any machine with admin AWS access):
+```bash
+aws route53 list-hosted-zones-by-name --dns-name datbdo.com --query 'HostedZones[0].Id' --output text
+fleet ddns policy --zone-id Z0123ABC --name lighthouse.datbdo.com > fleet-ddns-policy.json
+aws iam create-user --user-name fleet-ddns
+aws iam put-user-policy --user-name fleet-ddns --policy-name fleet-ddns --policy-document file://fleet-ddns-policy.json
+aws iam create-access-key --user-name fleet-ddns     # copy AccessKeyId + SecretAccessKey
+```
+On the Mac mini:
+```bash
+brew install awscli
+aws configure --profile fleet-ddns                   # paste the key; region us-east-1
+```
+The policy allows exactly one change: an UPSERT of the `lighthouse.datbdo.com` A record. If the Mac mini were
+compromised, that key can't touch the rest of the zone (e.g. the `datbdo.com` site).
+
+If you skipped `--route53-zone` during `init`, add DNS updates later with `fleet ddns setup --zone-id Z0123ABC`.
+Errors show up in `~/.fleet/ddns.log`. The updater refuses to publish a CGNAT/private address, because
+port forwarding can't work behind those.
 
 ## Register your laptop (first admin, at home)
 
@@ -99,7 +132,7 @@ For screen sharing, turn on Screen Sharing and limit it to your user.
 
 1. Install **Mobile Nebula** (by Defined Networking) and add a site. Have it generate a key, then copy the **public key**.
 2. On an admin Mac, run `fleet approve-mobile phone` and paste the key. It prints a certificate, the CA and the lighthouse address.
-3. In the app, paste the certificate and CA. Add a host: `10.213.0.1`, mark it as a **lighthouse**, with address `home.example.com:443`.
+3. In the app, paste the certificate and CA. Add a host: `10.213.0.1`, mark it as a **lighthouse**, with address `lighthouse.datbdo.com:443`.
 4. Add an SSH client (Blink, Termius), create a key, and authorize it on the Macs you'll manage.
 
 Phone and iPad certs last 1 year. To renew one, run `fleet set phone --group admin` and paste the new certificate into the app.
@@ -113,7 +146,7 @@ Phone and iPad certs last 1 year. To renew one, run `fleet set phone --group adm
 - **Reinstalled a Mac:** run `fleet join NAME --force` on it, then `fleet approve --replace` (it keeps its IP).
 - **Logs:**
   - `/var/log/fleet-sync.log` (every Mac)
-  - `~/.fleet/serve.log` (Mac mini)
+  - `~/.fleet/serve.log`, `~/.fleet/ddns.log` (Mac mini)
   - `/opt/homebrew/var/log/nebula.log`
 
 ## Security model

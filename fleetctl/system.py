@@ -11,7 +11,15 @@ import sys
 import tempfile
 from pathlib import Path
 
-from .paths import NEBULA_LABEL, REPO, SERVE_LABEL, SYNC_INTERVAL_SECONDS, SYNC_LABEL, state_dir
+from .paths import (
+    DDNS_LABEL,
+    NEBULA_LABEL,
+    REPO,
+    SERVE_LABEL,
+    SYNC_INTERVAL_SECONDS,
+    SYNC_LABEL,
+    state_dir,
+)  # fmt: skip
 
 LAUNCH_DAEMONS = Path("/Library/LaunchDaemons")
 
@@ -127,6 +135,11 @@ def install_sync_daemon() -> None:
 def install_serve_daemon(user: str) -> None:
     install_daemon(SERVE_LABEL, [LAUNCHER, "serve"], user=user, keepalive=True,
                    log=state_dir() / "serve.log")  # fmt: skip
+
+
+def install_ddns_daemon(user: str) -> None:
+    install_daemon(DDNS_LABEL, [LAUNCHER, "ddns", "run"], user=user, interval=SYNC_INTERVAL_SECONDS,
+                   log=state_dir() / "ddns.log")  # fmt: skip
 
 
 def repo_owner() -> str:

@@ -22,6 +22,7 @@ CA_HOURS = 43800  # 5 years
 LABEL_PREFIX = "io.github.bdatdo0601.fleet"
 SERVE_LABEL = f"{LABEL_PREFIX}.serve"
 SYNC_LABEL = f"{LABEL_PREFIX}.sync"
+DDNS_LABEL = f"{LABEL_PREFIX}.ddns"
 NEBULA_LABEL = "homebrew.mxcl.nebula"  # created by `sudo brew services start nebula`
 SYNC_INTERVAL_SECONDS = 300
 

@@ -15,10 +15,11 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import codes, pki, system
+from . import codes, ddns, pki, system
 from .client import ApiError, call
 from .core import Fleet, FleetError
 from .paths import (
+    DDNS_LABEL,
     LIGHTHOUSE_IP,
     NEBULA_LABEL,
     SERVE_LABEL,
@@ -108,6 +109,7 @@ def cmd_init(a: argparse.Namespace) -> None:
     if (root / "fleet.db").exists():
         raise UserError(f"{root}/fleet.db exists: this machine is already the lighthouse")
     system.ensure_nebula()
+    dns = ddns_preflight(a.host, a.route53_zone, a.aws_profile) if a.route53_zone else None
     info("choose the CA passphrase. You'll type it whenever you approve a device. Store it in your password manager.")
     passphrase = ask_passphrase(new=True)
 
@@ -129,6 +131,11 @@ def cmd_init(a: argparse.Namespace) -> None:
     system.install_sync_daemon()
     info("starting nebula ...")
     system.start_nebula()
+    if dns:
+        try:
+            ddns_activate(fleet, dns)
+        except (ddns.DdnsError, UserError) as e:
+            print(f"warning: DNS not set up: {e}\n         fix it, then run: fleet ddns setup --zone-id {dns.zone_id}")
     print(f"""
 Lighthouse ready.
   CA id:        {fleet.ca_id()}   (join codes show this id; check that it matches)
@@ -293,8 +300,8 @@ def cmd_status(_: argparse.Namespace) -> None:
     node = load_node()
     print(f"device:      {node['name']}")
     print(f"api:         {node['api']}")
-    for label in (NEBULA_LABEL, SYNC_LABEL, SERVE_LABEL):
-        if label == SERVE_LABEL and not node["api"].startswith("http://127.0.0.1"):
+    for label in (NEBULA_LABEL, SYNC_LABEL, SERVE_LABEL, DDNS_LABEL):
+        if label in (SERVE_LABEL, DDNS_LABEL) and not node["api"].startswith("http://127.0.0.1"):
             continue
         print(f"{label + ':':<44} {'loaded' if system.launchd_loaded(label) else 'NOT loaded'}")
     try:
@@ -302,6 +309,72 @@ def cmd_status(_: argparse.Namespace) -> None:
         print(f"lighthouse:  reachable, this device is {me['ip']}")
     except ApiError as e:
         print(f"lighthouse:  {e}")
+
+
+# ddns -----------------------------------------------------------------------------
+
+
+def ddns_preflight(name: str, zone_id: str, profile: str) -> ddns.Route53:
+    """Fail before anything is created if the AWS side isn't ready."""
+    zid = ddns.normalize_zone_id(zone_id)
+    if not shutil.which("aws"):
+        raise UserError("aws CLI not found: brew install awscli")
+    profiles = subprocess.run(["aws", "configure", "list-profiles"], capture_output=True, text=True).stdout.split()
+    if profile not in profiles:
+        raise UserError(
+            f"no AWS profile {profile!r}. Create an IAM user whose only policy is the output of\n"
+            f"  fleet ddns policy --zone-id {zid} --name {name}\n"
+            f"then store its access key with: aws configure --profile {profile}"
+        )
+    return ddns.Route53(name=name.rstrip("."), zone_id=zid, profile=profile, nameservers=ddns.find_nameservers(name))
+
+
+def ddns_activate(fleet: Fleet, cfg: ddns.Route53) -> None:
+    """Prove the credentials work with a real update, then save + schedule."""
+    before, ip, changed = ddns.sync(cfg)
+    fleet.set_ddns(cfg)
+    system.install_ddns_daemon(current_user())
+    state = f"updated {before or 'none'} -> {ip}" if changed else f"already {ip}"
+    info(f"DNS {cfg.name}: {state}; re-checked every 5 minutes")
+
+
+def cmd_ddns_setup(a: argparse.Namespace) -> None:
+    require_not_root("ddns setup")
+    fleet = Fleet()
+    host = fleet.settings().get("lighthouse_host")
+    name = a.name or host
+    if not name:
+        raise UserError("run on the lighthouse after `fleet init`, or pass --name")
+    if host and name.rstrip(".") != host:
+        print(f"warning: devices connect to {host}, not {name}")
+    ddns_activate(fleet, ddns_preflight(name, a.zone_id, a.profile))
+
+
+def cmd_ddns_run(_: argparse.Namespace) -> None:
+    cfg = Fleet().ddns_config()
+    if cfg is None:
+        raise UserError("DNS updates aren't configured (fleet ddns setup)")
+    stamp = datetime.now().isoformat(timespec="seconds")
+    try:
+        before, ip, changed = ddns.sync(cfg)
+    except ddns.DdnsError as e:
+        raise UserError(f"{stamp} {e}") from e
+    if changed:
+        print(f"{stamp} {cfg.name}: {before or 'none'} -> {ip}")
+
+
+def cmd_ddns_status(_: argparse.Namespace) -> None:
+    cfg = Fleet().ddns_config()
+    if cfg is None:
+        raise UserError("DNS updates aren't configured (fleet ddns setup)")
+    print(f"record:      {cfg.name} (zone {cfg.zone_id}, profile {cfg.profile})")
+    print(f"public IP:   {ddns.public_ipv4()}")
+    print(f"DNS answer:  {ddns.current_record(cfg) or 'no record'}  (from {cfg.nameservers[0]})")
+    print(f"{DDNS_LABEL + ':':<44} {'loaded' if system.launchd_loaded(DDNS_LABEL) else 'NOT loaded'}")
+
+
+def cmd_ddns_policy(a: argparse.Namespace) -> None:
+    print(json.dumps(ddns.policy(a.zone_id, a.name), indent=2))
 
 
 # entry point -------------------------------------------------------------------
@@ -315,6 +388,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--host", required=True, help="public DDNS name of the home connection")
     s.add_argument("--port", type=int, default=443, help="UDP port forwarded to this Mac (default 443)")
     s.add_argument("--lan-ip", help="this Mac's reserved LAN IP (fallback for routers without NAT loopback)")
+    s.add_argument("--route53-zone", metavar="ZONE_ID", help="keep --host pointed at this network via Route 53")
+    s.add_argument("--aws-profile", default="fleet-ddns", help="AWS profile for DNS updates (default fleet-ddns)")
     s.set_defaults(func=cmd_init)
 
     s = sub.add_parser("join", help="(new Mac) request to join, then paste the approval")
@@ -351,6 +426,20 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_sync)
 
     sub.add_parser("serve", help="(lighthouse, launchd) run the API").set_defaults(func=cmd_serve)
+
+    d = sub.add_parser("ddns", help="(lighthouse) keep the public DNS name pointed at home").add_subparsers(
+        dest="ddns_cmd", required=True)
+    s = d.add_parser("setup", help="verify AWS access, update the record now, schedule every 5 minutes")
+    s.add_argument("--zone-id", required=True, help="Route 53 hosted zone id (Z…)")
+    s.add_argument("--profile", default="fleet-ddns", help="AWS profile (default fleet-ddns)")
+    s.add_argument("--name", help="record to manage (default: the lighthouse host from fleet init)")
+    s.set_defaults(func=cmd_ddns_setup)
+    d.add_parser("run", help="(launchd) update the record if the public IP changed").set_defaults(func=cmd_ddns_run)
+    d.add_parser("status", help="public IP vs. what DNS answers").set_defaults(func=cmd_ddns_status)
+    s = d.add_parser("policy", help="print the least-privilege IAM policy for the DNS updater")
+    s.add_argument("--zone-id", required=True)
+    s.add_argument("--name", required=True, help="e.g. lighthouse.datbdo.com")
+    s.set_defaults(func=cmd_ddns_policy)
     sub.add_parser("status", help="show this machine's fleet status").set_defaults(func=cmd_status)
     return p
 
@@ -359,7 +448,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         args.func(args)
-    except (UserError, FleetError, ApiError, pki.PkiError, codes.CodeError) as e:
+    except (UserError, FleetError, ApiError, pki.PkiError, codes.CodeError, ddns.DdnsError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

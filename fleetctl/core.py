@@ -6,7 +6,7 @@ import ipaddress
 import re
 from pathlib import Path
 
-from . import pki
+from . import ddns, pki
 from .codes import short_id
 from .paths import (
     GROUPS,
@@ -64,6 +64,23 @@ class Fleet:
     def settings(self) -> dict[str, str]:
         keys = ("lighthouse_host", "lighthouse_port", "lighthouse_lan_ip")
         return {k: v for k in keys if (v := self.registry.setting(k)) is not None}
+
+    def ddns_config(self) -> ddns.Route53 | None:
+        zone = self.registry.setting("ddns_zone_id")
+        if not zone:
+            return None
+        return ddns.Route53(
+            name=self.registry.setting("ddns_name") or "",
+            zone_id=zone,
+            profile=self.registry.setting("ddns_profile") or "",
+            nameservers=tuple((self.registry.setting("ddns_nameservers") or "").split(",")),
+        )
+
+    def set_ddns(self, cfg: ddns.Route53) -> None:
+        self.registry.set_setting("ddns_name", cfg.name)
+        self.registry.set_setting("ddns_zone_id", cfg.zone_id)
+        self.registry.set_setting("ddns_profile", cfg.profile)
+        self.registry.set_setting("ddns_nameservers", ",".join(cfg.nameservers))
 
     def ca_pem(self) -> str:
         return self.ca_crt.read_text()
