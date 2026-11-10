@@ -1,0 +1,69 @@
+# Roaming Mac (laptop, office machine, ...). Rendered by bin/apply.
+
+pki:
+  ca: @NEBULA_ETC@/ca.crt
+  cert: @NEBULA_ETC@/host.crt
+  key: @NEBULA_ETC@/host.key
+@BLOCKLIST@
+
+# Public DDNS name first; the LAN address covers routers without NAT loopback while
+# this machine is at home. Elsewhere the LAN entry just fails its handshake harmlessly.
+static_host_map:
+  "@LIGHTHOUSE_IP@":
+    - "@LIGHTHOUSE_HOST@:@LIGHTHOUSE_PORT@"
+    - "@LIGHTHOUSE_LAN_IP@:@LIGHTHOUSE_PORT@"
+
+static_map:
+  cadence: 30s # re-resolve DDNS so a home IP change is picked up quickly
+
+lighthouse:
+  am_lighthouse: false
+  interval: 60
+  hosts:
+    - "@LIGHTHOUSE_IP@"
+
+listen:
+  host: "::"
+  port: 0 # random port: recommended for roaming nodes
+
+punchy:
+  punch: true
+  respond: true # if a peer can't punch in, punch back out to it
+
+relay:
+  # Peers that can't reach me directly (cellular, hotel/office NAT) go via the mini.
+  relays:
+    - "@LIGHTHOUSE_IP@"
+  am_relay: false
+  use_relays: true
+
+tun:
+  disabled: false
+  drop_local_broadcast: false
+  drop_multicast: false
+  mtu: 1300
+
+logging:
+  level: info
+  format: text
+
+firewall:
+  outbound_action: drop
+  inbound_action: drop
+  conntrack:
+    tcp_timeout: 12m
+    udp_timeout: 3m
+    default_timeout: 10m
+  outbound:
+    - port: any
+      proto: any
+      host: any
+  inbound:
+    - proto: icmp
+      host: any
+    - port: 22 # SSH
+      proto: tcp
+      group: admin
+    - port: 5900 # Screen Sharing (only listens if enabled in System Settings)
+      proto: tcp
+      group: admin

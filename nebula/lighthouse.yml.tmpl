@@ -1,0 +1,57 @@
+# Lighthouse + relay (the always-on home Mac mini). Rendered by bin/apply.
+
+pki:
+  ca: @NEBULA_ETC@/ca.crt
+  cert: @NEBULA_ETC@/host.crt
+  key: @NEBULA_ETC@/host.key
+@BLOCKLIST@
+
+static_host_map: {}
+
+lighthouse:
+  am_lighthouse: true
+  interval: 60
+
+listen:
+  host: "::"
+  port: @LIGHTHOUSE_PORT@ # router forwards this UDP port to the mini
+
+punchy:
+  punch: true
+  respond: true
+
+relay:
+  am_relay: true # peers that can't hole-punch relay through here (still end-to-end encrypted)
+  use_relays: true
+
+tun:
+  disabled: false
+  # dev omitted: macOS picks a free utunN
+  drop_local_broadcast: false
+  drop_multicast: false
+  mtu: 1300
+
+logging:
+  level: info
+  format: text
+
+firewall:
+  outbound_action: drop
+  inbound_action: drop
+  conntrack:
+    tcp_timeout: 12m
+    udp_timeout: 3m
+    default_timeout: 10m
+  outbound:
+    - port: any
+      proto: any
+      host: any
+  inbound:
+    - proto: icmp
+      host: any
+    - port: 22 # SSH
+      proto: tcp
+      group: admin
+    - port: 5900 # Screen Sharing (only listens if enabled in System Settings)
+      proto: tcp
+      group: admin

@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Offline validation, no sudo: script syntax, shellcheck (if installed), every
+# hosts.conf machine's rendered Nebula config against a throwaway CA, the
+# blocklist rendering, and the sshd drop-in.
+# shellcheck source=lib.sh
+. "$(dirname "$0")/lib.sh"
+
+command -v nebula >/dev/null || die "nebula not installed (brew install nebula)"
+fail=0
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+scripts=("$REPO_ROOT"/bin/*)
+for s in "${scripts[@]}"; do
+  bash -n "$s" || { echo "syntax error: $s"; fail=1; }
+done
+if command -v shellcheck >/dev/null; then
+  shellcheck -x -e SC1091 "${scripts[@]}" || fail=1
+else
+  echo "(shellcheck not installed; skipped)"
+fi
+
+# Throwaway env + CA, a fake revoked fingerprint so the blocklist branch renders.
+LIGHTHOUSE_HOST=lighthouse.invalid LIGHTHOUSE_LAN_IP=192.0.2.10 LIGHTHOUSE_PORT=443
+SSH_USER=checkuser
+nebula-cert ca -name check -duration 1h -networks "$MESH_CIDR" \
+  -out-key "$work/ca.key" -out-crt "$work/ca.crt"
+BLOCKLIST_FILE="$work/blocklist.conf"
+cp "$REPO_ROOT/blocklist.conf" "$BLOCKLIST_FILE"
+printf '%064d  # check\n' 0 >>"$BLOCKLIST_FILE"
+
+[ "$(awk '/^[[:space:]]*(#|$)/ { next } $3 == "lighthouse"' "$REPO_ROOT/hosts.conf" | wc -l | tr -d ' ')" = 1 ] ||
+  { echo "hosts.conf must have exactly one lighthouse"; fail=1; }
+
+for name in $(host_names); do
+  kind="$(host_field "$name" 3)"
+  ip="$(host_field "$name" 2)"
+  groups="$(host_field "$name" 4)"
+  d="$work/$name"
+  mkdir -p "$d"
+  cp "$work/ca.crt" "$d/ca.crt"
+  nebula-cert sign -ca-key "$work/ca.key" -ca-crt "$work/ca.crt" -name "$name" \
+    -networks "$ip/$MESH_PREFIX" -groups "$groups" -out-crt "$d/host.crt" -out-key "$d/host.key" ||
+    { echo "FAIL sign $name"; fail=1; continue; }
+  tmpl="$(template_for_kind "$kind")" || { echo "ok   $name ($kind: cert only)"; continue; }
+  render "$tmpl" "$d" >"$d/config.yml"
+  if grep -q '@[A-Z_]*@' "$d/config.yml"; then
+    echo "FAIL $name: unrendered placeholder"; fail=1
+  elif out="$(nebula -test -config "$d/config.yml" 2>&1)" && ! grep -qE 'level=(warn|error)' <<<"$out"; then
+    echo "ok   $name ($kind)"
+  else
+    echo "FAIL $name ($kind)"; printf '%s\n' "$out" | grep -E 'level=(warn|error)|error' | head -5; fail=1
+  fi
+done
+
+ssh-keygen -q -t ed25519 -N '' -f "$work/sshd_host_key"
+sshd_dropin >"$work/sshd.conf"
+if /usr/sbin/sshd -T -f "$work/sshd.conf" -h "$work/sshd_host_key" \
+  -C "user=$SSH_USER,host=x,addr=10.213.0.20" 2>/dev/null | grep -qi "allowusers $SSH_USER@$MESH_CIDR"; then
+  echo "ok   sshd drop-in"
+else
+  echo "FAIL sshd drop-in"; fail=1
+fi
+
+if [ "$fail" != 0 ]; then
+  echo "checks failed"
+  exit 1
+fi
+echo "all checks passed"

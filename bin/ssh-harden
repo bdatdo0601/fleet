@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# On a Mac you want to reach over SSH: key-only logins, accepted only from the mesh.
+# (macOS sshd listens on every interface, so without this it is exposed on
+# office/hotel Wi-Fi too.) Turn on Remote Login yourself in System Settings.
+# shellcheck source=lib.sh
+. "$(dirname "$0")/lib.sh"
+load_env
+
+conf=/etc/ssh/sshd_config.d/200-fleet.conf
+tmp="$(mktemp)"
+sshd_dropin >"$tmp"
+sudo install -m 644 "$tmp" "$conf"
+rm -f "$tmp"
+if ! sudo /usr/sbin/sshd -t; then
+  sudo rm -f "$conf"
+  die "sshd rejected the config; removed $conf"
+fi
+info "installed $conf (AllowUsers ${SSH_USER}@${MESH_CIDR})"
+info "make sure System Settings > General > Sharing > Remote Login is on, and add your"
+info "admin devices' SSH public keys to ~/.ssh/authorized_keys"

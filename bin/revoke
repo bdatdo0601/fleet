@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Revoke a device (lost phone, retired machine): add its cert fingerprint to blocklist.conf.
+#   bin/revoke NAME
+# shellcheck source=lib.sh
+. "$(dirname "$0")/lib.sh"
+
+name="${1:-}"
+[ -n "$name" ] || die "usage: bin/revoke NAME"
+cert="$REPO_ROOT/pki/certs/$name.crt"
+[ -f "$cert" ] || die "no cert at pki/certs/$name.crt"
+
+fp="$(cert_fingerprint "$cert")"
+[ -n "$fp" ] || die "could not read fingerprint of $cert"
+if grep -q "^$fp" "$REPO_ROOT/blocklist.conf"; then
+  info "$name already revoked"
+  exit 0
+fi
+printf '%s  # %s revoked %s\n' "$fp" "$name" "$(date +%Y-%m-%d)" >>"$REPO_ROOT/blocklist.conf"
+info "revoked $name ($fp)"
+cat <<EOF
+Next: commit + push blocklist.conf, then on EVERY Mac: git pull && bin/apply
+Also remove $name's SSH key from ~/.ssh/authorized_keys on the machines it could reach.
+EOF

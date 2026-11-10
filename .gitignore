@@ -1,0 +1,4 @@
+# Private keys never belong in this repo (the CA key lives in $CA_DIR, host keys in /opt/homebrew/etc/nebula).
+*.key
+local.env
+.DS_Store
