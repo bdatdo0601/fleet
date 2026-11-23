@@ -44,6 +44,8 @@ into it from anywhere. No third-party servers are involved.
 | Admin device | `fleet ls` | Lists devices: IP, group, last check-in, cert expiry, status |
 | Admin device | `fleet revoke NAME` | Cuts a device off everywhere within about 5 minutes |
 | Admin device | `fleet set NAME --group G` | Moves a device to another group (re-signs its cert, also used to renew one) |
+| Any Mac | `fleet agents [--all]` | Lists live AI agent sessions (`claude`, `codex`, `antigravity`) across the mesh |
+| Any Mac | `fleet mcp status\|install\|uninstall` | Checks or manages MCP + lifecycle hook configs for installed agent harnesses |
 | Any Mac | `fleet status` | Shows the services, whether the lighthouse is reachable, and this device's IP |
 
 ## Setup
@@ -166,6 +168,18 @@ Each certificate carries one group. The CA signs it into the certificate, so a d
 - **Reinstalled a Mac:** run `fleet join NAME --force` on it, then `fleet approve --replace`. It keeps its IP.
 - **Logs:** `/var/log/fleet-sync.log` (every Mac), `~/.fleet/serve.log` and `~/.fleet/ddns.log` (lighthouse),
   `/opt/homebrew/var/log/nebula.log`.
+
+## Agent sessions (MCP)
+
+`fleet serve` also brokers live session discovery, transcript/git inspection, and peer messaging in `~/.fleet/agents.db`
+on the lighthouse across all active Macs (`admin` and `managed` alike).
+
+- **Auto-configured everywhere:** `fleet init`, `fleet join`, and `fleet sync` automatically register `fleet` as a local
+  `stdio` MCP server and lifecycle hook handler for whichever harnesses exist on each Mac (**Claude Code**, **Codex CLI**,
+  and **Antigravity**). Run `fleet mcp status` or `fleet mcp install` to inspect or refresh manually.
+- **Tools exposed to agents:** `fleet_list_agents`, `fleet_inspect_agent`, `fleet_send_message`, `fleet_check_inbox`,
+  and `fleet_ask_agent`.
+- **CLI inspection:** Run `fleet agents` from any Mac to view active sessions, repos, branches, and last prompts.
 
 ## Security model
 

@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import json
 import sys
+import urllib.parse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from .agents import AgentError
 from .core import Fleet, FleetError
 
-MAX_BODY = 64 * 1024
+MAX_BODY = 256 * 1024
 
 
 def make_handler(fleet: Fleet, quiet: bool = False) -> type[BaseHTTPRequestHandler]:
@@ -43,14 +45,103 @@ def make_handler(fleet: Fleet, quiet: bool = False) -> type[BaseHTTPRequestHandl
             except json.JSONDecodeError as e:
                 raise FleetError("invalid JSON") from e
 
+        def _dispatch_agents(self, caller_name: str, method: str, path_only: str, query: dict[str, list[str]]) -> bool:
+            def q(key: str) -> str | None:
+                vals = query.get(key)
+                return vals[0] if vals and vals[0] else None
+
+            if (method, path_only) == ("GET", "/v1/agents"):
+                self._send(200, {"agents": fleet.agents.list_sessions(
+                    device=q("device"), repo=q("repo"), harness=q("harness"),
+                    include_stale=(q("include_stale") or "").lower() in ("1", "true"),
+                )})  # fmt: skip
+                return True
+            if method == "GET" and path_only.startswith("/v1/agents/"):
+                target = urllib.parse.unquote(path_only[len("/v1/agents/"):])
+                self._send(200, {"agent": fleet.agents.get_session(target)})
+                return True
+            if method != "POST":
+                return False
+
+            body = self._body()
+            harness = str(body.get("harness", "claude"))
+            cwd = str(body.get("cwd", ""))
+            pid = int(body["pid"]) if body.get("pid") is not None else None
+
+            if path_only == "/v1/agents/heartbeat":
+                tail = body.get("tail")
+                res = fleet.agents.heartbeat(
+                    device=caller_name, harness=harness, raw_id=str(body.get("raw_id", "")),
+                    pid=pid, cwd=cwd, repo=str(body.get("repo", "")), branch=str(body.get("branch", "")),
+                    state=str(body.get("state", "working")),
+                    summary=str(body["summary"]) if body.get("summary") is not None else None,
+                    git_status=str(body["git_status"]) if body.get("git_status") is not None else None,
+                    tail=tail if isinstance(tail, list) else None,
+                    drain_inbox=bool(body.get("drain_inbox", False)),
+                )  # fmt: skip
+                self._send(200, res)
+                return True
+            if path_only == "/v1/agents/deregister":
+                sid = str(body["session_id"]) if body.get("session_id") else None
+                res = fleet.agents.deregister(
+                    device=caller_name, session_id=sid,
+                    harness=str(body["harness"]) if body.get("harness") else None, pid=pid,
+                )  # fmt: skip
+                self._send(200, res)
+                return True
+            if path_only == "/v1/agents/send":
+                from_sid = fleet.agents.resolve_caller_session(
+                    device=caller_name, harness=harness,
+                    session_id=str(body["session_id"]) if body.get("session_id") else None, cwd=cwd, pid=pid,
+                )
+                reply_to = int(body["reply_to"]) if body.get("reply_to") is not None else None
+                msg = fleet.agents.send_message(
+                    device=caller_name, from_session=from_sid, to=str(body.get("to", "")),
+                    body=str(body.get("body", "")),
+                    thread_id=str(body["thread_id"]) if body.get("thread_id") else None,
+                    reply_to=reply_to, known_devices=fleet.active_device_names(),
+                )  # fmt: skip
+                self._send(200, {"message": msg})
+                return True
+            if path_only == "/v1/agents/inbox":
+                sid = fleet.agents.resolve_caller_session(
+                    device=caller_name, harness=harness,
+                    session_id=str(body["session_id"]) if body.get("session_id") else None, cwd=cwd, pid=pid,
+                )
+                msgs = fleet.agents.fetch_inbox(
+                    device=caller_name, session_id=sid,
+                    unread_only=bool(body.get("unread_only", True)),
+                    mark_read=bool(body.get("mark_read", True)),
+                )  # fmt: skip
+                self._send(200, {"session_id": sid, "messages": msgs})
+                return True
+            if path_only == "/v1/agents/ask":
+                from_sid = fleet.agents.resolve_caller_session(
+                    device=caller_name, harness=harness,
+                    session_id=str(body["session_id"]) if body.get("session_id") else None, cwd=cwd, pid=pid,
+                )
+                res = fleet.agents.ask(
+                    device=caller_name, from_session=from_sid, to=str(body.get("to", "")),
+                    body=str(body.get("body", "")), timeout=float(body.get("timeout", 30.0)),
+                    known_devices=fleet.active_device_names(),
+                )  # fmt: skip
+                self._send(200, res)
+                return True
+            return False
+
         def _dispatch(self, method: str) -> None:
             try:
                 caller = fleet.identify(self.client_address[0])
                 if caller is None:
                     raise FleetError("not a member of this fleet", 403)
-                route = (method, self.path.split("?")[0])
+                path_only, _, query_str = self.path.partition("?")
+                route = (method, path_only)
                 if route == ("GET", "/v1/sync"):
                     return self._send(200, fleet.sync(caller))
+                if path_only == "/v1/agents" or path_only.startswith("/v1/agents/"):
+                    if self._dispatch_agents(caller.name, method, path_only, urllib.parse.parse_qs(query_str)):
+                        return
+                    raise FleetError("not found", 404)
                 if not fleet.is_admin(caller):
                     raise FleetError(f"{caller.name} is not an admin device", 403)
                 if route == ("GET", "/v1/devices"):
@@ -70,7 +161,7 @@ def make_handler(fleet: Fleet, quiet: bool = False) -> type[BaseHTTPRequestHandl
                         str(body.get("name", "")), str(body.get("group", "")), str(body.get("passphrase", ""))
                     ))  # fmt: skip
                 raise FleetError("not found", 404)
-            except FleetError as e:
+            except (FleetError, AgentError) as e:
                 self._send(e.status, {"error": str(e)})
             except Exception as e:  # noqa: BLE001 - report, keep serving
                 self.log_message("internal error: %r", e)

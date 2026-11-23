@@ -102,7 +102,7 @@ class FleetTest(unittest.TestCase):
         self.mini_key, mini_pub = keypair(self.tmp, "mini")
         self.fleet = Fleet.initialize(root=self.tmp / "state", host="home.example.com", port=443,
                                       lan_ip="192.168.1.50", passphrase=PASSPHRASE, lighthouse_pubkey=mini_pub)  # fmt: skip
-        self.addCleanup(self.fleet.registry.close)
+        self.addCleanup(self.fleet.close)
 
     def approve(self, name: str, group: str = "admin", kind: str = "mac", replace: bool = False) -> tuple[dict, Path]:
         key, pub = keypair(self.tmp, f"{name}-{os.urandom(2).hex()}")

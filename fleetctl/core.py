@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 
 from . import ddns, pki
+from .agents import AgentHub
 from .codes import short_id
 from .paths import (
     GROUPS,
@@ -37,6 +38,11 @@ class Fleet:
         self.ca_key = self.root / "ca.key"
         self.ca_crt = self.root / "ca.crt"
         self.registry = Registry(self.root / "fleet.db")
+        self.agents = AgentHub(self.root / "agents.db")
+
+    def close(self) -> None:
+        self.registry.close()
+        self.agents.close()
 
     # setup ---------------------------------------------------------------
     @classmethod
@@ -194,6 +200,9 @@ class Fleet:
     def list(self) -> list[dict]:
         return [{"name": d.name, "ip": d.ip, "kind": d.kind, "group": d.grp, "not_after": d.not_after,
                  "last_seen": d.last_seen, "revoked_at": d.revoked_at} for d in self.registry.devices()]  # fmt: skip
+
+    def active_device_names(self) -> set[str]:
+        return {d.name for d in self.registry.devices() if d.active}
 
     def _existing(self, name: str) -> Device:
         dev = self.registry.get(name)

@@ -15,11 +15,12 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import codes, ddns, pki, system
+from . import codes, ddns, hooks, mcp, mcp_install, pki, system
 from .client import ApiError, call
 from .core import Fleet, FleetError
 from .paths import (
     DDNS_LABEL,
+    HARNESSES,
     LIGHTHOUSE_IP,
     SERVE_LABEL,
     SYNC_LABEL,
@@ -130,6 +131,8 @@ def cmd_init(a: argparse.Namespace) -> None:
     system.install_sync_daemon()
     info("starting nebula ...")
     system.start_nebula()
+    if mcp_updated := mcp_install.install():
+        info(f"configured agent MCP & hooks ({len(mcp_updated)} file(s))")
     if dns:
         try:
             ddns_activate(fleet, dns)
@@ -178,6 +181,8 @@ def cmd_join(a: argparse.Namespace) -> None:
                        node={"name": resp["name"], "api": resp["api"]})  # fmt: skip
     system.install_sync_daemon()
     system.start_nebula()
+    if mcp_updated := mcp_install.install():
+        info(f"configured agent MCP & hooks ({len(mcp_updated)} file(s))")
     key.unlink()
     pub.unlink(missing_ok=True)
     check_lighthouse()
@@ -278,6 +283,8 @@ def cmd_sync(a: argparse.Namespace) -> None:
         if node["api"].startswith("http://127.0.0.1"):
             system.restart(SERVE_LABEL)
             time.sleep(2)  # let the restarted server bind before we call it
+    if mcp_updated := mcp_install.sync_owner_configs():
+        print(f"{stamp} updated MCP/hook configs: {', '.join(p.name for p in mcp_updated)}")
     deadline = time.monotonic() + (a.wait if a.wait else 0)
     while True:
         try:
@@ -321,6 +328,74 @@ def cmd_status(_: argparse.Namespace) -> None:
         print(f"lighthouse:  reachable, this device is {me['ip']}")
     except ApiError as e:
         print(f"lighthouse:  {e}")
+
+
+# agents & mcp -----------------------------------------------------------------
+
+
+def cmd_agents(a: argparse.Namespace) -> None:
+    params = []
+    if a.all:
+        params.append("include_stale=true")
+    if a.device:
+        params.append(f"device={a.device}")
+    if a.repo:
+        params.append(f"repo={a.repo}")
+    qs = f"?{'&'.join(params)}" if params else ""
+    agents = call(api(), "GET", f"/v1/agents{qs}")["agents"]
+    if not agents:
+        print("no active agent sessions")
+        return
+    rows = [("SESSION", "DEVICE", "HARNESS", "REPO", "STATE", "LAST SEEN", "SUMMARY")]
+    for ag in agents:
+        state = ag["state"] if ag["live"] else f"{ag['state']} (stale)"
+        repo_label = f"{ag['repo']}@{ag['branch']}" if ag["repo"] and ag["branch"] else ag["repo"]
+        rows.append((
+            ag["session_id"],
+            ag["device"],
+            ag["harness"],
+            repo_label or "-",
+            state,
+            ago(ag["updated_at"]),
+            (ag["summary"] or "").replace("\n", " ")[:48],
+        ))
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    for r in rows:
+        print("  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip())
+
+
+def cmd_mcp_install(a: argparse.Namespace) -> None:
+    require_not_root("mcp install")
+    updated = mcp_install.install(force_all=a.all)
+    if updated:
+        for p in updated:
+            print(f"updated {p}")
+    else:
+        print("already up to date")
+
+
+def cmd_mcp_uninstall(_: argparse.Namespace) -> None:
+    require_not_root("mcp uninstall")
+    removed = mcp_install.uninstall()
+    if removed:
+        for p in removed:
+            print(f"updated {p}")
+    else:
+        print("no fleet MCP/hook entries found")
+
+
+def cmd_mcp_status(_: argparse.Namespace) -> None:
+    st = mcp_install.status()
+    for name in HARNESSES:
+        print(f"{name + ':':<14} {'configured' if st[name] else 'not configured'}")
+
+
+def cmd_mcp_serve(a: argparse.Namespace) -> None:
+    mcp.serve_stdio(a.harness)
+
+
+def cmd_agent_hook(a: argparse.Namespace) -> None:
+    hooks.run_hook(a.harness)
 
 
 # ddns -----------------------------------------------------------------------------
@@ -453,6 +528,27 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--name", required=True, help="e.g. lighthouse.example.com")
     s.set_defaults(func=cmd_ddns_policy)
     sub.add_parser("status", help="show this machine's fleet status").set_defaults(func=cmd_status)
+
+    s = sub.add_parser("agents", help="list active AI agent sessions across the fleet")
+    s.add_argument("--all", action="store_true", help="include stale and exited sessions")
+    s.add_argument("--device", help="filter by fleet device name")
+    s.add_argument("--repo", help="filter by repository name")
+    s.set_defaults(func=cmd_agents)
+
+    m = sub.add_parser("mcp", help="manage MCP and lifecycle hooks for claude, codex, and antigravity").add_subparsers(
+        dest="mcp_cmd", required=True)
+    s = m.add_parser("install", help="configure MCP + hooks for installed harnesses")
+    s.add_argument("--all", action="store_true", help="write configs for all harnesses even if not yet installed")
+    s.set_defaults(func=cmd_mcp_install)
+    m.add_parser("uninstall", help="remove fleet MCP + hook configs").set_defaults(func=cmd_mcp_uninstall)
+    m.add_parser("status", help="show harness configuration status").set_defaults(func=cmd_mcp_status)
+    s = m.add_parser("serve", help="(internal) run MCP stdio server")
+    s.add_argument("--harness", choices=HARNESSES, required=True)
+    s.set_defaults(func=cmd_mcp_serve)
+
+    s = sub.add_parser("agent-hook", help="(internal) handle a harness lifecycle hook")
+    s.add_argument("--harness", choices=HARNESSES, required=True)
+    s.set_defaults(func=cmd_agent_hook)
     return p
 
 
