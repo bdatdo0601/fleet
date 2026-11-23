@@ -30,11 +30,14 @@ def make_handler(fleet: Fleet, quiet: bool = False) -> type[BaseHTTPRequestHandl
 
         def _send(self, status: int, body: dict) -> None:
             data = json.dumps(body).encode()
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         def _body(self) -> dict:
             length = int(self.headers.get("Content-Length") or 0)
@@ -74,6 +77,9 @@ def make_handler(fleet: Fleet, quiet: bool = False) -> type[BaseHTTPRequestHandl
                     device=caller_name, harness=harness, raw_id=str(body.get("raw_id", "")),
                     pid=pid, cwd=cwd, repo=str(body.get("repo", "")), branch=str(body.get("branch", "")),
                     state=str(body.get("state", "working")),
+                    title=str(body["title"]) if body.get("title") is not None else None,
+                    name=str(body["name"]) if body.get("name") is not None else None,
+                    explicit_name=bool(body.get("explicit_name", False)),
                     summary=str(body["summary"]) if body.get("summary") is not None else None,
                     git_status=str(body["git_status"]) if body.get("git_status") is not None else None,
                     tail=tail if isinstance(tail, list) else None,
@@ -95,13 +101,13 @@ def make_handler(fleet: Fleet, quiet: bool = False) -> type[BaseHTTPRequestHandl
                     session_id=str(body["session_id"]) if body.get("session_id") else None, cwd=cwd, pid=pid,
                 )
                 reply_to = int(body["reply_to"]) if body.get("reply_to") is not None else None
-                msg = fleet.agents.send_message(
+                res = fleet.agents.send_message_with_report(
                     device=caller_name, from_session=from_sid, to=str(body.get("to", "")),
                     body=str(body.get("body", "")),
                     thread_id=str(body["thread_id"]) if body.get("thread_id") else None,
                     reply_to=reply_to, known_devices=fleet.active_device_names(),
                 )  # fmt: skip
-                self._send(200, {"message": msg})
+                self._send(200, res)
                 return True
             if path_only == "/v1/agents/inbox":
                 sid = fleet.agents.resolve_caller_session(
@@ -123,7 +129,45 @@ def make_handler(fleet: Fleet, quiet: bool = False) -> type[BaseHTTPRequestHandl
                 res = fleet.agents.ask(
                     device=caller_name, from_session=from_sid, to=str(body.get("to", "")),
                     body=str(body.get("body", "")), timeout=float(body.get("timeout", 30.0)),
+                    wait_if_idle=bool(body.get("wait_if_idle", False)),
                     known_devices=fleet.active_device_names(),
+                )  # fmt: skip
+                self._send(200, res)
+                return True
+            if path_only == "/v1/agents/wait":
+                sid = fleet.agents.resolve_caller_session(
+                    device=caller_name, harness=harness,
+                    session_id=str(body["session_id"]) if body.get("session_id") else None, cwd=cwd, pid=pid,
+                )
+                res = fleet.agents.wait_for_messages(
+                    device=caller_name, session_id=sid,
+                    timeout=float(body.get("timeout", 55.0)),
+                    mark_read=bool(body.get("mark_read", True)),
+                    limit=int(body.get("limit", 50)),
+                    require_full_id=bool(body.get("require_full_id", False)),
+                )  # fmt: skip
+                self._send(200, res)
+                return True
+            if path_only == "/v1/agents/ack":
+                sid = fleet.agents.resolve_caller_session(
+                    device=caller_name, harness=harness,
+                    session_id=str(body["session_id"]) if body.get("session_id") else None, cwd=cwd, pid=pid,
+                )
+                raw_ids = body.get("message_ids")
+                if not isinstance(raw_ids, list):
+                    raise AgentError("message_ids list is required")
+                res = fleet.agents.ack_messages(
+                    device=caller_name, session_id=sid, message_ids=[int(x) for x in raw_ids],
+                )  # fmt: skip
+                self._send(200, res)
+                return True
+            if path_only == "/v1/agents/rename":
+                sid = fleet.agents.resolve_caller_session(
+                    device=caller_name, harness=harness,
+                    session_id=str(body["session_id"]) if body.get("session_id") else None, cwd=cwd, pid=pid,
+                )
+                res = fleet.agents.rename_session(
+                    device=caller_name, session_id=sid, new_name=str(body.get("name", "")),
                 )  # fmt: skip
                 self._send(200, res)
                 return True
@@ -177,7 +221,9 @@ def make_handler(fleet: Fleet, quiet: bool = False) -> type[BaseHTTPRequestHandl
 
 
 def make_server(fleet: Fleet, host: str, port: int, quiet: bool = False) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer((host, port), make_handler(fleet, quiet))
+    httpd = ThreadingHTTPServer((host, port), make_handler(fleet, quiet))
+    httpd.daemon_threads = True
+    return httpd
 
 
 def serve(port: int, host: str = "0.0.0.0") -> None:  # noqa: S104 - see module docstring

@@ -12,10 +12,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import codes, ddns, hooks, mcp, mcp_install, pki, system
+from . import codes, ddns, hooks, mcp, mcp_install, pki, system, waiter
 from .client import ApiError, call
 from .core import Fleet, FleetError
 from .paths import (
@@ -346,22 +347,45 @@ def cmd_agents(a: argparse.Namespace) -> None:
     if not agents:
         print("no active agent sessions")
         return
-    rows = [("SESSION", "DEVICE", "HARNESS", "REPO", "STATE", "LAST SEEN", "SUMMARY")]
+    rows = [("NAME", "DEVICE", "HARNESS", "REPO", "STATE", "LAST SEEN", "TITLE", "SESSION")]
     for ag in agents:
-        state = ag["state"] if ag["live"] else f"{ag['state']} (stale)"
+        if not ag["live"]:
+            state = f"{ag['state']} (stale)"
+        elif ag.get("listening"):
+            state = f"{ag['state']} (listening)"
+        else:
+            state = ag["state"]
         repo_label = f"{ag['repo']}@{ag['branch']}" if ag["repo"] and ag["branch"] else ag["repo"]
+        title_text = (ag.get("title") or ag.get("summary") or "").replace("\n", " ")[:48]
         rows.append((
-            ag["session_id"],
+            ag.get("name") or "-",
             ag["device"],
             ag["harness"],
             repo_label or "-",
             state,
             ago(ag["updated_at"]),
-            (ag["summary"] or "").replace("\n", " ")[:48],
+            title_text,
+            ag["session_id"],
         ))
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
     for r in rows:
         print("  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip())
+
+
+def cmd_agents_wait(a: argparse.Namespace) -> None:
+    waiter.wait_for_inbox_cli(
+        session_id=a.session,
+        harness=a.harness,
+        max_wait=a.timeout,
+        poll_timeout=a.poll_timeout,
+    )
+
+
+def cmd_agents_rename(a: argparse.Namespace) -> None:
+    target = urllib.parse.quote(a.target, safe="")
+    info_resp = call(api(), "GET", f"/v1/agents/{target}")["agent"]
+    res = call(api(), "POST", "/v1/agents/rename", {"session_id": info_resp["session_id"], "name": a.name})
+    print(f"{res['session_id']} -> {res['name']}")
 
 
 def cmd_mcp_install(a: argparse.Namespace) -> None:
@@ -529,11 +553,22 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_ddns_policy)
     sub.add_parser("status", help="show this machine's fleet status").set_defaults(func=cmd_status)
 
-    s = sub.add_parser("agents", help="list active AI agent sessions across the fleet")
-    s.add_argument("--all", action="store_true", help="include stale and exited sessions")
-    s.add_argument("--device", help="filter by fleet device name")
-    s.add_argument("--repo", help="filter by repository name")
-    s.set_defaults(func=cmd_agents)
+    ag = sub.add_parser("agents", help="list active AI agent sessions across the fleet")
+    ag.add_argument("--all", action="store_true", help="include stale and exited sessions")
+    ag.add_argument("--device", help="filter by fleet device name")
+    ag.add_argument("--repo", help="filter by repository name")
+    ag.set_defaults(func=cmd_agents)
+    ag_sub = ag.add_subparsers(dest="agents_cmd", required=False)
+    w = ag_sub.add_parser("wait", help="wait for incoming messages for a session")
+    w.add_argument("--session", required=True, help="session_id to wait on")
+    w.add_argument("--harness", choices=HARNESSES, help="harness override")
+    w.add_argument("--timeout", type=float, default=0.0, help="max wait seconds (0 = wait indefinitely)")
+    w.add_argument("--poll-timeout", type=float, default=50.0, help="per-request long-poll seconds")
+    w.set_defaults(func=cmd_agents_wait)
+    rn = ag_sub.add_parser("rename", help="assign a friendly name to an agent session")
+    rn.add_argument("target", help="session_id, short id, name, or title")
+    rn.add_argument("name", help="new friendly session name")
+    rn.set_defaults(func=cmd_agents_rename)
 
     m = sub.add_parser("mcp", help="manage MCP and lifecycle hooks for claude, codex, and antigravity").add_subparsers(
         dest="mcp_cmd", required=True)

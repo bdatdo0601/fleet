@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import time
@@ -238,14 +239,176 @@ def read_transcript_tail(
     return summary, tail
 
 
-def _format_unread(session_id: str, messages: list[dict]) -> str:
+def _read_claude_title(transcript_path: str | None) -> tuple[str, bool]:
+    if not transcript_path:
+        return "", False
+    path = Path(transcript_path)
+    if not path.is_file():
+        return "", False
+    custom_title = ""
+    agent_name = ""
+    ai_title = ""
+    try:
+        with path.open("rb") as f:
+            for raw_line in f:
+                if (
+                    b'"custom-title"' not in raw_line
+                    and b'"agent-name"' not in raw_line
+                    and b'"ai-title"' not in raw_line
+                ):
+                    continue
+                try:
+                    obj = json.loads(raw_line.decode("utf-8", errors="replace"))
+                except ValueError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                kind = obj.get("type")
+                if kind == "custom-title" and isinstance(obj.get("customTitle"), str) and obj["customTitle"].strip():
+                    custom_title = obj["customTitle"].strip()
+                elif kind == "agent-name" and isinstance(obj.get("agentName"), str) and obj["agentName"].strip():
+                    agent_name = obj["agentName"].strip()
+                elif kind == "ai-title" and isinstance(obj.get("aiTitle"), str) and obj["aiTitle"].strip():
+                    ai_title = obj["aiTitle"].strip()
+    except OSError:
+        return "", False
+    if custom_title:
+        return custom_title, True
+    if agent_name:
+        return agent_name, True
+    if ai_title:
+        return ai_title, False
+    return "", False
+
+
+def _read_codex_title(full_raw_id: str, codex_home: Path | None = None) -> tuple[str, bool]:
+    if not full_raw_id or full_raw_id.startswith("pid-"):
+        return "", False
+    index_path = (codex_home or Path.home() / ".codex") / "session_index.jsonl"
+    if not index_path.is_file():
+        return "", False
+    latest = ""
+    try:
+        with index_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if full_raw_id not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if (
+                    isinstance(obj, dict)
+                    and obj.get("id") == full_raw_id
+                    and isinstance(obj.get("thread_name"), str)
+                    and obj["thread_name"].strip()
+                ):
+                    latest = obj["thread_name"].strip()
+    except OSError:
+        return "", False
+    return latest, False
+
+
+def _read_antigravity_title(
+    full_raw_id: str,
+    transcript_path: str | None,
+    gemini_home: Path | None = None,
+) -> tuple[str, bool]:
+    if not full_raw_id or full_raw_id.startswith("pid-"):
+        return "", False
+    candidates: list[Path] = []
+    if transcript_path:
+        for parent in Path(transcript_path).expanduser().parents:
+            db = parent / "conversation_summaries.db"
+            if db.is_file():
+                candidates.append(db)
+    base = gemini_home or Path.home() / ".gemini"
+    for subdir in ("antigravity", "antigravity-cli", "antigravity-ide"):
+        db = base / subdir / "conversation_summaries.db"
+        if db.is_file() and db not in candidates:
+            candidates.append(db)
+
+    for db in candidates:
+        try:
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=0.5)
+            try:
+                row = conn.execute(
+                    "SELECT title FROM conversation_summaries WHERE conversation_id = ?",
+                    (full_raw_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            if row and isinstance(row[0], str) and row[0].strip():
+                return row[0].strip(), False
+        except (sqlite3.Error, OSError):
+            continue
+    return "", False
+
+
+def read_session_title(
+    harness: str,
+    full_raw_id: str,
+    transcript_path: str | None,
+    *,
+    codex_home: Path | None = None,
+    gemini_home: Path | None = None,
+) -> tuple[str, bool]:
+    """Return `(title, is_explicit_name)` discovered from the local harness state."""
+    if harness == "claude":
+        return _read_claude_title(transcript_path)
+    if harness == "codex":
+        return _read_codex_title(full_raw_id, codex_home=codex_home)
+    if harness == "antigravity":
+        return _read_antigravity_title(full_raw_id, transcript_path, gemini_home=gemini_home)
+    return "", False
+
+
+def _format_unread(
+    session_id: str,
+    messages: list[dict],
+    *,
+    session_name: str = "",
+    rearm_hint: str = "",
+) -> str:
+    label = f"{session_name} ({session_id})" if session_name else session_id
     lines = [
-        f"[Fleet Peer Messages for {session_id}]",
+        f"[Fleet Peer Messages for {label}]",
         "Reply using `fleet_send_message` (include `reply_to` / `thread_id` and `session_id` below):",
     ]
     for m in messages:
+        sender = f"{m['from_name']} ({m['from_session']})" if m.get("from_name") else m["from_session"]
         lines.append(
-            f"- id={m['id']} thread={m['thread_id']} from={m['from_session']}: {m['body']}"
+            f"- id={m['id']} thread={m['thread_id']} from={sender}: {m['body']}"
+        )
+    if rearm_hint:
+        lines.append("")
+        lines.append(rearm_hint)
+    return "\n".join(lines)
+
+
+def _session_start_message(harness: str, session_id: str, session_name: str = "") -> str:
+    id_label = f"`{session_id}` (name `{session_name}`)" if session_name else f"`{session_id}`"
+    lines = [
+        f"Your fleet agent session ID is {id_label}. "
+        f"Pass `{session_id}` as `session_id` when calling `fleet_send_message`, `fleet_check_inbox`, "
+        "`fleet_ask_agent`, `fleet_set_name`, or `fleet_listen`.",
+    ]
+    if harness == "antigravity":
+        lines.append(
+            f"To receive peer messages immediately while idle, on your first turn run "
+            f"`fleet agents wait --session {session_id}` in the background via `run_command` "
+            "(`WaitMsBeforeAsync=500`, `IsDaemon=false`), and re-run it after handling each incoming fleet message."
+        )
+    elif harness == "claude":
+        lines.append(
+            f"To receive peer messages immediately while idle, on your first turn run "
+            f"`fleet agents wait --session {session_id}` in the background via Bash "
+            "(`run_in_background=true`), and re-run it after handling each incoming fleet message."
+        )
+    elif harness == "codex":
+        lines.append(
+            "The fleet MCP server automatically listens in the background and delivers incoming peer "
+            "messages to this session via `codex queue` (use `fleet_listen` to check status or pause/resume)."
         )
     return "\n".join(lines)
 
@@ -257,8 +420,9 @@ def _format_hook_output(
     session_id: str,
     unread: list[dict],
     can_inject: bool,
+    session_name: str = "",
 ) -> dict:
-    unread_text = _format_unread(session_id, unread) if unread else ""
+    unread_text = _format_unread(session_id, unread, session_name=session_name) if unread else ""
     if harness == "antigravity":
         if event == "PostToolUse":
             return {}
@@ -267,11 +431,7 @@ def _format_hook_output(
                 return {}
             parts = []
             if session_id:
-                parts.append(
-                    f"Your fleet agent session ID is `{session_id}`. "
-                    "Pass this as `session_id` when calling `fleet_send_message`, `fleet_check_inbox`, "
-                    "or `fleet_ask_agent`."
-                )
+                parts.append(_session_start_message(harness, session_id, session_name))
             if unread_text:
                 parts.append(unread_text)
             return {"injectSteps": [{"systemMessage": {"systemMessage": "\n\n".join(parts)}}]}
@@ -286,7 +446,7 @@ def _format_hook_output(
     if event == "SessionStart":
         parts = []
         if session_id:
-            parts.append(f"Your fleet agent session ID is `{session_id}`.")
+            parts.append(_session_start_message(harness, session_id, session_name))
         if unread_text:
             parts.append(unread_text)
         if not parts:
@@ -352,14 +512,13 @@ def run_hook(
         event == "Stop" and (cont_active or term_reason != "NO_TOOL_CALL")
     )
     repo, branch, git_status = git_context(cwd)
-    tail_summary, tail = read_transcript_tail(
-        harness,
-        str(transcript_path) if transcript_path else None,
-        cwd=cwd,
-    )
+    transcript_str = str(transcript_path) if transcript_path else None
+    tail_summary, tail = read_transcript_tail(harness, transcript_str, cwd=cwd)
+    title, is_explicit_name = read_session_title(harness, raw_id, transcript_str)
     summary = prompt.strip()[:160] if isinstance(prompt, str) and prompt.strip() else tail_summary
 
     session_id = ""
+    session_name = ""
     unread: list[dict] = []
     try:
         api = _resolve_api(api_url)
@@ -375,6 +534,9 @@ def run_hook(
                 "repo": repo,
                 "branch": branch,
                 "state": state,
+                "title": title or None,
+                "name": title if is_explicit_name else None,
+                "explicit_name": is_explicit_name,
                 "summary": summary or None,
                 "git_status": git_status,
                 "tail": tail,
@@ -383,6 +545,7 @@ def run_hook(
             timeout=2.0,
         )
         session_id = str(resp.get("session_id") or "")
+        session_name = str(resp.get("name") or "")
         raw_unread = resp.get("unread")
         if isinstance(raw_unread, list):
             unread = raw_unread
@@ -393,6 +556,7 @@ def run_hook(
         harness=harness,
         event=event,
         session_id=session_id,
+        session_name=session_name,
         unread=unread,
         can_inject=can_inject,
     )

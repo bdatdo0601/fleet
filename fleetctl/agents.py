@@ -19,11 +19,15 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
   device      TEXT NOT NULL,
   harness     TEXT NOT NULL,
   raw_id      TEXT NOT NULL,
+  full_raw_id TEXT NOT NULL DEFAULT '',
   pid         INTEGER,
   cwd         TEXT NOT NULL DEFAULT '',
   repo        TEXT NOT NULL DEFAULT '',
   branch      TEXT NOT NULL DEFAULT '',
   state       TEXT NOT NULL DEFAULT 'working',
+  title       TEXT NOT NULL DEFAULT '',
+  name        TEXT NOT NULL DEFAULT '',
+  custom_name INTEGER NOT NULL DEFAULT 0,
   summary     TEXT NOT NULL DEFAULT '',
   git_status  TEXT NOT NULL DEFAULT '',
   tail_json   TEXT NOT NULL DEFAULT '[]',
@@ -56,8 +60,16 @@ CREATE TABLE IF NOT EXISTS agent_reads (
 );
 """
 
+SESSION_MIGRATIONS = (
+    ("full_raw_id", "TEXT NOT NULL DEFAULT ''"),
+    ("title", "TEXT NOT NULL DEFAULT ''"),
+    ("name", "TEXT NOT NULL DEFAULT ''"),
+    ("custom_name", "INTEGER NOT NULL DEFAULT 0"),
+)
+
 VALID_STATES = ("working", "idle", "exited")
 MAX_MESSAGE_BYTES = 32 * 1024
+WAITER_REARM_GRACE_SECONDS = 20.0
 
 
 class AgentError(Exception):
@@ -90,13 +102,33 @@ def make_session_id(device: str, harness: str, raw_id: str) -> tuple[str, str]:
     return f"{device}:{harness}:{short}", short
 
 
+def slugify_name(text: str, *, max_words: int = 5, max_len: int = 32) -> str:
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    if not tokens:
+        return ""
+    return "-".join(tokens[:max_words])[:max_len].rstrip("-")
+
+
+def delivery_mode(*, live: bool, state: str, listening: bool) -> str:
+    if not live or state == "exited":
+        return "offline"
+    if listening:
+        return "immediate"
+    if state == "working":
+        return "next_hook"
+    return "queued_idle"
+
+
 def _row_to_message(row: sqlite3.Row) -> dict:
+    keys = row.keys()
     return {
         "id": row["id"],
         "thread_id": row["thread_id"],
         "reply_to": row["reply_to"],
         "from_session": row["from_session"],
         "from_device": row["from_device"],
+        "from_name": (row["from_name"] or "") if "from_name" in keys else "",
+        "from_title": (row["from_title"] or "") if "from_title" in keys else "",
         "to_device": row["to_device"],
         "to_session": row["to_session"],
         "to_repo": row["to_repo"],
@@ -105,23 +137,33 @@ def _row_to_message(row: sqlite3.Row) -> dict:
     }
 
 
-def _row_to_session(row: sqlite3.Row, now_dt: datetime | None = None) -> dict:
+def _row_to_session(row: sqlite3.Row, now_dt: datetime | None = None, *, listening: bool = False) -> dict:
     now_dt = now_dt or _now_dt()
     updated = datetime.fromisoformat(row["updated_at"])
     age = max(0, int((now_dt - updated).total_seconds()))
     live = row["state"] != "exited" and age <= AGENT_ACTIVE_SECONDS
     tail = json.loads(row["tail_json"] or "[]")
+    keys = row.keys()
+    full_raw_id = (row["full_raw_id"] or "") if "full_raw_id" in keys else ""
+    title = (row["title"] or "") if "title" in keys else ""
+    name = (row["name"] or "") if "name" in keys else ""
+    is_listening = bool(listening and live and row["state"] != "exited")
     return {
         "session_id": row["session_id"],
         "device": row["device"],
         "harness": row["harness"],
+        "full_raw_id": full_raw_id,
         "pid": row["pid"],
         "cwd": row["cwd"],
         "repo": row["repo"],
         "branch": row["branch"],
         "state": row["state"],
         "live": live,
+        "listening": is_listening,
+        "delivery": delivery_mode(live=live, state=row["state"], listening=is_listening),
         "age_seconds": age,
+        "title": title,
+        "name": name,
         "summary": row["summary"],
         "git_status": row["git_status"],
         "turn_count": len(tail),
@@ -137,6 +179,10 @@ class AgentHub:
         self.lock = threading.RLock()
         self.cond = threading.Condition(self.lock)
         self._last_prune = 0.0
+        self._waiters: dict[str, int] = {}
+        self._wait_seen_at: dict[str, float] = {}
+        self._promoted_to: dict[str, str] = {}
+        self._closed = False
         self.conn = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None)
         self.conn.row_factory = sqlite3.Row
         if path.exists():
@@ -144,9 +190,15 @@ class AgentHub:
         self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
+        existing_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(agent_sessions)").fetchall()}
+        for col, col_def in SESSION_MIGRATIONS:
+            if col not in existing_cols:
+                self.conn.execute(f"ALTER TABLE agent_sessions ADD COLUMN {col} {col_def}")
 
     def close(self) -> None:
-        with self.lock:
+        with self.cond:
+            self._closed = True
+            self.cond.notify_all()
             self.conn.close()
 
     def prune(self, *, force: bool = False) -> None:
@@ -170,23 +222,21 @@ class AgentHub:
                 self.conn.execute("ROLLBACK")
                 raise
 
-    def _promote_placeholder(self, *, device: str, harness: str, cwd: str, pid: int | None, target_id: str) -> tuple[int | None, str | None]:  # noqa: E501
-        """If a stdio `pid-*` placeholder exists for this session, migrate its identity & messages."""
-        if not cwd:
-            return pid, None
-        cutoff = (_now_dt() - timedelta(seconds=AGENT_ACTIVE_SECONDS)).isoformat()
-        rows = self.conn.execute(
-            "SELECT session_id, pid, started_at FROM agent_sessions "
-            "WHERE device = ? AND harness = ? AND cwd = ? AND raw_id LIKE 'pid-%' "
-            "AND state != 'exited' AND updated_at >= ? ORDER BY updated_at DESC",
-            (device, harness, cwd, cutoff),
-        ).fetchall()
-        if not rows:
-            return pid, None
-        chosen = next((r for r in rows if pid is not None and r["pid"] == pid), rows[0])
-        old_id = chosen["session_id"]
+    def _transfer_waiter(self, old_id: str, target_id: str) -> None:
         if old_id == target_id:
-            return pid, chosen["started_at"]
+            return
+        if old_id in self._waiters:
+            self._waiters[target_id] = self._waiters.get(target_id, 0) + self._waiters.pop(old_id)
+        if old_id in self._wait_seen_at:
+            self._wait_seen_at[target_id] = max(
+                self._wait_seen_at.get(target_id, 0.0),
+                self._wait_seen_at.pop(old_id),
+            )
+        self._promoted_to[old_id] = target_id
+
+    def _migrate_session_identity(self, *, old_id: str, target_id: str) -> None:
+        if old_id == target_id:
+            return
         self.conn.execute("UPDATE agent_messages SET to_session = ? WHERE to_session = ?", (target_id, old_id))
         self.conn.execute("UPDATE agent_messages SET from_session = ? WHERE from_session = ?", (target_id, old_id))
         self.conn.execute(
@@ -196,7 +246,139 @@ class AgentHub:
         )
         self.conn.execute("DELETE FROM agent_reads WHERE session_id = ?", (old_id,))
         self.conn.execute("DELETE FROM agent_sessions WHERE session_id = ?", (old_id,))
-        return pid if pid is not None else chosen["pid"], chosen["started_at"]
+        self._transfer_waiter(old_id, target_id)
+
+    def _is_listening(self, session_id: str, state: str, live: bool, now_mono: float | None = None) -> bool:
+        if not live or state == "exited":
+            return False
+        if self._waiters.get(session_id, 0) > 0:
+            return True
+        now_mono = time.monotonic() if now_mono is None else now_mono
+        return (
+            state == "working"
+            and (now_mono - self._wait_seen_at.get(session_id, -1e9)) <= WAITER_REARM_GRACE_SECONDS
+        )
+
+    def _serialize_session(
+        self,
+        row: sqlite3.Row,
+        now_dt: datetime | None = None,
+        now_mono: float | None = None,
+    ) -> dict:
+        now_dt = now_dt or _now_dt()
+        updated = datetime.fromisoformat(row["updated_at"])
+        age = max(0, int((now_dt - updated).total_seconds()))
+        live = row["state"] != "exited" and age <= AGENT_ACTIVE_SECONDS
+        listening = self._is_listening(row["session_id"], row["state"], live, now_mono=now_mono)
+        return _row_to_session(row, now_dt, listening=listening)
+
+    def _unique_auto_name(self, base: str, *, device: str, exclude_sid: str) -> str:
+        if not base:
+            return ""
+        cutoff = (_now_dt() - timedelta(seconds=AGENT_ACTIVE_SECONDS)).isoformat()
+        rows = self.conn.execute(
+            "SELECT LOWER(name) AS lname FROM agent_sessions "
+            "WHERE device = ? AND state != 'exited' AND updated_at >= ? AND session_id != ? AND name != ''",
+            (device, cutoff, exclude_sid),
+        ).fetchall()
+        taken = {r["lname"] for r in rows}
+        if base.lower() not in taken:
+            return base
+        n = 2
+        while True:
+            suffix = f"-{n}"
+            candidate = f"{base[:max(1, 32 - len(suffix))].rstrip('-')}{suffix}"
+            if candidate.lower() not in taken:
+                return candidate
+            n += 1
+
+    def _resolve_title_and_name(
+        self,
+        *,
+        device: str,
+        session_id: str,
+        repo: str,
+        title: str | None,
+        name: str | None,
+        explicit_name: bool,
+        base_title: str,
+        base_name: str,
+        base_custom: int,
+    ) -> tuple[str, str, int]:
+        eff_title = title.strip()[:160] if isinstance(title, str) and title.strip() else base_title
+        if base_custom:
+            return eff_title, base_name, 1
+        if isinstance(name, str) and name.strip():
+            slug = slugify_name(name)
+            if slug:
+                eff_name = (
+                    slug
+                    if explicit_name
+                    else self._unique_auto_name(slug, device=device, exclude_sid=session_id)
+                )
+                return eff_title, eff_name, 0
+        if eff_title and (eff_title != base_title or not base_name):
+            slug = slugify_name(eff_title)
+            if slug:
+                return eff_title, self._unique_auto_name(slug, device=device, exclude_sid=session_id), 0
+        if not base_name and repo:
+            slug = slugify_name(repo)
+            if slug:
+                return eff_title, self._unique_auto_name(slug, device=device, exclude_sid=session_id), 0
+        return eff_title, base_name, 0
+
+    def _promote_placeholder(
+        self,
+        *,
+        device: str,
+        harness: str,
+        cwd: str,
+        pid: int | None,
+        target_id: str,
+    ) -> tuple[int | None, str | None, str, str, int]:
+        """If a stdio `pid-*` placeholder exists for this session, migrate its identity & messages."""
+        if not cwd:
+            return pid, None, "", "", 0
+        cutoff = (_now_dt() - timedelta(seconds=AGENT_ACTIVE_SECONDS)).isoformat()
+        rows = self.conn.execute(
+            "SELECT session_id, pid, started_at, title, name, custom_name FROM agent_sessions "
+            "WHERE device = ? AND harness = ? AND cwd = ? AND raw_id LIKE 'pid-%' "
+            "AND state != 'exited' AND updated_at >= ? ORDER BY updated_at DESC",
+            (device, harness, cwd, cutoff),
+        ).fetchall()
+        if not rows:
+            return pid, None, "", "", 0
+        chosen = next((r for r in rows if pid is not None and r["pid"] == pid), rows[0])
+        old_id = chosen["session_id"]
+        self._migrate_session_identity(old_id=old_id, target_id=target_id)
+        return (
+            pid if pid is not None else chosen["pid"],
+            chosen["started_at"],
+            chosen["title"] or "",
+            chosen["name"] or "",
+            int(chosen["custom_name"] or 0),
+        )
+
+    def _find_promoted_session(self, *, device: str, harness: str, pid: int, cwd: str) -> sqlite3.Row | None:
+        cutoff = (_now_dt() - timedelta(seconds=AGENT_ACTIVE_SECONDS)).isoformat()
+        by_pid = self.conn.execute(
+            "SELECT * FROM agent_sessions "
+            "WHERE device = ? AND harness = ? AND pid = ? AND raw_id NOT LIKE 'pid-%' "
+            "AND state != 'exited' AND updated_at >= ? ORDER BY updated_at DESC LIMIT 1",
+            (device, harness, pid, cutoff),
+        ).fetchone()
+        if by_pid is not None:
+            return by_pid
+        if cwd:
+            by_cwd = self.conn.execute(
+                "SELECT * FROM agent_sessions "
+                "WHERE device = ? AND harness = ? AND cwd = ? AND pid IS NULL AND raw_id NOT LIKE 'pid-%' "
+                "AND state != 'exited' AND updated_at >= ? ORDER BY updated_at DESC",
+                (device, harness, cwd, cutoff),
+            ).fetchall()
+            if len(by_cwd) == 1:
+                return by_cwd[0]
+        return None
 
     def heartbeat(
         self,
@@ -209,6 +391,9 @@ class AgentHub:
         repo: str = "",
         branch: str = "",
         state: str = "working",
+        title: str | None = None,
+        name: str | None = None,
+        explicit_name: bool = False,
         summary: str | None = None,
         git_status: str | None = None,
         tail: list[dict] | None = None,
@@ -217,32 +402,118 @@ class AgentHub:
         if state not in VALID_STATES:
             raise AgentError(f"invalid state {state!r}")
         session_id, short_id = make_session_id(device, harness, raw_id)
+        raw_clean = raw_id.strip()[:128]
         now_iso = _now()
-        with self.lock:
+        with self.cond:
             self.prune()
             self.conn.execute("BEGIN")
             try:
-                old_pid, old_started = (
-                    self._promote_placeholder(device=device, harness=harness, cwd=cwd, pid=pid, target_id=session_id)
-                    if not short_id.startswith("pid-")
-                    else (pid, None)
-                )
+                if short_id.startswith("pid-") and pid is not None:
+                    promoted = self._find_promoted_session(device=device, harness=harness, pid=pid, cwd=cwd)
+                    if promoted is not None:
+                        target_id = promoted["session_id"]
+                        self._migrate_session_identity(old_id=session_id, target_id=target_id)
+                        eff_title, eff_name, eff_custom = self._resolve_title_and_name(
+                            device=device,
+                            session_id=target_id,
+                            repo=repo or promoted["repo"],
+                            title=title,
+                            name=name,
+                            explicit_name=explicit_name,
+                            base_title=promoted["title"] or "",
+                            base_name=promoted["name"] or "",
+                            base_custom=int(promoted["custom_name"] or 0),
+                        )
+                        self.conn.execute(
+                            "UPDATE agent_sessions SET pid = ?, cwd = ?, repo = ?, branch = ?, "
+                            "title = ?, name = ?, custom_name = ?, summary = ?, git_status = ?, "
+                            "tail_json = ?, updated_at = ? WHERE session_id = ?",
+                            (
+                                promoted["pid"] if promoted["pid"] is not None else pid,
+                                cwd or promoted["cwd"],
+                                repo or promoted["repo"],
+                                branch or promoted["branch"],
+                                eff_title,
+                                eff_name,
+                                eff_custom,
+                                promoted["summary"] if summary is None else summary[:160],
+                                promoted["git_status"] if git_status is None else git_status[:1500],
+                                promoted["tail_json"] if tail is None else json.dumps(tail[-25:]),
+                                now_iso,
+                                target_id,
+                            ),
+                        )
+                        self.conn.execute("COMMIT")
+                        self.cond.notify_all()
+                        unread = (
+                            self.fetch_inbox(device=device, session_id=target_id, unread_only=True, mark_read=True)
+                            if drain_inbox
+                            else []
+                        )
+                        return {
+                            "session_id": target_id,
+                            "full_raw_id": promoted["full_raw_id"] or "",
+                            "name": eff_name,
+                            "title": eff_title,
+                            "unread": unread,
+                        }
+
+                if not short_id.startswith("pid-"):
+                    old_pid, old_started, old_title, old_name, old_custom = self._promote_placeholder(
+                        device=device, harness=harness, cwd=cwd, pid=pid, target_id=session_id
+                    )
+                else:
+                    old_pid, old_started, old_title, old_name, old_custom = pid, None, "", "", 0
+
                 existing = self.conn.execute(
-                    "SELECT pid, cwd, repo, branch, summary, git_status, tail_json, started_at "
+                    "SELECT full_raw_id, pid, cwd, repo, branch, title, name, custom_name, "
+                    "summary, git_status, tail_json, started_at "
                     "FROM agent_sessions WHERE session_id = ?",
                     (session_id,),
                 ).fetchone()
+
+                base_title = (existing["title"] if existing else "") or old_title
+                if existing and existing["custom_name"]:
+                    base_name = existing["name"] or ""
+                    base_custom = 1
+                elif old_custom:
+                    base_name = old_name
+                    base_custom = 1
+                else:
+                    base_name = (existing["name"] if existing else "") or old_name
+                    base_custom = 0
+
+                eff_repo = repo or (existing["repo"] if existing else "")
+                eff_title, eff_name, eff_custom = self._resolve_title_and_name(
+                    device=device,
+                    session_id=session_id,
+                    repo=eff_repo,
+                    title=title,
+                    name=name,
+                    explicit_name=explicit_name,
+                    base_title=base_title,
+                    base_name=base_name,
+                    base_custom=base_custom,
+                )
+                full_raw = raw_clean if not short_id.startswith("pid-") else (
+                    existing["full_raw_id"] if existing else ""
+                )
+
                 if existing:
                     self.conn.execute(
-                        "UPDATE agent_sessions SET pid = ?, cwd = ?, repo = ?, branch = ?, state = ?, "
-                        "summary = ?, git_status = ?, tail_json = ?, started_at = ?, updated_at = ? "
-                        "WHERE session_id = ?",
+                        "UPDATE agent_sessions SET full_raw_id = ?, pid = ?, cwd = ?, repo = ?, branch = ?, "
+                        "state = ?, title = ?, name = ?, custom_name = ?, summary = ?, git_status = ?, "
+                        "tail_json = ?, started_at = ?, updated_at = ? WHERE session_id = ?",
                         (
+                            full_raw or existing["full_raw_id"],
                             old_pid if old_pid is not None else existing["pid"],
                             cwd or existing["cwd"],
-                            repo or existing["repo"],
+                            eff_repo,
                             branch or existing["branch"],
                             state,
+                            eff_title,
+                            eff_name,
+                            eff_custom,
                             existing["summary"] if summary is None else summary[:160],
                             existing["git_status"] if git_status is None else git_status[:1500],
                             existing["tail_json"] if tail is None else json.dumps(tail[-25:]),
@@ -253,19 +524,23 @@ class AgentHub:
                     )
                 else:
                     self.conn.execute(
-                        "INSERT INTO agent_sessions(session_id, device, harness, raw_id, pid, cwd, repo, branch, "
-                        "state, summary, git_status, tail_json, started_at, updated_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "INSERT INTO agent_sessions(session_id, device, harness, raw_id, full_raw_id, pid, cwd, repo, "
+                        "branch, state, title, name, custom_name, summary, git_status, tail_json, started_at, "
+                        "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             session_id,
                             device,
                             harness,
                             short_id,
+                            full_raw,
                             old_pid,
                             cwd,
                             repo,
                             branch,
                             state,
+                            eff_title,
+                            eff_name,
+                            eff_custom,
                             (summary or "")[:160],
                             (git_status or "")[:1500],
                             json.dumps((tail or [])[-25:]),
@@ -274,6 +549,7 @@ class AgentHub:
                         ),
                     )
                 self.conn.execute("COMMIT")
+                self.cond.notify_all()
             except BaseException:
                 self.conn.execute("ROLLBACK")
                 raise
@@ -282,7 +558,33 @@ class AgentHub:
                 if drain_inbox
                 else []
             )
-        return {"session_id": session_id, "unread": unread}
+        return {
+            "session_id": session_id,
+            "full_raw_id": full_raw,
+            "name": eff_name,
+            "title": eff_title,
+            "unread": unread,
+        }
+
+    def rename_session(self, *, device: str, session_id: str, new_name: str) -> dict:
+        if not session_id.startswith(f"{device}:"):
+            raise AgentError("session belongs to another device", 403)
+        raw = new_name.strip().lower()
+        if raw.startswith(("repo:", "device:")):
+            raise AgentError("invalid session name")
+        slug = slugify_name(new_name, max_words=6, max_len=40)
+        if not slug or slug in ("all",):
+            raise AgentError("session name must contain letters or digits and cannot be reserved")
+        now_iso = _now()
+        with self.lock:
+            cur = self.conn.execute(
+                "UPDATE agent_sessions SET name = ?, custom_name = 1, updated_at = ? "
+                "WHERE device = ? AND session_id = ?",
+                (slug, now_iso, device, session_id),
+            )
+            if cur.rowcount == 0:
+                raise AgentError(f"no agent session {session_id!r}", 404)
+        return {"session_id": session_id, "name": slug}
 
     def deregister(
         self,
@@ -295,7 +597,7 @@ class AgentHub:
         if session_id is not None and not session_id.startswith(f"{device}:"):
             raise AgentError("session belongs to another device", 403)
         now_iso = _now()
-        with self.lock:
+        with self.cond:
             if session_id is not None:
                 self.conn.execute(
                     "UPDATE agent_sessions SET state = 'exited', updated_at = ? WHERE device = ? AND session_id = ?",
@@ -309,6 +611,7 @@ class AgentHub:
                 )
             else:
                 raise AgentError("session_id or (harness, pid) is required")
+            self.cond.notify_all()
         return {"ok": True}
 
     def resolve_caller_session(
@@ -324,7 +627,11 @@ class AgentHub:
             if ":" in session_id:
                 if not session_id.startswith(f"{device}:"):
                     raise AgentError("session belongs to another device", 403)
-                return session_id
+                with self.lock:
+                    cur = session_id
+                    while cur in self._promoted_to:
+                        cur = self._promoted_to[cur]
+                    return cur
             resolved, _ = make_session_id(device, harness, session_id)
             return resolved
         if harness not in HARNESSES:
@@ -363,8 +670,9 @@ class AgentHub:
                 "ORDER BY updated_at DESC",
                 (device, device, repo, repo, harness, harness),
             ).fetchall()
-        now_dt = _now_dt()
-        sessions = [_row_to_session(r, now_dt) for r in rows]
+            now_dt = _now_dt()
+            now_mono = time.monotonic()
+            sessions = [self._serialize_session(r, now_dt=now_dt, now_mono=now_mono) for r in rows]
         return sessions if include_stale else [s for s in sessions if s["live"]]
 
     def get_session(self, target: str) -> dict:
@@ -372,25 +680,125 @@ class AgentHub:
         if not target:
             raise AgentError("session target is required")
         with self.lock:
-            exact = self.conn.execute("SELECT * FROM agent_sessions WHERE session_id = ?", (target,)).fetchone()
-            if exact:
-                info = _row_to_session(exact)
-                info["tail"] = json.loads(exact["tail_json"] or "[]")
-                return info
             rows = self.conn.execute("SELECT * FROM agent_sessions ORDER BY updated_at DESC").fetchall()
-        suffix_matches = [r for r in rows if r["session_id"].endswith(f":{target}")]
-        matches = suffix_matches or [r for r in rows if target in r["session_id"]]
-        if not matches:
-            raise AgentError(f"no agent session matching {target!r}", 404)
-        if len(matches) > 1:
-            ids = ", ".join(r["session_id"] for r in matches[:5])
-            raise AgentError(f"ambiguous session {target!r}: {ids}", 400)
-        row = matches[0]
-        info = _row_to_session(row)
-        info["tail"] = json.loads(row["tail_json"] or "[]")
-        return info
+            now_dt = _now_dt()
+            now_mono = time.monotonic()
 
-    def send_message(
+            def is_live(r: sqlite3.Row) -> bool:
+                updated = datetime.fromisoformat(r["updated_at"])
+                age = max(0, int((now_dt - updated).total_seconds()))
+                return r["state"] != "exited" and age <= AGENT_ACTIVE_SECONDS
+
+            def pick(matches: list[sqlite3.Row]) -> dict | None:
+                if not matches:
+                    return None
+                live_matches = [r for r in matches if is_live(r)]
+                pool = live_matches or matches
+                if len(pool) == 1:
+                    info = self._serialize_session(pool[0], now_dt=now_dt, now_mono=now_mono)
+                    info["tail"] = json.loads(pool[0]["tail_json"] or "[]")
+                    return info
+                cands = ", ".join(
+                    f"{r['name']} ({r['session_id']})" if r["name"] else r["session_id"] for r in pool[:5]
+                )
+                raise AgentError(f"ambiguous session {target!r}: {cands}", 400)
+
+            target_lower = target.lower()
+            tiers: list[list[sqlite3.Row]] = [
+                [r for r in rows if r["session_id"] == target],
+            ]
+            if "/" in target and ":" not in target:
+                dev_part, key_part = target.split("/", 1)
+                key_lower = key_part.lower()
+                dev_rows = [r for r in rows if r["device"] == dev_part]
+                if key_part:
+                    tiers.extend([
+                        [r for r in dev_rows if (r["name"] or "").lower() == key_lower],
+                        [r for r in dev_rows if (r["title"] or "").lower() == key_lower],
+                        [r for r in dev_rows if r["session_id"].endswith(f":{key_part}")],
+                        [
+                            r
+                            for r in dev_rows
+                            if key_lower in (r["name"] or "").lower()
+                            or key_lower in (r["title"] or "").lower()
+                            or key_part in r["session_id"]
+                        ],
+                    ])
+            tiers.extend([
+                [r for r in rows if r["name"] and r["name"].lower() == target_lower],
+                [r for r in rows if r["title"] and r["title"].lower() == target_lower],
+                [r for r in rows if r["session_id"].endswith(f":{target}")],
+                [
+                    r
+                    for r in rows
+                    if target_lower in (r["name"] or "").lower()
+                    or target_lower in (r["title"] or "").lower()
+                    or target in r["session_id"]
+                ],
+            ])
+            for matches in tiers:
+                found = pick(matches)
+                if found is not None:
+                    return found
+        raise AgentError(f"no agent session matching {target!r}", 404)
+
+    def _delivery_report_locked(self, msg: dict) -> dict:
+        now_dt = _now_dt()
+        now_mono = time.monotonic()
+        if msg["to_session"]:
+            sid = msg["to_session"]
+            row = self.conn.execute("SELECT * FROM agent_sessions WHERE session_id = ?", (sid,)).fetchone()
+            if row is None:
+                delivery = "offline"
+                label = sid
+            else:
+                sess = self._serialize_session(row, now_dt=now_dt, now_mono=now_mono)
+                delivery = sess["delivery"]
+                label = f"{sess['name']} ({sess['session_id']})" if sess["name"] else sess["session_id"]
+            woke = 1 if self._waiters.get(sid, 0) > 0 else 0
+            warning: str | None = None
+            if delivery == "queued_idle":
+                warning = (
+                    f"Recipient {label} is idle with no active listener; "
+                    "message queued until its next hook or user turn."
+                )
+            elif delivery == "offline":
+                warning = f"Recipient {label} is offline/stale; message saved in inbox but will not trigger action."
+            return {"delivery": delivery, "woke_waiters": woke, "recipients": None, "warning": warning}
+
+        rows = self.conn.execute(
+            "SELECT * FROM agent_sessions WHERE session_id != ? AND state != 'exited' ORDER BY updated_at DESC",
+            (msg["from_session"],),
+        ).fetchall()
+        recipients: dict[str, list[str]] = {"immediate": [], "next_hook": [], "queued_idle": []}
+        for r in rows:
+            if msg["to_device"] is not None and r["device"] != msg["to_device"]:
+                continue
+            if msg["to_repo"] is not None and (not r["repo"] or r["repo"] != msg["to_repo"]):
+                continue
+            sess = self._serialize_session(r, now_dt=now_dt, now_mono=now_mono)
+            if not sess["live"]:
+                continue
+            bucket = sess["delivery"]
+            if bucket in recipients:
+                recipients[bucket].append(sess["session_id"])
+        woke = len(recipients["immediate"])
+        warning = None
+        if not recipients["immediate"] and not recipients["next_hook"]:
+            if recipients["queued_idle"]:
+                warning = (
+                    "All matching recipients are idle with no active listener; "
+                    "message queued until next hook or user turn."
+                )
+            else:
+                warning = "No live matching recipients found; message saved in inbox."
+        return {"delivery": "broadcast", "woke_waiters": woke, "recipients": recipients, "warning": warning}
+
+    def delivery_report(self, msg: dict) -> dict:
+        with self.lock:
+            return self._delivery_report_locked(msg)
+
+    def _send_message_and_report(
         self,
         *,
         device: str,
@@ -400,7 +808,7 @@ class AgentHub:
         thread_id: str | None = None,
         reply_to: int | None = None,
         known_devices: set[str] | frozenset[str] = frozenset(),
-    ) -> dict:
+    ) -> tuple[dict, dict]:
         if not from_session.startswith(f"{device}:"):
             raise AgentError("session belongs to another device", 403)
         text = body.strip()
@@ -425,7 +833,7 @@ class AgentHub:
             to_device = target[7:].strip()
             if not to_device:
                 raise AgentError("device target cannot be empty")
-        elif ":" not in target and target in known_devices:
+        elif ":" not in target and "/" not in target and target in known_devices:
             to_device = target
         else:
             resolved = self.get_session(target)
@@ -445,11 +853,61 @@ class AgentHub:
                 "to_device, to_session, to_repo, body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (resolved_thread, reply_to, from_session, device, to_device, to_session, to_repo, text, now_iso),
             )
-            row = self.conn.execute("SELECT * FROM agent_messages WHERE id = ?", (cur.lastrowid,)).fetchone()
+            row = self.conn.execute(
+                "SELECT m.*, COALESCE(s.name, '') AS from_name, COALESCE(s.title, '') AS from_title "
+                "FROM agent_messages m LEFT JOIN agent_sessions s ON s.session_id = m.from_session "
+                "WHERE m.id = ?",
+                (cur.lastrowid,),
+            ).fetchone()
             assert row is not None
             msg = _row_to_message(row)
+            report = self._delivery_report_locked(msg)
             self.cond.notify_all()
-            return msg
+            return msg, report
+
+    def send_message(
+        self,
+        *,
+        device: str,
+        from_session: str,
+        to: str,
+        body: str,
+        thread_id: str | None = None,
+        reply_to: int | None = None,
+        known_devices: set[str] | frozenset[str] = frozenset(),
+    ) -> dict:
+        msg, _ = self._send_message_and_report(
+            device=device,
+            from_session=from_session,
+            to=to,
+            body=body,
+            thread_id=thread_id,
+            reply_to=reply_to,
+            known_devices=known_devices,
+        )
+        return msg
+
+    def send_message_with_report(
+        self,
+        *,
+        device: str,
+        from_session: str,
+        to: str,
+        body: str,
+        thread_id: str | None = None,
+        reply_to: int | None = None,
+        known_devices: set[str] | frozenset[str] = frozenset(),
+    ) -> dict:
+        msg, report = self._send_message_and_report(
+            device=device,
+            from_session=from_session,
+            to=to,
+            body=body,
+            thread_id=thread_id,
+            reply_to=reply_to,
+            known_devices=known_devices,
+        )
+        return {"message": msg, **report}
 
     def fetch_inbox(
         self,
@@ -471,7 +929,9 @@ class AgentHub:
             repo = sess["repo"] if sess else ""
             started_at = sess["started_at"] if sess else "1970-01-01T00:00:00+00:00"
             rows = self.conn.execute(
-                "SELECT m.* FROM agent_messages m "
+                "SELECT m.*, COALESCE(s.name, '') AS from_name, COALESCE(s.title, '') AS from_title "
+                "FROM agent_messages m "
+                "LEFT JOIN agent_sessions s ON s.session_id = m.from_session "
                 "WHERE m.from_session != ? "
                 "AND (m.to_session = ? OR (m.to_session IS NULL "
                 "  AND (m.to_device IS NULL OR m.to_device = ?) "
@@ -507,6 +967,127 @@ class AgentHub:
                     raise
             return messages
 
+    def wait_for_messages(
+        self,
+        *,
+        device: str,
+        session_id: str,
+        timeout: float = 55.0,
+        mark_read: bool = True,
+        limit: int = 50,
+        require_full_id: bool = False,
+    ) -> dict:
+        if not session_id.startswith(f"{device}:"):
+            raise AgentError("session belongs to another device", 403)
+        timeout = max(0.05, min(float(timeout), 60.0))
+        deadline = time.monotonic() + timeout
+        current_sid = session_id
+        registered_sid: str | None = None
+        with self.cond:
+            try:
+                while True:
+                    if self._closed:
+                        return {
+                            "session_id": current_sid,
+                            "full_raw_id": "",
+                            "name": "",
+                            "title": "",
+                            "messages": [],
+                            "timed_out": True,
+                            "exited": False,
+                        }
+                    while current_sid in self._promoted_to:
+                        current_sid = self._promoted_to[current_sid]
+                    if registered_sid is not None and registered_sid != current_sid:
+                        self._transfer_waiter(registered_sid, current_sid)
+                        registered_sid = current_sid
+
+                    row = self.conn.execute(
+                        "SELECT state, full_raw_id, name, title FROM agent_sessions WHERE session_id = ?",
+                        (current_sid,),
+                    ).fetchone()
+                    if row is not None and row["state"] == "exited":
+                        return {
+                            "session_id": current_sid,
+                            "full_raw_id": row["full_raw_id"] or "",
+                            "name": row["name"] or "",
+                            "title": row["title"] or "",
+                            "messages": [],
+                            "timed_out": False,
+                            "exited": True,
+                        }
+                    if row is not None:
+                        self.conn.execute(
+                            "UPDATE agent_sessions SET updated_at = ? WHERE session_id = ?",
+                            (_now(), current_sid),
+                        )
+                    full_raw_id = (row["full_raw_id"] or "") if row else ""
+                    sess_name = (row["name"] or "") if row else ""
+                    sess_title = (row["title"] or "") if row else ""
+                    ready = (not require_full_id) or (bool(full_raw_id) and not full_raw_id.startswith("pid-"))
+                    if ready:
+                        if registered_sid != current_sid:
+                            self._waiters[current_sid] = self._waiters.get(current_sid, 0) + 1
+                            registered_sid = current_sid
+                        msgs = self.fetch_inbox(
+                            device=device,
+                            session_id=current_sid,
+                            unread_only=True,
+                            mark_read=mark_read,
+                            limit=limit,
+                        )
+                        if msgs:
+                            return {
+                                "session_id": current_sid,
+                                "full_raw_id": full_raw_id,
+                                "name": sess_name,
+                                "title": sess_title,
+                                "messages": msgs,
+                                "timed_out": False,
+                                "exited": False,
+                            }
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return {
+                            "session_id": current_sid,
+                            "full_raw_id": full_raw_id,
+                            "name": sess_name,
+                            "title": sess_title,
+                            "messages": [],
+                            "timed_out": True,
+                            "exited": False,
+                        }
+                    self.cond.wait(timeout=remaining)
+            finally:
+                if registered_sid is not None:
+                    count = self._waiters.get(registered_sid, 0) - 1
+                    if count <= 0:
+                        self._waiters.pop(registered_sid, None)
+                    else:
+                        self._waiters[registered_sid] = count
+                    self._wait_seen_at[registered_sid] = time.monotonic()
+
+    def ack_messages(self, *, device: str, session_id: str, message_ids: list[int]) -> dict:
+        if not session_id.startswith(f"{device}:"):
+            raise AgentError("session belongs to another device", 403)
+        ids = [int(mid) for mid in message_ids]
+        if not ids:
+            return {"ok": True, "acked": 0}
+        read_at = _now()
+        with self.lock:
+            self.conn.execute("BEGIN")
+            try:
+                for mid in ids:
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO agent_reads(session_id, message_id, read_at) VALUES (?, ?, ?)",
+                        (session_id, mid, read_at),
+                    )
+                self.conn.execute("COMMIT")
+            except BaseException:
+                self.conn.execute("ROLLBACK")
+                raise
+        return {"ok": True, "acked": len(ids)}
+
     def ask(
         self,
         *,
@@ -515,24 +1096,54 @@ class AgentHub:
         to: str,
         body: str,
         timeout: float = 30.0,
+        wait_if_idle: bool = False,
         known_devices: set[str] | frozenset[str] = frozenset(),
     ) -> dict:
-        timeout = max(1.0, min(float(timeout), 120.0))
-        sent = self.send_message(
-            device=device,
-            from_session=from_session,
-            to=to,
-            body=body,
-            known_devices=known_devices,
-        )
-        deadline = time.monotonic() + timeout
+        timeout = max(0.1, min(float(timeout), 120.0))
         with self.cond:
+            sent, report = self._send_message_and_report(
+                device=device,
+                from_session=from_session,
+                to=to,
+                body=body,
+                known_devices=known_devices,
+            )
+            if sent["to_session"]:
+                if report["delivery"] == "offline":
+                    return {
+                        "sent": sent,
+                        "reply": None,
+                        "timed_out": False,
+                        "delivered": False,
+                        "delivery": "offline",
+                        "warning": report["warning"],
+                    }
+                if report["delivery"] == "queued_idle" and not wait_if_idle:
+                    return {
+                        "sent": sent,
+                        "reply": None,
+                        "timed_out": False,
+                        "delivered": False,
+                        "delivery": "queued_idle",
+                        "warning": report["warning"],
+                    }
+            deadline = time.monotonic() + timeout
             while True:
+                if self._closed:
+                    return {
+                        "sent": sent,
+                        "reply": None,
+                        "timed_out": True,
+                        "delivered": False,
+                        "delivery": report["delivery"],
+                        "warning": report["warning"],
+                    }
                 row = self.conn.execute(
-                    "SELECT * FROM agent_messages "
-                    "WHERE thread_id = ? AND id > ? AND from_session != ? "
-                    "AND (to_session = ? OR (to_session IS NULL AND (to_device IS NULL OR to_device = ?))) "
-                    "ORDER BY id ASC LIMIT 1",
+                    "SELECT m.*, COALESCE(s.name, '') AS from_name, COALESCE(s.title, '') AS from_title "
+                    "FROM agent_messages m LEFT JOIN agent_sessions s ON s.session_id = m.from_session "
+                    "WHERE m.thread_id = ? AND m.id > ? AND m.from_session != ? "
+                    "AND (m.to_session = ? OR (m.to_session IS NULL AND (m.to_device IS NULL OR m.to_device = ?))) "
+                    "ORDER BY m.id ASC LIMIT 1",
                     (sent["thread_id"], sent["id"], from_session, from_session, device),
                 ).fetchone()
                 if row is not None:
@@ -540,8 +1151,22 @@ class AgentHub:
                         "INSERT OR IGNORE INTO agent_reads(session_id, message_id, read_at) VALUES (?, ?, ?)",
                         (from_session, row["id"], _now()),
                     )
-                    return {"sent": sent, "reply": _row_to_message(row), "timed_out": False}
+                    return {
+                        "sent": sent,
+                        "reply": _row_to_message(row),
+                        "timed_out": False,
+                        "delivered": True,
+                        "delivery": report["delivery"],
+                        "warning": report["warning"],
+                    }
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    return {"sent": sent, "reply": None, "timed_out": True}
+                    return {
+                        "sent": sent,
+                        "reply": None,
+                        "timed_out": True,
+                        "delivered": False,
+                        "delivery": report["delivery"],
+                        "warning": report["warning"],
+                    }
                 self.cond.wait(timeout=remaining)

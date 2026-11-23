@@ -177,9 +177,19 @@ on the lighthouse across all active Macs (`admin` and `managed` alike).
 - **Auto-configured everywhere:** `fleet init`, `fleet join`, and `fleet sync` automatically register `fleet` as a local
   `stdio` MCP server and lifecycle hook handler for whichever harnesses exist on each Mac (**Claude Code**, **Codex CLI**,
   and **Antigravity**). Run `fleet mcp status` or `fleet mcp install` to inspect or refresh manually.
+- **Friendly session names & titles:** Sessions automatically pick up harness titles (Claude `customTitle`/`aiTitle`,
+  Codex `thread_name`, Antigravity `conversation_summaries`) and derive short handles (`name`), or can be renamed anytime
+  with `fleet_set_name` / `fleet agents rename`. Peer tools accept `name`, `device/name`, `title`, short ID, or `session_id`.
+- **Real-time delivery & availability:** Every session reports `listening` and a `delivery` status (`immediate`,
+  `next_hook`, `queued_idle`, or `offline`), and `fleet_send_message` / `fleet_ask_agent` report delivery state immediately
+  (`fleet_ask_agent` fails fast on `queued_idle` unless `wait_if_idle=true`). Codex listens automatically inside its MCP
+  server via `codex queue`; Claude Code and Antigravity sessions arm `fleet agents wait` as a background command on turn 1
+  (optionally allowlist `fleet agents wait*` in shell permissions to avoid approval prompts).
 - **Tools exposed to agents:** `fleet_list_agents`, `fleet_inspect_agent`, `fleet_send_message`, `fleet_check_inbox`,
-  and `fleet_ask_agent`.
-- **CLI inspection:** Run `fleet agents` from any Mac to view active sessions, repos, branches, and last prompts.
+  `fleet_ask_agent`, `fleet_set_name`, and `fleet_listen`.
+- **CLI inspection:** Run `fleet agents` from any Mac to view active sessions, names, listener status, titles, and
+  repos, `fleet agents rename <target> <name>` to rename a session, or `fleet agents wait --session <id>` to block until
+  unread messages arrive.
 
 ## Security model
 
