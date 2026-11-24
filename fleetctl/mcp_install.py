@@ -91,20 +91,39 @@ def _is_fleet_hook_group(group: object, harness: str) -> bool:
     return any(isinstance(h, dict) and needle in str(h.get("command") or "") for h in handlers)
 
 
+CLAUDE_HOOK_EVENTS: tuple[tuple[str, str | None, int], ...] = (
+    ("SessionStart", None, 5),
+    ("UserPromptSubmit", None, 5),
+    ("PreToolUse", "AskUserQuestion|ExitPlanMode", 5),
+    ("PermissionRequest", "*", 5),
+    ("PostToolUse", "*", 5),
+    ("PostToolUseFailure", "*", 5),
+    ("PermissionDenied", "*", 5),
+    ("Notification", "permission_prompt|elicitation_dialog|elicitation_url_dialog|agent_needs_input", 5),
+    ("Stop", None, 5),
+)
+
+CODEX_HOOK_EVENTS: tuple[tuple[str, str | None, int], ...] = (
+    ("SessionStart", None, 5),
+    ("UserPromptSubmit", None, 5),
+    ("PreToolUse", "request_user_input", 5),
+    ("PermissionRequest", "*", 5),
+    ("PostToolUse", "*", 5),
+    ("Stop", None, 5),
+    ("Interrupt", None, 3),
+    ("SessionEnd", None, 3),
+)
+
+
 def _upsert_claude_style_hooks(hooks_root: dict, *, harness: str, cmd_bin: str) -> None:
     hook_cmd = f"{cmd_bin} agent-hook --harness {harness}"
-    events: tuple[tuple[str, str | None], ...] = (
-        ("SessionStart", None),
-        ("UserPromptSubmit", None),
-        ("PostToolUse", "*"),
-        ("Stop", None),
-    )
-    for event, matcher in events:
+    events = CLAUDE_HOOK_EVENTS if harness == "claude" else CODEX_HOOK_EVENTS
+    for event, matcher, timeout in events:
         entries = hooks_root.get(event)
         if not isinstance(entries, list):
             entries = []
             hooks_root[event] = entries
-        handler = {"type": "command", "command": hook_cmd, "timeout": 5}
+        handler = {"type": "command", "command": hook_cmd, "timeout": timeout}
         desired = {"matcher": matcher, "hooks": [handler]} if matcher is not None else {"hooks": [handler]}
         idx = next((i for i, g in enumerate(entries) if _is_fleet_hook_group(g, harness)), None)
         if idx is not None:
@@ -116,7 +135,7 @@ def _upsert_claude_style_hooks(hooks_root: dict, *, harness: str, cmd_bin: str) 
 
 def _remove_claude_style_hooks(hooks_root: dict, harness: str) -> bool:
     changed = False
-    for event in ("SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"):
+    for event in list(hooks_root):
         entries = hooks_root.get(event)
         if not isinstance(entries, list):
             continue
@@ -244,6 +263,7 @@ def install(
         agy_hooks_data["fleet"] = {
             "SessionStart": [handler],
             "PreInvocation": [handler],
+            "PreToolUse": [{"matcher": "ask_question|ask_permission", "hooks": [handler]}],
             "PostToolUse": [{"matcher": "*", "hooks": [handler]}],
             "Stop": [handler],
         }

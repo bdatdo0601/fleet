@@ -648,6 +648,22 @@ class McpInstallTest(unittest.TestCase):
 
         agy_hooks = json.loads((self.home / ".gemini" / "config" / "hooks.json").read_text())
         self.assertIn("PreInvocation", agy_hooks["fleet"])
+        self.assertEqual(agy_hooks["fleet"]["PreToolUse"][0]["matcher"], "ask_question|ask_permission")
+
+        # Verify newly added Claude & Codex hook events, matchers, and Codex Interrupt/SessionEnd timeouts
+        claude_settings = json.loads((self.home / ".claude" / "settings.json").read_text())["hooks"]
+        self.assertEqual(claude_settings["PreToolUse"][0]["matcher"], "AskUserQuestion|ExitPlanMode")
+        self.assertEqual(claude_settings["PermissionRequest"][0]["matcher"], "*")
+        self.assertEqual(claude_settings["PostToolUseFailure"][0]["matcher"], "*")
+        self.assertEqual(claude_settings["PermissionDenied"][0]["matcher"], "*")
+        self.assertIn("permission_prompt", claude_settings["Notification"][0]["matcher"])
+        self.assertIn("elicitation_dialog", claude_settings["Notification"][0]["matcher"])
+
+        codex_hooks_all = json.loads((self.home / ".codex" / "hooks.json").read_text())["hooks"]
+        self.assertEqual(codex_hooks_all["PreToolUse"][0]["matcher"], "request_user_input")
+        self.assertEqual(codex_hooks_all["PermissionRequest"][0]["matcher"], "*")
+        self.assertEqual(codex_hooks_all["Interrupt"][0]["hooks"][0]["timeout"], 3)
+        self.assertEqual(codex_hooks_all["SessionEnd"][0]["hooks"][0]["timeout"], 3)
 
         # Uninstall cleans fleet entries while keeping existing settings intact
         mcp_install.uninstall(self.home)
@@ -655,6 +671,14 @@ class McpInstallTest(unittest.TestCase):
         self.assertIn("other", json.loads((self.home / ".claude.json").read_text())["mcpServers"])
         self.assertIn('trusted_hash = "sha256:abc"', (self.home / ".codex" / "config.toml").read_text())
         self.assertNotIn("[mcp_servers.fleet]", (self.home / ".codex" / "config.toml").read_text())
+        claude_after = json.loads((self.home / ".claude" / "settings.json").read_text())["hooks"]
+        self.assertEqual([g["hooks"][0]["command"] for g in claude_after["SessionStart"]], ["existing.sh"])
+        self.assertNotIn("PermissionRequest", claude_after)
+        self.assertNotIn("Notification", claude_after)
+        codex_after = json.loads((self.home / ".codex" / "hooks.json").read_text())["hooks"]
+        self.assertEqual([g["hooks"][0]["command"] for g in codex_after["SessionStart"]], ["first.sh"])
+        self.assertNotIn("PermissionRequest", codex_after)
+        self.assertNotIn("Interrupt", codex_after)
 
 
 class RealtimeAndFriendlyNamesTest(unittest.TestCase):
@@ -730,11 +754,16 @@ class RealtimeAndFriendlyNamesTest(unittest.TestCase):
         hub = AgentHub(db_path)
         self.addCleanup(hub.close)
         cols = {r["name"] for r in hub.conn.execute("PRAGMA table_info(agent_sessions)").fetchall()}
-        self.assertTrue({"full_raw_id", "title", "name", "custom_name"}.issubset(cols))
+        self.assertTrue(
+            {"full_raw_id", "state_changed_at", "pending_action_json", "title", "name", "custom_name"}.issubset(cols)
+        )
         listed = hub.list_sessions()
         self.assertEqual(len(listed), 1)
         self.assertEqual(listed[0]["session_id"], "mini:claude:leg1")
         self.assertEqual(listed[0]["delivery"], "next_hook")
+        self.assertIsNone(listed[0]["pending_action"])
+        self.assertIsNone(listed[0]["waiting_seconds"])
+        self.assertEqual(listed[0]["state_changed_at"], now_iso)
         hb = hub.heartbeat(device="mini", harness="claude", raw_id="leg1-full", title="Migrated Session", cwd="/proj")
         self.assertEqual(hb["name"], "migrated-session")
 
@@ -1294,6 +1323,478 @@ class RealtimeAndFriendlyNamesTest(unittest.TestCase):
             self.assertIn("NAME", table)
             self.assertIn("TITLE", table)
             self.assertIn("ui-lead", table)
+
+    def test_waiting_state_lifecycle_retention_and_filtering(self) -> None:
+        hub = self.fleet.agents
+        hub.heartbeat(device="mini", harness="claude", raw_id="pid-5151", pid=5151, cwd="/wait")
+        hub.heartbeat(
+            device="mini",
+            harness="claude",
+            raw_id="cl-wait-1",
+            pid=5151,
+            cwd="/wait",
+            state="waiting_permission",
+            pending_action={"kind": "permission", "tool": "Bash", "detail": "rm -rf build", "event": "PermissionRequest"},
+        )
+        sess = hub.get_session("cl-wait-1")
+        self.assertEqual(sess["state"], "waiting_permission")
+        self.assertEqual(sess["delivery"], "waiting_user")
+        self.assertEqual(sess["pending_action"]["tool"], "Bash")
+        self.assertEqual(sess["pending_action"]["detail"], "rm -rf build")
+        self.assertIsInstance(sess["waiting_seconds"], int)
+        orig_changed_at = sess["state_changed_at"]
+
+        # Delayed generic Notification(permission_prompt) without tool must NOT clobber rich PermissionRequest or reset timer
+        time.sleep(0.02)
+        hub.heartbeat(
+            device="mini",
+            harness="claude",
+            raw_id="cl-wait-1",
+            pid=5151,
+            cwd="/wait",
+            state="waiting_permission",
+            pending_action={"kind": "permission", "detail": "Claude needs your permission", "event": "Notification:permission_prompt"},
+        )
+        sess2 = hub.get_session("cl-wait-1")
+        self.assertEqual(sess2["pending_action"]["tool"], "Bash")
+        self.assertEqual(sess2["pending_action"]["detail"], "rm -rf build")
+        self.assertEqual(sess2["state_changed_at"], orig_changed_at)
+
+        # Waiting sessions stay live past 5 min (up to 60 min) and pid keepalive preserves waiting state & pending_action
+        ts_20m_ago = (datetime.now(timezone.utc) - timedelta(minutes=20)).replace(microsecond=0).isoformat()
+        hub.conn.execute(
+            "UPDATE agent_sessions SET updated_at = ?, state_changed_at = ? WHERE session_id = ?",
+            (ts_20m_ago, ts_20m_ago, "mini:claude:cl-wait-1"),
+        )
+        live_20m = hub.list_sessions()
+        self.assertEqual([s["session_id"] for s in live_20m], ["mini:claude:cl-wait-1"])
+        self.assertGreaterEqual(live_20m[0]["waiting_seconds"], 1190)
+
+        keepalive = hub.heartbeat(device="mini", harness="claude", raw_id="pid-5151", pid=5151, cwd="/wait", state="working")
+        self.assertEqual(keepalive["session_id"], "mini:claude:cl-wait-1")
+        after_ka = hub.get_session("cl-wait-1")
+        self.assertEqual(after_ka["state"], "waiting_permission")
+        self.assertEqual(after_ka["pending_action"]["tool"], "Bash")
+        self.assertEqual(after_ka["state_changed_at"], ts_20m_ago)
+
+        # After 65 min, waiting session is stale
+        ts_65m_ago = (datetime.now(timezone.utc) - timedelta(minutes=65)).replace(microsecond=0).isoformat()
+        hub.conn.execute("UPDATE agent_sessions SET updated_at = ? WHERE session_id = ?", (ts_65m_ago, "mini:claude:cl-wait-1"))
+        self.assertEqual(hub.list_sessions(), [])
+        # Normal working/idle session is stale after 10 min
+        hub.heartbeat(device="mini", harness="codex", raw_id="cx-work", cwd="/w2", state="working")
+        hub.heartbeat(
+            device="mini",
+            harness="antigravity",
+            raw_id="agy-q",
+            cwd="/q",
+            state="waiting_question",
+            pending_action={"kind": "question", "tool": "ask_question", "detail": "Which DB?", "event": "PreToolUse"},
+        )
+        ts_10m_ago = (datetime.now(timezone.utc) - timedelta(minutes=10)).replace(microsecond=0).isoformat()
+        hub.conn.execute("UPDATE agent_sessions SET updated_at = ? WHERE session_id = ?", (ts_10m_ago, "mini:codex:cx-work"))
+        # Re-touch cl-wait-1 so both waiting states are live
+        hub.heartbeat(device="mini", harness="claude", raw_id="cl-wait-1", pid=5151, cwd="/wait", state="waiting_permission")
+        hub.heartbeat(device="mini", harness="codex", raw_id="cx-live", cwd="/w3", state="working")
+
+        self.assertEqual(
+            {s["session_id"] for s in hub.list_sessions(state="waiting")},
+            {"mini:claude:cl-wait-1", "mini:antigravity:agy-q"},
+        )
+        self.assertEqual(
+            [s["session_id"] for s in hub.list_sessions(state="waiting_question")],
+            ["mini:antigravity:agy-q"],
+        )
+        self.assertEqual(
+            [s["session_id"] for s in hub.list_sessions(state="waiting_permission")],
+            ["mini:claude:cl-wait-1"],
+        )
+        with self.assertRaisesRegex(AgentError, "invalid state filter"):
+            hub.list_sessions(state="bogus")
+
+        # Returning to working/idle/exited clears pending_action and waiting_seconds
+        hub.heartbeat(device="mini", harness="claude", raw_id="cl-wait-1", pid=5151, cwd="/wait", state="working")
+        resumed = hub.get_session("cl-wait-1")
+        self.assertEqual(resumed["state"], "working")
+        self.assertIsNone(resumed["pending_action"])
+        self.assertIsNone(resumed["waiting_seconds"])
+
+        hub.deregister(device="mini", session_id="mini:antigravity:agy-q")
+        exited = hub.get_session("agy-q")
+        self.assertEqual(exited["state"], "exited")
+        self.assertIsNone(exited["pending_action"])
+        self.assertIsNone(exited["waiting_seconds"])
+
+    def test_waiting_user_delivery_reports_and_ask_fail_fast(self) -> None:
+        hub = self.fleet.agents
+        hub.heartbeat(device="mini", harness="claude", raw_id="asker", cwd="/a", state="working")
+        hub.heartbeat(
+            device="mini",
+            harness="codex",
+            raw_id="01a1ece5-f00c-7860-a0dc-6c1897e73f99",
+            cwd="/w",
+            state="waiting_permission",
+            pending_action={"kind": "permission", "tool": "Bash", "detail": "git push", "event": "PermissionRequest"},
+        )
+        hub.heartbeat(device="mini", harness="claude", raw_id="idle-peer", cwd="/i", state="idle")
+
+        # Even when listening=True, waiting state reports delivery="waiting_user"
+        stop_wait = threading.Event()
+        t = threading.Thread(
+            target=lambda: hub.wait_for_messages(
+                device="mini",
+                session_id="mini:codex:01a1ece5-f00",
+                timeout=2.0,
+                mark_read=False,
+            )
+            if not stop_wait.is_set()
+            else None,
+            daemon=True,
+        )
+        t.start()
+        for _ in range(30):
+            if hub.get_session("01a1ece5-f00")["listening"]:
+                break
+            time.sleep(0.02)
+        self.assertTrue(hub.get_session("01a1ece5-f00")["listening"])
+        self.assertEqual(hub.get_session("01a1ece5-f00")["delivery"], "waiting_user")
+
+        send_wait = call(
+            self.api,
+            "POST",
+            "/v1/agents/send",
+            {"harness": "claude", "session_id": "mini:claude:asker", "to": "01a1ece5-f00", "body": "ping"},
+        )
+        self.assertEqual(send_wait["delivery"], "waiting_user")
+        self.assertIn("permission approval", send_wait["warning"])
+        self.assertIn("Bash: git push", send_wait["warning"])
+        t.join(timeout=2.0)
+        stop_wait.set()
+
+        # Broadcast populates recipients["waiting_user"]
+        bcast = call(
+            self.api,
+            "POST",
+            "/v1/agents/send",
+            {"harness": "claude", "session_id": "mini:claude:asker", "to": "*", "body": "heads up"},
+        )
+        self.assertEqual(bcast["recipients"]["waiting_user"], ["mini:codex:01a1ece5-f00"])
+        self.assertEqual(bcast["recipients"]["queued_idle"], ["mini:claude:idle-peer"])
+        self.assertIn("waiting for user input or idle", bcast["warning"])
+
+        # ask() fails fast on waiting_user unless wait_if_idle=True
+        t0 = time.monotonic()
+        ask_fast = call(
+            self.api,
+            "POST",
+            "/v1/agents/ask",
+            {"harness": "claude", "session_id": "mini:claude:asker", "to": "01a1ece5-f00", "body": "status?", "timeout": 10},
+        )
+        self.assertLess(time.monotonic() - t0, 1.0)
+        self.assertFalse(ask_fast["delivered"])
+        self.assertFalse(ask_fast["timed_out"])
+        self.assertEqual(ask_fast["delivery"], "waiting_user")
+
+        def answer_later() -> None:
+            for _ in range(40):
+                msgs = hub.fetch_inbox(device="mini", session_id="mini:codex:01a1ece5-f00")
+                if msgs and msgs[-1]["body"] == "wait for approval":
+                    hub.send_message(
+                        device="mini",
+                        from_session="mini:codex:01a1ece5-f00",
+                        to="asker",
+                        body="approved and done",
+                        reply_to=msgs[-1]["id"],
+                    )
+                    return
+                time.sleep(0.02)
+
+        rt = threading.Thread(target=answer_later, daemon=True)
+        rt.start()
+        ask_wait = call(
+            self.api,
+            "POST",
+            "/v1/agents/ask",
+            {
+                "harness": "claude",
+                "session_id": "mini:claude:asker",
+                "to": "01a1ece5-f00",
+                "body": "wait for approval",
+                "timeout": 3.0,
+                "wait_if_idle": True,
+            },
+        )
+        rt.join(timeout=2.0)
+        self.assertTrue(ask_wait["delivered"])
+        self.assertEqual(ask_wait["reply"]["body"], "approved and done")
+
+    def test_waiting_hooks_across_all_three_harnesses_and_mcp_cli(self) -> None:
+        hub = self.fleet.agents
+        hub.heartbeat(device="mini", harness="claude", raw_id="sender-h", cwd="/s")
+
+        def fire(harness: str, payload: dict) -> dict:
+            out = io.StringIO()
+            rc = hooks.run_hook(harness, stdin=io.StringIO(json.dumps(payload)), stdout=out, api_url=self.api)
+            self.assertEqual(rc, 0)
+            return json.loads(out.getvalue())
+
+        # --- Claude Code ---
+        fire("claude", {"hook_event_name": "SessionStart", "session_id": "cl-h1", "cwd": str(self.tmp)})
+        hub.send_message(device="mini", from_session="mini:claude:sender-h", to="mini:claude:cl-h1", body="keep unread")
+
+        # PermissionRequest on Bash -> waiting_permission, passive {}, does NOT drain inbox
+        self.assertEqual(
+            fire("claude", {
+                "hook_event_name": "PermissionRequest",
+                "session_id": "cl-h1",
+                "cwd": str(self.tmp),
+                "tool_name": "Bash",
+                "tool_input": {"command": "npm test"},
+            }),
+            {},
+        )
+        s = hub.get_session("cl-h1")
+        self.assertEqual(s["state"], "waiting_permission")
+        self.assertEqual(s["pending_action"]["tool"], "Bash")
+        self.assertEqual(s["pending_action"]["detail"], "npm test")
+        self.assertEqual(len(hub.fetch_inbox(device="mini", session_id="mini:claude:cl-h1", mark_read=False)), 1)
+
+        # Notification(permission_prompt) keeps richer tool info, unknown Notification is no-op
+        fire("claude", {
+            "hook_event_name": "Notification",
+            "session_id": "cl-h1",
+            "cwd": str(self.tmp),
+            "notification_type": "permission_prompt",
+            "message": "Claude needs your permission",
+        })
+        self.assertEqual(hub.get_session("cl-h1")["pending_action"]["tool"], "Bash")
+        fire("claude", {
+            "hook_event_name": "Notification",
+            "session_id": "cl-h1",
+            "cwd": str(self.tmp),
+            "notification_type": "auth_success",
+        })
+        self.assertEqual(hub.get_session("cl-h1")["state"], "waiting_permission")
+
+        # PostToolUseFailure clears waiting back to working without draining; PostToolUse clears & injects unread
+        self.assertEqual(
+            fire("claude", {
+                "hook_event_name": "PostToolUseFailure",
+                "session_id": "cl-h1",
+                "cwd": str(self.tmp),
+                "tool_name": "Bash",
+            }),
+            {},
+        )
+        self.assertEqual(hub.get_session("cl-h1")["state"], "working")
+        self.assertIsNone(hub.get_session("cl-h1")["pending_action"])
+
+        # PreToolUse AskUserQuestion & ExitPlanMode & PermissionRequest AskUserQuestion
+        self.assertEqual(
+            fire("claude", {
+                "hook_event_name": "PreToolUse",
+                "session_id": "cl-h1",
+                "cwd": str(self.tmp),
+                "tool_name": "AskUserQuestion",
+                "tool_input": {"questions": [{"question": "Use SQLite or Postgres?"}]},
+            }),
+            {},
+        )
+        s = hub.get_session("cl-h1")
+        self.assertEqual(s["state"], "waiting_question")
+        self.assertEqual(s["pending_action"]["detail"], "Use SQLite or Postgres?")
+
+        self.assertEqual(
+            fire("claude", {
+                "hook_event_name": "PermissionDenied",
+                "session_id": "cl-h1",
+                "cwd": str(self.tmp),
+                "tool_name": "Bash",
+            }),
+            {},
+        )
+        self.assertEqual(hub.get_session("cl-h1")["state"], "working")
+
+        fire("claude", {
+            "hook_event_name": "PreToolUse",
+            "session_id": "cl-h1",
+            "cwd": str(self.tmp),
+            "tool_name": "ExitPlanMode",
+            "tool_input": {},
+        })
+        self.assertEqual(hub.get_session("cl-h1")["pending_action"]["detail"], "Waiting for plan approval")
+
+        fire("claude", {
+            "hook_event_name": "PermissionRequest",
+            "session_id": "cl-h1",
+            "cwd": str(self.tmp),
+            "tool_name": "AskUserQuestion",
+            "tool_input": {"questions": [{"question": "Confirm deploy?"}]},
+        })
+        self.assertEqual(hub.get_session("cl-h1")["state"], "waiting_question")
+        self.assertEqual(hub.get_session("cl-h1")["pending_action"]["detail"], "Confirm deploy?")
+
+        fire("claude", {
+            "hook_event_name": "PostToolUseFailure",
+            "session_id": "cl-h1",
+            "cwd": str(self.tmp),
+            "tool_name": "AskUserQuestion",
+        })
+        self.assertEqual(hub.get_session("cl-h1")["state"], "working")
+
+        fire("claude", {
+            "hook_event_name": "Notification",
+            "session_id": "cl-h1",
+            "cwd": str(self.tmp),
+            "notification_type": "elicitation_dialog",
+            "message": "Enter API key",
+        })
+        self.assertEqual(hub.get_session("cl-h1")["state"], "waiting_question")
+        self.assertEqual(hub.get_session("cl-h1")["pending_action"]["detail"], "Enter API key")
+
+        ups = fire("claude", {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "cl-h1",
+            "cwd": str(self.tmp),
+            "prompt": "continue",
+        })
+        self.assertIn("keep unread", ups["hookSpecificOutput"]["additionalContext"])
+
+        hub.send_message(device="mini", from_session="mini:claude:sender-h", to="mini:claude:cl-h1", body="keep unread 2")
+        fire("claude", {
+            "hook_event_name": "Notification",
+            "session_id": "cl-h1",
+            "cwd": str(self.tmp),
+            "notification_type": "agent_needs_input",
+            "message": "Agent needs confirmation",
+        })
+        self.assertEqual(hub.get_session("cl-h1")["state"], "waiting_question")
+        self.assertEqual(hub.get_session("cl-h1")["pending_action"]["detail"], "Agent needs confirmation")
+        self.assertEqual(len(hub.fetch_inbox(device="mini", session_id="mini:claude:cl-h1", mark_read=False)), 1)
+
+        post_resp = fire("claude", {
+            "hook_event_name": "PostToolUse",
+            "session_id": "cl-h1",
+            "cwd": str(self.tmp),
+            "tool_name": "AskUserQuestion",
+        })
+        self.assertIn("keep unread 2", post_resp["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(hub.get_session("cl-h1")["state"], "working")
+
+        # --- Codex CLI ---
+        fire("codex", {"hook_event_name": "SessionStart", "session_id": "cx-h1", "cwd": str(self.tmp)})
+        hub.send_message(device="mini", from_session="mini:claude:sender-h", to="mini:codex:cx-h1", body="codex msg")
+        self.assertEqual(
+            fire("codex", {
+                "hook_event_name": "PermissionRequest",
+                "session_id": "cx-h1",
+                "cwd": str(self.tmp),
+                "tool_name": "Bash",
+                "tool_input": {"command": "deploy.sh"},
+            }),
+            {},
+        )
+        self.assertEqual(hub.get_session("cx-h1")["state"], "waiting_permission")
+        self.assertEqual(hub.get_session("cx-h1")["pending_action"]["detail"], "deploy.sh")
+        self.assertEqual(len(hub.fetch_inbox(device="mini", session_id="mini:codex:cx-h1", mark_read=False)), 1)
+
+        self.assertEqual(
+            fire("codex", {
+                "hook_event_name": "PreToolUse",
+                "session_id": "cx-h1",
+                "cwd": str(self.tmp),
+                "tool_name": "request_user_input",
+                "tool_input": {"questions": [{"question": "Select environment"}]},
+            }),
+            {},
+        )
+        self.assertEqual(hub.get_session("cx-h1")["state"], "waiting_question")
+        self.assertEqual(hub.get_session("cx-h1")["pending_action"]["detail"], "Select environment")
+
+        # Keep Codex waiting on question for MCP/CLI filter check below, test Interrupt/SessionEnd on cx-h2
+        fire("codex", {"hook_event_name": "SessionStart", "session_id": "cx-h2", "cwd": str(self.tmp)})
+        fire("codex", {"hook_event_name": "Interrupt", "session_id": "cx-h2", "cwd": str(self.tmp)})
+        self.assertEqual(hub.get_session("cx-h2")["state"], "idle")
+        fire("codex", {"hook_event_name": "SessionEnd", "session_id": "cx-h2", "cwd": str(self.tmp)})
+        self.assertEqual(hub.get_session("cx-h2")["state"], "exited")
+
+        # --- Antigravity ---
+        fire("antigravity", {"hookEventName": "SessionStart", "conversationId": "agy-h1", "cwd": str(self.tmp)})
+        hub.send_message(device="mini", from_session="mini:claude:sender-h", to="mini:antigravity:agy-h1", body="agy msg")
+
+        pre_q = fire("antigravity", {
+            "hookEventName": "PreToolUse",
+            "conversationId": "agy-h1",
+            "cwd": str(self.tmp),
+            "toolCall": {"name": "ask_question", "args": {"questions": [{"question": "Keep both options?"}]}},
+        })
+        self.assertEqual(pre_q, {"decision": "allow"})
+        self.assertEqual(hub.get_session("agy-h1")["state"], "waiting_question")
+        self.assertEqual(hub.get_session("agy-h1")["pending_action"]["detail"], "Keep both options?")
+        self.assertEqual(len(hub.fetch_inbox(device="mini", session_id="mini:antigravity:agy-h1", mark_read=False)), 1)
+
+        self.assertEqual(
+            fire("antigravity", {"hookEventName": "PostToolUse", "conversationId": "agy-h1", "cwd": str(self.tmp)}),
+            {},
+        )
+        self.assertEqual(hub.get_session("agy-h1")["state"], "working")
+        pre_inv = fire("antigravity", {"hookEventName": "PreInvocation", "conversationId": "agy-h1", "cwd": str(self.tmp)})
+        self.assertIn("agy msg", pre_inv["injectSteps"][0]["systemMessage"]["systemMessage"])
+
+        pre_p = fire("antigravity", {
+            "hookEventName": "PreToolUse",
+            "conversationId": "agy-h1",
+            "cwd": str(self.tmp),
+            "toolCall": {
+                "name": "ask_permission",
+                "args": {"Action": "Write", "Target": "/etc/hosts", "Reason": "Add local test alias"},
+            },
+        })
+        self.assertEqual(pre_p, {"decision": "allow"})
+        self.assertEqual(hub.get_session("agy-h1")["state"], "waiting_permission")
+        self.assertIn("Write /etc/hosts", hub.get_session("agy-h1")["pending_action"]["detail"])
+
+        # --- MCP fleet_list_agents(state="waiting") & fleet_inspect_agent & CLI `fleet agents --waiting` ---
+        reqs = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}},
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "fleet_list_agents", "arguments": {"state": "waiting"}},
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "fleet_inspect_agent", "arguments": {"agent_id": "agy-h1"}},
+            },
+        ]
+        mcp_out = io.StringIO()
+        mcp.serve_stdio(
+            "antigravity",
+            stdin=io.StringIO("\n".join(json.dumps(r) for r in reqs) + "\n"),
+            stdout=mcp_out,
+            api_url=self.api,
+        )
+        mcp_resps = [json.loads(line) for line in mcp_out.getvalue().splitlines() if line.strip()]
+        waiting_list = json.loads(mcp_resps[1]["result"]["content"][0]["text"])["agents"]
+        self.assertEqual({a["session_id"] for a in waiting_list}, {"mini:codex:cx-h1", "mini:antigravity:agy-h1"})
+        inspected = json.loads(mcp_resps[2]["result"]["content"][0]["text"])["agent"]
+        self.assertEqual(inspected["state"], "waiting_permission")
+        self.assertEqual(inspected["pending_action"]["tool"], "ask_permission")
+
+        parser = cli.build_parser()
+        with mock.patch.object(cli, "api", return_value=self.api):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                ns = parser.parse_args(["agents", "--waiting"])
+                ns.func(ns)
+            table = buf.getvalue()
+            self.assertIn("waiting_permission", table)
+            self.assertIn("waiting_question", table)
+            self.assertIn("ask_permission", table)
+            self.assertNotIn("cl-h1", table)
 
 
 if __name__ == "__main__":

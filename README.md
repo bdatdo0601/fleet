@@ -44,7 +44,7 @@ into it from anywhere. No third-party servers are involved.
 | Admin device | `fleet ls` | Lists devices: IP, group, last check-in, cert expiry, status |
 | Admin device | `fleet revoke NAME` | Cuts a device off everywhere within about 5 minutes |
 | Admin device | `fleet set NAME --group G` | Moves a device to another group (re-signs its cert, also used to renew one) |
-| Any Mac | `fleet agents [--all]` | Lists live AI agent sessions (`claude`, `codex`, `antigravity`) across the mesh |
+| Any Mac | `fleet agents [--all] [--waiting]` | Lists live AI agent sessions (`claude`, `codex`, `antigravity`), including sessions blocked on permission or question prompts |
 | Any Mac | `fleet mcp status\|install\|uninstall` | Checks or manages MCP + lifecycle hook configs for installed agent harnesses |
 | Any Mac | `fleet status` | Shows the services, whether the lighthouse is reachable, and this device's IP |
 
@@ -176,20 +176,28 @@ on the lighthouse across all active Macs (`admin` and `managed` alike).
 
 - **Auto-configured everywhere:** `fleet init`, `fleet join`, and `fleet sync` automatically register `fleet` as a local
   `stdio` MCP server and lifecycle hook handler for whichever harnesses exist on each Mac (**Claude Code**, **Codex CLI**,
-  and **Antigravity**). Run `fleet mcp status` or `fleet mcp install` to inspect or refresh manually.
+  and **Antigravity**). Run `fleet mcp status` or `fleet mcp install` to inspect or refresh manually. In Codex CLI, approve
+  new hook entries once via `/hooks` when prompted.
 - **Friendly session names & titles:** Sessions automatically pick up harness titles (Claude `customTitle`/`aiTitle`,
   Codex `thread_name`, Antigravity `conversation_summaries`) and derive short handles (`name`), or can be renamed anytime
   with `fleet_set_name` / `fleet agents rename`. Peer tools accept `name`, `device/name`, `title`, short ID, or `session_id`.
+- **Permission & question tracking:** Sessions report `waiting_permission` or `waiting_question` alongside
+  `state_changed_at`, `waiting_seconds`, and structured `pending_action` metadata (`kind`, `tool`, `detail`, `event`), and
+  stay live for 60 minutes while waiting (vs. 5 minutes for normal activity). Claude Code and Codex detect both permission
+  and user-input prompts via `PermissionRequest`, `PreToolUse`, and `Notification`; Antigravity tracks explicit
+  `ask_question` and `ask_permission` calls via `PreToolUse` (Antigravity does not yet expose an implicit tool-approval
+  hook).
 - **Real-time delivery & availability:** Every session reports `listening` and a `delivery` status (`immediate`,
-  `next_hook`, `queued_idle`, or `offline`), and `fleet_send_message` / `fleet_ask_agent` report delivery state immediately
-  (`fleet_ask_agent` fails fast on `queued_idle` unless `wait_if_idle=true`). Codex listens automatically inside its MCP
-  server via `codex queue`; Claude Code and Antigravity sessions arm `fleet agents wait` as a background command on turn 1
-  (optionally allowlist `fleet agents wait*` in shell permissions to avoid approval prompts).
-- **Tools exposed to agents:** `fleet_list_agents`, `fleet_inspect_agent`, `fleet_send_message`, `fleet_check_inbox`,
-  `fleet_ask_agent`, `fleet_set_name`, and `fleet_listen`.
-- **CLI inspection:** Run `fleet agents` from any Mac to view active sessions, names, listener status, titles, and
-  repos, `fleet agents rename <target> <name>` to rename a session, or `fleet agents wait --session <id>` to block until
-  unread messages arrive.
+  `next_hook`, `waiting_user`, `queued_idle`, or `offline`), and `fleet_send_message` / `fleet_ask_agent` report delivery
+  state immediately (`fleet_ask_agent` fails fast on `queued_idle` and `waiting_user` unless `wait_if_idle=true`). Codex
+  listens automatically inside its MCP server via `codex queue`; Claude Code and Antigravity sessions arm
+  `fleet agents wait` as a background command on turn 1 (optionally allowlist `fleet agents wait*` in shell permissions
+  to avoid approval prompts).
+- **Tools exposed to agents:** `fleet_list_agents` (supports `state="waiting"`), `fleet_inspect_agent`, `fleet_send_message`,
+  `fleet_check_inbox`, `fleet_ask_agent`, `fleet_set_name`, and `fleet_listen`.
+- **CLI inspection:** Run `fleet agents` (or `fleet agents --waiting` / `--state ...`) from any Mac to view active
+  sessions, names, listener status, wait durations, pending prompts, titles, and repos; `fleet agents rename <target> <name>`
+  to rename a session; or `fleet agents wait --session <id>` to block until unread messages arrive.
 
 ## Security model
 

@@ -20,6 +20,7 @@ NAME_PATTERN = r"^[a-z0-9][a-z0-9-]{0,31}$"
 MOBILE_CERT_HOURS = 8760  # phones/tablets: 1 year, re-sign with `fleet set`
 CA_HOURS = 43800  # 5 years
 AGENT_ACTIVE_SECONDS = 300
+AGENT_WAITING_ACTIVE_SECONDS = 3600
 AGENT_RETENTION_SECONDS = 172800
 
 LABEL_PREFIX = "io.github.bdatdo0601.fleet"

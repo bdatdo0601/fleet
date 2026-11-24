@@ -55,7 +55,7 @@ def make_handler(fleet: Fleet, quiet: bool = False) -> type[BaseHTTPRequestHandl
 
             if (method, path_only) == ("GET", "/v1/agents"):
                 self._send(200, {"agents": fleet.agents.list_sessions(
-                    device=q("device"), repo=q("repo"), harness=q("harness"),
+                    device=q("device"), repo=q("repo"), harness=q("harness"), state=q("state"),
                     include_stale=(q("include_stale") or "").lower() in ("1", "true"),
                 )})  # fmt: skip
                 return True
@@ -73,10 +73,12 @@ def make_handler(fleet: Fleet, quiet: bool = False) -> type[BaseHTTPRequestHandl
 
             if path_only == "/v1/agents/heartbeat":
                 tail = body.get("tail")
+                pending_action = body.get("pending_action")
                 res = fleet.agents.heartbeat(
                     device=caller_name, harness=harness, raw_id=str(body.get("raw_id", "")),
                     pid=pid, cwd=cwd, repo=str(body.get("repo", "")), branch=str(body.get("branch", "")),
                     state=str(body.get("state", "working")),
+                    pending_action=pending_action if isinstance(pending_action, dict) else None,
                     title=str(body["title"]) if body.get("title") is not None else None,
                     name=str(body["name"]) if body.get("name") is not None else None,
                     explicit_name=bool(body.get("explicit_name", False)),

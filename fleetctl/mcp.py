@@ -22,7 +22,8 @@ TOOLS = [
         "name": "fleet_list_agents",
         "description": (
             "List active AI agent sessions (claude, codex, antigravity) across the Nebula fleet, "
-            "including friendly names, titles, listening status, and delivery modes."
+            "including friendly names, titles, state (working, waiting_permission, waiting_question, idle), "
+            "waiting_seconds, pending_action, listening status, and delivery modes."
         ),
         "inputSchema": {
             "type": "object",
@@ -30,13 +31,21 @@ TOOLS = [
                 "device": {"type": "string", "description": "Optional fleet device name filter (e.g. mini, laptop)."},
                 "repo": {"type": "string", "description": "Optional repository name filter."},
                 "harness": {"type": "string", "enum": list(HARNESSES), "description": "Optional harness filter."},
+                "state": {
+                    "type": "string",
+                    "enum": ["working", "waiting", "waiting_permission", "waiting_question", "idle", "exited"],
+                    "description": "Optional state filter ('waiting' matches waiting_permission and waiting_question).",
+                },
                 "include_stale": {"type": "boolean", "description": "Include recently inactive or exited sessions."},
             },
         },
     },
     {
         "name": "fleet_inspect_agent",
-        "description": "Inspect another agent session's cwd, git branch/status, and recent conversation/tool activity.",
+        "description": (
+            "Inspect another agent session's cwd, git branch/status, pending permission/question prompts "
+            "(pending_action, waiting_seconds), and recent conversation/tool activity."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -220,7 +229,7 @@ def _call_tool(
     api = _resolve_api(api_url)
     if name == "fleet_list_agents":
         params = {}
-        for key in ("device", "repo", "harness"):
+        for key in ("device", "repo", "harness", "state"):
             if args.get(key):
                 params[key] = str(args[key])
         if args.get("include_stale"):

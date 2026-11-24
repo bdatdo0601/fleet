@@ -11,28 +11,30 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .paths import AGENT_ACTIVE_SECONDS, AGENT_RETENTION_SECONDS, HARNESSES
+from .paths import AGENT_ACTIVE_SECONDS, AGENT_RETENTION_SECONDS, AGENT_WAITING_ACTIVE_SECONDS, HARNESSES
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agent_sessions (
-  session_id  TEXT PRIMARY KEY,
-  device      TEXT NOT NULL,
-  harness     TEXT NOT NULL,
-  raw_id      TEXT NOT NULL,
-  full_raw_id TEXT NOT NULL DEFAULT '',
-  pid         INTEGER,
-  cwd         TEXT NOT NULL DEFAULT '',
-  repo        TEXT NOT NULL DEFAULT '',
-  branch      TEXT NOT NULL DEFAULT '',
-  state       TEXT NOT NULL DEFAULT 'working',
-  title       TEXT NOT NULL DEFAULT '',
-  name        TEXT NOT NULL DEFAULT '',
-  custom_name INTEGER NOT NULL DEFAULT 0,
-  summary     TEXT NOT NULL DEFAULT '',
-  git_status  TEXT NOT NULL DEFAULT '',
-  tail_json   TEXT NOT NULL DEFAULT '[]',
-  started_at  TEXT NOT NULL,
-  updated_at  TEXT NOT NULL
+  session_id          TEXT PRIMARY KEY,
+  device              TEXT NOT NULL,
+  harness             TEXT NOT NULL,
+  raw_id              TEXT NOT NULL,
+  full_raw_id         TEXT NOT NULL DEFAULT '',
+  pid                 INTEGER,
+  cwd                 TEXT NOT NULL DEFAULT '',
+  repo                TEXT NOT NULL DEFAULT '',
+  branch              TEXT NOT NULL DEFAULT '',
+  state               TEXT NOT NULL DEFAULT 'working',
+  state_changed_at    TEXT NOT NULL DEFAULT '',
+  pending_action_json TEXT NOT NULL DEFAULT '',
+  title               TEXT NOT NULL DEFAULT '',
+  name                TEXT NOT NULL DEFAULT '',
+  custom_name         INTEGER NOT NULL DEFAULT 0,
+  summary             TEXT NOT NULL DEFAULT '',
+  git_status          TEXT NOT NULL DEFAULT '',
+  tail_json           TEXT NOT NULL DEFAULT '[]',
+  started_at          TEXT NOT NULL,
+  updated_at          TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_agent_sessions_lookup
   ON agent_sessions(device, harness, cwd, updated_at);
@@ -62,12 +64,16 @@ CREATE TABLE IF NOT EXISTS agent_reads (
 
 SESSION_MIGRATIONS = (
     ("full_raw_id", "TEXT NOT NULL DEFAULT ''"),
+    ("state_changed_at", "TEXT NOT NULL DEFAULT ''"),
+    ("pending_action_json", "TEXT NOT NULL DEFAULT ''"),
     ("title", "TEXT NOT NULL DEFAULT ''"),
     ("name", "TEXT NOT NULL DEFAULT ''"),
     ("custom_name", "INTEGER NOT NULL DEFAULT 0"),
 )
 
-VALID_STATES = ("working", "idle", "exited")
+WAITING_STATES = ("waiting_permission", "waiting_question")
+VALID_STATES = ("working", "waiting_permission", "waiting_question", "idle", "exited")
+VALID_STATE_FILTERS = (*VALID_STATES, "waiting")
 MAX_MESSAGE_BYTES = 32 * 1024
 WAITER_REARM_GRACE_SECONDS = 20.0
 
@@ -109,9 +115,42 @@ def slugify_name(text: str, *, max_words: int = 5, max_len: int = 32) -> str:
     return "-".join(tokens[:max_words])[:max_len].rstrip("-")
 
 
+def _is_live_row(state: str, age: int) -> bool:
+    if state == "exited":
+        return False
+    limit = AGENT_WAITING_ACTIVE_SECONDS if state in WAITING_STATES else AGENT_ACTIVE_SECONDS
+    return age <= limit
+
+
+def _normalize_pending_action(action: dict | None) -> dict | None:
+    if not isinstance(action, dict):
+        return None
+    limits = {"kind": 32, "tool": 120, "detail": 1000, "event": 64}
+    cleaned: dict[str, str] = {}
+    for key, max_len in limits.items():
+        val = action.get(key)
+        if isinstance(val, str):
+            text = val.strip()[:max_len]
+            if text:
+                cleaned[key] = text
+    return cleaned or None
+
+
+def _parse_pending_action(raw: str | None) -> dict | None:
+    if not raw:
+        return None
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        return None
+    return obj if isinstance(obj, dict) and obj else None
+
+
 def delivery_mode(*, live: bool, state: str, listening: bool) -> str:
     if not live or state == "exited":
         return "offline"
+    if state in WAITING_STATES:
+        return "waiting_user"
     if listening:
         return "immediate"
     if state == "working":
@@ -141,13 +180,27 @@ def _row_to_session(row: sqlite3.Row, now_dt: datetime | None = None, *, listeni
     now_dt = now_dt or _now_dt()
     updated = datetime.fromisoformat(row["updated_at"])
     age = max(0, int((now_dt - updated).total_seconds()))
-    live = row["state"] != "exited" and age <= AGENT_ACTIVE_SECONDS
+    state = row["state"]
+    live = _is_live_row(state, age)
     tail = json.loads(row["tail_json"] or "[]")
     keys = row.keys()
     full_raw_id = (row["full_raw_id"] or "") if "full_raw_id" in keys else ""
     title = (row["title"] or "") if "title" in keys else ""
     name = (row["name"] or "") if "name" in keys else ""
-    is_listening = bool(listening and live and row["state"] != "exited")
+    state_changed_at = (
+        (row["state_changed_at"] or row["updated_at"]) if "state_changed_at" in keys else row["updated_at"]
+    )
+    pending_action = (
+        _parse_pending_action(row["pending_action_json"])
+        if ("pending_action_json" in keys and state in WAITING_STATES)
+        else None
+    )
+    waiting_seconds = (
+        max(0, int((now_dt - datetime.fromisoformat(state_changed_at)).total_seconds()))
+        if state in WAITING_STATES
+        else None
+    )
+    is_listening = bool(listening and live and state != "exited")
     return {
         "session_id": row["session_id"],
         "device": row["device"],
@@ -157,10 +210,13 @@ def _row_to_session(row: sqlite3.Row, now_dt: datetime | None = None, *, listeni
         "cwd": row["cwd"],
         "repo": row["repo"],
         "branch": row["branch"],
-        "state": row["state"],
+        "state": state,
+        "state_changed_at": state_changed_at,
+        "waiting_seconds": waiting_seconds,
+        "pending_action": pending_action,
         "live": live,
         "listening": is_listening,
-        "delivery": delivery_mode(live=live, state=row["state"], listening=is_listening),
+        "delivery": delivery_mode(live=live, state=state, listening=is_listening),
         "age_seconds": age,
         "title": title,
         "name": name,
@@ -268,18 +324,22 @@ class AgentHub:
         now_dt = now_dt or _now_dt()
         updated = datetime.fromisoformat(row["updated_at"])
         age = max(0, int((now_dt - updated).total_seconds()))
-        live = row["state"] != "exited" and age <= AGENT_ACTIVE_SECONDS
+        live = _is_live_row(row["state"], age)
         listening = self._is_listening(row["session_id"], row["state"], live, now_mono=now_mono)
         return _row_to_session(row, now_dt, listening=listening)
 
     def _unique_auto_name(self, base: str, *, device: str, exclude_sid: str) -> str:
         if not base:
             return ""
-        cutoff = (_now_dt() - timedelta(seconds=AGENT_ACTIVE_SECONDS)).isoformat()
+        now_dt = _now_dt()
+        cutoff = (now_dt - timedelta(seconds=AGENT_ACTIVE_SECONDS)).isoformat()
+        waiting_cutoff = (now_dt - timedelta(seconds=AGENT_WAITING_ACTIVE_SECONDS)).isoformat()
         rows = self.conn.execute(
             "SELECT LOWER(name) AS lname FROM agent_sessions "
-            "WHERE device = ? AND state != 'exited' AND updated_at >= ? AND session_id != ? AND name != ''",
-            (device, cutoff, exclude_sid),
+            "WHERE device = ? AND state != 'exited' "
+            "AND (updated_at >= ? OR (state IN ('waiting_permission', 'waiting_question') AND updated_at >= ?)) "
+            "AND session_id != ? AND name != ''",
+            (device, cutoff, waiting_cutoff, exclude_sid),
         ).fetchall()
         taken = {r["lname"] for r in rows}
         if base.lower() not in taken:
@@ -360,12 +420,16 @@ class AgentHub:
         )
 
     def _find_promoted_session(self, *, device: str, harness: str, pid: int, cwd: str) -> sqlite3.Row | None:
-        cutoff = (_now_dt() - timedelta(seconds=AGENT_ACTIVE_SECONDS)).isoformat()
+        now_dt = _now_dt()
+        cutoff = (now_dt - timedelta(seconds=AGENT_ACTIVE_SECONDS)).isoformat()
+        waiting_cutoff = (now_dt - timedelta(seconds=AGENT_WAITING_ACTIVE_SECONDS)).isoformat()
         by_pid = self.conn.execute(
             "SELECT * FROM agent_sessions "
             "WHERE device = ? AND harness = ? AND pid = ? AND raw_id NOT LIKE 'pid-%' "
-            "AND state != 'exited' AND updated_at >= ? ORDER BY updated_at DESC LIMIT 1",
-            (device, harness, pid, cutoff),
+            "AND state != 'exited' "
+            "AND (updated_at >= ? OR (state IN ('waiting_permission', 'waiting_question') AND updated_at >= ?)) "
+            "ORDER BY updated_at DESC LIMIT 1",
+            (device, harness, pid, cutoff, waiting_cutoff),
         ).fetchone()
         if by_pid is not None:
             return by_pid
@@ -373,8 +437,10 @@ class AgentHub:
             by_cwd = self.conn.execute(
                 "SELECT * FROM agent_sessions "
                 "WHERE device = ? AND harness = ? AND cwd = ? AND pid IS NULL AND raw_id NOT LIKE 'pid-%' "
-                "AND state != 'exited' AND updated_at >= ? ORDER BY updated_at DESC",
-                (device, harness, cwd, cutoff),
+                "AND state != 'exited' "
+                "AND (updated_at >= ? OR (state IN ('waiting_permission', 'waiting_question') AND updated_at >= ?)) "
+                "ORDER BY updated_at DESC",
+                (device, harness, cwd, cutoff, waiting_cutoff),
             ).fetchall()
             if len(by_cwd) == 1:
                 return by_cwd[0]
@@ -391,6 +457,7 @@ class AgentHub:
         repo: str = "",
         branch: str = "",
         state: str = "working",
+        pending_action: dict | None = None,
         title: str | None = None,
         name: str | None = None,
         explicit_name: bool = False,
@@ -466,8 +533,8 @@ class AgentHub:
                     old_pid, old_started, old_title, old_name, old_custom = pid, None, "", "", 0
 
                 existing = self.conn.execute(
-                    "SELECT full_raw_id, pid, cwd, repo, branch, title, name, custom_name, "
-                    "summary, git_status, tail_json, started_at "
+                    "SELECT full_raw_id, pid, cwd, repo, branch, state, state_changed_at, pending_action_json, "
+                    "title, name, custom_name, summary, git_status, tail_json, started_at, updated_at "
                     "FROM agent_sessions WHERE session_id = ?",
                     (session_id,),
                 ).fetchone()
@@ -499,11 +566,41 @@ class AgentHub:
                     existing["full_raw_id"] if existing else ""
                 )
 
+                if state in WAITING_STATES:
+                    norm_action = _normalize_pending_action(pending_action)
+                    existing_same_state = existing is not None and existing["state"] == state
+                    existing_pending = (
+                        _parse_pending_action(existing["pending_action_json"]) if existing_same_state else None
+                    )
+                    if norm_action is None:
+                        new_pending_json = (existing["pending_action_json"] or "") if existing_same_state else ""
+                    elif (
+                        existing_same_state
+                        and existing_pending
+                        and existing_pending.get("tool")
+                        and not norm_action.get("tool")
+                    ):
+                        new_pending_json = existing["pending_action_json"] or ""
+                    else:
+                        new_pending_json = json.dumps(norm_action)
+                else:
+                    new_pending_json = ""
+
+                if (
+                    existing is not None
+                    and existing["state"] == state
+                    and (state not in WAITING_STATES or new_pending_json == (existing["pending_action_json"] or ""))
+                ):
+                    new_state_changed_at = existing["state_changed_at"] or existing["updated_at"]
+                else:
+                    new_state_changed_at = now_iso
+
                 if existing:
                     self.conn.execute(
                         "UPDATE agent_sessions SET full_raw_id = ?, pid = ?, cwd = ?, repo = ?, branch = ?, "
-                        "state = ?, title = ?, name = ?, custom_name = ?, summary = ?, git_status = ?, "
-                        "tail_json = ?, started_at = ?, updated_at = ? WHERE session_id = ?",
+                        "state = ?, state_changed_at = ?, pending_action_json = ?, title = ?, name = ?, "
+                        "custom_name = ?, summary = ?, git_status = ?, tail_json = ?, started_at = ?, "
+                        "updated_at = ? WHERE session_id = ?",
                         (
                             full_raw or existing["full_raw_id"],
                             old_pid if old_pid is not None else existing["pid"],
@@ -511,6 +608,8 @@ class AgentHub:
                             eff_repo,
                             branch or existing["branch"],
                             state,
+                            new_state_changed_at,
+                            new_pending_json,
                             eff_title,
                             eff_name,
                             eff_custom,
@@ -525,8 +624,9 @@ class AgentHub:
                 else:
                     self.conn.execute(
                         "INSERT INTO agent_sessions(session_id, device, harness, raw_id, full_raw_id, pid, cwd, repo, "
-                        "branch, state, title, name, custom_name, summary, git_status, tail_json, started_at, "
-                        "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "branch, state, state_changed_at, pending_action_json, title, name, custom_name, summary, "
+                        "git_status, tail_json, started_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             session_id,
                             device,
@@ -538,6 +638,8 @@ class AgentHub:
                             repo,
                             branch,
                             state,
+                            new_state_changed_at,
+                            new_pending_json,
                             eff_title,
                             eff_name,
                             eff_custom,
@@ -600,14 +702,15 @@ class AgentHub:
         with self.cond:
             if session_id is not None:
                 self.conn.execute(
-                    "UPDATE agent_sessions SET state = 'exited', updated_at = ? WHERE device = ? AND session_id = ?",
-                    (now_iso, device, session_id),
+                    "UPDATE agent_sessions SET state = 'exited', state_changed_at = ?, "
+                    "pending_action_json = '', updated_at = ? WHERE device = ? AND session_id = ?",
+                    (now_iso, now_iso, device, session_id),
                 )
             elif harness is not None and pid is not None:
                 self.conn.execute(
-                    "UPDATE agent_sessions SET state = 'exited', updated_at = ? "
-                    "WHERE device = ? AND harness = ? AND pid = ?",
-                    (now_iso, device, harness, pid),
+                    "UPDATE agent_sessions SET state = 'exited', state_changed_at = ?, "
+                    "pending_action_json = '', updated_at = ? WHERE device = ? AND harness = ? AND pid = ?",
+                    (now_iso, now_iso, device, harness, pid),
                 )
             else:
                 raise AgentError("session_id or (harness, pid) is required")
@@ -661,8 +764,11 @@ class AgentHub:
         device: str | None = None,
         repo: str | None = None,
         harness: str | None = None,
+        state: str | None = None,
         include_stale: bool = False,
     ) -> list[dict]:
+        if state is not None and state not in VALID_STATE_FILTERS:
+            raise AgentError(f"invalid state filter {state!r}")
         with self.lock:
             rows = self.conn.execute(
                 "SELECT * FROM agent_sessions "
@@ -673,7 +779,13 @@ class AgentHub:
             now_dt = _now_dt()
             now_mono = time.monotonic()
             sessions = [self._serialize_session(r, now_dt=now_dt, now_mono=now_mono) for r in rows]
-        return sessions if include_stale else [s for s in sessions if s["live"]]
+        filtered = sessions if include_stale else [s for s in sessions if s["live"]]
+        if state is not None:
+            if state == "waiting":
+                filtered = [s for s in filtered if s["state"] in WAITING_STATES]
+            else:
+                filtered = [s for s in filtered if s["state"] == state]
+        return filtered
 
     def get_session(self, target: str) -> dict:
         target = target.strip()
@@ -687,7 +799,7 @@ class AgentHub:
             def is_live(r: sqlite3.Row) -> bool:
                 updated = datetime.fromisoformat(r["updated_at"])
                 age = max(0, int((now_dt - updated).total_seconds()))
-                return r["state"] != "exited" and age <= AGENT_ACTIVE_SECONDS
+                return _is_live_row(r["state"], age)
 
             def pick(matches: list[sqlite3.Row]) -> dict | None:
                 if not matches:
@@ -748,6 +860,7 @@ class AgentHub:
         if msg["to_session"]:
             sid = msg["to_session"]
             row = self.conn.execute("SELECT * FROM agent_sessions WHERE session_id = ?", (sid,)).fetchone()
+            sess: dict | None = None
             if row is None:
                 delivery = "offline"
                 label = sid
@@ -757,7 +870,22 @@ class AgentHub:
                 label = f"{sess['name']} ({sess['session_id']})" if sess["name"] else sess["session_id"]
             woke = 1 if self._waiters.get(sid, 0) > 0 else 0
             warning: str | None = None
-            if delivery == "queued_idle":
+            if delivery == "waiting_user" and sess is not None:
+                kind_label = "permission approval" if sess["state"] == "waiting_permission" else "user input"
+                pending = sess.get("pending_action") or {}
+                tool = str(pending.get("tool") or "").strip()
+                detail = str(pending.get("detail") or "").strip()
+                if tool and detail:
+                    wait_desc = f"{kind_label} ({tool}: {detail[:120]})"
+                elif tool or detail:
+                    wait_desc = f"{kind_label} ({(tool or detail)[:120]})"
+                else:
+                    wait_desc = kind_label
+                warning = (
+                    f"Recipient {label} is waiting for {wait_desc}; "
+                    "message saved in inbox until the user responds."
+                )
+            elif delivery == "queued_idle":
                 warning = (
                     f"Recipient {label} is idle with no active listener; "
                     "message queued until its next hook or user turn."
@@ -770,7 +898,12 @@ class AgentHub:
             "SELECT * FROM agent_sessions WHERE session_id != ? AND state != 'exited' ORDER BY updated_at DESC",
             (msg["from_session"],),
         ).fetchall()
-        recipients: dict[str, list[str]] = {"immediate": [], "next_hook": [], "queued_idle": []}
+        recipients: dict[str, list[str]] = {
+            "immediate": [],
+            "next_hook": [],
+            "waiting_user": [],
+            "queued_idle": [],
+        }
         for r in rows:
             if msg["to_device"] is not None and r["device"] != msg["to_device"]:
                 continue
@@ -785,7 +918,17 @@ class AgentHub:
         woke = len(recipients["immediate"])
         warning = None
         if not recipients["immediate"] and not recipients["next_hook"]:
-            if recipients["queued_idle"]:
+            if recipients["waiting_user"] and recipients["queued_idle"]:
+                warning = (
+                    "All matching recipients are waiting for user input or idle with no active listener; "
+                    "message saved in inbox."
+                )
+            elif recipients["waiting_user"]:
+                warning = (
+                    "All matching recipients are waiting for user permission/input; "
+                    "message saved in inbox until the user responds."
+                )
+            elif recipients["queued_idle"]:
                 warning = (
                     "All matching recipients are idle with no active listener; "
                     "message queued until next hook or user turn."
@@ -1118,13 +1261,13 @@ class AgentHub:
                         "delivery": "offline",
                         "warning": report["warning"],
                     }
-                if report["delivery"] == "queued_idle" and not wait_if_idle:
+                if report["delivery"] in ("queued_idle", "waiting_user") and not wait_if_idle:
                     return {
                         "sent": sent,
                         "reply": None,
                         "timed_out": False,
                         "delivered": False,
-                        "delivery": "queued_idle",
+                        "delivery": report["delivery"],
                         "warning": report["warning"],
                     }
             deadline = time.monotonic() + timeout

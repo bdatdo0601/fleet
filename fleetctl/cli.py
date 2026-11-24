@@ -334,14 +334,28 @@ def cmd_status(_: argparse.Namespace) -> None:
 # agents & mcp -----------------------------------------------------------------
 
 
+def _format_wait_duration(secs: int) -> str:
+    secs = max(0, int(secs))
+    if secs < 60:
+        return f"{secs}s"
+    mins = secs // 60
+    if mins < 60:
+        return f"{mins}m"
+    hours, rem_mins = divmod(mins, 60)
+    return f"{hours}h{rem_mins}m" if rem_mins else f"{hours}h"
+
+
 def cmd_agents(a: argparse.Namespace) -> None:
     params = []
     if a.all:
         params.append("include_stale=true")
     if a.device:
-        params.append(f"device={a.device}")
+        params.append(f"device={urllib.parse.quote(a.device, safe='')}")
     if a.repo:
-        params.append(f"repo={a.repo}")
+        params.append(f"repo={urllib.parse.quote(a.repo, safe='')}")
+    state_filter = "waiting" if a.waiting else a.state
+    if state_filter:
+        params.append(f"state={urllib.parse.quote(state_filter, safe='')}")
     qs = f"?{'&'.join(params)}" if params else ""
     agents = call(api(), "GET", f"/v1/agents{qs}")["agents"]
     if not agents:
@@ -351,12 +365,35 @@ def cmd_agents(a: argparse.Namespace) -> None:
     for ag in agents:
         if not ag["live"]:
             state = f"{ag['state']} (stale)"
+        elif ag["state"] in ("waiting_permission", "waiting_question"):
+            wait_secs = ag.get("waiting_seconds")
+            tags: list[str] = []
+            if wait_secs is not None:
+                tags.append(_format_wait_duration(int(wait_secs)))
+            if ag.get("listening"):
+                tags.append("listening")
+            state = f"{ag['state']} ({', '.join(tags)})" if tags else ag["state"]
         elif ag.get("listening"):
             state = f"{ag['state']} (listening)"
         else:
             state = ag["state"]
         repo_label = f"{ag['repo']}@{ag['branch']}" if ag["repo"] and ag["branch"] else ag["repo"]
-        title_text = (ag.get("title") or ag.get("summary") or "").replace("\n", " ")[:48]
+        base_title = (ag.get("title") or ag.get("summary") or "").replace("\n", " ").strip()
+        pending = ag.get("pending_action")
+        if isinstance(pending, dict):
+            tool = str(pending.get("tool") or "").strip()
+            detail = str(pending.get("detail") or "").replace("\n", " ").strip()
+            if tool and detail:
+                snippet = f"[{tool}: {detail}]"
+            elif tool or detail:
+                snippet = f"[{tool or detail}]"
+            else:
+                snippet = ""
+            title_text = (
+                f"{snippet} {base_title}"[:60] if snippet and base_title else (snippet or base_title)[:60]
+            )
+        else:
+            title_text = base_title[:48]
         rows.append((
             ag.get("name") or "-",
             ag["device"],
@@ -555,6 +592,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     ag = sub.add_parser("agents", help="list active AI agent sessions across the fleet")
     ag.add_argument("--all", action="store_true", help="include stale and exited sessions")
+    ag.add_argument("--waiting", action="store_true", help="show only sessions waiting on permission or user input")
+    ag.add_argument(
+        "--state",
+        choices=("working", "waiting", "waiting_permission", "waiting_question", "idle", "exited"),
+        help="filter by session state",
+    )
     ag.add_argument("--device", help="filter by fleet device name")
     ag.add_argument("--repo", help="filter by repository name")
     ag.set_defaults(func=cmd_agents)

@@ -413,6 +413,232 @@ def _session_start_message(harness: str, session_id: str, session_name: str = ""
     return "\n".join(lines)
 
 
+def _summarize_questions(tool_name: str, args: object) -> str:
+    if isinstance(args, dict):
+        questions = args.get("questions")
+        if isinstance(questions, list) and questions:
+            parts = []
+            for q in questions:
+                if isinstance(q, dict):
+                    txt = str(q.get("question") or q.get("header") or "").strip()
+                    if txt:
+                        parts.append(txt)
+            if parts:
+                return " | ".join(parts)[:400]
+        for key in ("question", "prompt"):
+            val = args.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()[:400]
+    return _fmt_tool(tool_name, args)[:400]
+
+
+def _summarize_tool_detail(tool_name: str, tool_input: object) -> str:
+    if isinstance(tool_input, dict):
+        if tool_name == "ask_permission" or any(k in tool_input for k in ("Action", "Target", "Reason")):
+            action = str(tool_input.get("Action") or "").strip()
+            target = str(tool_input.get("Target") or "").strip()
+            reason = str(tool_input.get("Reason") or "").strip()
+            head = f"{action} {target}".strip()
+            if head and reason:
+                return f"{head} — {reason}"[:400]
+            if head or reason:
+                return (head or reason)[:400]
+        for key in ("command", "CommandLine", "cmd"):
+            val = tool_input.get(key)
+            if isinstance(val, list):
+                joined = " ".join(str(x) for x in val if x is not None).strip()
+                if joined:
+                    return joined[:400]
+            elif isinstance(val, str) and val.strip():
+                return val.strip()[:400]
+        for key in ("file_path", "TargetFile", "path", "AbsolutePath"):
+            val = tool_input.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()[:400]
+        desc = tool_input.get("description")
+        if isinstance(desc, str) and desc.strip():
+            return desc.strip()[:400]
+        return _fmt_tool(tool_name, tool_input)[:400]
+    if isinstance(tool_input, str) and tool_input.strip():
+        return tool_input.strip()[:400]
+    return ""
+
+
+def _classify_hook_event(
+    harness: str,
+    event: str,
+    payload: dict,
+    *,
+    cont_active: bool,
+    term_reason: str,
+) -> tuple[str | None, dict | None, bool]:
+    if harness == "antigravity":
+        if event == "Stop":
+            return "idle", None, not (cont_active or term_reason != "NO_TOOL_CALL")
+        if event == "PreToolUse":
+            tool_call = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else {}
+            tool_name = str(tool_call.get("name") or "")
+            tool_args = tool_call.get("args")
+            if tool_name == "ask_question":
+                return (
+                    "waiting_question",
+                    {
+                        "kind": "question",
+                        "tool": tool_name,
+                        "detail": _summarize_questions(tool_name, tool_args),
+                        "event": event,
+                    },
+                    False,
+                )
+            if tool_name == "ask_permission":
+                return (
+                    "waiting_permission",
+                    {
+                        "kind": "permission",
+                        "tool": tool_name,
+                        "detail": _summarize_tool_detail(tool_name, tool_args),
+                        "event": event,
+                    },
+                    False,
+                )
+            return "working", None, False
+        if event in ("SessionStart", "PreInvocation"):
+            return "working", None, True
+        return "working", None, False
+
+    tool_name = str(payload.get("tool_name") or "")
+    tool_input = payload.get("tool_input")
+
+    if harness == "claude":
+        if event == "PermissionRequest":
+            if tool_name == "AskUserQuestion":
+                return (
+                    "waiting_question",
+                    {
+                        "kind": "question",
+                        "tool": tool_name,
+                        "detail": _summarize_questions(tool_name, tool_input),
+                        "event": event,
+                    },
+                    False,
+                )
+            if tool_name == "ExitPlanMode":
+                return (
+                    "waiting_question",
+                    {
+                        "kind": "question",
+                        "tool": tool_name,
+                        "detail": "Waiting for plan approval",
+                        "event": event,
+                    },
+                    False,
+                )
+            return (
+                "waiting_permission",
+                {
+                    "kind": "permission",
+                    "tool": tool_name,
+                    "detail": _summarize_tool_detail(tool_name, tool_input),
+                    "event": event,
+                },
+                False,
+            )
+        if event == "PreToolUse":
+            if tool_name == "AskUserQuestion":
+                return (
+                    "waiting_question",
+                    {
+                        "kind": "question",
+                        "tool": tool_name,
+                        "detail": _summarize_questions(tool_name, tool_input),
+                        "event": event,
+                    },
+                    False,
+                )
+            if tool_name == "ExitPlanMode":
+                return (
+                    "waiting_question",
+                    {
+                        "kind": "question",
+                        "tool": tool_name,
+                        "detail": "Waiting for plan approval",
+                        "event": event,
+                    },
+                    False,
+                )
+            return "working", None, False
+        if event == "Notification":
+            notif_type = str(payload.get("notification_type") or "")
+            notif_msg = str(payload.get("message") or payload.get("title") or "").strip()[:400]
+            if notif_type == "permission_prompt":
+                return (
+                    "waiting_permission",
+                    {
+                        "kind": "permission",
+                        "detail": notif_msg or "Waiting for permission approval",
+                        "event": f"Notification:{notif_type}",
+                    },
+                    False,
+                )
+            if notif_type in ("elicitation_dialog", "elicitation_url_dialog", "agent_needs_input"):
+                return (
+                    "waiting_question",
+                    {
+                        "kind": "question",
+                        "detail": notif_msg or f"Waiting for user input ({notif_type})",
+                        "event": f"Notification:{notif_type}",
+                    },
+                    False,
+                )
+            if notif_type == "idle_prompt":
+                return "idle", None, False
+            return None, None, False
+        if event == "Stop":
+            return "idle", None, not cont_active
+        if event == "SessionEnd":
+            return "exited", None, False
+        if event in ("SessionStart", "UserPromptSubmit", "PostToolUse"):
+            return "working", None, True
+        return "working", None, False
+
+    if harness == "codex":
+        if event == "PermissionRequest":
+            return (
+                "waiting_permission",
+                {
+                    "kind": "permission",
+                    "tool": tool_name,
+                    "detail": _summarize_tool_detail(tool_name, tool_input),
+                    "event": event,
+                },
+                False,
+            )
+        if event == "PreToolUse":
+            if tool_name == "request_user_input":
+                return (
+                    "waiting_question",
+                    {
+                        "kind": "question",
+                        "tool": tool_name,
+                        "detail": _summarize_questions(tool_name, tool_input),
+                        "event": event,
+                    },
+                    False,
+                )
+            return "working", None, False
+        if event == "Stop":
+            return "idle", None, not cont_active
+        if event == "Interrupt":
+            return "idle", None, False
+        if event == "SessionEnd":
+            return "exited", None, False
+        if event in ("SessionStart", "UserPromptSubmit", "PostToolUse"):
+            return "working", None, True
+        return "working", None, False
+
+    return "working", None, False
+
+
 def _format_hook_output(
     *,
     harness: str,
@@ -424,6 +650,8 @@ def _format_hook_output(
 ) -> dict:
     unread_text = _format_unread(session_id, unread, session_name=session_name) if unread else ""
     if harness == "antigravity":
+        if event == "PreToolUse":
+            return {"decision": "allow"}
         if event == "PostToolUse":
             return {}
         if event == "SessionStart":
@@ -507,10 +735,18 @@ def run_hook(
         cont_active = bool(payload.get("stop_hook_active"))
         term_reason = "NO_TOOL_CALL"
 
-    state = "idle" if event == "Stop" else "working"
-    can_inject = not (harness == "antigravity" and event == "PostToolUse") and not (
-        event == "Stop" and (cont_active or term_reason != "NO_TOOL_CALL")
+    state, pending_action, can_inject = _classify_hook_event(
+        harness,
+        event,
+        payload,
+        cont_active=cont_active,
+        term_reason=term_reason,
     )
+    if state is None:
+        out_stream.write("{}\n")
+        out_stream.flush()
+        return 0
+
     repo, branch, git_status = git_context(cwd)
     transcript_str = str(transcript_path) if transcript_path else None
     tail_summary, tail = read_transcript_tail(harness, transcript_str, cwd=cwd)
@@ -522,28 +758,25 @@ def run_hook(
     unread: list[dict] = []
     try:
         api = _resolve_api(api_url)
-        resp = call(
-            api,
-            "POST",
-            "/v1/agents/heartbeat",
-            {
-                "harness": harness,
-                "raw_id": raw_id,
-                "pid": None if harness == "antigravity" else os.getppid(),
-                "cwd": cwd,
-                "repo": repo,
-                "branch": branch,
-                "state": state,
-                "title": title or None,
-                "name": title if is_explicit_name else None,
-                "explicit_name": is_explicit_name,
-                "summary": summary or None,
-                "git_status": git_status,
-                "tail": tail,
-                "drain_inbox": can_inject,
-            },
-            timeout=2.0,
-        )
+        hb_payload: dict = {
+            "harness": harness,
+            "raw_id": raw_id,
+            "pid": None if harness == "antigravity" else os.getppid(),
+            "cwd": cwd,
+            "repo": repo,
+            "branch": branch,
+            "state": state,
+            "title": title or None,
+            "name": title if is_explicit_name else None,
+            "explicit_name": is_explicit_name,
+            "summary": summary or None,
+            "git_status": git_status,
+            "tail": tail,
+            "drain_inbox": can_inject,
+        }
+        if pending_action is not None:
+            hb_payload["pending_action"] = pending_action
+        resp = call(api, "POST", "/v1/agents/heartbeat", hb_payload, timeout=2.0)
         session_id = str(resp.get("session_id") or "")
         session_name = str(resp.get("name") or "")
         raw_unread = resp.get("unread")
