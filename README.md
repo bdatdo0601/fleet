@@ -78,8 +78,8 @@ ln -s /usr/local/libexec/fleet/fleet /opt/homebrew/bin/fleet
 ```
 `fleet sync` on the lighthouse updates its clone with `git pull --ff-only`, builds `darwin/arm64` and `darwin/amd64`
 into `~/.fleet/bin/` (use `sudo fleet sync --rebuild` to force a rebuild), verifies `fleet serve` health, and serves
-verified binaries to other Macs over Nebula (`GET /v1/binary`). Existing Macs migrating from the Python `fleetctl`
-package automatically switch on their next `fleet sync` once `go` is installed on the lighthouse.
+verified binaries to other Macs over Nebula (`GET /v1/binary`). To bootstrap a new Mac without Go installed, copy
+`~/.fleet/bin/fleet-darwin-<arch>` from the lighthouse to `/usr/local/libexec/fleet/fleet` and symlink `/opt/homebrew/bin/fleet`.
 
 ### 3. DNS updates (Route 53, optional)
 
@@ -287,6 +287,5 @@ go test -race ./...                                     # uses the real nebula/n
 go vet ./...
 CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build ./cmd/fleet
 CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build ./cmd/fleet
-FLEET_FORCE_PYTHON=1 python3 -m unittest discover -s tests
-uvx ruff check . && shellcheck bin/fleet bin/ssh-harden
+shellcheck bin/ssh-harden
 ```
