@@ -2,6 +2,7 @@ package core
 
 import (
 	"database/sql"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -176,7 +177,7 @@ func TestApproveRevokeSetGroupIdentifyAndNumericIPSort(t *testing.T) {
 
 	// Duplicate without --replace returns 409
 	_, err = f.Approve(ApproveOpts{Name: "laptop", Pubkey: lapPub, Kind: "mac", Group: "admin", Passphrase: testPassphrase})
-	if fe, ok := err.(*FleetError); !ok || fe.Status != 409 {
+	if fe, ok := errors.AsType[*FleetError](err); !ok || fe.Status != 409 {
 		t.Fatalf("expected 409 FleetError, got %v", err)
 	}
 	second, err := f.Approve(ApproveOpts{
@@ -193,7 +194,7 @@ func TestApproveRevokeSetGroupIdentifyAndNumericIPSort(t *testing.T) {
 	// Wrong passphrase returns 401 and does not register
 	_, badPub := makeKeypair(t, tmp, "x")
 	_, err = f.Approve(ApproveOpts{Name: "x", Pubkey: badPub, Kind: "mac", Group: "admin", Passphrase: "nope"})
-	if fe, ok := err.(*FleetError); !ok || fe.Status != 401 || !strings.Contains(fe.Msg, "wrong CA passphrase") {
+	if fe, ok := errors.AsType[*FleetError](err); !ok || fe.Status != 401 || !strings.Contains(fe.Msg, "wrong CA passphrase") {
 		t.Fatalf("expected 401 wrong passphrase, got %v", err)
 	}
 	if dev, _ := f.Registry.Get("x"); dev != nil {

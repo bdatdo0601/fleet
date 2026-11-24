@@ -3,6 +3,7 @@ package agents
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -22,13 +23,11 @@ func openTestHub(t *testing.T) *Hub {
 	return h
 }
 
-func ptr[T any](v T) *T { return &v }
-
 func TestHeartbeatPlaceholderPromotionAndDeregister(t *testing.T) {
 	hub := openTestHub(t)
 
 	hb1, err := hub.Heartbeat(HeartbeatParams{
-		Device: "laptop", Harness: "claude", RawID: "pid-4242", PID: ptr(4242),
+		Device: "laptop", Harness: "claude", RawID: "pid-4242", PID: new(4242),
 		CWD: "/Users/datdo/proj", Repo: "proj", Branch: "main",
 	})
 	if err != nil || hb1.SessionID != "laptop:claude:pid-4242" {
@@ -40,15 +39,15 @@ func TestHeartbeatPlaceholderPromotionAndDeregister(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	msg, err := hub.SendMessage("office", "office:codex:codex-1111", "laptop:claude:pid-4242", "check api.py", nil, nil, nil)
-	if err != nil || msg.ToSession == nil || *msg.ToSession != "laptop:claude:pid-4242" {
-		t.Fatalf("send failed: %+v, %v", msg, err)
+	sendRes, err := hub.SendMessageWithReport("office", "office:codex:codex-1111", "laptop:claude:pid-4242", "check api.py", nil, nil, nil)
+	if err != nil || sendRes.Message.ToSession == nil || *sendRes.Message.ToSession != "laptop:claude:pid-4242" {
+		t.Fatalf("send failed: %+v, %v", sendRes, err)
 	}
 
 	hb2, err := hub.Heartbeat(HeartbeatParams{
 		Device: "laptop", Harness: "claude", RawID: "c779894d-fe1c-41c0",
 		CWD: "/Users/datdo/proj", Repo: "proj", Branch: "main",
-		Summary:    ptr("fix bug"),
+		Summary:    new("fix bug"),
 		Tail:       []TailItem{{Role: "user", Text: "fix bug"}},
 		DrainInbox: true,
 	})
@@ -68,7 +67,7 @@ func TestHeartbeatPlaceholderPromotionAndDeregister(t *testing.T) {
 		t.Fatalf("unexpected detail: %+v, %v", detail, err)
 	}
 
-	if err := hub.Deregister("laptop", nil, ptr("claude"), ptr(4242)); err != nil {
+	if err := hub.Deregister("laptop", nil, new("claude"), new(4242)); err != nil {
 		t.Fatal(err)
 	}
 	if after, _ := hub.ListSessions("laptop", "", "", "", false); len(after) != 0 {
@@ -86,7 +85,7 @@ func TestBroadcastReadsAndAskWakeup(t *testing.T) {
 	_, _ = hub.Heartbeat(HeartbeatParams{Device: "office", Harness: "antigravity", RawID: "s3", Repo: "other", CWD: "/o"})
 	known := map[string]bool{"mini": true, "laptop": true, "office": true}
 
-	if _, err := hub.SendMessage("mini", "mini:claude:s1", "repo:fleet", "rebasing main", nil, nil, known); err != nil {
+	if _, err := hub.SendMessageWithReport("mini", "mini:claude:s1", "repo:fleet", "rebasing main", nil, nil, known); err != nil {
 		t.Fatal(err)
 	}
 	if m, _ := hub.FetchInbox("laptop", "laptop:codex:s2", true, true, 50); len(m) != 1 {
@@ -99,7 +98,7 @@ func TestBroadcastReadsAndAskWakeup(t *testing.T) {
 		t.Fatalf("expected 0 for other repo, got %d", len(m))
 	}
 
-	if _, err := hub.SendMessage("mini", "mini:claude:s1", "*", "deploying", nil, nil, known); err != nil {
+	if _, err := hub.SendMessageWithReport("mini", "mini:claude:s1", "*", "deploying", nil, nil, known); err != nil {
 		t.Fatal(err)
 	}
 	if m, _ := hub.FetchInbox("laptop", "laptop:codex:s2", true, true, 50); len(m) != 1 {
@@ -111,18 +110,16 @@ func TestBroadcastReadsAndAskWakeup(t *testing.T) {
 
 	// Concurrent ask wakeup
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for i := 0; i < 60; i++ {
+	wg.Go(func() {
+		for range 60 {
 			msgs, _ := hub.FetchInbox("laptop", "laptop:codex:s2", true, true, 50)
 			if len(msgs) > 0 {
-				_, _ = hub.SendMessage("laptop", "laptop:codex:s2", msgs[0].FromSession, "tests pass", nil, &msgs[0].ID, known)
+				_, _ = hub.SendMessageWithReport("laptop", "laptop:codex:s2", msgs[0].FromSession, "tests pass", nil, &msgs[0].ID, known)
 				return
 			}
 			time.Sleep(15 * time.Millisecond)
 		}
-	}()
+	})
 	res, err := hub.Ask(context.Background(), AskParams{
 		Device: "mini", FromSession: "mini:claude:s1", To: "laptop:codex:s2", Body: "status?", Timeout: 3.0,
 	})
@@ -185,7 +182,7 @@ func TestLegacyAgentsDBMigrationAndNamingAndWaiting(t *testing.T) {
 		t.Fatalf("unexpected migrated session: %+v, err=%v", listed, err)
 	}
 	hb, err := hub.Heartbeat(HeartbeatParams{
-		Device: "mini", Harness: "claude", RawID: "leg1-full", Title: ptr("Migrated Session"), CWD: "/proj",
+		Device: "mini", Harness: "claude", RawID: "leg1-full", Title: new("Migrated Session"), CWD: "/proj",
 	})
 	if err != nil || hb.Name != "migrated-session" {
 		t.Fatalf("unexpected migrated name: %+v, err=%v", hb, err)
@@ -193,14 +190,14 @@ func TestLegacyAgentsDBMigrationAndNamingAndWaiting(t *testing.T) {
 
 	// Rich pending action not clobbered by generic notification
 	_, _ = hub.Heartbeat(HeartbeatParams{
-		Device: "mini", Harness: "claude", RawID: "cl-wait-1", PID: ptr(5151), CWD: "/wait",
+		Device: "mini", Harness: "claude", RawID: "cl-wait-1", PID: new(5151), CWD: "/wait",
 		State:         "waiting_permission",
 		PendingAction: map[string]string{"kind": "permission", "tool": "Bash", "detail": "rm -rf build", "event": "PermissionRequest"},
 	})
 	s1, _ := hub.GetSession("cl-wait-1")
 	origChanged := s1.StateChangedAt
 	_, _ = hub.Heartbeat(HeartbeatParams{
-		Device: "mini", Harness: "claude", RawID: "cl-wait-1", PID: ptr(5151), CWD: "/wait",
+		Device: "mini", Harness: "claude", RawID: "cl-wait-1", PID: new(5151), CWD: "/wait",
 		State:         "waiting_permission",
 		PendingAction: map[string]string{"kind": "permission", "detail": "Claude needs permission", "event": "Notification:permission_prompt"},
 	})
@@ -224,7 +221,7 @@ func TestWaiterContextCancellationCleansUpWaiterCount(t *testing.T) {
 	}()
 
 	var listening bool
-	for i := 0; i < 40; i++ {
+	for range 40 {
 		s, _ := hub.GetSession("w1")
 		if s.Listening {
 			listening = true
@@ -239,7 +236,7 @@ func TestWaiterContextCancellationCleansUpWaiterCount(t *testing.T) {
 	cancel()
 	select {
 	case err := <-done:
-		if err != context.Canceled {
+		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("expected context.Canceled, got %v", err)
 		}
 	case <-time.After(2 * time.Second):

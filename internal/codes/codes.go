@@ -24,13 +24,6 @@ const (
 	Response = "FLEET JOIN RESPONSE"
 )
 
-// CodeError indicates an invalid or damaged copy-paste join block.
-type CodeError struct {
-	Msg string
-}
-
-func (e *CodeError) Error() string { return e.Msg }
-
 // Encode serializes payload as compact JSON, zlib-compresses at level 9, base64-encodes,
 // wraps at 64 columns, and surrounds with PEM markers.
 func Encode(label string, payload any) (string, error) {
@@ -61,10 +54,7 @@ func Encode(label string, payload any) (string, error) {
 	out.WriteString(label)
 	out.WriteString("-----")
 	for i := 0; i < len(b64); i += 64 {
-		end := i + 64
-		if end > len(b64) {
-			end = len(b64)
-		}
+		end := min(i+64, len(b64))
 		out.WriteByte('\n')
 		out.WriteString(b64[i:end])
 	}
@@ -78,16 +68,14 @@ func Encode(label string, payload any) (string, error) {
 func Decode(label, text string, out any) error {
 	begin := "-----BEGIN " + label + "-----"
 	end := "-----END " + label + "-----"
-	bi := strings.Index(text, begin)
-	if bi < 0 {
-		return &CodeError{Msg: fmt.Sprintf("expected a %s block", label)}
+	_, after, ok := strings.Cut(text, begin)
+	if !ok {
+		return fmt.Errorf("expected a %s block", label)
 	}
-	afterBegin := text[bi+len(begin):]
-	ei := strings.Index(afterBegin, end)
-	if ei < 0 {
-		return &CodeError{Msg: fmt.Sprintf("expected a %s block", label)}
+	body, _, ok := strings.Cut(after, end)
+	if !ok {
+		return fmt.Errorf("expected a %s block", label)
 	}
-	body := afterBegin[:ei]
 	cleaned := strings.Map(func(r rune) rune {
 		if unicode.IsSpace(r) {
 			return -1
@@ -97,19 +85,19 @@ func Decode(label, text string, out any) error {
 
 	raw, err := base64.StdEncoding.DecodeString(cleaned)
 	if err != nil {
-		return &CodeError{Msg: fmt.Sprintf("%s block is damaged; copy it again (%v)", label, err)}
+		return fmt.Errorf("%s block is damaged; copy it again (%w)", label, err)
 	}
 	zr, err := zlib.NewReader(bytes.NewReader(raw))
 	if err != nil {
-		return &CodeError{Msg: fmt.Sprintf("%s block is damaged; copy it again (%v)", label, err)}
+		return fmt.Errorf("%s block is damaged; copy it again (%w)", label, err)
 	}
 	defer func() { _ = zr.Close() }()
 	plain, err := io.ReadAll(zr)
 	if err != nil {
-		return &CodeError{Msg: fmt.Sprintf("%s block is damaged; copy it again (%v)", label, err)}
+		return fmt.Errorf("%s block is damaged; copy it again (%w)", label, err)
 	}
 	if err := json.Unmarshal(plain, out); err != nil {
-		return &CodeError{Msg: fmt.Sprintf("%s block is damaged; copy it again (%v)", label, err)}
+		return fmt.Errorf("%s block is damaged; copy it again (%w)", label, err)
 	}
 	return nil
 }

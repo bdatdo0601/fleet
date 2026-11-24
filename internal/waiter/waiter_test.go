@@ -41,8 +41,8 @@ func setupWaiterServer(t *testing.T) (*core.Fleet, *httptest.Server, string) {
 
 func TestWaitForInboxCLIAndPIDLockReplacement(t *testing.T) {
 	f, srv, tmp := setupWaiterServer(t)
-	_, _ = f.Agents.Heartbeat(agents.HeartbeatParams{Device: "mini", Harness: "antigravity", RawID: "agy-wait", Title: ptr("Deploy Helper"), CWD: "/d"})
-	_, _ = f.Agents.Heartbeat(agents.HeartbeatParams{Device: "mini", Harness: "claude", RawID: "sender-w", Title: ptr("Coordinator"), CWD: "/c"})
+	_, _ = f.Agents.Heartbeat(agents.HeartbeatParams{Device: "mini", Harness: "antigravity", RawID: "agy-wait", Title: new("Deploy Helper"), CWD: "/d"})
+	_, _ = f.Agents.Heartbeat(agents.HeartbeatParams{Device: "mini", Harness: "claude", RawID: "sender-w", Title: new("Coordinator"), CWD: "/c"})
 
 	lockDir := filepath.Join(tmp, "locks")
 	_ = os.MkdirAll(lockDir, 0o755)
@@ -61,7 +61,7 @@ func TestWaitForInboxCLIAndPIDLockReplacement(t *testing.T) {
 
 	go func() {
 		time.Sleep(150 * time.Millisecond)
-		_, _ = f.Agents.SendMessage("mini", "mini:claude:sender-w", "deploy-helper", "run migration", nil, nil, nil)
+		_, _ = f.Agents.SendMessageWithReport("mini", "mini:claude:sender-w", "deploy-helper", "run migration", nil, nil, nil)
 	}()
 
 	var out bytes.Buffer
@@ -122,7 +122,7 @@ func TestCodexQueueListenerSuccessAndFailurePause(t *testing.T) {
 	fullUUID := "01a1ece5-f00c-7860-a0dc-6c1897e73f30"
 	_, _ = f.Agents.Heartbeat(agents.HeartbeatParams{Device: "mini", Harness: "codex", RawID: fullUUID, PID: &pid, CWD: "/codex", State: "idle"})
 
-	for i := 0; i < 40; i++ {
+	for range 40 {
 		if s, err := f.Agents.GetSession("01a1ece5-f00"); err == nil && s.Listening {
 			break
 		}
@@ -132,8 +132,8 @@ func TestCodexQueueListenerSuccessAndFailurePause(t *testing.T) {
 		t.Fatal("expected listener to be listening")
 	}
 
-	_, _ = f.Agents.SendMessage("mini", "mini:claude:peer-1", "01a1ece5-f00", "check diff", nil, nil, nil)
-	for i := 0; i < 50; i++ {
+	_, _ = f.Agents.SendMessageWithReport("mini", "mini:claude:peer-1", "01a1ece5-f00", "check diff", nil, nil, nil)
+	for range 50 {
 		if listener.Status().DeliveredCount == 1 {
 			break
 		}
@@ -153,7 +153,7 @@ func TestCodexQueueListenerSuccessAndFailurePause(t *testing.T) {
 	}
 
 	// Failure pauses listener without acking
-	for i := 0; i < 40; i++ {
+	for range 40 {
 		if s, _ := f.Agents.GetSession("01a1ece5-f00"); s.Listening {
 			break
 		}
@@ -164,8 +164,8 @@ func TestCodexQueueListenerSuccessAndFailurePause(t *testing.T) {
 	errMode = "daemon unavailable"
 	mu.Unlock()
 
-	_, _ = f.Agents.SendMessage("mini", "mini:claude:peer-1", "01a1ece5-f00", "still unread", nil, nil, nil)
-	for i := 0; i < 50; i++ {
+	_, _ = f.Agents.SendMessageWithReport("mini", "mini:claude:peer-1", "01a1ece5-f00", "still unread", nil, nil, nil)
+	for range 50 {
 		st := listener.Status()
 		if st.LastError != nil && *st.LastError == "daemon unavailable" {
 			break
@@ -181,5 +181,3 @@ func TestCodexQueueListenerSuccessAndFailurePause(t *testing.T) {
 		t.Fatalf("expected unacked message, got %+v", inbox)
 	}
 }
-
-func ptr[T any](v T) *T { return &v }

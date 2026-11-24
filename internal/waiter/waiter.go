@@ -83,9 +83,6 @@ func pidAlive(pid int) bool {
 
 func acquirePIDLock(sessionID, lockDir string) (string, error) {
 	path := pidLockPath(sessionID, lockDir)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return "", err
-	}
 	if data, err := os.ReadFile(path); err == nil {
 		if oldPID, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && oldPID > 0 && oldPID != os.Getpid() {
 			_ = syscall.Kill(oldPID, syscall.SIGTERM)
@@ -95,13 +92,7 @@ func acquirePIDLock(sessionID, lockDir string) (string, error) {
 			}
 		}
 	}
-	tmp := filepath.Join(filepath.Dir(path), fmt.Sprintf(".%s.%d.tmp", filepath.Base(path), os.Getpid()))
-	if err := os.WriteFile(tmp, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o600); err != nil {
-		return "", err
-	}
-	_ = os.Chmod(tmp, 0o600)
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	if _, err := paths.WriteFileAtomic(path, fmt.Appendf(nil, "%d\n", os.Getpid()), 0o600, nil, nil); err != nil {
 		return "", err
 	}
 	return path, nil
@@ -138,21 +129,34 @@ func inferHarness(sessionID, override string) string {
 	return "antigravity"
 }
 
-func resolveNodeAPI(apiURL string) (string, error) {
-	if apiURL != "" {
-		return apiURL, nil
+func nextBackoff(cur float64) float64 {
+	if cur < 5.0 {
+		return 5.0
 	}
-	data, err := os.ReadFile(paths.NodeFile())
-	if err != nil {
-		return "", &client.ApiError{Msg: "this machine hasn't joined a fleet (fleet join NAME)"}
+	return 10.0
+}
+
+func sleepOrCancel(cancelCh <-chan struct{}, secs float64) bool {
+	t := time.NewTimer(time.Duration(secs * float64(time.Second)))
+	defer t.Stop()
+	select {
+	case <-cancelCh:
+		return false
+	case <-t.C:
+		return true
 	}
-	var out struct {
-		API string `json:"api"`
+}
+
+func calcPollTimeout(pollTimeout float64, hasDeadline bool, deadline time.Time) (float64, bool) {
+	reqTimeout := max(0.05, min(pollTimeout, 60.0))
+	if !hasDeadline {
+		return reqTimeout, true
 	}
-	if err := unmarshalJSON(data, &out); err != nil || out.API == "" {
-		return "", &client.ApiError{Msg: "invalid fleet.json"}
+	rem := time.Until(deadline).Seconds()
+	if rem <= 0 {
+		return 0, false
 	}
-	return out.API, nil
+	return max(0.05, min(reqTimeout, rem)), true
 }
 
 // WaitForInboxCLI blocks on /v1/agents/wait until unread messages arrive, then prints and exits 0.
@@ -161,7 +165,7 @@ func WaitForInboxCLI(opts WaitCLIOpts) (int, error) {
 	if stdout == nil {
 		stdout = os.Stdout
 	}
-	api, err := resolveNodeAPI(opts.APIURL)
+	api, err := client.ResolveAPI(opts.APIURL)
 	if err != nil {
 		return 1, err
 	}
@@ -171,9 +175,8 @@ func WaitForInboxCLI(opts WaitCLIOpts) (int, error) {
 	}
 	resolvedHarness := inferHarness(opts.SessionID, opts.Harness)
 	initialPPID := os.Getppid()
-
-	var deadline time.Time
 	hasDeadline := opts.MaxWait > 0
+	var deadline time.Time
 	if hasDeadline {
 		deadline = time.Now().Add(time.Duration(opts.MaxWait * float64(time.Second)))
 	}
@@ -190,73 +193,34 @@ func WaitForInboxCLI(opts WaitCLIOpts) (int, error) {
 	currentSID := opts.SessionID
 	backoff := 2.0
 	for {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || (opts.WatchParent && parentGone(initialPPID)) {
 			return 0, nil
 		}
-		if opts.WatchParent && parentGone(initialPPID) {
+		reqTimeout, ok := calcPollTimeout(pollTimeout, hasDeadline, deadline)
+		if !ok {
+			_, _ = io.WriteString(stdout, "[Fleet listener idle timeout; do not auto-restart unless still expecting peer messages]\n")
 			return 0, nil
 		}
-		reqTimeout := pollTimeout
-		if reqTimeout < 0.05 {
-			reqTimeout = 0.05
-		} else if reqTimeout > 60.0 {
-			reqTimeout = 60.0
-		}
-		if hasDeadline {
-			rem := time.Until(deadline).Seconds()
-			if rem <= 0 {
-				_, _ = io.WriteString(stdout, "[Fleet listener idle timeout; do not auto-restart unless still expecting peer messages]\n")
-				return 0, nil
-			}
-			if rem < reqTimeout {
-				reqTimeout = rem
-			}
-			if reqTimeout < 0.05 {
-				reqTimeout = 0.05
-			}
-		}
-
 		var resp agents.WaitResult
-		err := client.Call(
-			api,
-			"POST",
-			"/v1/agents/wait",
-			map[string]any{
-				"session_id": currentSID,
-				"harness":    resolvedHarness,
-				"timeout":    reqTimeout,
-				"mark_read":  true,
-			},
-			time.Duration((reqTimeout+15.0)*float64(time.Second)),
-			nil,
-			&resp,
-		)
+		err := client.Call(api, "POST", "/v1/agents/wait", map[string]any{
+			"session_id": currentSID, "harness": resolvedHarness, "timeout": reqTimeout, "mark_read": true,
+		}, time.Duration((reqTimeout+15.0)*float64(time.Second)), nil, &resp)
 		if err != nil {
 			if ctx.Err() != nil || (opts.WatchParent && parentGone(initialPPID)) {
 				return 0, nil
 			}
 			sleepFor := backoff
-			if backoff < 5.0 {
-				backoff = 5.0
-			} else {
-				backoff = 10.0
-			}
+			backoff = nextBackoff(backoff)
 			if hasDeadline {
 				rem := time.Until(deadline).Seconds()
 				if rem <= 0 {
 					_, _ = io.WriteString(stdout, "[Fleet listener idle timeout; do not auto-restart unless still expecting peer messages]\n")
 					return 0, nil
 				}
-				if rem < sleepFor {
-					sleepFor = rem
-				}
+				sleepFor = min(sleepFor, rem)
 			}
-			t := time.NewTimer(time.Duration(sleepFor * float64(time.Second)))
-			select {
-			case <-ctx.Done():
-				t.Stop()
+			if !sleepOrCancel(ctx.Done(), sleepFor) {
 				return 0, nil
-			case <-t.C:
 			}
 			continue
 		}
@@ -268,12 +232,7 @@ func WaitForInboxCLI(opts WaitCLIOpts) (int, error) {
 			return 0, nil
 		}
 		if len(resp.Messages) > 0 {
-			text := FormatWaitOutput(
-				currentSID,
-				resp.Name,
-				resp.Messages,
-				fmt.Sprintf("fleet agents wait --session %s", currentSID),
-			)
+			text := FormatWaitOutput(currentSID, resp.Name, resp.Messages, "fleet agents wait --session "+currentSID)
 			_, _ = io.WriteString(stdout, text+"\n")
 			return 0, nil
 		}
@@ -447,12 +406,63 @@ func (l *CodexQueueListener) invokeQueue(cmd []string) (int, string) {
 		if detail == "" {
 			detail = err.Error()
 		}
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
 			return exitErr.ExitCode(), detail
 		}
 		return 1, detail
 	}
 	return 0, strings.TrimSpace(stderr.String())
+}
+
+func (l *CodexQueueListener) setError(msg string, disable bool) {
+	l.mu.Lock()
+	l.lastError = &msg
+	if disable {
+		l.enabled = false
+	}
+	l.mu.Unlock()
+}
+
+func (l *CodexQueueListener) deliverMessages(api, bin string, resp agents.WaitResult) {
+	text := FormatWaitOutput(resp.SessionID, resp.Name, resp.Messages, "")
+	cmd := []string{bin, "queue", "--thread", resp.FullRawID, "--message", text, "--resume"}
+	rc, errDetail := l.invokeQueue(cmd)
+	if rc != 0 {
+		msg := errDetail
+		if msg == "" {
+			msg = fmt.Sprintf("codex queue exited with status %d", rc)
+		}
+		l.setError(msg, true)
+		return
+	}
+	ids := make([]int64, len(resp.Messages))
+	for i, m := range resp.Messages {
+		ids[i] = m.ID
+	}
+	_ = client.Call(api, "POST", "/v1/agents/ack", map[string]any{
+		"harness": "codex", "session_id": resp.SessionID, "message_ids": ids,
+	}, 5*time.Second, nil, nil)
+	l.mu.Lock()
+	l.deliveredCount += len(resp.Messages)
+	l.lastError = nil
+	l.mu.Unlock()
+}
+
+func (l *CodexQueueListener) pollOnce(knownSID string) (string, agents.WaitResult, error) {
+	api, err := client.ResolveAPI(l.apiURL)
+	if err != nil {
+		return "", agents.WaitResult{}, err
+	}
+	payload := map[string]any{
+		"harness": "codex", "pid": l.ppid, "cwd": l.cwd, "timeout": l.pollTimeout,
+		"mark_read": false, "require_full_id": true,
+	}
+	if knownSID != "" {
+		payload["session_id"] = knownSID
+	}
+	var resp agents.WaitResult
+	err = client.Call(api, "POST", "/v1/agents/wait", payload, time.Duration((l.pollTimeout+15.0)*float64(time.Second)), nil, &resp)
+	return api, resp, err
 }
 
 func (l *CodexQueueListener) loop(stopCh, doneCh chan struct{}) {
@@ -471,9 +481,7 @@ func (l *CodexQueueListener) loop(stopCh, doneCh chan struct{}) {
 		default:
 		}
 		l.mu.Lock()
-		enabled := l.enabled
-		bin := l.codexBin
-		knownSID := l.sessionID
+		enabled, bin, knownSID := l.enabled, l.codexBin, l.sessionID
 		l.mu.Unlock()
 
 		if !enabled {
@@ -489,68 +497,20 @@ func (l *CodexQueueListener) loop(stopCh, doneCh chan struct{}) {
 			continue
 		}
 		if bin == "" {
-			l.mu.Lock()
-			msg := "codex binary not found"
-			l.lastError = &msg
-			l.enabled = false
-			l.mu.Unlock()
+			l.setError("codex binary not found", true)
 			return
 		}
-
-		api, err := resolveNodeAPI(l.apiURL)
+		api, resp, err := l.pollOnce(knownSID)
 		if err != nil {
-			l.mu.Lock()
-			msg := err.Error()
-			l.lastError = &msg
-			l.mu.Unlock()
-			t := time.NewTimer(time.Duration(backoff * float64(time.Second)))
-			if backoff < 5.0 {
-				backoff = 5.0
-			} else {
-				backoff = 10.0
-			}
-			select {
-			case <-stopCh:
-				t.Stop()
+			l.setError(err.Error(), false)
+			sleepFor := backoff
+			backoff = nextBackoff(backoff)
+			if !sleepOrCancel(stopCh, sleepFor) {
 				return
-			case <-t.C:
-			}
-			continue
-		}
-
-		payload := map[string]any{
-			"harness":         "codex",
-			"pid":             l.ppid,
-			"cwd":             l.cwd,
-			"timeout":         l.pollTimeout,
-			"mark_read":       false,
-			"require_full_id": true,
-		}
-		if knownSID != "" {
-			payload["session_id"] = knownSID
-		}
-		var resp agents.WaitResult
-		if err := client.Call(api, "POST", "/v1/agents/wait", payload, time.Duration((l.pollTimeout+15.0)*float64(time.Second)), nil, &resp); err != nil {
-			l.mu.Lock()
-			msg := err.Error()
-			l.lastError = &msg
-			l.mu.Unlock()
-			t := time.NewTimer(time.Duration(backoff * float64(time.Second)))
-			if backoff < 5.0 {
-				backoff = 5.0
-			} else {
-				backoff = 10.0
-			}
-			select {
-			case <-stopCh:
-				t.Stop()
-				return
-			case <-t.C:
 			}
 			continue
 		}
 		backoff = 2.0
-
 		select {
 		case <-stopCh:
 			return
@@ -562,7 +522,6 @@ func (l *CodexQueueListener) loop(stopCh, doneCh chan struct{}) {
 			l.mu.Unlock()
 			return
 		}
-
 		l.mu.Lock()
 		if resp.SessionID != "" {
 			l.sessionID = resp.SessionID
@@ -572,37 +531,8 @@ func (l *CodexQueueListener) loop(stopCh, doneCh chan struct{}) {
 		}
 		stillEnabled := l.enabled
 		l.mu.Unlock()
-
-		if !stillEnabled || len(resp.Messages) == 0 || resp.FullRawID == "" {
-			continue
-		}
-
-		text := FormatWaitOutput(resp.SessionID, resp.Name, resp.Messages, "")
-		cmd := []string{bin, "queue", "--thread", resp.FullRawID, "--message", text, "--resume"}
-		rc, errDetail := l.invokeQueue(cmd)
-		if rc == 0 {
-			ids := make([]int64, len(resp.Messages))
-			for i, m := range resp.Messages {
-				ids[i] = m.ID
-			}
-			_ = client.Call(api, "POST", "/v1/agents/ack", map[string]any{
-				"harness":     "codex",
-				"session_id":  resp.SessionID,
-				"message_ids": ids,
-			}, 5*time.Second, nil, nil)
-			l.mu.Lock()
-			l.deliveredCount += len(resp.Messages)
-			l.lastError = nil
-			l.mu.Unlock()
-		} else {
-			msg := errDetail
-			if msg == "" {
-				msg = fmt.Sprintf("codex queue exited with status %d", rc)
-			}
-			l.mu.Lock()
-			l.lastError = &msg
-			l.enabled = false
-			l.mu.Unlock()
+		if stillEnabled && len(resp.Messages) > 0 && resp.FullRawID != "" {
+			l.deliverMessages(api, bin, resp)
 		}
 	}
 }

@@ -4,6 +4,7 @@ package hooks
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -40,37 +42,58 @@ func GitContext(cwd string) (string, string, string) {
 		return filepath.Base(cwd), "", ""
 	}
 	repo := filepath.Base(cwd)
-	branch := ""
-	gitStatus := ""
+	var branch, gitStatus string
 
 	ctx1, cancel1 := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 	defer cancel1()
 	topOut, err := exec.CommandContext(ctx1, "git", "-C", cwd, "rev-parse", "--show-toplevel", "--abbrev-ref", "HEAD").Output()
-	if err == nil {
-		var lines []string
-		for _, ln := range strings.Split(string(topOut), "\n") {
-			if t := strings.TrimSpace(ln); t != "" {
-				lines = append(lines, t)
-			}
-		}
-		if len(lines) > 0 {
-			repo = filepath.Base(lines[0])
-		}
-		if len(lines) > 1 {
-			branch = lines[1]
-		}
-		ctx2, cancel2 := context.WithTimeout(context.Background(), 1500*time.Millisecond)
-		defer cancel2()
-		stOut, err := exec.CommandContext(ctx2, "git", "-C", cwd, "status", "--short").Output()
-		if err == nil && strings.TrimSpace(string(stOut)) != "" {
-			stLines := strings.Split(string(stOut), "\n")
-			if len(stLines) > 25 {
-				stLines = stLines[:25]
-			}
-			gitStatus = agents.TruncateRunes(strings.Join(stLines, "\n"), 1500)
+	if err != nil {
+		return repo, "", ""
+	}
+	var lines []string
+	for ln := range strings.SplitSeq(string(topOut), "\n") {
+		if t := strings.TrimSpace(ln); t != "" {
+			lines = append(lines, t)
 		}
 	}
+	if len(lines) > 0 {
+		repo = filepath.Base(lines[0])
+	}
+	if len(lines) > 1 {
+		branch = lines[1]
+	}
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel2()
+	if stOut, err := exec.CommandContext(ctx2, "git", "-C", cwd, "status", "--short").Output(); err == nil && strings.TrimSpace(string(stOut)) != "" {
+		stLines := strings.Split(string(stOut), "\n")
+		if len(stLines) > 25 {
+			stLines = stLines[:25]
+		}
+		gitStatus = agents.TruncateRunes(strings.Join(stLines, "\n"), 1500)
+	}
 	return repo, branch, gitStatus
+}
+
+func firstLineCWDMatch(path, cwd string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	firstLine, err := bufio.NewReader(f).ReadString('\n')
+	_ = f.Close()
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false
+	}
+	trimmed := strings.TrimSpace(firstLine)
+	if trimmed == "" {
+		return false
+	}
+	var obj struct {
+		Payload struct {
+			CWD string `json:"cwd"`
+		} `json:"payload"`
+	}
+	return json.Unmarshal([]byte(trimmed), &obj) == nil && obj.Payload.CWD == cwd
 }
 
 // FindCodexTranscript locates the most recent Codex rollout JSONL matching cwd.
@@ -93,81 +116,56 @@ func FindCodexTranscript(cwd, codexHome string) string {
 		path  string
 	}
 	var cands []cand
-	_ = filepath.WalkDir(sessionsDir, func(p string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".jsonl") {
-			return nil
-		}
-		fi, err := d.Info()
-		if err != nil {
-			return nil
-		}
-		if !fi.ModTime().Before(cutoff) {
-			cands = append(cands, cand{mtime: fi.ModTime(), path: p})
+	_ = filepath.WalkDir(sessionsDir, func(p string, d os.DirEntry, walkErr error) error {
+		if walkErr == nil && !d.IsDir() && strings.HasSuffix(d.Name(), ".jsonl") {
+			if fi, fiErr := d.Info(); fiErr == nil && !fi.ModTime().Before(cutoff) {
+				cands = append(cands, cand{mtime: fi.ModTime(), path: p})
+			}
 		}
 		return nil
 	})
-	sort.Slice(cands, func(i, j int) bool {
-		return cands[i].mtime.After(cands[j].mtime)
-	})
+	sort.Slice(cands, func(i, j int) bool { return cands[i].mtime.After(cands[j].mtime) })
 	if len(cands) > 10 {
 		cands = cands[:10]
 	}
 	for _, c := range cands {
-		f, err := os.Open(c.path)
-		if err != nil {
-			continue
-		}
-		br := bufio.NewReader(f)
-		firstLine, err := br.ReadString('\n')
-		_ = f.Close()
-		if err != nil && !errors.Is(err, io.EOF) {
-			continue
-		}
-		firstLine = strings.TrimSpace(firstLine)
-		if firstLine == "" {
-			continue
-		}
-		var obj map[string]any
-		if json.Unmarshal([]byte(firstLine), &obj) != nil {
-			continue
-		}
-		if payload, ok := obj["payload"].(map[string]any); ok {
-			if pCWD, ok := payload["cwd"].(string); ok && pCWD == cwd {
-				return c.path
-			}
+		if firstLineCWDMatch(c.path, cwd) {
+			return c.path
 		}
 	}
 	return ""
 }
 
-func extractTextBlocks(content any) string {
-	switch v := content.(type) {
-	case string:
-		return strings.TrimSpace(v)
-	case []any:
-		var parts []string
-		for _, item := range v {
-			m, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			t, _ := m["type"].(string)
-			if t == "text" || t == "input_text" || t == "output_text" {
-				if txt, ok := m["text"].(string); ok && strings.TrimSpace(txt) != "" {
-					parts = append(parts, strings.TrimSpace(txt))
-				}
-			}
-		}
-		return strings.TrimSpace(strings.Join(parts, "\n"))
+func extractTextBlocks(raw json.RawMessage) string {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return ""
 	}
-	return ""
+	if trimmed[0] == '"' {
+		var s string
+		if json.Unmarshal(trimmed, &s) == nil {
+			return strings.TrimSpace(s)
+		}
+		return ""
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(trimmed, &blocks) != nil {
+		return ""
+	}
+	var parts []string
+	for _, b := range blocks {
+		if (b.Type == "text" || b.Type == "input_text" || b.Type == "output_text") && strings.TrimSpace(b.Text) != "" {
+			parts = append(parts, strings.TrimSpace(b.Text))
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
 }
 
-func fmtTool(name, args any) string {
-	toolName := "tool"
-	if s, ok := name.(string); ok && s != "" {
-		toolName = s
-	}
+func fmtTool(name string, args any) string {
+	toolName := cmp.Or(name, "tool")
 	if m, ok := args.(map[string]any); ok {
 		keys := make([]string, 0, len(m))
 		for k := range m {
@@ -192,127 +190,127 @@ func fmtTool(name, args any) string {
 	return toolName
 }
 
-func parseClaudeLine(obj map[string]any) []agents.TailItem {
-	kind, _ := obj["type"].(string)
-	msg, ok := obj["message"].(map[string]any)
-	if !ok {
+func parseClaudeLine(raw []byte) []agents.TailItem {
+	var ev struct {
+		Type    string `json:"type"`
+		IsMeta  bool   `json:"isMeta"`
+		Message *struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"message"`
+	}
+	if json.Unmarshal(raw, &ev) != nil || ev.Message == nil {
 		return nil
 	}
-	isMeta, _ := obj["isMeta"].(bool)
-	if kind == "user" && !isMeta {
-		text := extractTextBlocks(msg["content"])
-		if text != "" {
+	if ev.Type == "user" && !ev.IsMeta {
+		if text := extractTextBlocks(ev.Message.Content); text != "" {
 			return []agents.TailItem{{Role: "user", Text: agents.TruncateRunes(text, 400)}}
 		}
 		return nil
 	}
-	if kind == "assistant" {
-		if s, ok := msg["content"].(string); ok && strings.TrimSpace(s) != "" {
+	if ev.Type != "assistant" {
+		return nil
+	}
+	trimmed := bytes.TrimSpace(ev.Message.Content)
+	if len(trimmed) > 0 && trimmed[0] == '"' {
+		var s string
+		if json.Unmarshal(trimmed, &s) == nil && strings.TrimSpace(s) != "" {
 			return []agents.TailItem{{Role: "assistant", Text: agents.TruncateRunes(strings.TrimSpace(s), 400)}}
 		}
-		if blocks, ok := msg["content"].([]any); ok {
-			var items []agents.TailItem
-			for _, raw := range blocks {
-				block, ok := raw.(map[string]any)
-				if !ok {
-					continue
-				}
-				btype, _ := block["type"].(string)
-				switch btype {
-				case "text":
-					if txt, ok := block["text"].(string); ok && strings.TrimSpace(txt) != "" {
-						items = append(items, agents.TailItem{Role: "assistant", Text: agents.TruncateRunes(strings.TrimSpace(txt), 400)})
-					}
-				case "tool_use":
-					items = append(items, agents.TailItem{
-						Role: "tool",
-						Text: agents.TruncateRunes(fmtTool(block["name"], block["input"]), 400),
-					})
-				}
-			}
-			return items
-		}
-	}
-	return nil
-}
-
-func parseCodexLine(obj map[string]any) []agents.TailItem {
-	if t, _ := obj["type"].(string); t != "response_item" {
 		return nil
 	}
-	payload, ok := obj["payload"].(map[string]any)
-	if !ok {
+	var blocks []struct {
+		Type  string `json:"type"`
+		Text  string `json:"text"`
+		Name  string `json:"name"`
+		Input any    `json:"input"`
+	}
+	if json.Unmarshal(trimmed, &blocks) != nil {
 		return nil
 	}
-	ptype, _ := payload["type"].(string)
-	if ptype == "message" {
-		role, _ := payload["role"].(string)
-		if role == "user" || role == "assistant" {
-			text := extractTextBlocks(payload["content"])
-			if text == "" || strings.HasPrefix(text, "<environment_context>") || strings.HasPrefix(text, "<permissions") {
-				return nil
+	var items []agents.TailItem
+	for _, b := range blocks {
+		switch b.Type {
+		case "text":
+			if txt := strings.TrimSpace(b.Text); txt != "" {
+				items = append(items, agents.TailItem{Role: "assistant", Text: agents.TruncateRunes(txt, 400)})
 			}
-			return []agents.TailItem{{Role: role, Text: agents.TruncateRunes(text, 400)}}
+		case "tool_use":
+			items = append(items, agents.TailItem{Role: "tool", Text: agents.TruncateRunes(fmtTool(b.Name, b.Input), 400)})
 		}
 	}
-	if ptype == "function_call" || ptype == "custom_tool_call" || ptype == "local_shell_call" {
-		name := payload["name"]
-		if name == nil || name == "" {
-			name = ptype
-		}
-		args := payload["arguments"]
-		if args == nil {
-			args = payload["input"]
-		}
-		return []agents.TailItem{{Role: "tool", Text: agents.TruncateRunes(fmtTool(name, args), 400)}}
-	}
-	return nil
+	return items
 }
 
-func parseAntigravityLine(obj map[string]any) []agents.TailItem {
-	kind, _ := obj["type"].(string)
-	if kind == "USER_INPUT" {
-		raw, ok := obj["content"].(string)
-		if !ok {
+func parseCodexLine(raw []byte) []agents.TailItem {
+	var ev struct {
+		Type    string `json:"type"`
+		Payload *struct {
+			Type      string          `json:"type"`
+			Role      string          `json:"role"`
+			Content   json.RawMessage `json:"content"`
+			Name      string          `json:"name"`
+			Arguments any             `json:"arguments"`
+			Input     any             `json:"input"`
+		} `json:"payload"`
+	}
+	if json.Unmarshal(raw, &ev) != nil || ev.Type != "response_item" || ev.Payload == nil {
+		return nil
+	}
+	p := ev.Payload
+	if p.Type == "message" && (p.Role == "user" || p.Role == "assistant") {
+		text := extractTextBlocks(p.Content)
+		if text == "" || strings.HasPrefix(text, "<environment_context>") || strings.HasPrefix(text, "<permissions") {
 			return nil
 		}
-		text := raw
-		if m := userRequestRE.FindStringSubmatch(raw); len(m) > 1 {
+		return []agents.TailItem{{Role: p.Role, Text: agents.TruncateRunes(text, 400)}}
+	}
+	if p.Type == "function_call" || p.Type == "custom_tool_call" || p.Type == "local_shell_call" {
+		args := p.Arguments
+		if args == nil {
+			args = p.Input
+		}
+		return []agents.TailItem{{Role: "tool", Text: agents.TruncateRunes(fmtTool(cmp.Or(p.Name, p.Type), args), 400)}}
+	}
+	return nil
+}
+
+func parseAntigravityLine(raw []byte) []agents.TailItem {
+	var ev struct {
+		Type      string `json:"type"`
+		Content   string `json:"content"`
+		ToolCalls []struct {
+			Name string `json:"name"`
+			Tool string `json:"tool"`
+		} `json:"tool_calls"`
+	}
+	if json.Unmarshal(raw, &ev) != nil {
+		return nil
+	}
+	if ev.Type == "USER_INPUT" {
+		text := ev.Content
+		if m := userRequestRE.FindStringSubmatch(text); len(m) > 1 {
 			text = m[1]
 		}
-		text = strings.TrimSpace(text)
-		if text != "" {
-			return []agents.TailItem{{Role: "user", Text: agents.TruncateRunes(text, 400)}}
+		if trimmed := strings.TrimSpace(text); trimmed != "" {
+			return []agents.TailItem{{Role: "user", Text: agents.TruncateRunes(trimmed, 400)}}
 		}
 		return nil
 	}
-	_, hasCalls := obj["tool_calls"]
-	if kind == "PLANNER_RESPONSE" || kind == "EXECUTOR_RESPONSE" || kind == "MODEL_RESPONSE" || hasCalls {
-		var items []agents.TailItem
-		if raw, ok := obj["content"].(string); ok && strings.TrimSpace(raw) != "" {
-			items = append(items, agents.TailItem{Role: "assistant", Text: agents.TruncateRunes(strings.TrimSpace(raw), 400)})
-		}
-		if calls, ok := obj["tool_calls"].([]any); ok && len(calls) > 0 {
-			var names []string
-			for _, rawC := range calls {
-				if c, ok := rawC.(map[string]any); ok {
-					n, _ := c["name"].(string)
-					if n == "" {
-						n, _ = c["tool"].(string)
-					}
-					if n == "" {
-						n = "tool"
-					}
-					names = append(names, n)
-				}
-			}
-			if len(names) > 0 {
-				items = append(items, agents.TailItem{Role: "tool", Text: agents.TruncateRunes(strings.Join(names, ", "), 400)})
-			}
-		}
-		return items
+	if ev.Type != "PLANNER_RESPONSE" && ev.Type != "EXECUTOR_RESPONSE" && ev.Type != "MODEL_RESPONSE" && len(ev.ToolCalls) == 0 {
+		return nil
 	}
-	return nil
+	var items []agents.TailItem
+	if txt := strings.TrimSpace(ev.Content); txt != "" {
+		items = append(items, agents.TailItem{Role: "assistant", Text: agents.TruncateRunes(txt, 400)})
+	}
+	if len(ev.ToolCalls) > 0 {
+		names := make([]string, len(ev.ToolCalls))
+		for i, tc := range ev.ToolCalls {
+			names[i] = cmp.Or(tc.Name, tc.Tool, "tool")
+		}
+		items = append(items, agents.TailItem{Role: "tool", Text: agents.TruncateRunes(strings.Join(names, ", "), 400)})
+	}
+	return items
 }
 
 // ReadTranscriptTail reads up to the last maxItems normalized events from a harness transcript JSONL.
@@ -320,26 +318,17 @@ func ReadTranscriptTail(harness, transcriptPath, cwd string, maxItems int) (stri
 	if maxItems <= 0 {
 		maxItems = 20
 	}
+	parsers := map[string]func([]byte) []agents.TailItem{
+		"claude": parseClaudeLine, "codex": parseCodexLine, "antigravity": parseAntigravityLine,
+	}
+	parser := parsers[harness]
 	resolved := transcriptPath
 	if (resolved == "" || !isRegularFile(resolved)) && harness == "codex" && cwd != "" {
 		resolved = FindCodexTranscript(cwd, "")
 	}
-	if resolved == "" || !isRegularFile(resolved) {
+	if parser == nil || resolved == "" || !isRegularFile(resolved) {
 		return "", []agents.TailItem{}
 	}
-
-	var parser func(map[string]any) []agents.TailItem
-	switch harness {
-	case "claude":
-		parser = parseClaudeLine
-	case "codex":
-		parser = parseCodexLine
-	case "antigravity":
-		parser = parseAntigravityLine
-	default:
-		return "", []agents.TailItem{}
-	}
-
 	f, err := os.Open(resolved)
 	if err != nil {
 		return "", []agents.TailItem{}
@@ -349,10 +338,7 @@ func ReadTranscriptTail(harness, transcriptPath, cwd string, maxItems int) (stri
 	if err != nil {
 		return "", []agents.TailItem{}
 	}
-	start := fi.Size() - MaxTranscriptBytes
-	if start < 0 {
-		start = 0
-	}
+	start := max(fi.Size()-MaxTranscriptBytes, 0)
 	if start > 0 {
 		if _, err := f.Seek(start, io.SeekStart); err != nil {
 			return "", []agents.TailItem{}
@@ -362,22 +348,16 @@ func ReadTranscriptTail(harness, transcriptPath, cwd string, maxItems int) (stri
 	if start > 0 {
 		_, _ = br.ReadBytes('\n') // discard partial first line
 	}
-
 	var items []agents.TailItem
 	for {
 		line, err := br.ReadBytes('\n')
-		trimmed := bytes.TrimSpace(line)
-		if len(trimmed) > 0 {
-			var obj map[string]any
-			if json.Unmarshal(trimmed, &obj) == nil && obj != nil {
-				items = append(items, parser(obj)...)
-			}
+		if trimmed := bytes.TrimSpace(line); len(trimmed) > 0 {
+			items = append(items, parser(trimmed)...)
 		}
 		if err != nil {
 			break
 		}
 	}
-
 	tail := items
 	if len(tail) > maxItems {
 		tail = tail[len(tail)-maxItems:]
@@ -386,9 +366,9 @@ func ReadTranscriptTail(harness, transcriptPath, cwd string, maxItems int) (stri
 		tail = []agents.TailItem{}
 	}
 	summary := ""
-	for i := len(items) - 1; i >= 0; i-- {
-		if items[i].Role == "user" && items[i].Text != "" {
-			summary = agents.TruncateRunes(items[i].Text, 160)
+	for _, it := range slices.Backward(items) {
+		if it.Role == "user" && it.Text != "" {
+			summary = agents.TruncateRunes(it.Text, 160)
 			break
 		}
 	}
@@ -414,26 +394,21 @@ func readClaudeTitle(transcriptPath string) (string, bool) {
 	br := bufio.NewReader(f)
 	for {
 		rawLine, err := br.ReadBytes('\n')
-		if len(rawLine) > 0 &&
-			(bytes.Contains(rawLine, []byte(`"custom-title"`)) ||
-				bytes.Contains(rawLine, []byte(`"agent-name"`)) ||
-				bytes.Contains(rawLine, []byte(`"ai-title"`))) {
-			var obj map[string]any
+		if len(rawLine) > 0 && (bytes.Contains(rawLine, []byte(`"custom-title"`)) || bytes.Contains(rawLine, []byte(`"agent-name"`)) || bytes.Contains(rawLine, []byte(`"ai-title"`))) {
+			var obj struct {
+				Type        string `json:"type"`
+				CustomTitle string `json:"customTitle"`
+				AgentName   string `json:"agentName"`
+				AITitle     string `json:"aiTitle"`
+			}
 			if json.Unmarshal(bytes.TrimSpace(rawLine), &obj) == nil {
-				kind, _ := obj["type"].(string)
-				switch kind {
+				switch obj.Type {
 				case "custom-title":
-					if v, ok := obj["customTitle"].(string); ok && strings.TrimSpace(v) != "" {
-						customTitle = strings.TrimSpace(v)
-					}
+					customTitle = cmp.Or(strings.TrimSpace(obj.CustomTitle), customTitle)
 				case "agent-name":
-					if v, ok := obj["agentName"].(string); ok && strings.TrimSpace(v) != "" {
-						agentName = strings.TrimSpace(v)
-					}
+					agentName = cmp.Or(strings.TrimSpace(obj.AgentName), agentName)
 				case "ai-title":
-					if v, ok := obj["aiTitle"].(string); ok && strings.TrimSpace(v) != "" {
-						aiTitle = strings.TrimSpace(v)
-					}
+					aiTitle = cmp.Or(strings.TrimSpace(obj.AITitle), aiTitle)
 				}
 			}
 		}
@@ -441,16 +416,10 @@ func readClaudeTitle(transcriptPath string) (string, bool) {
 			break
 		}
 	}
-	if customTitle != "" {
-		return customTitle, true
+	if exp := cmp.Or(customTitle, agentName); exp != "" {
+		return exp, true
 	}
-	if agentName != "" {
-		return agentName, true
-	}
-	if aiTitle != "" {
-		return aiTitle, false
-	}
-	return "", false
+	return aiTitle, false
 }
 
 func readCodexTitle(fullRawID, codexHome string) (string, bool) {
@@ -462,9 +431,6 @@ func readCodexTitle(fullRawID, codexHome string) (string, bool) {
 		codexHome = filepath.Join(h, ".codex")
 	}
 	indexPath := filepath.Join(codexHome, "session_index.jsonl")
-	if !isRegularFile(indexPath) {
-		return "", false
-	}
 	f, err := os.Open(indexPath)
 	if err != nil {
 		return "", false
@@ -477,13 +443,12 @@ func readCodexTitle(fullRawID, codexHome string) (string, bool) {
 	for {
 		rawLine, err := br.ReadBytes('\n')
 		if len(rawLine) > 0 && bytes.Contains(rawLine, needle) {
-			var obj map[string]any
-			if json.Unmarshal(bytes.TrimSpace(rawLine), &obj) == nil {
-				if id, _ := obj["id"].(string); id == fullRawID {
-					if tn, ok := obj["thread_name"].(string); ok && strings.TrimSpace(tn) != "" {
-						latest = strings.TrimSpace(tn)
-					}
-				}
+			var obj struct {
+				ID         string `json:"id"`
+				ThreadName string `json:"thread_name"`
+			}
+			if json.Unmarshal(bytes.TrimSpace(rawLine), &obj) == nil && obj.ID == fullRawID {
+				latest = cmp.Or(strings.TrimSpace(obj.ThreadName), latest)
 			}
 		}
 		if err != nil {
@@ -506,14 +471,11 @@ func readAntigravityTitle(fullRawID, transcriptPath, geminiHome string) (string,
 		}
 	}
 	if transcriptPath != "" {
-		cur := filepath.Dir(transcriptPath)
-		for {
+		for cur := filepath.Dir(transcriptPath); ; cur = filepath.Dir(cur) {
 			addCand(filepath.Join(cur, "conversation_summaries.db"))
-			parent := filepath.Dir(cur)
-			if parent == cur {
+			if filepath.Dir(cur) == cur {
 				break
 			}
-			cur = parent
 		}
 	}
 	if geminiHome == "" {
@@ -523,10 +485,8 @@ func readAntigravityTitle(fullRawID, transcriptPath, geminiHome string) (string,
 	for _, sub := range []string{"antigravity", "antigravity-cli", "antigravity-ide"} {
 		addCand(filepath.Join(geminiHome, sub, "conversation_summaries.db"))
 	}
-
 	for _, dbPath := range candidates {
-		dsn := fmt.Sprintf("file:%s?mode=ro", filepath.ToSlash(dbPath))
-		db, err := sql.Open("sqlite", dsn)
+		db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?mode=ro", filepath.ToSlash(dbPath)))
 		if err != nil {
 			continue
 		}
@@ -615,88 +575,6 @@ func sessionStartMessage(harness, sessionID, sessionName string) string {
 	return strings.Join(lines, "\n")
 }
 
-func summarizeQuestions(toolName string, args any) string {
-	if m, ok := args.(map[string]any); ok {
-		if qs, ok := m["questions"].([]any); ok && len(qs) > 0 {
-			var parts []string
-			for _, raw := range qs {
-				if q, ok := raw.(map[string]any); ok {
-					txt, _ := q["question"].(string)
-					if txt == "" {
-						txt, _ = q["header"].(string)
-					}
-					if strings.TrimSpace(txt) != "" {
-						parts = append(parts, strings.TrimSpace(txt))
-					}
-				}
-			}
-			if len(parts) > 0 {
-				return agents.TruncateRunes(strings.Join(parts, " | "), 400)
-			}
-		}
-		for _, k := range []string{"question", "prompt"} {
-			if v, ok := m[k].(string); ok && strings.TrimSpace(v) != "" {
-				return agents.TruncateRunes(strings.TrimSpace(v), 400)
-			}
-		}
-	}
-	return agents.TruncateRunes(fmtTool(toolName, args), 400)
-}
-
-func summarizeToolDetail(toolName string, toolInput any) string {
-	if m, ok := toolInput.(map[string]any); ok {
-		_, hasAction := m["Action"]
-		_, hasTarget := m["Target"]
-		_, hasReason := m["Reason"]
-		if toolName == "ask_permission" || hasAction || hasTarget || hasReason {
-			action := strings.TrimSpace(strVal(m["Action"]))
-			target := strings.TrimSpace(strVal(m["Target"]))
-			reason := strings.TrimSpace(strVal(m["Reason"]))
-			head := strings.TrimSpace(action + " " + target)
-			if head != "" && reason != "" {
-				return agents.TruncateRunes(head+" — "+reason, 400)
-			}
-			if head != "" {
-				return agents.TruncateRunes(head, 400)
-			}
-			if reason != "" {
-				return agents.TruncateRunes(reason, 400)
-			}
-		}
-		for _, k := range []string{"command", "CommandLine", "cmd"} {
-			switch v := m[k].(type) {
-			case []any:
-				var parts []string
-				for _, x := range v {
-					if x != nil {
-						parts = append(parts, fmt.Sprint(x))
-					}
-				}
-				if joined := strings.TrimSpace(strings.Join(parts, " ")); joined != "" {
-					return agents.TruncateRunes(joined, 400)
-				}
-			case string:
-				if strings.TrimSpace(v) != "" {
-					return agents.TruncateRunes(strings.TrimSpace(v), 400)
-				}
-			}
-		}
-		for _, k := range []string{"file_path", "TargetFile", "path", "AbsolutePath"} {
-			if v, ok := m[k].(string); ok && strings.TrimSpace(v) != "" {
-				return agents.TruncateRunes(strings.TrimSpace(v), 400)
-			}
-		}
-		if d, ok := m["description"].(string); ok && strings.TrimSpace(d) != "" {
-			return agents.TruncateRunes(strings.TrimSpace(d), 400)
-		}
-		return agents.TruncateRunes(fmtTool(toolName, m), 400)
-	}
-	if s, ok := toolInput.(string); ok && strings.TrimSpace(s) != "" {
-		return agents.TruncateRunes(strings.TrimSpace(s), 400)
-	}
-	return ""
-}
-
 func strVal(v any) string {
 	if v == nil {
 		return ""
@@ -707,160 +585,211 @@ func strVal(v any) string {
 	return fmt.Sprint(v)
 }
 
-func classifyHookEvent(harness, event string, payload map[string]any, contActive bool, termReason string) (string, map[string]string, bool) {
-	if harness == "antigravity" {
-		switch event {
-		case "Stop":
-			canInject := !(contActive || termReason != "NO_TOOL_CALL")
-			return "idle", nil, canInject
-		case "PreToolUse":
-			toolCall, _ := payload["toolCall"].(map[string]any)
-			toolName := strVal(toolCall["name"])
-			toolArgs := toolCall["args"]
-			if toolName == "ask_question" {
-				return "waiting_question", map[string]string{
-					"kind":   "question",
-					"tool":   toolName,
-					"detail": summarizeQuestions(toolName, toolArgs),
-					"event":  event,
-				}, false
+func summarizeQuestions(toolName string, args any) string {
+	if m, ok := args.(map[string]any); ok {
+		if qs, ok := m["questions"].([]any); ok && len(qs) > 0 {
+			var parts []string
+			for _, raw := range qs {
+				if q, ok := raw.(map[string]any); ok {
+					if txt := strings.TrimSpace(cmp.Or(strVal(q["question"]), strVal(q["header"]))); txt != "" {
+						parts = append(parts, txt)
+					}
+				}
 			}
-			if toolName == "ask_permission" {
-				return "waiting_permission", map[string]string{
-					"kind":   "permission",
-					"tool":   toolName,
-					"detail": summarizeToolDetail(toolName, toolArgs),
-					"event":  event,
-				}, false
+			if len(parts) > 0 {
+				return agents.TruncateRunes(strings.Join(parts, " | "), 400)
 			}
+		}
+		for _, k := range []string{"question", "prompt"} {
+			if txt := strings.TrimSpace(strVal(m[k])); txt != "" {
+				return agents.TruncateRunes(txt, 400)
+			}
+		}
+	}
+	return agents.TruncateRunes(fmtTool(toolName, args), 400)
+}
+
+func summarizePermissionMap(toolName string, m map[string]any) (string, bool) {
+	_, hasAction := m["Action"]
+	_, hasTarget := m["Target"]
+	_, hasReason := m["Reason"]
+	if toolName != "ask_permission" && !hasAction && !hasTarget && !hasReason {
+		return "", false
+	}
+	head := strings.TrimSpace(strings.TrimSpace(strVal(m["Action"])) + " " + strings.TrimSpace(strVal(m["Target"])))
+	reason := strings.TrimSpace(strVal(m["Reason"]))
+	if head != "" && reason != "" {
+		return agents.TruncateRunes(head+" — "+reason, 400), true
+	}
+	return agents.TruncateRunes(cmp.Or(head, reason), 400), head != "" || reason != ""
+}
+
+func summarizeToolDetail(toolName string, toolInput any) string {
+	m, ok := toolInput.(map[string]any)
+	if !ok {
+		return agents.TruncateRunes(strings.TrimSpace(strVal(toolInput)), 400)
+	}
+	if s, ok := summarizePermissionMap(toolName, m); ok {
+		return s
+	}
+	for _, k := range []string{"command", "CommandLine", "cmd"} {
+		if xs, ok := m[k].([]any); ok {
+			var parts []string
+			for _, x := range xs {
+				if x != nil {
+					parts = append(parts, fmt.Sprint(x))
+				}
+			}
+			if joined := strings.TrimSpace(strings.Join(parts, " ")); joined != "" {
+				return agents.TruncateRunes(joined, 400)
+			}
+		} else if s := strings.TrimSpace(strVal(m[k])); s != "" {
+			return agents.TruncateRunes(s, 400)
+		}
+	}
+	for _, k := range []string{"file_path", "TargetFile", "path", "AbsolutePath", "description"} {
+		if s := strings.TrimSpace(strVal(m[k])); s != "" {
+			return agents.TruncateRunes(s, 400)
+		}
+	}
+	return agents.TruncateRunes(fmtTool(toolName, m), 400)
+}
+
+func pendingActionMap(kind, tool, detail, event string) map[string]string {
+	m := map[string]string{"kind": kind, "detail": detail, "event": event}
+	if tool != "" {
+		m["tool"] = tool
+	}
+	return m
+}
+
+type hookInput struct {
+	HookEventName      string   `json:"hookEventName"`
+	ConversationID     string   `json:"conversationId"`
+	WorkspacePaths     []string `json:"workspacePaths"`
+	TranscriptPath     string   `json:"transcriptPath"`
+	LastUserInput      string   `json:"lastUserInput"`
+	ContinuationActive bool     `json:"continuationActive"`
+	TerminationReason  string   `json:"terminationReason"`
+	ToolCall           *struct {
+		Name string `json:"name"`
+		Args any    `json:"args"`
+	} `json:"toolCall"`
+
+	SnakeEvent          string `json:"hook_event_name"`
+	SessionID           string `json:"session_id"`
+	SnakeTranscriptPath string `json:"transcript_path"`
+	Prompt              string `json:"prompt"`
+	StopHookActive      bool   `json:"stop_hook_active"`
+	ToolName            string `json:"tool_name"`
+	ToolInput           any    `json:"tool_input"`
+	NotificationType    string `json:"notification_type"`
+	Message             string `json:"message"`
+	Title               string `json:"title"`
+	CWD                 string `json:"cwd"`
+}
+
+func classifyAntigravityEvent(event string, in *hookInput) (string, map[string]string, bool) {
+	switch event {
+	case "Stop":
+		term := cmp.Or(in.TerminationReason, "NO_TOOL_CALL")
+		return "idle", nil, !in.ContinuationActive && term == "NO_TOOL_CALL"
+	case "PreToolUse":
+		if in.ToolCall == nil {
 			return "working", nil, false
-		case "SessionStart", "PreInvocation":
-			return "working", nil, true
+		}
+		switch in.ToolCall.Name {
+		case "ask_question":
+			return "waiting_question", pendingActionMap("question", in.ToolCall.Name, summarizeQuestions(in.ToolCall.Name, in.ToolCall.Args), event), false
+		case "ask_permission":
+			return "waiting_permission", pendingActionMap("permission", in.ToolCall.Name, summarizeToolDetail(in.ToolCall.Name, in.ToolCall.Args), event), false
 		default:
 			return "working", nil, false
 		}
+	case "SessionStart", "PreInvocation":
+		return "working", nil, true
+	default:
+		return "working", nil, false
 	}
+}
 
-	toolName := strVal(payload["tool_name"])
-	toolInput := payload["tool_input"]
+func classifyClaudeNotification(in *hookInput) (string, map[string]string, bool) {
+	msg := agents.TruncateRunes(strings.TrimSpace(cmp.Or(in.Message, in.Title)), 400)
+	switch in.NotificationType {
+	case "permission_prompt":
+		return "waiting_permission", pendingActionMap("permission", "", cmp.Or(msg, "Waiting for permission approval"), "Notification:"+in.NotificationType), false
+	case "elicitation_dialog", "elicitation_url_dialog", "agent_needs_input":
+		return "waiting_question", pendingActionMap("question", "", cmp.Or(msg, fmt.Sprintf("Waiting for user input (%s)", in.NotificationType)), "Notification:"+in.NotificationType), false
+	case "idle_prompt":
+		return "idle", nil, false
+	default:
+		return "", nil, false
+	}
+}
 
+func classifyHookEvent(harness, event string, in *hookInput) (string, map[string]string, bool) {
+	if harness == "antigravity" {
+		return classifyAntigravityEvent(event, in)
+	}
 	if harness == "claude" {
 		switch event {
-		case "PermissionRequest":
-			if toolName == "AskUserQuestion" {
-				return "waiting_question", map[string]string{
-					"kind":   "question",
-					"tool":   toolName,
-					"detail": summarizeQuestions(toolName, toolInput),
-					"event":  event,
-				}, false
+		case "PermissionRequest", "PreToolUse":
+			switch in.ToolName {
+			case "AskUserQuestion":
+				return "waiting_question", pendingActionMap("question", in.ToolName, summarizeQuestions(in.ToolName, in.ToolInput), event), false
+			case "ExitPlanMode":
+				return "waiting_question", pendingActionMap("question", in.ToolName, "Waiting for plan approval", event), false
 			}
-			if toolName == "ExitPlanMode" {
-				return "waiting_question", map[string]string{
-					"kind":   "question",
-					"tool":   toolName,
-					"detail": "Waiting for plan approval",
-					"event":  event,
-				}, false
-			}
-			return "waiting_permission", map[string]string{
-				"kind":   "permission",
-				"tool":   toolName,
-				"detail": summarizeToolDetail(toolName, toolInput),
-				"event":  event,
-			}, false
-		case "PreToolUse":
-			if toolName == "AskUserQuestion" {
-				return "waiting_question", map[string]string{
-					"kind":   "question",
-					"tool":   toolName,
-					"detail": summarizeQuestions(toolName, toolInput),
-					"event":  event,
-				}, false
-			}
-			if toolName == "ExitPlanMode" {
-				return "waiting_question", map[string]string{
-					"kind":   "question",
-					"tool":   toolName,
-					"detail": "Waiting for plan approval",
-					"event":  event,
-				}, false
+			if event == "PermissionRequest" {
+				return "waiting_permission", pendingActionMap("permission", in.ToolName, summarizeToolDetail(in.ToolName, in.ToolInput), event), false
 			}
 			return "working", nil, false
 		case "Notification":
-			notifType := strVal(payload["notification_type"])
-			notifMsg := strings.TrimSpace(strVal(payload["message"]))
-			if notifMsg == "" {
-				notifMsg = strings.TrimSpace(strVal(payload["title"]))
-			}
-			notifMsg = agents.TruncateRunes(notifMsg, 400)
-			if notifType == "permission_prompt" {
-				if notifMsg == "" {
-					notifMsg = "Waiting for permission approval"
-				}
-				return "waiting_permission", map[string]string{
-					"kind":   "permission",
-					"detail": notifMsg,
-					"event":  "Notification:" + notifType,
-				}, false
-			}
-			if notifType == "elicitation_dialog" || notifType == "elicitation_url_dialog" || notifType == "agent_needs_input" {
-				if notifMsg == "" {
-					notifMsg = fmt.Sprintf("Waiting for user input (%s)", notifType)
-				}
-				return "waiting_question", map[string]string{
-					"kind":   "question",
-					"detail": notifMsg,
-					"event":  "Notification:" + notifType,
-				}, false
-			}
-			if notifType == "idle_prompt" {
-				return "idle", nil, false
-			}
-			return "", nil, false
-		case "Stop":
-			return "idle", nil, !contActive
-		case "SessionEnd":
-			return "exited", nil, false
-		case "SessionStart", "UserPromptSubmit", "PostToolUse":
-			return "working", nil, true
-		default:
-			return "working", nil, false
+			return classifyClaudeNotification(in)
 		}
 	}
-
 	if harness == "codex" {
 		switch event {
 		case "PermissionRequest":
-			return "waiting_permission", map[string]string{
-				"kind":   "permission",
-				"tool":   toolName,
-				"detail": summarizeToolDetail(toolName, toolInput),
-				"event":  event,
-			}, false
+			return "waiting_permission", pendingActionMap("permission", in.ToolName, summarizeToolDetail(in.ToolName, in.ToolInput), event), false
 		case "PreToolUse":
-			if toolName == "request_user_input" {
-				return "waiting_question", map[string]string{
-					"kind":   "question",
-					"tool":   toolName,
-					"detail": summarizeQuestions(toolName, toolInput),
-					"event":  event,
-				}, false
+			if in.ToolName == "request_user_input" {
+				return "waiting_question", pendingActionMap("question", in.ToolName, summarizeQuestions(in.ToolName, in.ToolInput), event), false
 			}
 			return "working", nil, false
-		case "Stop":
-			return "idle", nil, !contActive
 		case "Interrupt":
 			return "idle", nil, false
-		case "SessionEnd":
-			return "exited", nil, false
-		case "SessionStart", "UserPromptSubmit", "PostToolUse":
-			return "working", nil, true
-		default:
-			return "working", nil, false
 		}
 	}
-	return "working", nil, false
+	switch event {
+	case "Stop":
+		return "idle", nil, !in.StopHookActive
+	case "SessionEnd":
+		return "exited", nil, false
+	case "SessionStart", "UserPromptSubmit", "PostToolUse":
+		return "working", nil, true
+	default:
+		return "working", nil, false
+	}
+}
+
+func formatAntigravityOutput(event, contextText, unreadText string, canInject bool) map[string]any {
+	switch event {
+	case "PreToolUse":
+		return map[string]any{"decision": "allow"}
+	case "SessionStart", "PreInvocation":
+		if contextText == "" {
+			return map[string]any{}
+		}
+		return map[string]any{"injectSteps": []map[string]any{{"systemMessage": map[string]any{"systemMessage": contextText}}}}
+	case "Stop":
+		if unreadText != "" && canInject {
+			return map[string]any{"decision": "continue", "reason": unreadText}
+		}
+		return map[string]any{"decision": "allow"}
+	default:
+		return map[string]any{}
+	}
 }
 
 func formatHookOutput(harness, event, sessionID string, unread []agents.Message, canInject bool, sessionName string) map[string]any {
@@ -868,75 +797,23 @@ func formatHookOutput(harness, event, sessionID string, unread []agents.Message,
 	if len(unread) > 0 {
 		unreadText = FormatUnread(sessionID, unread, sessionName, "")
 	}
-	if harness == "antigravity" {
-		switch event {
-		case "PreToolUse":
-			return map[string]any{"decision": "allow"}
-		case "PostToolUse":
-			return map[string]any{}
-		case "SessionStart":
-			if sessionID == "" && unreadText == "" {
-				return map[string]any{}
-			}
-			var parts []string
-			if sessionID != "" {
-				parts = append(parts, sessionStartMessage(harness, sessionID, sessionName))
-			}
-			if unreadText != "" {
-				parts = append(parts, unreadText)
-			}
-			return map[string]any{
-				"injectSteps": []map[string]any{
-					{"systemMessage": map[string]any{"systemMessage": strings.Join(parts, "\n\n")}},
-				},
-			}
-		case "PreInvocation":
-			if unreadText == "" {
-				return map[string]any{}
-			}
-			return map[string]any{
-				"injectSteps": []map[string]any{
-					{"systemMessage": map[string]any{"systemMessage": unreadText}},
-				},
-			}
-		case "Stop":
-			if unreadText != "" && canInject {
-				return map[string]any{"decision": "continue", "reason": unreadText}
-			}
-			return map[string]any{"decision": "allow"}
-		default:
-			return map[string]any{}
-		}
+	var parts []string
+	if event == "SessionStart" && sessionID != "" {
+		parts = append(parts, sessionStartMessage(harness, sessionID, sessionName))
 	}
-
+	if unreadText != "" {
+		parts = append(parts, unreadText)
+	}
+	joined := strings.Join(parts, "\n\n")
+	if harness == "antigravity" {
+		return formatAntigravityOutput(event, joined, unreadText, canInject)
+	}
 	switch event {
-	case "SessionStart":
-		var parts []string
-		if sessionID != "" {
-			parts = append(parts, sessionStartMessage(harness, sessionID, sessionName))
-		}
-		if unreadText != "" {
-			parts = append(parts, unreadText)
-		}
-		if len(parts) == 0 {
+	case "SessionStart", "UserPromptSubmit", "PostToolUse":
+		if joined == "" {
 			return map[string]any{}
 		}
-		return map[string]any{
-			"hookSpecificOutput": map[string]any{
-				"hookEventName":     "SessionStart",
-				"additionalContext": strings.Join(parts, "\n\n"),
-			},
-		}
-	case "UserPromptSubmit", "PostToolUse":
-		if unreadText == "" {
-			return map[string]any{}
-		}
-		return map[string]any{
-			"hookSpecificOutput": map[string]any{
-				"hookEventName":     event,
-				"additionalContext": unreadText,
-			},
-		}
+		return map[string]any{"hookSpecificOutput": map[string]any{"hookEventName": event, "additionalContext": joined}}
 	case "Stop":
 		if unreadText != "" && canInject {
 			return map[string]any{"decision": "block", "reason": unreadText}
@@ -947,24 +824,20 @@ func formatHookOutput(harness, event, sessionID string, unread []agents.Message,
 	}
 }
 
-func resolveAPI(apiURL string) (string, error) {
-	if apiURL != "" {
-		return apiURL, nil
+func parseHookInput(harness string, stdin io.Reader) (in hookInput, event, rawID, cwd, transcriptPath, prompt string) {
+	rawBytes, _ := io.ReadAll(stdin)
+	if trimmed := bytes.TrimSpace(rawBytes); len(trimmed) > 0 {
+		_ = json.Unmarshal(trimmed, &in)
 	}
-	data, err := os.ReadFile(paths.NodeFile())
-	if err != nil {
-		return "", err
+	cwdDefault, _ := os.Getwd()
+	if harness == "antigravity" {
+		fallbackWS := ""
+		if len(in.WorkspacePaths) > 0 {
+			fallbackWS = in.WorkspacePaths[0]
+		}
+		return in, in.HookEventName, cmp.Or(in.ConversationID, "agy"), cmp.Or(in.CWD, fallbackWS, cwdDefault), in.TranscriptPath, in.LastUserInput
 	}
-	var node struct {
-		API string `json:"api"`
-	}
-	if err := json.Unmarshal(data, &node); err != nil {
-		return "", err
-	}
-	if node.API == "" {
-		return "", errors.New("missing api in fleet.json")
-	}
-	return node.API, nil
+	return in, in.SnakeEvent, cmp.Or(in.SessionID, fmt.Sprintf("pid-%d", os.Getppid())), cmp.Or(in.CWD, cwdDefault), in.SnakeTranscriptPath, in.Prompt
 }
 
 // RunHook processes a single lifecycle hook payload from stdin and writes harness JSON to stdout.
@@ -978,138 +851,52 @@ func RunHook(harness string, stdin io.Reader, stdout io.Writer, apiURL string) (
 	if stdout == nil {
 		stdout = os.Stdout
 	}
-	rawBytes, _ := io.ReadAll(stdin)
-	rawTrim := strings.TrimSpace(string(rawBytes))
-	payload := map[string]any{}
-	if rawTrim != "" {
-		_ = json.Unmarshal([]byte(rawTrim), &payload)
-		if payload == nil {
-			payload = map[string]any{}
-		}
-	}
-
-	var event, rawID, cwd, transcriptPath, prompt, termReason string
-	var contActive bool
-	cwdDefault, _ := os.Getwd()
-
-	if harness == "antigravity" {
-		event = strVal(payload["hookEventName"])
-		rawID = strVal(payload["conversationId"])
-		if rawID == "" {
-			rawID = "agy"
-		}
-		fallbackWS := ""
-		if ws, ok := payload["workspacePaths"].([]any); ok && len(ws) > 0 {
-			fallbackWS = strVal(ws[0])
-		}
-		cwd = strVal(payload["cwd"])
-		if cwd == "" {
-			cwd = fallbackWS
-		}
-		if cwd == "" {
-			cwd = cwdDefault
-		}
-		transcriptPath = strVal(payload["transcriptPath"])
-		prompt = strVal(payload["lastUserInput"])
-		contActive, _ = payload["continuationActive"].(bool)
-		termReason = strVal(payload["terminationReason"])
-		if termReason == "" {
-			termReason = "NO_TOOL_CALL"
-		}
-	} else {
-		event = strVal(payload["hook_event_name"])
-		rawID = strVal(payload["session_id"])
-		if rawID == "" {
-			rawID = fmt.Sprintf("pid-%d", os.Getppid())
-		}
-		cwd = strVal(payload["cwd"])
-		if cwd == "" {
-			cwd = cwdDefault
-		}
-		transcriptPath = strVal(payload["transcript_path"])
-		prompt = strVal(payload["prompt"])
-		contActive, _ = payload["stop_hook_active"].(bool)
-		termReason = "NO_TOOL_CALL"
-	}
-
-	state, pendingAction, canInject := classifyHookEvent(harness, event, payload, contActive, termReason)
+	in, event, rawID, cwd, transcriptPath, prompt := parseHookInput(harness, stdin)
+	state, pendingAction, canInject := classifyHookEvent(harness, event, &in)
 	if state == "" {
 		_, _ = io.WriteString(stdout, "{}\n")
 		return 0, nil
 	}
 
-	var (
-		repo, branch, gitStatus string
-		tailSummary             string
-		tail                    []agents.TailItem
-		title                   string
-		isExplicitName          bool
-	)
+	var repo, branch, gitStatus, tailSummary, title string
+	var tail []agents.TailItem
+	var isExplicitName bool
 	var wg sync.WaitGroup
-	wg.Add(3)
-	go func() {
-		defer wg.Done()
-		repo, branch, gitStatus = GitContext(cwd)
-	}()
-	go func() {
-		defer wg.Done()
-		tailSummary, tail = ReadTranscriptTail(harness, transcriptPath, cwd, 20)
-	}()
-	go func() {
-		defer wg.Done()
-		title, isExplicitName = ReadSessionTitle(harness, rawID, transcriptPath, "", "")
-	}()
+	wg.Go(func() { repo, branch, gitStatus = GitContext(cwd) })
+	wg.Go(func() { tailSummary, tail = ReadTranscriptTail(harness, transcriptPath, cwd, 20) })
+	wg.Go(func() { title, isExplicitName = ReadSessionTitle(harness, rawID, transcriptPath, "", "") })
 	wg.Wait()
 
 	summary := tailSummary
-	if strings.TrimSpace(prompt) != "" {
-		summary = agents.TruncateRunes(strings.TrimSpace(prompt), 160)
+	if trimmed := strings.TrimSpace(prompt); trimmed != "" {
+		summary = agents.TruncateRunes(trimmed, 160)
 	}
 
 	var sessionID, sessionName string
 	var unread []agents.Message
-
-	if api, err := resolveAPI(apiURL); err == nil {
-		hbPayload := map[string]any{
-			"harness":       harness,
-			"raw_id":        rawID,
-			"cwd":           cwd,
-			"repo":          repo,
-			"branch":        branch,
-			"state":         state,
-			"explicit_name": isExplicitName,
-			"git_status":    gitStatus,
-			"tail":          tail,
-			"drain_inbox":   canInject,
-		}
+	if api, err := client.ResolveAPI(apiURL); err == nil {
+		var pidPtr *int
 		if harness != "antigravity" {
-			hbPayload["pid"] = os.Getppid()
-		} else {
-			hbPayload["pid"] = nil
+			pidPtr = new(os.Getppid())
 		}
+		var titlePtr, namePtr, sumPtr *string
 		if title != "" {
-			hbPayload["title"] = title
-		} else {
-			hbPayload["title"] = nil
-		}
-		if isExplicitName && title != "" {
-			hbPayload["name"] = title
-		} else {
-			hbPayload["name"] = nil
+			titlePtr = &title
+			if isExplicitName {
+				namePtr = &title
+			}
 		}
 		if summary != "" {
-			hbPayload["summary"] = summary
-		} else {
-			hbPayload["summary"] = nil
-		}
-		if pendingAction != nil {
-			hbPayload["pending_action"] = pendingAction
+			sumPtr = &summary
 		}
 		var resp agents.HeartbeatResult
-		if err := client.Call(api, "POST", "/v1/agents/heartbeat", hbPayload, 2*time.Second, nil, &resp); err == nil {
-			sessionID = resp.SessionID
-			sessionName = resp.Name
-			unread = resp.Unread
+		err := client.Call(api, "POST", "/v1/agents/heartbeat", agents.HeartbeatParams{
+			Harness: harness, RawID: rawID, PID: pidPtr, CWD: cwd, Repo: repo, Branch: branch,
+			State: state, PendingAction: pendingAction, Title: titlePtr, Name: namePtr,
+			ExplicitName: isExplicitName, Summary: sumPtr, GitStatus: &gitStatus, Tail: tail, DrainInbox: canInject,
+		}, 2*time.Second, nil, &resp)
+		if err == nil {
+			sessionID, sessionName, unread = resp.SessionID, resp.Name, resp.Unread
 		}
 	}
 

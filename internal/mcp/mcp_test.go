@@ -43,7 +43,7 @@ func TestMCPStdioRoundtripAndDeregisterOnEOF(t *testing.T) {
 
 	_, _ = f.Agents.Heartbeat(agents.HeartbeatParams{
 		Device: "mini", Harness: "antigravity", RawID: "conv-9999",
-		CWD: "/srv", Repo: "infra", Summary: ptr("checking logs"),
+		CWD: "/srv", Repo: "infra", Summary: new("checking logs"),
 		Tail: []agents.TailItem{{Role: "user", Text: "check logs"}},
 	})
 	ppid := os.Getppid()
@@ -51,14 +51,14 @@ func TestMCPStdioRoundtripAndDeregisterOnEOF(t *testing.T) {
 	_, _ = f.Agents.Heartbeat(agents.HeartbeatParams{
 		Device: "mini", Harness: "claude", RawID: fmt.Sprintf("pid-%d", ppid), PID: &ppid, CWD: cwd,
 	})
-	_, _ = f.Agents.SendMessage("mini", "mini:antigravity:conv-9999", fmt.Sprintf("mini:claude:pid-%d", ppid), "see line 12", nil, nil, nil)
+	_, _ = f.Agents.SendMessageWithReport("mini", "mini:antigravity:conv-9999", fmt.Sprintf("mini:claude:pid-%d", ppid), "see line 12", nil, nil, nil)
 
 	go func() {
-		for i := 0; i < 60; i++ {
+		for range 60 {
 			msgs, _ := f.Agents.FetchInbox("mini", "mini:antigravity:conv-9999", true, true, 50)
 			for _, m := range msgs {
 				if m.Body == "which port?" {
-					_, _ = f.Agents.SendMessage("mini", "mini:antigravity:conv-9999", m.FromSession, "port 7443", nil, &m.ID, nil)
+					_, _ = f.Agents.SendMessageWithReport("mini", "mini:antigravity:conv-9999", m.FromSession, "port 7443", nil, &m.ID, nil)
 					return
 				}
 			}
@@ -89,7 +89,7 @@ func TestMCPStdioRoundtripAndDeregisterOnEOF(t *testing.T) {
 	}
 
 	var resps []map[string]any
-	for _, ln := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+	for ln := range strings.SplitSeq(strings.TrimSpace(out.String()), "\n") {
 		var r map[string]any
 		if err := json.Unmarshal([]byte(ln), &r); err != nil {
 			t.Fatalf("bad response %q: %v", ln, err)
@@ -158,5 +158,3 @@ func TestMCPCodexAutoListenAndSetName(t *testing.T) {
 		t.Fatalf("unexpected codex listen states: %v / %v / %v", st0, st1, st2)
 	}
 }
-
-func ptr[T any](v T) *T { return &v }

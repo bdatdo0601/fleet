@@ -6,6 +6,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 )
 
@@ -14,8 +15,8 @@ const (
 	MeshPrefix   = 16
 	LighthouseIP = "10.213.0.1"
 
-	MobileCertHours           = 8760   // phones/tablets: 1 year, re-sign with `fleet set`
-	CAHours                   = 43800  // 5 years
+	MobileCertHours           = 8760  // phones/tablets: 1 year, re-sign with `fleet set`
+	CAHours                   = 43800 // 5 years
 	AgentActiveSeconds        = 300
 	AgentWaitingActiveSeconds = 3600
 	AgentRetentionSeconds     = 172800
@@ -23,7 +24,7 @@ const (
 	LabelPrefix = "io.github.bdatdo0601.fleet"
 	ServeLabel  = LabelPrefix + ".serve"
 	SyncLabel   = LabelPrefix + ".sync"
-	DdnsLabel   = LabelPrefix + ".ddns"
+	DDNSLabel   = LabelPrefix + ".ddns"
 
 	SyncIntervalSeconds = 300
 
@@ -152,20 +153,10 @@ func LauncherPath() string {
 
 // ValidHarness reports whether name is a supported agent harness.
 func ValidHarness(name string) bool {
-	for _, h := range Harnesses {
-		if h == name {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(Harnesses, name)
 }
 
 // ValidGroup reports whether group is a supported device group.
 func ValidGroup(group string) bool {
-	for _, g := range Groups {
-		if g == group {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(Groups, group)
 }

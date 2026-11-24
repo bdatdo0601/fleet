@@ -7,10 +7,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	"regexp"
-	"strconv"
+	"slices"
 	"strings"
 
 	"github.com/bdatdo0601/fleet/internal/paths"
@@ -94,60 +93,47 @@ func marshalPrettyJSON(data any) (string, error) {
 	return buf.String(), nil
 }
 
-func ensureDir(dir string, uid, gid *int) error {
-	var missing []string
-	cur := dir
-	for {
-		if _, err := os.Stat(cur); err == nil {
-			break
-		}
-		missing = append(missing, cur)
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			break
-		}
-		cur = parent
-	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	if uid != nil && gid != nil && os.Geteuid() == 0 {
-		for i := len(missing) - 1; i >= 0; i-- {
-			_ = os.Chown(missing[i], *uid, *gid)
-		}
-	}
-	return nil
+func pathExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }
 
 func writeUserFile(path, content string, uid, gid *int) (bool, error) {
-	if existing, err := os.ReadFile(path); err == nil && string(existing) == content {
-		return false, nil
-	}
-	if err := ensureDir(filepath.Dir(path), uid, gid); err != nil {
-		return false, err
-	}
 	mode := os.FileMode(0o600)
 	if fi, err := os.Stat(path); err == nil {
 		mode = fi.Mode().Perm()
 	}
-	tmp := filepath.Join(filepath.Dir(path), fmt.Sprintf(".%s.fleet-tmp", filepath.Base(path)))
-	if err := os.WriteFile(tmp, []byte(content), mode); err != nil {
-		return false, err
-	}
-	_ = os.Chmod(tmp, mode)
-	if uid != nil && gid != nil && os.Geteuid() == 0 {
-		_ = os.Chown(tmp, *uid, *gid)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return false, err
-	}
-	return true, nil
+	return paths.WriteFileAtomic(path, []byte(content), mode, uid, gid)
 }
 
-func pathExists(p string) bool {
-	_, err := os.Stat(p)
-	return err == nil
+func subMap(root map[string]any, key string, create bool) map[string]any {
+	if m, ok := root[key].(map[string]any); ok {
+		return m
+	}
+	if _, exists := root[key]; exists || !create {
+		return nil
+	}
+	m := map[string]any{}
+	root[key] = m
+	return m
+}
+
+func editJSONFile(path string, uid, gid *int, create bool, mutate func(map[string]any) bool) (bool, error) {
+	if !create && !pathExists(path) {
+		return false, nil
+	}
+	data, err := loadJSON(path)
+	if err != nil {
+		return false, err
+	}
+	if !mutate(data) {
+		return false, nil
+	}
+	txt, err := marshalPrettyJSON(data)
+	if err != nil {
+		return false, err
+	}
+	return writeUserFile(path, txt, uid, gid)
 }
 
 func hasBinary(name, home string) bool {
@@ -165,9 +151,7 @@ func hasBinary(name, home string) bool {
 // DetectHarnesses returns installed agent harnesses under home (or all if forceAll is true).
 func DetectHarnesses(home string, forceAll bool) []string {
 	if forceAll {
-		out := make([]string, len(paths.Harnesses))
-		copy(out, paths.Harnesses)
-		return out
+		return slices.Clone(paths.Harnesses)
 	}
 	var found []string
 	if pathExists(filepath.Join(home, ".claude")) || pathExists(filepath.Join(home, ".claude.json")) || hasBinary("claude", home) {
@@ -209,24 +193,15 @@ func upsertClaudeStyleHooks(hooksRoot map[string]any, harness, cmdBin string) {
 		events = codexHookEvents
 	}
 	for _, spec := range events {
-		var entries []any
-		if raw, ok := hooksRoot[spec.event].([]any); ok {
-			entries = raw
-		}
+		entries, _ := hooksRoot[spec.event].([]any)
 		handler := map[string]any{"type": "command", "command": hookCmd, "timeout": spec.timeout}
 		desired := map[string]any{"hooks": []any{handler}}
 		if spec.matcher != "" {
 			desired["matcher"] = spec.matcher
 		}
-		replaced := false
-		for i, g := range entries {
-			if isFleetHookGroup(g, harness) {
-				entries[i] = desired
-				replaced = true
-				break
-			}
-		}
-		if !replaced {
+		if idx := slices.IndexFunc(entries, func(g any) bool { return isFleetHookGroup(g, harness) }); idx >= 0 {
+			entries[idx] = desired
+		} else {
 			// Append only, never reorder earlier items (preserves Codex trust-hash indices).
 			entries = append(entries, desired)
 		}
@@ -241,12 +216,9 @@ func removeClaudeStyleHooks(hooksRoot map[string]any, harness string) bool {
 		if !ok {
 			continue
 		}
-		var filtered []any
-		for _, g := range entries {
-			if !isFleetHookGroup(g, harness) {
-				filtered = append(filtered, g)
-			}
-		}
+		filtered := slices.DeleteFunc(slices.Clone(entries), func(g any) bool {
+			return isFleetHookGroup(g, harness)
+		})
 		if len(filtered) != len(entries) {
 			changed = true
 			if len(filtered) > 0 {
@@ -259,20 +231,12 @@ func removeClaudeStyleHooks(hooksRoot map[string]any, harness string) bool {
 	return changed
 }
 
-func updateCodexTOML(raw, cmdBin string, remove bool) string {
-	var lines []string
-	if raw != "" {
-		rawClean := strings.ReplaceAll(raw, "\r\n", "\n")
-		rawClean = strings.TrimSuffix(rawClean, "\n")
-		if rawClean != "" || strings.Contains(raw, "\n") {
-			lines = strings.Split(rawClean, "\n")
-		}
-	}
+func stripTOMLSection(lines []string, header string) []string {
 	var cleaned []string
 	skipping := false
 	for _, line := range lines {
 		stripped := strings.TrimSpace(line)
-		if stripped == "[mcp_servers.fleet]" {
+		if stripped == header {
 			skipping = true
 			continue
 		}
@@ -283,6 +247,44 @@ func updateCodexTOML(raw, cmdBin string, remove bool) string {
 			cleaned = append(cleaned, line)
 		}
 	}
+	return cleaned
+}
+
+func ensureCodexFeaturesHook(lines []string) []string {
+	featIdx := slices.IndexFunc(lines, func(ln string) bool {
+		return strings.TrimSpace(ln) == "[features]"
+	})
+	if featIdx < 0 {
+		if len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) != "" {
+			lines = append(lines, "")
+		}
+		return append(lines, "[features]", "hooks = true")
+	}
+	endIdx := len(lines)
+	for i := featIdx + 1; i < len(lines); i++ {
+		if tomlHeaderRE.MatchString(strings.TrimSpace(lines[i])) {
+			endIdx = i
+			break
+		}
+	}
+	for i := featIdx + 1; i < endIdx; i++ {
+		if tomlHooksRE.MatchString(lines[i]) {
+			lines[i] = "hooks = true"
+			return lines
+		}
+	}
+	return slices.Insert(lines, featIdx+1, "hooks = true")
+}
+
+func updateCodexTOML(raw, cmdBin string, remove bool) string {
+	var lines []string
+	if raw != "" {
+		clean := strings.TrimSuffix(strings.ReplaceAll(raw, "\r\n", "\n"), "\n")
+		if clean != "" || strings.Contains(raw, "\n") {
+			lines = strings.Split(clean, "\n")
+		}
+	}
+	cleaned := stripTOMLSection(lines, "[mcp_servers.fleet]")
 	if remove {
 		for len(cleaned) > 0 && strings.TrimSpace(cleaned[len(cleaned)-1]) == "" {
 			cleaned = cleaned[:len(cleaned)-1]
@@ -293,39 +295,7 @@ func updateCodexTOML(raw, cmdBin string, remove bool) string {
 		return strings.Join(cleaned, "\n") + "\n"
 	}
 
-	featIdx := -1
-	for i, ln := range cleaned {
-		if strings.TrimSpace(ln) == "[features]" {
-			featIdx = i
-			break
-		}
-	}
-	if featIdx < 0 {
-		if len(cleaned) > 0 && strings.TrimSpace(cleaned[len(cleaned)-1]) != "" {
-			cleaned = append(cleaned, "")
-		}
-		cleaned = append(cleaned, "[features]", "hooks = true")
-	} else {
-		endIdx := len(cleaned)
-		for i := featIdx + 1; i < len(cleaned); i++ {
-			if tomlHeaderRE.MatchString(strings.TrimSpace(cleaned[i])) {
-				endIdx = i
-				break
-			}
-		}
-		hooksIdx := -1
-		for i := featIdx + 1; i < endIdx; i++ {
-			if tomlHooksRE.MatchString(cleaned[i]) {
-				hooksIdx = i
-				break
-			}
-		}
-		if hooksIdx >= 0 {
-			cleaned[hooksIdx] = "hooks = true"
-		} else {
-			cleaned = append(cleaned[:featIdx+1], append([]string{"hooks = true"}, cleaned[featIdx+1:]...)...)
-		}
-	}
+	cleaned = ensureCodexFeaturesHook(cleaned)
 	if len(cleaned) > 0 && strings.TrimSpace(cleaned[len(cleaned)-1]) != "" {
 		cleaned = append(cleaned, "")
 	}
@@ -338,321 +308,162 @@ func updateCodexTOML(raw, cmdBin string, remove bool) string {
 	return strings.Join(cleaned, "\n") + "\n"
 }
 
-func containsHarness(list []string, target string) bool {
-	for _, s := range list {
-		if s == target {
-			return true
+type jsonEditSpec struct {
+	relPath string
+	mutate  func(map[string]any) bool
+}
+
+func applyEdits(home string, uid, gid *int, create bool, specs []jsonEditSpec) ([]string, error) {
+	var changed []string
+	for _, s := range specs {
+		p := filepath.Join(home, s.relPath)
+		wrote, err := editJSONFile(p, uid, gid, create, s.mutate)
+		if err != nil {
+			return nil, err
+		}
+		if wrote {
+			changed = append(changed, p)
 		}
 	}
-	return false
+	return changed, nil
 }
 
 // Install idempotently writes MCP and lifecycle hook configs for detected harnesses.
 func Install(opts InstallOpts) ([]string, error) {
 	targetHome := opts.Home
 	if targetHome == "" {
-		h, err := os.UserHomeDir()
-		if err != nil {
+		var err error
+		if targetHome, err = os.UserHomeDir(); err != nil {
 			return nil, err
 		}
-		targetHome = h
 	}
 	cmdBin := opts.BinPath
 	if cmdBin == "" {
 		cmdBin = paths.LauncherPath()
 	}
 	harnesses := DetectHarnesses(targetHome, opts.ForceAll)
-	var changed []string
+	var specs []jsonEditSpec
 
-	if containsHarness(harnesses, "claude") {
-		claudeJSON := filepath.Join(targetHome, ".claude.json")
-		data, err := loadJSON(claudeJSON)
-		if err != nil {
-			return nil, err
-		}
-		servers, ok := data["mcpServers"].(map[string]any)
-		if !ok {
-			if _, exists := data["mcpServers"]; !exists {
-				servers = map[string]any{}
-				data["mcpServers"] = servers
-			}
-		}
-		if servers != nil {
-			servers["fleet"] = map[string]any{
-				"type":    "stdio",
-				"command": cmdBin,
-				"args":    []string{"mcp", "serve", "--harness", "claude"},
-			}
-			txt, err := marshalPrettyJSON(data)
-			if err != nil {
-				return nil, err
-			}
-			wrote, err := writeUserFile(claudeJSON, txt, opts.UID, opts.GID)
-			if err != nil {
-				return nil, err
-			}
-			if wrote {
-				changed = append(changed, claudeJSON)
-			}
-		}
-
-		settingsJSON := filepath.Join(targetHome, ".claude", "settings.json")
-		settings, err := loadJSON(settingsJSON)
-		if err != nil {
-			return nil, err
-		}
-		hooksRoot, ok := settings["hooks"].(map[string]any)
-		if !ok {
-			if _, exists := settings["hooks"]; !exists {
-				hooksRoot = map[string]any{}
-				settings["hooks"] = hooksRoot
-			}
-		}
-		if hooksRoot != nil {
-			upsertClaudeStyleHooks(hooksRoot, "claude", cmdBin)
-			txt, err := marshalPrettyJSON(settings)
-			if err != nil {
-				return nil, err
-			}
-			wrote, err := writeUserFile(settingsJSON, txt, opts.UID, opts.GID)
-			if err != nil {
-				return nil, err
-			}
-			if wrote {
-				changed = append(changed, settingsJSON)
-			}
-		}
+	if slices.Contains(harnesses, "claude") {
+		specs = append(specs,
+			jsonEditSpec{".claude.json", func(d map[string]any) bool {
+				srv := subMap(d, "mcpServers", true)
+				if srv == nil {
+					return false
+				}
+				srv["fleet"] = map[string]any{"type": "stdio", "command": cmdBin, "args": []string{"mcp", "serve", "--harness", "claude"}}
+				return true
+			}},
+			jsonEditSpec{filepath.Join(".claude", "settings.json"), func(d map[string]any) bool {
+				h := subMap(d, "hooks", true)
+				if h == nil {
+					return false
+				}
+				upsertClaudeStyleHooks(h, "claude", cmdBin)
+				return true
+			}},
+		)
 	}
 
-	if containsHarness(harnesses, "codex") {
+	var changed []string
+	if slices.Contains(harnesses, "codex") {
 		codexTOML := filepath.Join(targetHome, ".codex", "config.toml")
-		rawTOML := ""
-		if b, err := os.ReadFile(codexTOML); err == nil {
-			rawTOML = string(b)
-		}
-		updatedTOML := updateCodexTOML(rawTOML, cmdBin, false)
-		wrote, err := writeUserFile(codexTOML, updatedTOML, opts.UID, opts.GID)
+		rawTOML, _ := os.ReadFile(codexTOML)
+		wrote, err := writeUserFile(codexTOML, updateCodexTOML(string(rawTOML), cmdBin, false), opts.UID, opts.GID)
 		if err != nil {
 			return nil, err
 		}
 		if wrote {
 			changed = append(changed, codexTOML)
 		}
-
-		codexHooks := filepath.Join(targetHome, ".codex", "hooks.json")
-		hooksData, err := loadJSON(codexHooks)
-		if err != nil {
-			return nil, err
-		}
-		hooksRoot, ok := hooksData["hooks"].(map[string]any)
-		if !ok {
-			if _, exists := hooksData["hooks"]; !exists {
-				hooksRoot = map[string]any{}
-				hooksData["hooks"] = hooksRoot
+		specs = append(specs, jsonEditSpec{filepath.Join(".codex", "hooks.json"), func(d map[string]any) bool {
+			h := subMap(d, "hooks", true)
+			if h == nil {
+				return false
 			}
-		}
-		if hooksRoot != nil {
-			upsertClaudeStyleHooks(hooksRoot, "codex", cmdBin)
-			txt, err := marshalPrettyJSON(hooksData)
-			if err != nil {
-				return nil, err
-			}
-			wrote, err := writeUserFile(codexHooks, txt, opts.UID, opts.GID)
-			if err != nil {
-				return nil, err
-			}
-			if wrote {
-				changed = append(changed, codexHooks)
-			}
-		}
+			upsertClaudeStyleHooks(h, "codex", cmdBin)
+			return true
+		}})
 	}
 
-	if containsHarness(harnesses, "antigravity") {
-		agyMCP := filepath.Join(targetHome, ".gemini", "config", "mcp_config.json")
-		mcpData, err := loadJSON(agyMCP)
-		if err != nil {
-			return nil, err
-		}
-		servers, ok := mcpData["mcpServers"].(map[string]any)
-		if !ok {
-			if _, exists := mcpData["mcpServers"]; !exists {
-				servers = map[string]any{}
-				mcpData["mcpServers"] = servers
-			}
-		}
-		if servers != nil {
-			servers["fleet"] = map[string]any{
-				"command": cmdBin,
-				"args":    []string{"mcp", "serve", "--harness", "antigravity"},
-			}
-			txt, err := marshalPrettyJSON(mcpData)
-			if err != nil {
-				return nil, err
-			}
-			wrote, err := writeUserFile(agyMCP, txt, opts.UID, opts.GID)
-			if err != nil {
-				return nil, err
-			}
-			if wrote {
-				changed = append(changed, agyMCP)
-			}
-		}
-
-		agyHooks := filepath.Join(targetHome, ".gemini", "config", "hooks.json")
-		agyHooksData, err := loadJSON(agyHooks)
-		if err != nil {
-			return nil, err
-		}
-		hookCmd := fmt.Sprintf("%s agent-hook --harness antigravity", cmdBin)
-		handler := map[string]any{"type": "command", "command": hookCmd, "timeout": 5}
-		agyHooksData["fleet"] = map[string]any{
-			"SessionStart":  []any{handler},
-			"PreInvocation": []any{handler},
-			"PreToolUse":    []any{map[string]any{"matcher": "ask_question|ask_permission", "hooks": []any{handler}}},
-			"PostToolUse":   []any{map[string]any{"matcher": "*", "hooks": []any{handler}}},
-			"Stop":          []any{handler},
-		}
-		txt, err := marshalPrettyJSON(agyHooksData)
-		if err != nil {
-			return nil, err
-		}
-		wrote, err := writeUserFile(agyHooks, txt, opts.UID, opts.GID)
-		if err != nil {
-			return nil, err
-		}
-		if wrote {
-			changed = append(changed, agyHooks)
-		}
+	if slices.Contains(harnesses, "antigravity") {
+		handler := map[string]any{"type": "command", "command": cmdBin + " agent-hook --harness antigravity", "timeout": 5}
+		specs = append(specs,
+			jsonEditSpec{filepath.Join(".gemini", "config", "mcp_config.json"), func(d map[string]any) bool {
+				srv := subMap(d, "mcpServers", true)
+				if srv == nil {
+					return false
+				}
+				srv["fleet"] = map[string]any{"command": cmdBin, "args": []string{"mcp", "serve", "--harness", "antigravity"}}
+				return true
+			}},
+			jsonEditSpec{filepath.Join(".gemini", "config", "hooks.json"), func(d map[string]any) bool {
+				d["fleet"] = map[string]any{
+					"SessionStart":  []any{handler},
+					"PreInvocation": []any{handler},
+					"PreToolUse":    []any{map[string]any{"matcher": "ask_question|ask_permission", "hooks": []any{handler}}},
+					"PostToolUse":   []any{map[string]any{"matcher": "*", "hooks": []any{handler}}},
+					"Stop":          []any{handler},
+				}
+				return true
+			}},
+		)
 	}
 
-	return changed, nil
+	edited, err := applyEdits(targetHome, opts.UID, opts.GID, true, specs)
+	if err != nil {
+		return nil, err
+	}
+	return append(changed, edited...), nil
+}
+
+func deleteKey(root map[string]any, sub, key string) bool {
+	m := root
+	if sub != "" {
+		m = subMap(root, sub, false)
+	}
+	if _, ok := m[key]; !ok {
+		return false
+	}
+	delete(m, key)
+	return true
 }
 
 // Uninstall removes fleet MCP and hook entries from all harness configs under home.
 func Uninstall(home string) ([]string, error) {
 	targetHome := home
 	if targetHome == "" {
-		h, err := os.UserHomeDir()
-		if err != nil {
+		var err error
+		if targetHome, err = os.UserHomeDir(); err != nil {
 			return nil, err
 		}
-		targetHome = h
 	}
 	var changed []string
-
-	claudeJSON := filepath.Join(targetHome, ".claude.json")
-	if pathExists(claudeJSON) {
-		data, err := loadJSON(claudeJSON)
-		if err != nil {
-			return nil, err
-		}
-		if servers, ok := data["mcpServers"].(map[string]any); ok {
-			if _, exists := servers["fleet"]; exists {
-				delete(servers, "fleet")
-				txt, err := marshalPrettyJSON(data)
-				if err != nil {
-					return nil, err
-				}
-				if wrote, err := writeUserFile(claudeJSON, txt, nil, nil); err != nil {
-					return nil, err
-				} else if wrote {
-					changed = append(changed, claudeJSON)
-				}
-			}
-		}
-	}
-
-	settingsJSON := filepath.Join(targetHome, ".claude", "settings.json")
-	if pathExists(settingsJSON) {
-		settings, err := loadJSON(settingsJSON)
-		if err != nil {
-			return nil, err
-		}
-		if hooksRoot, ok := settings["hooks"].(map[string]any); ok && removeClaudeStyleHooks(hooksRoot, "claude") {
-			txt, err := marshalPrettyJSON(settings)
-			if err != nil {
-				return nil, err
-			}
-			if wrote, err := writeUserFile(settingsJSON, txt, nil, nil); err != nil {
-				return nil, err
-			} else if wrote {
-				changed = append(changed, settingsJSON)
-			}
-		}
-	}
-
 	codexTOML := filepath.Join(targetHome, ".codex", "config.toml")
 	if raw, err := os.ReadFile(codexTOML); err == nil {
-		updated := updateCodexTOML(string(raw), "", true)
-		if wrote, err := writeUserFile(codexTOML, updated, nil, nil); err != nil {
+		if wrote, err := writeUserFile(codexTOML, updateCodexTOML(string(raw), "", true), nil, nil); err != nil {
 			return nil, err
 		} else if wrote {
 			changed = append(changed, codexTOML)
 		}
 	}
-
-	codexHooks := filepath.Join(targetHome, ".codex", "hooks.json")
-	if pathExists(codexHooks) {
-		hooksData, err := loadJSON(codexHooks)
-		if err != nil {
-			return nil, err
-		}
-		if hooksRoot, ok := hooksData["hooks"].(map[string]any); ok && removeClaudeStyleHooks(hooksRoot, "codex") {
-			txt, err := marshalPrettyJSON(hooksData)
-			if err != nil {
-				return nil, err
-			}
-			if wrote, err := writeUserFile(codexHooks, txt, nil, nil); err != nil {
-				return nil, err
-			} else if wrote {
-				changed = append(changed, codexHooks)
-			}
-		}
+	edited, err := applyEdits(targetHome, nil, nil, false, []jsonEditSpec{
+		{".claude.json", func(d map[string]any) bool { return deleteKey(d, "mcpServers", "fleet") }},
+		{filepath.Join(".claude", "settings.json"), func(d map[string]any) bool {
+			h := subMap(d, "hooks", false)
+			return h != nil && removeClaudeStyleHooks(h, "claude")
+		}},
+		{filepath.Join(".codex", "hooks.json"), func(d map[string]any) bool {
+			h := subMap(d, "hooks", false)
+			return h != nil && removeClaudeStyleHooks(h, "codex")
+		}},
+		{filepath.Join(".gemini", "config", "mcp_config.json"), func(d map[string]any) bool { return deleteKey(d, "mcpServers", "fleet") }},
+		{filepath.Join(".gemini", "config", "hooks.json"), func(d map[string]any) bool { return deleteKey(d, "", "fleet") }},
+	})
+	if err != nil {
+		return nil, err
 	}
-
-	agyMCP := filepath.Join(targetHome, ".gemini", "config", "mcp_config.json")
-	if pathExists(agyMCP) {
-		mcpData, err := loadJSON(agyMCP)
-		if err != nil {
-			return nil, err
-		}
-		if servers, ok := mcpData["mcpServers"].(map[string]any); ok {
-			if _, exists := servers["fleet"]; exists {
-				delete(servers, "fleet")
-				txt, err := marshalPrettyJSON(mcpData)
-				if err != nil {
-					return nil, err
-				}
-				if wrote, err := writeUserFile(agyMCP, txt, nil, nil); err != nil {
-					return nil, err
-				} else if wrote {
-					changed = append(changed, agyMCP)
-				}
-			}
-		}
-	}
-
-	agyHooks := filepath.Join(targetHome, ".gemini", "config", "hooks.json")
-	if pathExists(agyHooks) {
-		agyHooksData, err := loadJSON(agyHooks)
-		if err != nil {
-			return nil, err
-		}
-		if _, exists := agyHooksData["fleet"]; exists {
-			delete(agyHooksData, "fleet")
-			txt, err := marshalPrettyJSON(agyHooksData)
-			if err != nil {
-				return nil, err
-			}
-			if wrote, err := writeUserFile(agyHooks, txt, nil, nil); err != nil {
-				return nil, err
-			} else if wrote {
-				changed = append(changed, agyHooks)
-			}
-		}
-	}
-
-	return changed, nil
+	return append(changed, edited...), nil
 }
 
 // Status reports {harness: configured} for all supported harnesses.
@@ -661,42 +472,27 @@ func Status(home string) map[string]bool {
 	if targetHome == "" {
 		targetHome, _ = os.UserHomeDir()
 	}
-	hasFleetHook := func(hooksMap map[string]any, harness string) bool {
-		if hooksMap == nil {
-			return false
-		}
+	hasFleetHook := func(relPath, harness string) bool {
+		d, _ := loadJSON(filepath.Join(targetHome, relPath))
+		hooksMap := subMap(d, "hooks", false)
 		entries, _ := hooksMap["SessionStart"].([]any)
-		for _, g := range entries {
-			if isFleetHookGroup(g, harness) {
-				return true
-			}
+		return slices.ContainsFunc(entries, func(g any) bool { return isFleetHookGroup(g, harness) })
+	}
+	hasKey := func(relPath, sub, key string) bool {
+		d, _ := loadJSON(filepath.Join(targetHome, relPath))
+		m := d
+		if sub != "" {
+			m = subMap(d, sub, false)
 		}
-		return false
+		_, ok := m[key]
+		return ok
 	}
 
-	clData, _ := loadJSON(filepath.Join(targetHome, ".claude.json"))
-	clMCP, _ := clData["mcpServers"].(map[string]any)
-	clSet, _ := loadJSON(filepath.Join(targetHome, ".claude", "settings.json"))
-	clHooks, _ := clSet["hooks"].(map[string]any)
-	_, hasClMCP := clMCP["fleet"]
-	claudeOK := hasClMCP && hasFleetHook(clHooks, "claude")
-
 	codexTOMLRaw, _ := os.ReadFile(filepath.Join(targetHome, ".codex", "config.toml"))
-	cxHooksData, _ := loadJSON(filepath.Join(targetHome, ".codex", "hooks.json"))
-	cxHooks, _ := cxHooksData["hooks"].(map[string]any)
-	codexOK := strings.Contains(string(codexTOMLRaw), "[mcp_servers.fleet]") && hasFleetHook(cxHooks, "codex")
-
-	agyMCPData, _ := loadJSON(filepath.Join(targetHome, ".gemini", "config", "mcp_config.json"))
-	agyMCP, _ := agyMCPData["mcpServers"].(map[string]any)
-	agyHooksData, _ := loadJSON(filepath.Join(targetHome, ".gemini", "config", "hooks.json"))
-	_, hasAgyMCP := agyMCP["fleet"]
-	_, hasAgyHooks := agyHooksData["fleet"]
-	agyOK := hasAgyMCP && hasAgyHooks
-
 	return map[string]bool{
-		"claude":      claudeOK,
-		"codex":       codexOK,
-		"antigravity": agyOK,
+		"claude":      hasKey(".claude.json", "mcpServers", "fleet") && hasFleetHook(filepath.Join(".claude", "settings.json"), "claude"),
+		"codex":       strings.Contains(string(codexTOMLRaw), "[mcp_servers.fleet]") && hasFleetHook(filepath.Join(".codex", "hooks.json"), "codex"),
+		"antigravity": hasKey(filepath.Join(".gemini", "config", "mcp_config.json"), "mcpServers", "fleet") && hasKey(filepath.Join(".gemini", "config", "hooks.json"), "", "fleet"),
 	}
 }
 
@@ -705,21 +501,13 @@ func SyncOwnerConfigs(owner string) ([]string, error) {
 	if owner == "" || owner == "root" {
 		return nil, nil
 	}
-	u, err := user.Lookup(owner)
+	home := paths.HomeForUser(owner)
+	if home == "" {
+		return nil, fmt.Errorf("lookup user %q failed", owner)
+	}
+	uid, gid, err := paths.LookupUIDGID(owner)
 	if err != nil {
 		return nil, err
 	}
-	uid, err := strconv.Atoi(u.Uid)
-	if err != nil {
-		return nil, err
-	}
-	gid, err := strconv.Atoi(u.Gid)
-	if err != nil {
-		return nil, err
-	}
-	return Install(InstallOpts{
-		Home: u.HomeDir,
-		UID:  &uid,
-		GID:  &gid,
-	})
+	return Install(InstallOpts{Home: home, UID: &uid, GID: &gid})
 }

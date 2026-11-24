@@ -2,6 +2,7 @@
 package core
 
 import (
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +32,9 @@ type FleetError struct {
 }
 
 func (e *FleetError) Error() string { return e.Msg }
+
+// HTTPStatus returns the HTTP status code associated with this error.
+func (e *FleetError) HTTPStatus() int { return e.Status }
 
 func newFleetErr(msg string, status int) *FleetError {
 	if status == 0 {
@@ -111,12 +115,12 @@ type InitOpts struct {
 
 // ApproveOpts configures Fleet.Approve.
 type ApproveOpts struct {
-	Name       string
-	Pubkey     string
-	Kind       string
-	Group      string
-	Passphrase string
-	Replace    bool
+	Name       string `json:"name"`
+	Pubkey     string `json:"pubkey"`
+	Kind       string `json:"kind"`
+	Group      string `json:"group"`
+	Passphrase string `json:"passphrase"`
+	Replace    bool   `json:"replace"`
 }
 
 // Fleet coordinates CA keys, the device registry, and the agent session hub.
@@ -254,8 +258,8 @@ func (f *Fleet) Settings() (map[string]string, error) {
 	return out, nil
 }
 
-// DdnsConfig loads the stored Route 53 configuration, or nil if unconfigured.
-func (f *Fleet) DdnsConfig() (*ddns.Route53, error) {
+// DDNSConfig loads the stored Route 53 configuration, or nil if unconfigured.
+func (f *Fleet) DDNSConfig() (*ddns.Route53, error) {
 	zone, ok, err := f.Registry.Setting("ddns_zone_id")
 	if err != nil || !ok || zone == "" {
 		return nil, err
@@ -284,8 +288,8 @@ func (f *Fleet) DdnsConfig() (*ddns.Route53, error) {
 	}, nil
 }
 
-// SetDdns stores Route 53 DDNS configuration in fleet.db.
-func (f *Fleet) SetDdns(cfg ddns.Route53) error {
+// SetDDNS stores Route 53 DDNS configuration in fleet.db.
+func (f *Fleet) SetDDNS(cfg ddns.Route53) error {
 	for _, kv := range [][2]string{
 		{"ddns_name", cfg.Name},
 		{"ddns_zone_id", cfg.ZoneID},
@@ -356,12 +360,8 @@ func (f *Fleet) sign(pubkey, name, ip, group, passphrase string, hours int) (str
 		Hours:      hours,
 	})
 	if err != nil {
-		var pkiErr *pki.PkiError
-		if errors.As(err, &pkiErr) {
-			if strings.Contains(pkiErr.Msg, "invalid passphrase") {
-				return "", newFleetErr(WrongPassphraseMsg, 401)
-			}
-			return "", newFleetErr("signing failed: "+pkiErr.Msg, 400)
+		if strings.Contains(err.Error(), "invalid passphrase") {
+			return "", newFleetErr(WrongPassphraseMsg, 401)
 		}
 		return "", newFleetErr("signing failed: "+err.Error(), 400)
 	}
@@ -381,14 +381,7 @@ func (f *Fleet) mobileHours() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	hours := rem - 1
-	if hours > paths.MobileCertHours {
-		hours = paths.MobileCertHours
-	}
-	if hours < 1 {
-		hours = 1
-	}
-	return hours, nil
+	return max(min(rem-1, paths.MobileCertHours), 1), nil
 }
 
 // Identify resolves the calling device from peerIP (loopback -> lighthouse; mesh IP -> active device).
@@ -397,23 +390,22 @@ func (f *Fleet) Identify(peerIP string) (*registry.Device, error) {
 		return f.IdentifyOverride(peerIP), nil
 	}
 	addr, err := netip.ParseAddr(peerIP)
-	if err != nil {
-		return nil, nil
-	}
-	if addr.IsLoopback() {
-		return f.Registry.Lighthouse()
-	}
-	meshPrefix, err := netip.ParsePrefix(paths.MeshCIDR)
-	if err != nil {
-		return nil, err
-	}
-	if meshPrefix.Contains(addr) {
-		dev, err := f.Registry.ByIP(addr.String())
-		if err != nil {
-			return nil, err
+	if err == nil {
+		if addr.IsLoopback() {
+			return f.Registry.Lighthouse()
 		}
-		if dev != nil && dev.Active() {
-			return dev, nil
+		meshPrefix, pErr := netip.ParsePrefix(paths.MeshCIDR)
+		if pErr != nil {
+			return nil, pErr
+		}
+		if meshPrefix.Contains(addr) {
+			dev, bErr := f.Registry.ByIP(addr.String())
+			if bErr != nil {
+				return nil, bErr
+			}
+			if dev != nil && dev.Active() {
+				return dev, nil
+			}
 		}
 	}
 	return nil, nil
@@ -452,7 +444,7 @@ func (f *Fleet) BinaryForPlatform(osName, archName string) (string, string, stri
 	}
 	m, err := f.ReadBinaryManifest()
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return "", "", "", newFleetErr("no published binary manifest on lighthouse", 404)
 		}
 		return "", "", "", err
@@ -510,26 +502,65 @@ func (f *Fleet) Sync(dev *registry.Device, clientVersion, osName, archName strin
 	return res, nil
 }
 
-// Approve validates, signs, and registers (or re-keys) a device.
-func (f *Fleet) Approve(opts ApproveOpts) (ApproveResult, error) {
-	if opts.Kind == "" {
-		opts.Kind = "mac"
-	}
-	if opts.Group == "" {
-		opts.Group = "managed"
-	}
+func normalizeApproveOpts(opts ApproveOpts) (ApproveOpts, error) {
+	opts.Kind = cmp.Or(opts.Kind, "mac")
+	opts.Group = cmp.Or(opts.Group, "managed")
 	if !paths.NamePattern.MatchString(opts.Name) {
-		return ApproveResult{}, newFleetErr("name must be lowercase letters, digits and dashes (max 32)", 400)
+		return opts, newFleetErr("name must be lowercase letters, digits and dashes (max 32)", 400)
 	}
 	if opts.Kind != "mac" && opts.Kind != "mobile" {
-		return ApproveResult{}, newFleetErr(fmt.Sprintf("unknown kind %q", opts.Kind), 400)
+		return opts, newFleetErr(fmt.Sprintf("unknown kind %q", opts.Kind), 400)
 	}
 	if !paths.ValidGroup(opts.Group) {
-		return ApproveResult{}, newFleetErr("group must be one of "+strings.Join(paths.Groups, ", "), 400)
+		return opts, newFleetErr("group must be one of "+strings.Join(paths.Groups, ", "), 400)
 	}
 	pubkey, err := pki.NormalizePubkey(opts.Pubkey)
 	if err != nil {
-		return ApproveResult{}, newFleetErr(err.Error(), 400)
+		return opts, newFleetErr(err.Error(), 400)
+	}
+	opts.Pubkey = pubkey
+	return opts, nil
+}
+
+func (f *Fleet) buildApproveResult(opts ApproveOpts, dev *registry.Device, ip, cert, notAfter string) (ApproveResult, error) {
+	caPEM, err := f.CAPem()
+	if err != nil {
+		return ApproveResult{}, err
+	}
+	caID, err := f.CAID()
+	if err != nil {
+		return ApproveResult{}, err
+	}
+	res := ApproveResult{
+		Name: opts.Name, IP: ip, Kind: opts.Kind, Group: opts.Group,
+		CA: caPEM, Cert: cert, CAID: caID, NotAfter: notAfter,
+	}
+	if opts.Kind == "mac" {
+		cfg, err := f.ConfigFor(dev)
+		if err != nil {
+			return ApproveResult{}, err
+		}
+		res.Config = cfg
+		res.API = fmt.Sprintf("http://%s:%d", paths.LighthouseIP, paths.APIPort())
+		return res, nil
+	}
+	s, err := f.Settings()
+	if err != nil {
+		return ApproveResult{}, err
+	}
+	res.Lighthouse = &LighthouseInfo{
+		IP:      paths.LighthouseIP,
+		Address: fmt.Sprintf("%s:%s", s["lighthouse_host"], s["lighthouse_port"]),
+	}
+	return res, nil
+}
+
+// Approve validates, signs, and registers (or re-keys) a device.
+func (f *Fleet) Approve(opts ApproveOpts) (ApproveResult, error) {
+	var err error
+	opts, err = normalizeApproveOpts(opts)
+	if err != nil {
+		return ApproveResult{}, err
 	}
 
 	f.approveMu.Lock()
@@ -548,20 +579,16 @@ func (f *Fleet) Approve(opts ApproveOpts) (ApproveResult, error) {
 	ip := ""
 	if existing != nil {
 		ip = existing.IP
-	} else {
-		ip, err = f.Registry.NextIP()
-		if err != nil {
-			return ApproveResult{}, err
-		}
+	} else if ip, err = f.Registry.NextIP(); err != nil {
+		return ApproveResult{}, err
 	}
 	hours := 0
 	if opts.Kind == "mobile" {
-		hours, err = f.mobileHours()
-		if err != nil {
+		if hours, err = f.mobileHours(); err != nil {
 			return ApproveResult{}, err
 		}
 	}
-	cert, err := f.sign(pubkey, opts.Name, ip, opts.Group, opts.Passphrase, hours)
+	cert, err := f.sign(opts.Pubkey, opts.Name, ip, opts.Group, opts.Passphrase, hours)
 	if err != nil {
 		return ApproveResult{}, err
 	}
@@ -570,30 +597,18 @@ func (f *Fleet) Approve(opts ApproveOpts) (ApproveResult, error) {
 		return ApproveResult{}, err
 	}
 	if existing != nil {
-		if err := f.Registry.ReplaceCert(registry.ReplaceCertParams{
-			Name:        opts.Name,
-			Grp:         opts.Group,
-			Pubkey:      pubkey,
-			Cert:        cert,
-			Fingerprint: meta.Fingerprint,
-			NotAfter:    meta.NotAfter,
-			Reason:      "replaced",
-		}); err != nil {
-			return ApproveResult{}, err
-		}
+		err = f.Registry.ReplaceCert(registry.ReplaceCertParams{
+			Name: opts.Name, Grp: opts.Group, Pubkey: opts.Pubkey, Cert: cert,
+			Fingerprint: meta.Fingerprint, NotAfter: meta.NotAfter, Reason: "replaced",
+		})
 	} else {
-		if err := f.Registry.Add(registry.AddParams{
-			Name:        opts.Name,
-			IP:          ip,
-			Kind:        opts.Kind,
-			Grp:         opts.Group,
-			Pubkey:      pubkey,
-			Cert:        cert,
-			Fingerprint: meta.Fingerprint,
-			NotAfter:    meta.NotAfter,
-		}); err != nil {
-			return ApproveResult{}, err
-		}
+		err = f.Registry.Add(registry.AddParams{
+			Name: opts.Name, IP: ip, Kind: opts.Kind, Grp: opts.Group,
+			Pubkey: opts.Pubkey, Cert: cert, Fingerprint: meta.Fingerprint, NotAfter: meta.NotAfter,
+		})
+	}
+	if err != nil {
+		return ApproveResult{}, err
 	}
 	dev, err := f.Registry.Get(opts.Name)
 	if err != nil {
@@ -602,42 +617,7 @@ func (f *Fleet) Approve(opts ApproveOpts) (ApproveResult, error) {
 	if dev == nil {
 		return ApproveResult{}, newFleetErr("device missing after registration", 500)
 	}
-	caPEM, err := f.CAPem()
-	if err != nil {
-		return ApproveResult{}, err
-	}
-	caID, err := f.CAID()
-	if err != nil {
-		return ApproveResult{}, err
-	}
-	res := ApproveResult{
-		Name:     opts.Name,
-		IP:       ip,
-		Kind:     opts.Kind,
-		Group:    opts.Group,
-		CA:       caPEM,
-		Cert:     cert,
-		CAID:     caID,
-		NotAfter: meta.NotAfter,
-	}
-	if opts.Kind == "mac" {
-		cfg, err := f.ConfigFor(dev)
-		if err != nil {
-			return ApproveResult{}, err
-		}
-		res.Config = cfg
-		res.API = fmt.Sprintf("http://%s:%d", paths.LighthouseIP, paths.APIPort())
-	} else {
-		s, err := f.Settings()
-		if err != nil {
-			return ApproveResult{}, err
-		}
-		res.Lighthouse = &LighthouseInfo{
-			IP:      paths.LighthouseIP,
-			Address: fmt.Sprintf("%s:%s", s["lighthouse_host"], s["lighthouse_port"]),
-		}
-	}
-	return res, nil
+	return f.buildApproveResult(opts, dev, ip, cert, meta.NotAfter)
 }
 
 // SetGroup changes a device's group by re-signing its certificate and blocklisting the old cert.

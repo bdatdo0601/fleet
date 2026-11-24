@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -21,13 +22,6 @@ import (
 var pubkeyPEMRE = regexp.MustCompile(
 	`-----BEGIN NEBULA X25519 PUBLIC KEY-----\s*([A-Za-z0-9+/=\s]+?)\s*-----END NEBULA X25519 PUBLIC KEY-----`,
 )
-
-// PkiError represents an error returned by nebula-cert or key parsing.
-type PkiError struct {
-	Msg string
-}
-
-func (e *PkiError) Error() string { return e.Msg }
 
 // CertInfo holds parsed certificate details from `nebula-cert print -json`.
 type CertInfo struct {
@@ -55,7 +49,7 @@ type SignOpts struct {
 func binPath() (string, error) {
 	p, err := exec.LookPath("nebula-cert")
 	if err != nil {
-		return "", &PkiError{Msg: "nebula-cert not found (brew install nebula)"}
+		return "", errors.New("nebula-cert not found (brew install nebula)")
 	}
 	return p, nil
 }
@@ -89,7 +83,7 @@ func Run(passphrase *string, args ...string) (string, error) {
 		if msg == "" && len(args) > 0 {
 			msg = fmt.Sprintf("nebula-cert %s failed", args[0])
 		}
-		return "", &PkiError{Msg: msg}
+		return "", errors.New(msg)
 	}
 	return stdout.String(), nil
 }
@@ -121,15 +115,15 @@ func Keygen(keyPath, pubPath string) error {
 func NormalizePubkey(text string) (string, error) {
 	m := pubkeyPEMRE.FindStringSubmatch(text)
 	if len(m) < 2 {
-		return "", &PkiError{Msg: "not a Nebula public key (expected a NEBULA X25519 PUBLIC KEY block)"}
+		return "", errors.New("not a Nebula public key (expected a NEBULA X25519 PUBLIC KEY block)")
 	}
 	body := strings.Join(strings.Fields(m[1]), "")
 	raw, err := base64.StdEncoding.DecodeString(body)
 	if err != nil {
-		return "", &PkiError{Msg: fmt.Sprintf("invalid Nebula public key base64: %v", err)}
+		return "", fmt.Errorf("invalid Nebula public key base64: %w", err)
 	}
 	if len(raw) != 32 {
-		return "", &PkiError{Msg: "public key has the wrong length"}
+		return "", errors.New("public key has the wrong length")
 	}
 	return "-----BEGIN NEBULA X25519 PUBLIC KEY-----\n" + body + "\n-----END NEBULA X25519 PUBLIC KEY-----\n", nil
 }
@@ -138,7 +132,7 @@ func NormalizePubkey(text string) (string, error) {
 func PubkeyHex(pem string) (string, error) {
 	m := pubkeyPEMRE.FindStringSubmatch(pem)
 	if len(m) < 2 {
-		return "", &PkiError{Msg: "not a Nebula public key"}
+		return "", errors.New("not a Nebula public key")
 	}
 	body := strings.Join(strings.Fields(m[1]), "")
 	raw, err := base64.StdEncoding.DecodeString(body)
@@ -225,7 +219,7 @@ func Info(certPEM string) (CertInfo, error) {
 			return CertInfo{}, err
 		}
 		if len(list) == 0 {
-			return CertInfo{}, &PkiError{Msg: "empty certificate list"}
+			return CertInfo{}, errors.New("empty certificate list")
 		}
 		item = list[0]
 	} else {

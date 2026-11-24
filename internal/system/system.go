@@ -3,13 +3,16 @@ package system
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
@@ -27,6 +30,24 @@ import (
 	"github.com/bdatdo0601/fleet/internal/paths"
 	"github.com/bdatdo0601/fleet/internal/version"
 )
+
+func rootIDs() (*int, *int) {
+	if !IsRoot() {
+		return nil, nil
+	}
+	return new(0), new(0)
+}
+
+func ownerIDs(owner string) (*int, *int) {
+	if !IsRoot() || owner == "" || owner == "root" {
+		return nil, nil
+	}
+	uid, gid, err := paths.LookupUIDGID(owner)
+	if err != nil {
+		return nil, nil
+	}
+	return &uid, &gid
+}
 
 const (
 	LaunchDaemonsDir = "/Library/LaunchDaemons"
@@ -61,7 +82,7 @@ func Sudo(check bool, args ...string) (string, string, int, error) {
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
 			code := 1
-			if ee, ok := err.(*exec.ExitError); ok {
+			if ee, ok := errors.AsType[*exec.ExitError](err); ok {
 				code = ee.ExitCode()
 			}
 			return "", "", code, err
@@ -75,7 +96,7 @@ func Sudo(check bool, args ...string) (string, string, int, error) {
 	code := 0
 	if err != nil {
 		code = 1
-		if ee, ok := err.(*exec.ExitError); ok {
+		if ee, ok := errors.AsType[*exec.ExitError](err); ok {
 			code = ee.ExitCode()
 		}
 	}
@@ -87,23 +108,12 @@ func WriteRootFile(path, content string, mode os.FileMode) (bool, error) {
 	if mode == 0 {
 		mode = 0o644
 	}
+	if IsRoot() {
+		uid, gid := rootIDs()
+		return paths.WriteFileAtomic(path, []byte(content), mode, uid, gid)
+	}
 	if existing, err := os.ReadFile(path); err == nil && string(existing) == content {
 		return false, nil
-	}
-	if IsRoot() {
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			return false, err
-		}
-		tmp := filepath.Join(filepath.Dir(path), fmt.Sprintf(".%s.%d.tmp", filepath.Base(path), os.Getpid()))
-		if err := os.WriteFile(tmp, []byte(content), mode); err != nil {
-			return false, err
-		}
-		_ = os.Chmod(tmp, mode)
-		if err := os.Rename(tmp, path); err != nil {
-			_ = os.Remove(tmp)
-			return false, err
-		}
-		return true, nil
 	}
 	tmpFile, err := os.CreateTemp("", "fleet-root-*")
 	if err != nil {
@@ -267,7 +277,7 @@ func BuildDaemonPlist(opts DaemonOpts) (string, error) {
 	b.WriteString("\t<key>StandardErrorPath</key>\n\t<string>" + xmlEscape(opts.LogPath) + "</string>\n")
 	b.WriteString("\t<key>StandardOutPath</key>\n\t<string>" + xmlEscape(opts.LogPath) + "</string>\n")
 	if opts.Interval > 0 {
-		b.WriteString(fmt.Sprintf("\t<key>StartInterval</key>\n\t<integer>%d</integer>\n", opts.Interval))
+		fmt.Fprintf(&b, "\t<key>StartInterval</key>\n\t<integer>%d</integer>\n", opts.Interval)
 	}
 	if opts.User != "" {
 		b.WriteString("\t<key>UserName</key>\n\t<string>" + xmlEscape(opts.User) + "</string>\n")
@@ -281,7 +291,7 @@ func BuildDaemonPlist(opts DaemonOpts) (string, error) {
 
 func reloadDaemon(label, plistPath string) error {
 	_, _, _, _ = Sudo(false, "launchctl", "bootout", "system/"+label)
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		if !LaunchdLoaded(label) {
 			break
 		}
@@ -289,7 +299,7 @@ func reloadDaemon(label, plistPath string) error {
 	}
 	var lastStderr string
 	var lastErr error
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		_, stderrStr, rc, err := Sudo(false, "launchctl", "bootstrap", "system", plistPath)
 		if err == nil && rc == 0 {
 			return nil
@@ -298,7 +308,7 @@ func reloadDaemon(label, plistPath string) error {
 		lastErr = err
 		time.Sleep(300 * time.Millisecond)
 	}
-	return fmt.Errorf("launchctl bootstrap %s failed: %v (%s)", plistPath, lastErr, strings.TrimSpace(lastStderr))
+	return fmt.Errorf("launchctl bootstrap %s failed: %w (%s)", plistPath, lastErr, strings.TrimSpace(lastStderr))
 }
 
 // InstallDaemon writes the LaunchDaemon plist and loads/restarts it in launchd.
@@ -393,9 +403,9 @@ func InstallServeDaemon(binPath, username, stateDir, workDir string) error {
 	})
 }
 
-// InstallDdnsDaemon installs/updates the lighthouse `fleet ddns run` LaunchDaemon.
+// InstallDDNSDaemon installs/updates the lighthouse `fleet ddns run` LaunchDaemon.
 // stateDir is passed explicitly so ddns.log stays in the admin user's ~/.fleet even when run as root.
-func InstallDdnsDaemon(binPath, username, stateDir, workDir string) error {
+func InstallDDNSDaemon(binPath, username, stateDir, workDir string) error {
 	if binPath == "" {
 		binPath = paths.InstalledBinaryPath()
 	}
@@ -406,7 +416,7 @@ func InstallDdnsDaemon(binPath, username, stateDir, workDir string) error {
 		workDir = stateDir
 	}
 	return InstallDaemon(DaemonOpts{
-		Label:    paths.DdnsLabel,
+		Label:    paths.DDNSLabel,
 		Args:     []string{binPath, "ddns", "run"},
 		User:     username,
 		Interval: paths.SyncIntervalSeconds,
@@ -432,23 +442,6 @@ func PathOwner(p string) (string, error) {
 	return u.Username, nil
 }
 
-// LookupUIDGID returns numeric uid/gid for username.
-func LookupUIDGID(username string) (int, int, error) {
-	u, err := user.Lookup(username)
-	if err != nil {
-		return 0, 0, err
-	}
-	uid, err := strconv.Atoi(u.Uid)
-	if err != nil {
-		return 0, 0, err
-	}
-	gid, err := strconv.Atoi(u.Gid)
-	if err != nil {
-		return 0, 0, err
-	}
-	return uid, gid, nil
-}
-
 // FileSHA256 computes lowercase SHA-256 hex digest and size of path.
 func FileSHA256(path string) (string, int64, error) {
 	f, err := os.Open(path)
@@ -470,7 +463,7 @@ func SmokeTestBinary(binPath string) error {
 	defer cancel()
 	out, err := exec.CommandContext(ctx, binPath, "version").CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("smoke test `%s version` failed: %v (%s)", binPath, err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("smoke test `%s version` failed: %w (%s)", binPath, err, strings.TrimSpace(string(out)))
 	}
 	if !strings.Contains(string(out), "fleet ") {
 		return fmt.Errorf("smoke test `%s version` returned unexpected output: %q", binPath, strings.TrimSpace(string(out)))
@@ -504,62 +497,18 @@ func EnsureSymlink(target, linkPath string) error {
 	return err
 }
 
-func ensureExecDir(dir string) error {
-	var missing []string
-	cur := dir
-	for {
-		if _, err := os.Stat(cur); err == nil {
-			break
-		}
-		missing = append(missing, cur)
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			break
-		}
-		cur = parent
-	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	for _, d := range missing {
-		_ = os.Chmod(d, 0o755)
-		if IsRoot() {
-			_ = os.Chown(d, 0, 0)
-		}
-	}
-	_ = os.Chmod(dir, 0o755)
-	return nil
-}
-
 func copyFileAtomic(src, dst string, mode os.FileMode) error {
-	dir := filepath.Dir(dst)
-	if err := ensureExecDir(dir); err != nil {
-		return err
-	}
-	in, err := os.Open(src)
+	data, err := os.ReadFile(src)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = in.Close() }()
-	tmp := filepath.Join(dir, fmt.Sprintf(".%s.%d.tmp", filepath.Base(dst), os.Getpid()))
-	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	uid, gid := rootIDs()
+	written, err := paths.WriteFileAtomic(dst, data, mode, uid, gid)
 	if err != nil {
 		return err
 	}
-	_, copyErr := io.Copy(out, in)
-	closeErr := out.Close()
-	if copyErr != nil {
-		_ = os.Remove(tmp)
-		return copyErr
-	}
-	if closeErr != nil {
-		_ = os.Remove(tmp)
-		return closeErr
-	}
-	_ = os.Chmod(tmp, mode)
-	if err := os.Rename(tmp, dst); err != nil {
-		_ = os.Remove(tmp)
-		return err
+	if !written {
+		_ = os.Chmod(dst, mode)
 	}
 	return nil
 }
@@ -646,9 +595,7 @@ func RunAsOwner(owner, workDir string, envOverrides map[string]string, timeout t
 			envMap["HOME"] = h
 		}
 	}
-	for k, v := range envOverrides {
-		envMap[k] = v
-	}
+	maps.Copy(envMap, envOverrides)
 
 	var cmd *exec.Cmd
 	if IsRoot() && owner != "" && owner != "root" {
@@ -737,219 +684,164 @@ func waitHealthy(apiURL string, timeout time.Duration, checkFn func(string) bool
 }
 
 func writeOwnerFile(path string, data []byte, mode os.FileMode, owner string) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
+	uid, gid := ownerIDs(owner)
+	_, err := paths.WriteFileAtomic(path, data, mode, uid, gid)
+	return err
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
+}
+
+func pullLighthouseRepo(repoDir, owner string) string {
+	gitEnv := map[string]string{"GIT_TERMINAL_PROMPT": "0", "GIT_SSH_COMMAND": "ssh -o BatchMode=yes"}
+	if !fileExists(filepath.Join(repoDir, ".git")) {
+		return ""
 	}
-	tmp := filepath.Join(dir, fmt.Sprintf(".%s.%d.tmp", filepath.Base(path), os.Getpid()))
-	if err := os.WriteFile(tmp, data, mode); err != nil {
-		return err
+	if _, pullErrOut, err := RunAsOwner(owner, repoDir, gitEnv, 60*time.Second, "git", "-C", repoDir, "pull", "--ff-only", "-q"); err != nil {
+		detail := cmp.Or(strings.TrimSpace(pullErrOut), "git pull failed")
+		_, _ = fmt.Fprintf(os.Stderr, "self-update skipped: %s\n", detail)
 	}
-	_ = os.Chmod(tmp, mode)
-	if IsRoot() && owner != "" && owner != "root" {
-		if uid, gid, err := LookupUIDGID(owner); err == nil {
-			_ = os.Chown(dir, uid, gid)
-			_ = os.Chown(tmp, uid, gid)
+	if out, _, err := RunAsOwner(owner, repoDir, gitEnv, 15*time.Second, "git", "-C", repoDir, "rev-parse", "HEAD"); err == nil {
+		return strings.TrimSpace(out)
+	}
+	return ""
+}
+
+func buildDarwinBinaries(repoDir, binDir, owner, headSHA, builtAt string) (map[string]string, error) {
+	goBin := FindGoBinary()
+	if goBin == "" {
+		return nil, fmt.Errorf("go not found on lighthouse (install with: brew install go)")
+	}
+	uid, gid := ownerIDs(owner)
+	if err := paths.EnsureDir(binDir, 0o755, uid, gid); err != nil {
+		return nil, err
+	}
+	ldflags := fmt.Sprintf(
+		"-s -w -X github.com/bdatdo0601/fleet/internal/version.Commit=%s -X github.com/bdatdo0601/fleet/internal/version.BuiltAt=%s",
+		cmp.Or(headSHA, "dev"), builtAt,
+	)
+	tmpBins := map[string]string{}
+	for _, arch := range []string{"arm64", "amd64"} {
+		tmpOut := filepath.Join(binDir, fmt.Sprintf(".fleet-darwin-%s.tmp", arch))
+		tmpBins[arch] = tmpOut
+		buildEnv := map[string]string{"CGO_ENABLED": "0", "GOOS": "darwin", "GOARCH": arch, "GOTOOLCHAIN": "auto"}
+		if _, stderrStr, err := RunAsOwner(owner, repoDir, buildEnv, 240*time.Second, goBin, "build", "-ldflags", ldflags, "-o", tmpOut, "./cmd/fleet"); err != nil {
+			for _, p := range tmpBins {
+				_ = os.Remove(p)
+			}
+			return nil, fmt.Errorf("go build darwin/%s failed: %w (%s)", arch, err, strings.TrimSpace(stderrStr))
 		}
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	return tmpBins, nil
+}
+
+func restartAndVerifyLighthouse(opts LighthouseUpdateOpts, targetBin, prevBin, owner, stateDir string) error {
+	if opts.SkipDaemonControl {
+		return nil
+	}
+	ensureServe := func() {
+		if LaunchdLoaded(paths.ServeLabel) {
+			Restart(paths.ServeLabel)
+		} else {
+			_ = InstallServeDaemon(targetBin, owner, stateDir, stateDir)
+		}
+	}
+	if err := InstallServeDaemon(targetBin, owner, stateDir, stateDir); err != nil {
+		_ = RollbackBinary(targetBin, prevBin)
+		ensureServe()
 		return err
 	}
+	if LaunchdLoaded(paths.DDNSLabel) {
+		_ = InstallDDNSDaemon(targetBin, owner, stateDir, stateDir)
+	}
+	localAPI := cmp.Or(opts.LocalAPI, fmt.Sprintf("http://127.0.0.1:%d", paths.APIPort()))
+	if !waitHealthy(localAPI, opts.HealthcheckTimeout, opts.HealthcheckFn) {
+		_ = RollbackBinary(targetBin, prevBin)
+		ensureServe()
+		return fmt.Errorf("new fleet serve failed health check; rolled back")
+	}
 	return nil
+}
+
+func publishManifest(binDir, owner, headSHA, builtAt string, tmpBins map[string]string) error {
+	uid, gid := ownerIDs(owner)
+	manifest := core.BinaryManifest{Version: version.Version, Commit: headSHA, BuiltAt: builtAt, Binaries: map[string]core.BinaryEntry{}}
+	for _, arch := range []string{"arm64", "amd64"} {
+		finalName := "fleet-darwin-" + arch
+		finalPath := filepath.Join(binDir, finalName)
+		if err := os.Rename(tmpBins[arch], finalPath); err != nil {
+			return err
+		}
+		_ = os.Chmod(finalPath, 0o755)
+		if uid != nil && gid != nil {
+			_ = os.Chown(finalPath, *uid, *gid)
+		}
+		sha, sz, err := FileSHA256(finalPath)
+		if err != nil {
+			return err
+		}
+		manifest.Binaries["darwin/"+arch] = core.BinaryEntry{File: finalName, SHA256: sha, Size: sz}
+	}
+	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeOwnerFile(filepath.Join(binDir, "manifest.json"), append(manifestBytes, '\n'), 0o644, owner)
 }
 
 // SelfUpdateLighthouse pulls git, builds darwin/arm64 & darwin/amd64 when needed,
 // installs and healthchecks `fleet serve` (rolling back on failure), and publishes manifest.json only when healthy.
 func SelfUpdateLighthouse(opts LighthouseUpdateOpts) (bool, error) {
-	if opts.RepoDir == "" {
-		return false, nil
-	}
-	if _, err := os.Stat(filepath.Join(opts.RepoDir, "go.mod")); err != nil {
+	if opts.RepoDir == "" || !fileExists(filepath.Join(opts.RepoDir, "go.mod")) {
 		return false, nil
 	}
 	owner := opts.Owner
 	if owner == "" {
-		if o, err := PathOwner(opts.RepoDir); err == nil {
-			owner = o
-		}
+		owner, _ = PathOwner(opts.RepoDir)
 	}
-	stateDir := opts.StateDir
-	if stateDir == "" {
-		stateDir = paths.StateDirForOwner(owner)
-	}
-	targetBin := opts.TargetBin
-	if targetBin == "" {
-		targetBin = paths.InstalledBinaryPath()
-	}
-	symlinkPath := opts.SymlinkPath
-	if symlinkPath == "" {
-		symlinkPath = paths.SymlinkPath()
-	}
+	stateDir := cmp.Or(opts.StateDir, paths.StateDirForOwner(owner))
+	targetBin := cmp.Or(opts.TargetBin, paths.InstalledBinaryPath())
+	symlinkPath := cmp.Or(opts.SymlinkPath, paths.SymlinkPath())
 
-	gitEnv := map[string]string{
-		"GIT_TERMINAL_PROMPT": "0",
-		"GIT_SSH_COMMAND":     "ssh -o BatchMode=yes",
-	}
-	headSHA := ""
-	if _, err := os.Stat(filepath.Join(opts.RepoDir, ".git")); err == nil {
-		if _, pullErrOut, err := RunAsOwner(owner, opts.RepoDir, gitEnv, 60*time.Second, "git", "-C", opts.RepoDir, "pull", "--ff-only", "-q"); err != nil {
-			detail := strings.TrimSpace(pullErrOut)
-			if detail == "" {
-				detail = "git pull failed"
-			}
-			_, _ = fmt.Fprintf(os.Stderr, "self-update skipped: %s\n", detail)
-		}
-		if out, _, err := RunAsOwner(owner, opts.RepoDir, gitEnv, 15*time.Second, "git", "-C", opts.RepoDir, "rev-parse", "HEAD"); err == nil {
-			headSHA = strings.TrimSpace(out)
-		}
-	}
-
+	headSHA := pullLighthouseRepo(opts.RepoDir, owner)
 	binDir := filepath.Join(stateDir, "bin")
-	manifestPath := filepath.Join(binDir, "manifest.json")
-	var existingManifest core.BinaryManifest
+	var existing core.BinaryManifest
 	manifestOK := false
-	if raw, err := os.ReadFile(manifestPath); err == nil {
-		if json.Unmarshal(raw, &existingManifest) == nil && len(existingManifest.Binaries) > 0 {
-			manifestOK = true
-		}
+	if raw, err := os.ReadFile(filepath.Join(binDir, "manifest.json")); err == nil {
+		manifestOK = json.Unmarshal(raw, &existing) == nil && len(existing.Binaries) > 0
 	}
-	_, binStatErr := os.Stat(targetBin)
-	targetExists := binStatErr == nil
-
-	needBuild := opts.Rebuild || !targetExists || !manifestOK
-	if !needBuild && headSHA != "" && existingManifest.Commit != headSHA {
-		needBuild = true
-	}
-	if !needBuild {
+	if !opts.Rebuild && fileExists(targetBin) && manifestOK && (headSHA == "" || existing.Commit == headSHA) {
 		return false, nil
 	}
 
-	goBin := FindGoBinary()
-	if goBin == "" {
-		return false, fmt.Errorf("go not found on lighthouse (install with: brew install go)")
-	}
-	if err := os.MkdirAll(binDir, 0o755); err != nil {
+	builtAt := time.Now().UTC().Format(time.RFC3339)
+	tmpBins, err := buildDarwinBinaries(opts.RepoDir, binDir, owner, headSHA, builtAt)
+	if err != nil {
 		return false, err
 	}
-	if IsRoot() && owner != "" && owner != "root" {
-		if uid, gid, err := LookupUIDGID(owner); err == nil {
-			_ = os.Chown(stateDir, uid, gid)
-			_ = os.Chown(binDir, uid, gid)
-		}
-	}
-
-	builtAt := time.Now().UTC().Format(time.RFC3339)
-	commitVal := headSHA
-	if commitVal == "" {
-		commitVal = "dev"
-	}
-	ldflags := fmt.Sprintf(
-		"-s -w -X github.com/bdatdo0601/fleet/internal/version.Commit=%s -X github.com/bdatdo0601/fleet/internal/version.BuiltAt=%s",
-		commitVal, builtAt,
-	)
-
-	arches := []string{"arm64", "amd64"}
-	tmpBins := map[string]string{}
 	cleanupTmp := func() {
 		for _, p := range tmpBins {
 			_ = os.Remove(p)
 		}
 	}
-	for _, arch := range arches {
-		tmpOut := filepath.Join(binDir, fmt.Sprintf(".fleet-darwin-%s.tmp", arch))
-		tmpBins[arch] = tmpOut
-		buildEnv := map[string]string{
-			"CGO_ENABLED": "0",
-			"GOOS":        "darwin",
-			"GOARCH":      arch,
-			"GOTOOLCHAIN": "auto",
-		}
-		_, stderrStr, err := RunAsOwner(
-			owner, opts.RepoDir, buildEnv, 240*time.Second,
-			goBin, "build", "-ldflags", ldflags, "-o", tmpOut, "./cmd/fleet",
-		)
-		if err != nil {
-			cleanupTmp()
-			return false, fmt.Errorf("go build darwin/%s failed: %v (%s)", arch, err, strings.TrimSpace(stderrStr))
-		}
-	}
-
-	hostArch := runtime.GOARCH
-	hostTmp, ok := tmpBins[hostArch]
+	hostTmp, ok := tmpBins[runtime.GOARCH]
 	if !ok {
 		cleanupTmp()
-		return false, fmt.Errorf("unsupported host arch %s", hostArch)
+		return false, fmt.Errorf("unsupported host arch %s", runtime.GOARCH)
 	}
 	prevBin, err := InstallBinaryAtomic(hostTmp, targetBin, symlinkPath)
 	if err != nil {
 		cleanupTmp()
 		return false, err
 	}
-
-	if !opts.SkipDaemonControl {
-		ensureServeRunning := func() {
-			if LaunchdLoaded(paths.ServeLabel) {
-				Restart(paths.ServeLabel)
-			} else {
-				_ = InstallServeDaemon(targetBin, owner, stateDir, stateDir)
-			}
-		}
-		if err := InstallServeDaemon(targetBin, owner, stateDir, stateDir); err != nil {
-			_ = RollbackBinary(targetBin, prevBin)
-			ensureServeRunning()
-			cleanupTmp()
-			return false, err
-		}
-		if LaunchdLoaded(paths.DdnsLabel) {
-			_ = InstallDdnsDaemon(targetBin, owner, stateDir, stateDir)
-		}
-		localAPI := opts.LocalAPI
-		if localAPI == "" {
-			localAPI = fmt.Sprintf("http://127.0.0.1:%d", paths.APIPort())
-		}
-		if !waitHealthy(localAPI, opts.HealthcheckTimeout, opts.HealthcheckFn) {
-			_ = RollbackBinary(targetBin, prevBin)
-			ensureServeRunning()
-			cleanupTmp()
-			return false, fmt.Errorf("new fleet serve failed health check; rolled back")
-		}
-	}
-
-	manifest := core.BinaryManifest{
-		Version:  version.Version,
-		Commit:   headSHA,
-		BuiltAt:  builtAt,
-		Binaries: map[string]core.BinaryEntry{},
-	}
-	for _, arch := range arches {
-		finalName := fmt.Sprintf("fleet-darwin-%s", arch)
-		finalPath := filepath.Join(binDir, finalName)
-		if err := os.Rename(tmpBins[arch], finalPath); err != nil {
-			cleanupTmp()
-			return false, err
-		}
-		_ = os.Chmod(finalPath, 0o755)
-		if IsRoot() && owner != "" && owner != "root" {
-			if uid, gid, err := LookupUIDGID(owner); err == nil {
-				_ = os.Chown(finalPath, uid, gid)
-			}
-		}
-		sha, sz, err := FileSHA256(finalPath)
-		if err != nil {
-			return false, err
-		}
-		manifest.Binaries["darwin/"+arch] = core.BinaryEntry{
-			File:   finalName,
-			SHA256: sha,
-			Size:   sz,
-		}
-	}
-	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
+	if err := restartAndVerifyLighthouse(opts, targetBin, prevBin, owner, stateDir); err != nil {
+		cleanupTmp()
 		return false, err
 	}
-	if err := writeOwnerFile(manifestPath, append(manifestBytes, '\n'), 0o644, owner); err != nil {
+	if err := publishManifest(binDir, owner, headSHA, builtAt, tmpBins); err != nil {
+		cleanupTmp()
 		return false, err
 	}
 	return true, nil

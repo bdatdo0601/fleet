@@ -77,7 +77,7 @@ func TestDNSHelpers(t *testing.T) {
 	curDig := func(args ...string) ([]string, error) {
 		calls = append(calls, args)
 		if args[len(args)-1] == "@ns-1.awsdns.com" {
-			return nil, &DdnsError{Msg: "timeout"}
+			return nil, errors.New("timeout")
 		}
 		return []string{"9.9.9.9"}, nil
 	}
@@ -93,7 +93,7 @@ func TestDNSHelpers(t *testing.T) {
 	if err != nil || rec != nil {
 		t.Fatalf("expected nil record, got (%v, %v)", rec, err)
 	}
-	_, err = CurrentRecord(testCfg, func(...string) ([]string, error) { return nil, &DdnsError{Msg: "x"} })
+	_, err = CurrentRecord(testCfg, func(...string) ([]string, error) { return nil, errors.New("x") })
 	if err == nil || !strings.Contains(err.Error(), "no authoritative") {
 		t.Fatalf("expected error, got %v", err)
 	}
@@ -130,7 +130,7 @@ func TestSync(t *testing.T) {
 		t.Fatalf("unexpected changes: %v", changes)
 	}
 
-	failAWS := func(name string, args ...string) (string, string, error) {
+	failAWS := func(_ string, _ ...string) (string, string, error) {
 		return "", "AccessDenied", errors.New("exit 255")
 	}
 	_, _, _, err = Sync(testCfg, makeFetcher("1.1.1.9"), func(...string) ([]string, error) { return nil, nil }, "/opt/homebrew/bin/aws", failAWS)

@@ -4,6 +4,7 @@ package ddns
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,13 +22,6 @@ var CheckIPURLs = []string{
 	"https://checkip.amazonaws.com",
 	"https://api.ipify.org",
 }
-
-// DdnsError represents a DDNS lookup or Route 53 failure.
-type DdnsError struct {
-	Msg string
-}
-
-func (e *DdnsError) Error() string { return e.Msg }
 
 // Route53 configures Route 53 A-record synchronization.
 type Route53 struct {
@@ -87,7 +81,7 @@ func isASCIIAlnum(s string) bool {
 	}
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if !((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
+		if (c < '0' || c > '9') && (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') {
 			return false
 		}
 	}
@@ -101,7 +95,7 @@ func NormalizeZoneID(zoneID string) (string, error) {
 		trimmed = trimmed[idx+1:]
 	}
 	if !strings.HasPrefix(trimmed, "Z") || !isASCIIAlnum(trimmed) {
-		return "", &DdnsError{Msg: fmt.Sprintf("%q doesn't look like a Route 53 hosted zone id (Z…)", zoneID)}
+		return "", fmt.Errorf("%q doesn't look like a Route 53 hosted zone id (Z…)", zoneID)
 	}
 	return trimmed, nil
 }
@@ -173,18 +167,18 @@ func PublicIPv4(fetch FetchFn) (string, error) {
 			continue
 		}
 		if !isGlobalPublicIPv4(addr) {
-			return "", &DdnsError{Msg: fmt.Sprintf("public address %s is not internet-routable (CGNAT?); the lighthouse can't be reached", addr)}
+			return "", fmt.Errorf("public address %s is not internet-routable (CGNAT?); the lighthouse can't be reached", addr)
 		}
 		return addr.String(), nil
 	}
-	return "", &DdnsError{Msg: "couldn't determine the public IP: " + strings.Join(errs, "; ")}
+	return "", fmt.Errorf("couldn't determine the public IP: %s", strings.Join(errs, "; "))
 }
 
 // DefaultDig executes `dig +short +time=3 +tries=2 <args...>`.
 func DefaultDig(args ...string) ([]string, error) {
 	bin, err := exec.LookPath("dig")
 	if err != nil {
-		return nil, &DdnsError{Msg: "dig not found"}
+		return nil, errors.New("dig not found")
 	}
 	cmdArgs := append([]string{"+short", "+time=3", "+tries=2"}, args...)
 	cmd := exec.Command(bin, cmdArgs...)
@@ -193,10 +187,10 @@ func DefaultDig(args ...string) ([]string, error) {
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		detail := strings.TrimSpace(stdout.String() + stderr.String())
-		return nil, &DdnsError{Msg: fmt.Sprintf("dig %s failed: %s", strings.Join(args, " "), detail)}
+		return nil, fmt.Errorf("dig %s failed: %s", strings.Join(args, " "), detail)
 	}
 	var lines []string
-	for _, ln := range strings.Split(stdout.String(), "\n") {
+	for ln := range strings.SplitSeq(stdout.String(), "\n") {
 		ln = strings.TrimSpace(ln)
 		if ln != "" && !strings.HasPrefix(ln, ";") {
 			lines = append(lines, ln)
@@ -225,7 +219,7 @@ func FindNameservers(name string, digFn DigFn) ([]string, error) {
 			return cleaned, nil
 		}
 	}
-	return nil, &DdnsError{Msg: fmt.Sprintf("no nameservers found for %s", name)}
+	return nil, fmt.Errorf("no nameservers found for %s", name)
 }
 
 // CurrentRecord queries cfg.Nameservers directly for cfg.Name's A record.
@@ -249,7 +243,7 @@ func CurrentRecord(cfg Route53, digFn DigFn) (*string, error) {
 		}
 		return nil, nil
 	}
-	return nil, &DdnsError{Msg: "no authoritative nameserver answered: " + strings.Join(errs, "; ")}
+	return nil, fmt.Errorf("no authoritative nameserver answered: %s", strings.Join(errs, "; "))
 }
 
 // ChangeBatch constructs the Route 53 change-batch payload.
@@ -284,7 +278,7 @@ func Upsert(cfg Route53, ip string, awsBin string, runFn RunCmdFn) (string, erro
 	if awsBin == "" {
 		found, err := exec.LookPath("aws")
 		if err != nil {
-			return "", &DdnsError{Msg: "aws CLI not found (brew install awscli)"}
+			return "", errors.New("aws CLI not found (brew install awscli)")
 		}
 		awsBin = found
 	}
@@ -311,7 +305,7 @@ func Upsert(cfg Route53, ip string, awsBin string, runFn RunCmdFn) (string, erro
 		if detail == "" {
 			detail = err.Error()
 		}
-		return "", &DdnsError{Msg: "Route 53 update failed: " + detail}
+		return "", fmt.Errorf("route 53 update failed: %s", detail)
 	}
 	var parsed struct {
 		ChangeInfo struct {

@@ -68,7 +68,7 @@ func TestTitleExtractionAllThreeHarnesses(t *testing.T) {
 		`{"type":"agent-name","agentName":"Agent Alias"}`,
 		`{"type":"custom-title","customTitle":"Justin"}`,
 	}
-	for i := 0; i < 140; i++ {
+	for range 140 {
 		lines = append(lines, filler)
 	}
 	_ = os.WriteFile(claudeLog, []byte(strings.Join(lines, "\n")+"\n"), 0o644)
@@ -157,7 +157,7 @@ func TestHookLifecycleAllHarnesses(t *testing.T) {
 		t.Fatalf("expected session id in SessionStart: %s", bStart)
 	}
 
-	_, _ = f.Agents.SendMessage("mini", "mini:codex:sender-1", "mini:antigravity:40f94b03-136", "please check schema", nil, nil, nil)
+	_, _ = f.Agents.SendMessageWithReport("mini", "mini:codex:sender-1", "mini:antigravity:40f94b03-136", "please check schema", nil, nil, nil)
 	if len(fire("antigravity", map[string]any{"hookEventName": "PostToolUse", "conversationId": "40f94b03-1363", "cwd": tmp})) != 0 {
 		t.Fatal("expected {} from antigravity PostToolUse")
 	}
@@ -167,7 +167,7 @@ func TestHookLifecycleAllHarnesses(t *testing.T) {
 		t.Fatalf("expected unread in PreInvocation: %s", bPre)
 	}
 
-	_, _ = f.Agents.SendMessage("mini", "mini:codex:sender-1", "mini:antigravity:40f94b03-136", "one more question", nil, nil, nil)
+	_, _ = f.Agents.SendMessageWithReport("mini", "mini:codex:sender-1", "mini:antigravity:40f94b03-136", "one more question", nil, nil, nil)
 	stop1 := fire("antigravity", map[string]any{
 		"hookEventName": "Stop", "conversationId": "40f94b03-1363", "cwd": tmp,
 		"continuationActive": false, "terminationReason": "NO_TOOL_CALL",

@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,16 +15,57 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bdatdo0601/fleet/internal/paths"
 	"github.com/bdatdo0601/fleet/internal/version"
 )
 
-// ApiError represents an HTTP or transport failure talking to the lighthouse API.
-type ApiError struct {
+// NodeConfig mirrors /opt/homebrew/etc/nebula/fleet.json.
+type NodeConfig struct {
+	Name     string `json:"name"`
+	API      string `json:"api"`
+	Owner    string `json:"owner,omitempty"`
+	Repo     string `json:"repo,omitempty"`
+	StateDir string `json:"state_dir,omitempty"`
+}
+
+// LoadNode reads and decodes fleet.json from the Nebula config directory.
+func LoadNode() (NodeConfig, error) {
+	raw, err := os.ReadFile(paths.NodeFile())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return NodeConfig{}, &APIError{Msg: "this machine hasn't joined a fleet (fleet join NAME)"}
+		}
+		return NodeConfig{}, err
+	}
+	var nc NodeConfig
+	if err := json.Unmarshal(raw, &nc); err != nil {
+		return NodeConfig{}, err
+	}
+	return nc, nil
+}
+
+// ResolveAPI returns override if non-empty, otherwise reads api from fleet.json.
+func ResolveAPI(override string) (string, error) {
+	if override != "" {
+		return override, nil
+	}
+	n, err := LoadNode()
+	if err != nil {
+		return "", err
+	}
+	if n.API == "" {
+		return "", &APIError{Msg: "invalid fleet.json (missing api)"}
+	}
+	return n.API, nil
+}
+
+// APIError represents an HTTP or transport failure talking to the lighthouse API.
+type APIError struct {
 	Msg        string
 	StatusCode int
 }
 
-func (e *ApiError) Error() string { return e.Msg }
+func (e *APIError) Error() string { return e.Msg }
 
 var sharedTransport = &http.Transport{
 	MaxIdleConns:        32,
@@ -67,7 +109,7 @@ func Call(api, method, path string, body any, timeout time.Duration, headers map
 	url := strings.TrimRight(api, "/") + path
 	req, err := http.NewRequestWithContext(ctx, method, url, reqBody)
 	if err != nil {
-		return &ApiError{Msg: fmt.Sprintf("can't reach the lighthouse at %s: %v", api, err)}
+		return &APIError{Msg: fmt.Sprintf("can't reach the lighthouse at %s: %v", api, err)}
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -78,16 +120,16 @@ func Call(api, method, path string, body any, timeout time.Duration, headers map
 	}
 	resp, err := sharedClient.Do(req)
 	if err != nil {
-		return &ApiError{Msg: fmt.Sprintf("can't reach the lighthouse at %s: %v", api, err)}
+		return &APIError{Msg: fmt.Sprintf("can't reach the lighthouse at %s: %v", api, err)}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	respBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return &ApiError{Msg: fmt.Sprintf("can't reach the lighthouse at %s: %v", api, err)}
+		return &APIError{Msg: fmt.Sprintf("can't reach the lighthouse at %s: %v", api, err)}
 	}
 	if resp.StatusCode >= 400 {
-		return &ApiError{
+		return &APIError{
 			Msg:        parseErrorMsg(resp.StatusCode, resp.Status, respBytes),
 			StatusCode: resp.StatusCode,
 		}
@@ -110,18 +152,18 @@ func Download(api, path, dstPath string, timeout time.Duration) (string, int64, 
 	url := strings.TrimRight(api, "/") + path
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return "", 0, &ApiError{Msg: fmt.Sprintf("can't reach the lighthouse at %s: %v", api, err)}
+		return "", 0, &APIError{Msg: fmt.Sprintf("can't reach the lighthouse at %s: %v", api, err)}
 	}
 	req.Header.Set("X-Fleet-Client", version.ClientID())
 	resp, err := sharedClient.Do(req)
 	if err != nil {
-		return "", 0, &ApiError{Msg: fmt.Sprintf("can't reach the lighthouse at %s: %v", api, err)}
+		return "", 0, &APIError{Msg: fmt.Sprintf("can't reach the lighthouse at %s: %v", api, err)}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-		return "", 0, &ApiError{
+		return "", 0, &APIError{
 			Msg:        parseErrorMsg(resp.StatusCode, resp.Status, b),
 			StatusCode: resp.StatusCode,
 		}

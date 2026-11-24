@@ -171,15 +171,13 @@ func TestAgentsHTTPEndpointsAndWait(t *testing.T) {
 	var waitOut map[string]any
 	var waitErr error
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		waitErr = client.Call(srv.URL, http.MethodPost, "/v1/agents/wait", map[string]any{
 			"harness": "codex", "session_id": "mini:codex:s2", "timeout": 3.0,
 		}, 5*time.Second, nil, &waitOut)
-	}()
+	})
 
-	for i := 0; i < 40; i++ {
+	for range 40 {
 		s, _ := f.Agents.GetSession("mini:codex:s2")
 		if s.Listening {
 			break
@@ -203,5 +201,13 @@ func TestAgentsHTTPEndpointsAndWait(t *testing.T) {
 	msgs, ok := waitOut["messages"].([]any)
 	if !ok || len(msgs) != 1 {
 		t.Fatalf("expected 1 message from wait, got %+v", waitOut)
+	}
+
+	// Verify device/id and percent-encoded device%2Fid both route cleanly
+	for _, path := range []string{"/v1/agents/mini/s1", "/v1/agents/mini%2Fs1"} {
+		var detail map[string]any
+		if err := client.Call(srv.URL, http.MethodGet, path, nil, 5*time.Second, nil, &detail); err != nil {
+			t.Fatalf("GET %s failed: %v", path, err)
+		}
 	}
 }

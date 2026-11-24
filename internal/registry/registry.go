@@ -3,8 +3,11 @@ package registry
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -99,64 +102,88 @@ type Registry struct {
 	db   *sql.DB
 }
 
-// Open opens or initializes fleet.db at path, applying additive schema migrations.
-func Open(path string) (*Registry, error) {
+// ColumnMigration describes an additive column to ensure on an existing table.
+type ColumnMigration struct {
+	Col string
+	Def string
+}
+
+// OpenSQLite opens a single-connection WAL SQLite database, initializes schema, and applies additive migrations.
+func OpenSQLite(path, dbSchema, table string, migrations []ColumnMigration) (*sql.DB, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
-		return nil, fmt.Errorf("open registry %s: %w", path, err)
+		return nil, fmt.Errorf("open sqlite %s: %w", path, err)
 	}
 	db.SetMaxOpenConns(1)
 	for _, pragma := range []string{
+		"PRAGMA journal_mode = WAL",
 		"PRAGMA foreign_keys = ON",
 		"PRAGMA busy_timeout = 5000",
-		"PRAGMA journal_mode = WAL",
 	} {
 		if _, err := db.Exec(pragma); err != nil {
 			_ = db.Close()
-			return nil, fmt.Errorf("registry %s: %w", pragma, err)
+			return nil, fmt.Errorf("sqlite %s: %w", pragma, err)
 		}
 	}
-	if _, err := db.Exec(schema); err != nil {
+	if _, err := db.Exec(dbSchema); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("init registry schema: %w", err)
+		return nil, fmt.Errorf("init schema %s: %w", path, err)
 	}
-	if err := migrateDevices(db); err != nil {
-		_ = db.Close()
-		return nil, err
+	if table != "" && len(migrations) > 0 {
+		if err := migrateTable(db, table, migrations); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
 	}
-	return &Registry{Path: path, db: db}, nil
+	return db, nil
 }
 
-func migrateDevices(db *sql.DB) error {
-	rows, err := db.Query("PRAGMA table_info(devices)")
+func tableColumns(db *sql.DB, table string) (map[string]bool, error) {
+	rows, err := db.Query("PRAGMA table_info(" + table + ")")
 	if err != nil {
-		return err
+		return nil, err
 	}
+	defer func() { _ = rows.Close() }()
 	cols := map[string]bool{}
 	for rows.Next() {
-		var cid int
+		var cid, notnull, pk int
 		var name, ctype string
-		var notnull int
-		var dflt sql.NullString
-		var pk int
+		var dflt *string
 		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			_ = rows.Close()
-			return err
+			return nil, err
 		}
 		cols[name] = true
 	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
+	return cols, rows.Err()
+}
+
+func migrateTable(db *sql.DB, table string, migrations []ColumnMigration) error {
+	cols, err := tableColumns(db, table)
+	if err != nil {
 		return err
 	}
-	_ = rows.Close()
-
-	if !cols["client_version"] {
-		if _, err := db.Exec("ALTER TABLE devices ADD COLUMN client_version TEXT"); err != nil {
-			return fmt.Errorf("migrate devices.client_version: %w", err)
+	for _, m := range migrations {
+		if !cols[m.Col] {
+			if _, err := db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, m.Col, m.Def)); err != nil {
+				return fmt.Errorf("migrate %s.%s: %w", table, m.Col, err)
+			}
 		}
 	}
 	return nil
+}
+
+// Open opens or initializes fleet.db at path, applying additive schema migrations.
+func Open(path string) (*Registry, error) {
+	db, err := OpenSQLite(path, schema, "devices", []ColumnMigration{
+		{Col: "client_version", Def: "TEXT"},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &Registry{Path: path, db: db}, nil
 }
 
 // Close closes the underlying SQLite connection.
@@ -169,11 +196,6 @@ func (r *Registry) Close() error {
 	err := r.db.Close()
 	r.db = nil
 	return err
-}
-
-// DB exposes the raw *sql.DB for testing.
-func (r *Registry) DB() *sql.DB {
-	return r.db
 }
 
 // Setting retrieves a setting value by key.
@@ -206,29 +228,16 @@ const deviceSelectCols = "name, ip, kind, grp, pubkey, cert, fingerprint, not_af
 
 func scanDevice(scanner interface{ Scan(...any) error }) (*Device, error) {
 	var d Device
-	var revoked, lastSeen, clientVer sql.NullString
 	err := scanner.Scan(
 		&d.Name, &d.IP, &d.Kind, &d.Grp, &d.Pubkey, &d.Cert,
 		&d.Fingerprint, &d.NotAfter, &d.CreatedAt,
-		&revoked, &lastSeen, &clientVer,
+		&d.RevokedAt, &d.LastSeen, &d.ClientVersion,
 	)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
-	}
-	if revoked.Valid {
-		s := revoked.String
-		d.RevokedAt = &s
-	}
-	if lastSeen.Valid {
-		s := lastSeen.String
-		d.LastSeen = &s
-	}
-	if clientVer.Valid {
-		s := clientVer.String
-		d.ClientVersion = &s
 	}
 	return &d, nil
 }
@@ -291,29 +300,32 @@ func (r *Registry) Devices() ([]Device, error) {
 	return out, nil
 }
 
+func (r *Registry) usedIPsLocked() (map[string]bool, error) {
+	rows, err := r.db.Query("SELECT ip FROM devices")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	used := map[string]bool{}
+	for rows.Next() {
+		var ip string
+		if err := rows.Scan(&ip); err != nil {
+			return nil, err
+		}
+		used[ip] = true
+	}
+	return used, rows.Err()
+}
+
 // NextIP returns the lowest unassigned host address in the mesh subnet.
 // Addresses of revoked devices are never reused.
 func (r *Registry) NextIP() (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	rows, err := r.db.Query("SELECT ip FROM devices")
+	used, err := r.usedIPsLocked()
 	if err != nil {
 		return "", err
 	}
-	used := map[string]bool{}
-	for rows.Next() {
-		var ip string
-		if err := rows.Scan(&ip); err != nil {
-			_ = rows.Close()
-			return "", err
-		}
-		used[ip] = true
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return "", err
-	}
-	_ = rows.Close()
 
 	prefix, err := netip.ParsePrefix(paths.MeshCIDR)
 	if err != nil {

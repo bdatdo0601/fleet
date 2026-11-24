@@ -3,21 +3,23 @@ package cli
 
 import (
 	"bufio"
-	"bytes"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"net/url"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
 	"runtime"
-	"strconv"
+	"slices"
 	"strings"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
 	"golang.org/x/term"
@@ -37,26 +39,6 @@ import (
 	"github.com/bdatdo0601/fleet/internal/version"
 	"github.com/bdatdo0601/fleet/internal/waiter"
 )
-
-// UserError indicates invalid usage or expected operational failure reported cleanly without stack traces.
-type UserError struct {
-	Msg string
-}
-
-func (e *UserError) Error() string { return e.Msg }
-
-func userErr(format string, args ...any) error {
-	return &UserError{Msg: fmt.Sprintf(format, args...)}
-}
-
-// NodeConfig mirrors /opt/homebrew/etc/nebula/fleet.json.
-type NodeConfig struct {
-	Name     string `json:"name"`
-	API      string `json:"api"`
-	Owner    string `json:"owner,omitempty"`
-	Repo     string `json:"repo,omitempty"`
-	StateDir string `json:"state_dir,omitempty"`
-}
 
 // IO holds overridable streams and prompt hooks for CLI testing.
 type IO struct {
@@ -101,7 +83,7 @@ func (cio *IO) confirm(question string) error {
 	line, _ := cio.stdinReader().ReadString('\n')
 	ans := strings.ToLower(strings.TrimSpace(line))
 	if ans != "y" && ans != "yes" {
-		return userErr("cancelled")
+		return fmt.Errorf("cancelled")
 	}
 	return nil
 }
@@ -132,14 +114,14 @@ func (cio *IO) askPassphrase(newPass bool) (string, error) {
 	}
 	if newPass {
 		if len(pw) < 12 {
-			return "", userErr("use at least 12 characters")
+			return "", fmt.Errorf("use at least 12 characters")
 		}
 		pw2, err := readPass("Repeat passphrase: ")
 		if err != nil {
 			return "", err
 		}
 		if pw2 != pw {
-			return "", userErr("passphrases don't match")
+			return "", fmt.Errorf("passphrases don't match")
 		}
 	}
 	return pw, nil
@@ -154,7 +136,7 @@ func (cio *IO) paste(prompt, endMarker string) (string, error) {
 		return "", err
 	}
 	if !strings.Contains(text, endMarker) {
-		return "", userErr("input ended before the end of the block")
+		return "", fmt.Errorf("input ended before the end of the block")
 	}
 	return text, nil
 }
@@ -184,7 +166,7 @@ func parseFlagsInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
 			if trimmed == "h" || trimmed == "help" {
 				return nil, flag.ErrHelp
 			}
-			if eq := strings.IndexByte(trimmed, '='); eq >= 0 {
+			if found := strings.Contains(trimmed, "="); found {
 				flagArgs = append(flagArgs, a)
 				continue
 			}
@@ -222,38 +204,12 @@ func currentUsername() string {
 
 func requireNotRoot(cmd string) error {
 	if system.IsRoot() {
-		return userErr("run `fleet %s` as your normal user (it uses sudo where needed)", cmd)
+		return fmt.Errorf("run `fleet %s` as your normal user (it uses sudo where needed)", cmd)
 	}
 	return nil
 }
 
-func loadNode() (NodeConfig, error) {
-	raw, err := os.ReadFile(paths.NodeFile())
-	if err != nil {
-		if os.IsNotExist(err) {
-			return NodeConfig{}, userErr("this machine hasn't joined a fleet (fleet join NAME)")
-		}
-		return NodeConfig{}, err
-	}
-	var nc NodeConfig
-	if err := json.Unmarshal(raw, &nc); err != nil {
-		return NodeConfig{}, err
-	}
-	return nc, nil
-}
-
-func apiURL() (string, error) {
-	n, err := loadNode()
-	if err != nil {
-		return "", err
-	}
-	if n.API == "" {
-		return "", userErr("invalid fleet.json (missing api)")
-	}
-	return n.API, nil
-}
-
-func installNodeFiles(keyPEM *string, ca, cert, config string, node NodeConfig) error {
+func installNodeFiles(keyPEM *string, ca, cert, config string, node client.NodeConfig) error {
 	etc := paths.NebulaEtc()
 	if keyPEM != nil {
 		if _, err := system.WriteRootFile(filepath.Join(etc, "host.key"), *keyPEM, 0o600); err != nil {
@@ -295,10 +251,7 @@ func ago(ts *string) string {
 	if err != nil {
 		return *ts
 	}
-	secs := int(time.Since(t).Seconds())
-	if secs < 0 {
-		secs = 0
-	}
+	secs := max(int(time.Since(t).Seconds()), 0)
 	for _, unit := range []struct {
 		label string
 		size  int
@@ -314,32 +267,18 @@ func printTable(w io.Writer, rows [][]string) {
 	if len(rows) == 0 {
 		return
 	}
-	widths := make([]int, len(rows[0]))
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	for _, r := range rows {
-		for i, c := range r {
-			if len(c) > widths[i] {
-				widths[i] = len(c)
-			}
-		}
+		_, _ = fmt.Fprintln(tw, strings.Join(r, "\t"))
 	}
-	for _, r := range rows {
-		parts := make([]string, len(r))
-		for i, c := range r {
-			if i == len(r)-1 {
-				parts[i] = c
-			} else {
-				parts[i] = c + strings.Repeat(" ", widths[i]-len(c))
-			}
-		}
-		_, _ = fmt.Fprintln(w, strings.TrimRight(strings.Join(parts, "  "), " "))
-	}
+	_ = tw.Flush()
 }
 
 func withPassphrase(cio *IO, path string, payload map[string]any, attempts int, out any) error {
 	if attempts <= 0 {
 		attempts = 3
 	}
-	api, err := apiURL()
+	api, err := client.ResolveAPI("")
 	if err != nil {
 		return err
 	}
@@ -349,22 +288,20 @@ func withPassphrase(cio *IO, path string, payload map[string]any, attempts int, 
 			return err
 		}
 		body := make(map[string]any, len(payload)+1)
-		for k, v := range payload {
-			body[k] = v
-		}
+		maps.Copy(body, payload)
 		body["passphrase"] = pw
 		err = client.Call(api, "POST", path, body, 30*time.Second, nil, out)
 		if err == nil {
 			return nil
 		}
-		var apiErr *client.ApiError
+		var apiErr *client.APIError
 		if errors.As(err, &apiErr) && apiErr.StatusCode == 401 && attempt < attempts {
 			cio.printf("wrong CA passphrase, try again\n")
 			continue
 		}
 		return err
 	}
-	return userErr("passphrase attempts exhausted")
+	return fmt.Errorf("passphrase attempts exhausted")
 }
 
 func printMobile(cio *IO, resp core.ApproveResult) {
@@ -407,6 +344,103 @@ func detectRepoDir() string {
 
 // subcommands -----------------------------------------------------------------
 
+func generateTempHostKeypair() (string, string, error) {
+	tmp, err := os.MkdirTemp("", "fleet-init-*")
+	if err != nil {
+		return "", "", err
+	}
+	defer func() { _ = os.RemoveAll(tmp) }()
+	keyFile := filepath.Join(tmp, "host.key")
+	pubFile := filepath.Join(tmp, "host.pub")
+	if err := pki.Keygen(keyFile, pubFile); err != nil {
+		return "", "", err
+	}
+	keyBytes, err := os.ReadFile(keyFile)
+	if err != nil {
+		return "", "", err
+	}
+	pubBytes, err := os.ReadFile(pubFile)
+	if err != nil {
+		return "", "", err
+	}
+	return string(keyBytes), string(pubBytes), nil
+}
+
+func activateNodeRuntime(cio *IO, owner, root, syncWorkDir string, serve bool) (string, error) {
+	if serve {
+		cio.info("installing binary & launchd services (fleet serve, fleet sync) ...")
+	}
+	instBin, err := ensureInstalledSelf()
+	if err != nil {
+		return "", err
+	}
+	if serve {
+		if err := system.InstallServeDaemon(instBin, owner, root, syncWorkDir); err != nil {
+			return "", err
+		}
+	}
+	if err := system.InstallSyncDaemon(instBin, syncWorkDir, false); err != nil {
+		return "", err
+	}
+	if serve {
+		cio.info("starting nebula ...")
+	}
+	if err := system.StartNebula(); err != nil {
+		return "", err
+	}
+	if mcpUpdated, err := mcpinstall.Install(mcpinstall.InstallOpts{}); err == nil && len(mcpUpdated) > 0 {
+		cio.info(fmt.Sprintf("configured agent MCP & hooks (%d file(s))", len(mcpUpdated)))
+	}
+	return instBin, nil
+}
+
+func finishInit(cio *IO, fleet *core.Fleet, keyStr, root, host string, port int, dnsCfg *ddns.Route53) error {
+	mini, err := fleet.Registry.Lighthouse()
+	if err != nil || mini == nil {
+		return fmt.Errorf("lighthouse missing from registry after init")
+	}
+	cfgPtr, err := fleet.ConfigFor(mini)
+	if err != nil || cfgPtr == nil {
+		return err
+	}
+	caPEM, err := fleet.CAPem()
+	if err != nil {
+		return err
+	}
+	owner := currentUsername()
+	repo := detectRepoDir()
+	if err := installNodeFiles(&keyStr, caPEM, mini.Cert, *cfgPtr, client.NodeConfig{
+		Name:     mini.Name,
+		API:      fmt.Sprintf("http://127.0.0.1:%d", paths.APIPort()),
+		Owner:    owner,
+		Repo:     repo,
+		StateDir: root,
+	}); err != nil {
+		return err
+	}
+	workDir := cmp.Or(repo, root)
+	instBin, err := activateNodeRuntime(cio, owner, root, workDir, true)
+	if err != nil {
+		return err
+	}
+	if dnsCfg != nil {
+		if err := ddnsActivate(cio, fleet, *dnsCfg, instBin, root, workDir); err != nil {
+			cio.printf("warning: DNS not set up: %v\n         fix it, then run: fleet ddns setup --zone-id %s\n", err, dnsCfg.ZoneID)
+		}
+	}
+	caID, _ := fleet.CAID()
+	cio.printf(`
+Lighthouse ready.
+  CA id:        %s   (join codes show this id; check that it matches)
+  Public entry: %s:%d/udp  -> forward this UDP port on the router to this Mac
+  Back up:      %s/ca.key and the passphrase (e.g. 1Password)
+
+Next, register your laptop. On the laptop:   fleet join laptop
+                       Then on this Mac:     fleet approve --group admin
+`, caID, host, port, root)
+	return nil
+}
+
 func cmdInit(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	host := fs.String("host", "", "public DDNS name of the home connection")
@@ -419,14 +453,14 @@ func cmdInit(args []string, cio *IO) error {
 		return err
 	}
 	if len(pos) > 0 || *host == "" {
-		return userErr("usage: fleet init --host HOST [--port 443] [--lan-ip IP] [--route53-zone ZONE_ID]")
+		return fmt.Errorf("usage: fleet init --host HOST [--port 443] [--lan-ip IP] [--route53-zone ZONE_ID]")
 	}
 	if err := requireNotRoot("init"); err != nil {
 		return err
 	}
 	root := paths.StateDir()
 	if _, err := os.Stat(filepath.Join(root, "fleet.db")); err == nil {
-		return userErr("%s/fleet.db exists: this machine is already the lighthouse", root)
+		return fmt.Errorf("%s/fleet.db exists: this machine is already the lighthouse", root)
 	}
 	if err := system.EnsureNebula(); err != nil {
 		return err
@@ -445,22 +479,7 @@ func cmdInit(args []string, cio *IO) error {
 	if err != nil {
 		return err
 	}
-
-	tmp, err := os.MkdirTemp("", "fleet-init-*")
-	if err != nil {
-		return err
-	}
-	defer func() { _ = os.RemoveAll(tmp) }()
-	keyFile := filepath.Join(tmp, "host.key")
-	pubFile := filepath.Join(tmp, "host.pub")
-	if err := pki.Keygen(keyFile, pubFile); err != nil {
-		return err
-	}
-	keyBytes, err := os.ReadFile(keyFile)
-	if err != nil {
-		return err
-	}
-	pubBytes, err := os.ReadFile(pubFile)
+	keyStr, pubStr, err := generateTempHostKeypair()
 	if err != nil {
 		return err
 	}
@@ -470,7 +489,7 @@ func cmdInit(args []string, cio *IO) error {
 		Port:             *port,
 		LanIP:            *lanIP,
 		Passphrase:       passphrase,
-		LighthousePubkey: string(pubBytes),
+		LighthousePubkey: pubStr,
 	})
 	if err != nil {
 		return err
@@ -478,123 +497,42 @@ func cmdInit(args []string, cio *IO) error {
 	defer func() { _ = fleet.Close() }()
 
 	cio.info("CA, registry and lighthouse certificate created in " + root)
-	mini, err := fleet.Registry.Lighthouse()
-	if err != nil || mini == nil {
-		return userErr("lighthouse missing from registry after init")
-	}
-	cfgPtr, err := fleet.ConfigFor(mini)
-	if err != nil || cfgPtr == nil {
-		return err
-	}
-	caPEM, err := fleet.CAPem()
-	if err != nil {
-		return err
-	}
-	owner := currentUsername()
-	repo := detectRepoDir()
-	keyStr := string(keyBytes)
-	if err := installNodeFiles(&keyStr, caPEM, mini.Cert, *cfgPtr, NodeConfig{
-		Name:     mini.Name,
-		API:      fmt.Sprintf("http://127.0.0.1:%d", paths.APIPort()),
-		Owner:    owner,
-		Repo:     repo,
-		StateDir: root,
-	}); err != nil {
-		return err
-	}
-
-	cio.info("installing binary & launchd services (fleet serve, fleet sync) ...")
-	instBin, err := ensureInstalledSelf()
-	if err != nil {
-		return err
-	}
-	workDir := repo
-	if workDir == "" {
-		workDir = root
-	}
-	if err := system.InstallServeDaemon(instBin, owner, root, workDir); err != nil {
-		return err
-	}
-	if err := system.InstallSyncDaemon(instBin, workDir, false); err != nil {
-		return err
-	}
-	cio.info("starting nebula ...")
-	if err := system.StartNebula(); err != nil {
-		return err
-	}
-	if mcpUpdated, err := mcpinstall.Install(mcpinstall.InstallOpts{}); err == nil && len(mcpUpdated) > 0 {
-		cio.info(fmt.Sprintf("configured agent MCP & hooks (%d file(s))", len(mcpUpdated)))
-	}
-	if dnsCfg != nil {
-		if err := ddnsActivate(cio, fleet, *dnsCfg, instBin, root, workDir); err != nil {
-			cio.printf("warning: DNS not set up: %v\n         fix it, then run: fleet ddns setup --zone-id %s\n", err, dnsCfg.ZoneID)
-		}
-	}
-	caID, _ := fleet.CAID()
-	cio.printf(`
-Lighthouse ready.
-  CA id:        %s   (join codes show this id; check that it matches)
-  Public entry: %s:%d/udp  -> forward this UDP port on the router to this Mac
-  Back up:      %s/ca.key and the passphrase (e.g. 1Password)
-
-Next, register your laptop. On the laptop:   fleet join laptop
-                       Then on this Mac:     fleet approve --group admin
-`, caID, *host, *port, root)
-	return nil
+	return finishInit(cio, fleet, keyStr, root, *host, *port, dnsCfg)
 }
 
-func cmdJoin(args []string, cio *IO) error {
-	fs := flag.NewFlagSet("join", flag.ContinueOnError)
-	force := fs.Bool("force", false, "re-join even if already joined")
-	pos, err := parseFlagsInterspersed(fs, args)
-	if err != nil {
-		return err
-	}
-	if len(pos) != 1 {
-		return userErr("usage: fleet join NAME [--force]")
-	}
-	name := pos[0]
-	if err := requireNotRoot("join"); err != nil {
-		return err
-	}
-	if _, err := os.Stat(paths.NodeFile()); err == nil && !*force {
-		if n, err := loadNode(); err == nil {
-			return userErr("already joined as %s (use --force to re-join)", n.Name)
-		}
-		return userErr("already joined (use --force to re-join)")
-	}
-	if err := system.EnsureNebula(); err != nil {
-		return err
-	}
+func writePendingJoinRequest(name string, cio *IO) (string, string, string, error) {
 	pend := paths.PendingDir()
 	if err := os.MkdirAll(pend, 0o700); err != nil {
-		return err
+		return "", "", "", err
 	}
 	keyPath := filepath.Join(pend, name+".key")
 	pubPath := filepath.Join(pend, name+".pub")
 	if _, err := os.Stat(keyPath); os.IsNotExist(err) {
 		if err := pki.Keygen(keyPath, pubPath); err != nil {
-			return err
+			return "", "", "", err
 		}
 		_ = os.Chmod(keyPath, 0o600)
 	}
 	pubRaw, err := os.ReadFile(pubPath)
 	if err != nil {
-		return err
+		return "", "", "", err
 	}
 	pubkey, err := pki.NormalizePubkey(string(pubRaw))
 	if err != nil {
-		return err
+		return "", "", "", err
 	}
 	reqBlock, err := codes.Encode(codes.Request, map[string]any{"v": 1, "name": name, "pubkey": pubkey})
 	if err != nil {
-		return err
+		return "", "", "", err
 	}
 	cio.printf("\n%s\n\n", reqBlock)
 	cio.info("request id: " + codes.ShortID(pubkey))
 	cio.printf("    On an admin device (or the lighthouse) run `fleet approve` and paste the block above.\n")
 	cio.printf("    Re-running `fleet join` prints the same request until it's approved.\n\n")
+	return keyPath, pubPath, pubkey, nil
+}
 
+func finishJoin(cio *IO, keyPath, pubPath, pubkey string) error {
 	pasted, err := cio.paste("Paste the FLEET JOIN RESPONSE block:", "END "+codes.Response)
 	if err != nil {
 		return err
@@ -613,7 +551,7 @@ func cmdJoin(args []string, cio *IO) error {
 		return err
 	}
 	if resp.Kind != "mac" {
-		return userErr("that response is for a mobile device")
+		return fmt.Errorf("that response is for a mobile device")
 	}
 	certInfo, err := pki.Info(resp.Cert)
 	if err != nil {
@@ -624,7 +562,7 @@ func cmdJoin(args []string, cio *IO) error {
 		return err
 	}
 	if certInfo.PublicKey != pubHex {
-		return userErr("that response is for a different request (public key mismatch)")
+		return fmt.Errorf("that response is for a different request (public key mismatch)")
 	}
 	if err := pki.Verify(resp.CA, resp.Cert); err != nil {
 		return err
@@ -636,31 +574,51 @@ func cmdJoin(args []string, cio *IO) error {
 		return err
 	}
 	keyStr := string(keyBytes)
-	if err := installNodeFiles(&keyStr, resp.CA, resp.Cert, resp.Config, NodeConfig{
+	if err := installNodeFiles(&keyStr, resp.CA, resp.Cert, resp.Config, client.NodeConfig{
 		Name:  resp.Name,
 		API:   resp.API,
 		Owner: currentUsername(),
 	}); err != nil {
 		return err
 	}
-	instBin, err := ensureInstalledSelf()
-	if err != nil {
+	if _, err := activateNodeRuntime(cio, "", "", "", false); err != nil {
 		return err
-	}
-	if err := system.InstallSyncDaemon(instBin, "", false); err != nil {
-		return err
-	}
-	if err := system.StartNebula(); err != nil {
-		return err
-	}
-	if mcpUpdated, err := mcpinstall.Install(mcpinstall.InstallOpts{}); err == nil && len(mcpUpdated) > 0 {
-		cio.info(fmt.Sprintf("configured agent MCP & hooks (%d file(s))", len(mcpUpdated)))
 	}
 	_ = os.Remove(keyPath)
 	_ = os.Remove(pubPath)
 	cio.checkLighthouse()
 	cio.printf("\nJoined. Config and revocations now sync automatically every 5 minutes.\n")
 	return nil
+}
+
+func cmdJoin(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("join", flag.ContinueOnError)
+	force := fs.Bool("force", false, "re-join even if already joined")
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return fmt.Errorf("usage: fleet join NAME [--force]")
+	}
+	name := pos[0]
+	if err := requireNotRoot("join"); err != nil {
+		return err
+	}
+	if _, err := os.Stat(paths.NodeFile()); err == nil && !*force {
+		if n, err := client.LoadNode(); err == nil {
+			return fmt.Errorf("already joined as %s (use --force to re-join)", n.Name)
+		}
+		return fmt.Errorf("already joined (use --force to re-join)")
+	}
+	if err := system.EnsureNebula(); err != nil {
+		return err
+	}
+	keyPath, pubPath, pubkey, err := writePendingJoinRequest(name, cio)
+	if err != nil {
+		return err
+	}
+	return finishJoin(cio, keyPath, pubPath, pubkey)
 }
 
 func cmdApprove(args []string, cio *IO) error {
@@ -673,10 +631,10 @@ func cmdApprove(args []string, cio *IO) error {
 		return err
 	}
 	if len(pos) > 0 {
-		return userErr("unexpected arguments: %s", strings.Join(pos, " "))
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(pos, " "))
 	}
 	if !paths.ValidGroup(*group) {
-		return userErr("--group must be admin or managed")
+		return fmt.Errorf("--group must be admin or managed")
 	}
 	pasted, err := cio.paste("Paste the FLEET JOIN REQUEST block:", "END "+codes.Request)
 	if err != nil {
@@ -739,10 +697,10 @@ func cmdApproveMobile(args []string, cio *IO) error {
 		return err
 	}
 	if len(pos) != 1 {
-		return userErr("usage: fleet approve-mobile NAME [--group admin|managed] [--replace]")
+		return fmt.Errorf("usage: fleet approve-mobile NAME [--group admin|managed] [--replace]")
 	}
 	if !paths.ValidGroup(*group) {
-		return userErr("--group must be admin or managed")
+		return fmt.Errorf("--group must be admin or managed")
 	}
 	name := pos[0]
 	pem, err := cio.paste("Paste the public key from the Mobile Nebula app:", "END NEBULA X25519 PUBLIC KEY")
@@ -773,9 +731,9 @@ func cmdApproveMobile(args []string, cio *IO) error {
 
 func cmdLS(args []string, cio *IO) error {
 	if len(args) > 0 {
-		return userErr("usage: fleet ls")
+		return fmt.Errorf("usage: fleet ls")
 	}
-	api, err := apiURL()
+	api, err := client.ResolveAPI("")
 	if err != nil {
 		return err
 	}
@@ -811,10 +769,10 @@ func cmdLS(args []string, cio *IO) error {
 
 func cmdRevoke(args []string, cio *IO) error {
 	if len(args) != 1 {
-		return userErr("usage: fleet revoke NAME")
+		return fmt.Errorf("usage: fleet revoke NAME")
 	}
 	name := args[0]
-	api, err := apiURL()
+	api, err := client.ResolveAPI("")
 	if err != nil {
 		return err
 	}
@@ -836,7 +794,7 @@ func cmdSet(args []string, cio *IO) error {
 		return err
 	}
 	if len(pos) != 1 || !paths.ValidGroup(*group) {
-		return userErr("usage: fleet set NAME --group admin|managed")
+		return fmt.Errorf("usage: fleet set NAME --group admin|managed")
 	}
 	name := pos[0]
 	var resp core.ApproveResult
@@ -855,7 +813,7 @@ func cmdSet(args []string, cio *IO) error {
 	return nil
 }
 
-func persistUpdatedNodeIfNeeded(node NodeConfig) {
+func persistUpdatedNodeIfNeeded(node client.NodeConfig) {
 	b, err := json.MarshalIndent(node, "", "  ")
 	if err != nil {
 		return
@@ -863,131 +821,72 @@ func persistUpdatedNodeIfNeeded(node NodeConfig) {
 	_, _ = system.WriteRootFile(paths.NodeFile(), string(b)+"\n", 0o644)
 }
 
-func cmdSync(args []string, cio *IO) error {
-	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
-	noUpdate := fs.Bool("no-update", false, "skip binary/git self-update")
-	waitSec := fs.Int("wait", 0, "retry until the lighthouse answers")
-	rebuild := fs.Bool("rebuild", false, "(lighthouse) force rebuild & republish binaries")
-	pos, err := parseFlagsInterspersed(fs, args)
-	if err != nil {
-		return err
-	}
-	if len(pos) > 0 {
-		return userErr("unexpected arguments: %s", strings.Join(pos, " "))
-	}
-	if !system.IsRoot() {
-		return userErr("fleet sync runs as root (launchd does this every 5 minutes; or: sudo fleet sync)")
-	}
-	node, err := loadNode()
-	if err != nil {
-		return err
-	}
-	stamp := time.Now().Format("2006-01-02T15:04:05")
-	isLighthouse := strings.HasPrefix(node.API, "http://127.0.0.1")
-
-	// Backfill owner/state_dir/repo if missing
-	nodeDirty := false
+func backfillSyncNode(node client.NodeConfig, isLighthouse bool) client.NodeConfig {
+	dirty := false
 	if node.Repo == "" && isLighthouse {
 		if r := detectRepoDir(); r != "" {
 			node.Repo = r
-			nodeDirty = true
+			dirty = true
 		}
 	}
-	if node.Owner == "" {
-		if node.Repo != "" {
-			if o, err := system.PathOwner(node.Repo); err == nil && o != "root" {
-				node.Owner = o
-				nodeDirty = true
-			}
+	if node.Owner == "" && node.Repo != "" {
+		if o, err := system.PathOwner(node.Repo); err == nil && o != "root" {
+			node.Owner = o
+			dirty = true
 		}
 	}
 	if node.StateDir == "" && isLighthouse && node.Owner != "" {
 		node.StateDir = paths.StateDirForOwner(node.Owner)
-		nodeDirty = true
+		dirty = true
 	}
-	if nodeDirty {
+	if dirty {
 		persistUpdatedNodeIfNeeded(node)
 	}
+	return node
+}
 
-	if !*noUpdate && isLighthouse && node.Repo != "" {
-		updated, err := system.SelfUpdateLighthouse(system.LighthouseUpdateOpts{
-			RepoDir:     node.Repo,
-			StateDir:    node.StateDir,
-			Owner:       node.Owner,
-			TargetBin:   paths.InstalledBinaryPath(),
-			SymlinkPath: paths.SymlinkPath(),
-			LocalAPI:    node.API,
-			Rebuild:     *rebuild,
-		})
-		if err != nil {
-			cio.printf("%s lighthouse build/update warning: %v\n", stamp, err)
-		} else if updated {
-			cio.printf("%s code updated and binaries published\n", stamp)
-			_ = system.InstallSyncDaemon(paths.InstalledBinaryPath(), node.Repo, true)
-			targetBin := paths.InstalledBinaryPath()
-			if err := syscall.Exec(targetBin, []string{targetBin, "sync", "--no-update"}, os.Environ()); err != nil {
-				cio.printf("%s re-exec warning: %v\n", stamp, err)
-			}
-		}
+func reexecSyncUpdated(cio *IO, stamp, syncWorkDir string) {
+	targetBin := paths.InstalledBinaryPath()
+	_ = system.InstallSyncDaemon(targetBin, syncWorkDir, true)
+	if err := syscall.Exec(targetBin, []string{targetBin, "sync", "--no-update"}, os.Environ()); err != nil {
+		cio.printf("%s re-exec warning: %v\n", stamp, err)
 	}
+}
 
-	if node.Owner != "" {
-		if mcpUpdated, err := mcpinstall.SyncOwnerConfigs(node.Owner); err == nil && len(mcpUpdated) > 0 {
-			names := make([]string, len(mcpUpdated))
-			for i, p := range mcpUpdated {
-				names[i] = filepath.Base(p)
-			}
-			cio.printf("%s updated MCP/hook configs: %s\n", stamp, strings.Join(names, ", "))
-		}
-	}
-
+func waitSyncPayload(cio *IO, api, stamp string, waitSec int) (core.SyncResult, bool, error) {
 	syncPath := fmt.Sprintf("/v1/sync?os=%s&arch=%s", runtime.GOOS, runtime.GOARCH)
-	deadline := time.Now().Add(time.Duration(*waitSec) * time.Second)
+	deadline := time.Now().Add(time.Duration(waitSec) * time.Second)
 	var payload core.SyncResult
 	for {
-		err := client.Call(node.API, "GET", syncPath, nil, 15*time.Second, nil, &payload)
+		err := client.Call(api, "GET", syncPath, nil, 15*time.Second, nil, &payload)
 		if err == nil {
-			break
+			return payload, true, nil
 		}
-		var apiErr *client.ApiError
-		if errors.As(err, &apiErr) && apiErr.StatusCode == 403 {
-			return userErr("the lighthouse refused this device: %v", err)
+		if apiErr, ok := errors.AsType[*client.APIError](err); ok && apiErr.StatusCode == 403 {
+			return core.SyncResult{}, false, fmt.Errorf("the lighthouse refused this device: %w", err)
 		}
-		if *waitSec <= 0 || !time.Now().Before(deadline) {
+		if waitSec <= 0 || !time.Now().Before(deadline) {
 			cio.printf("%s lighthouse unreachable, keeping current config: %v\n", stamp, err)
-			return nil
+			return core.SyncResult{}, false, nil
 		}
 		time.Sleep(1 * time.Second)
 	}
+}
 
-	if !*noUpdate && !isLighthouse && payload.BinarySHA256 != "" {
-		updated, err := system.SelfUpdateClient(system.ClientUpdateOpts{
-			APIURL:      node.API,
-			ExpectedSHA: payload.BinarySHA256,
-			TargetBin:   paths.InstalledBinaryPath(),
-			SymlinkPath: paths.SymlinkPath(),
-		})
-		if err != nil {
-			cio.printf("%s binary update warning: %v\n", stamp, err)
-		} else if updated {
-			cio.printf("%s updated binary to %s\n", stamp, payload.BinaryVersion)
-			targetBin := paths.InstalledBinaryPath()
-			_ = system.InstallSyncDaemon(targetBin, "", true)
-			if err := syscall.Exec(targetBin, []string{targetBin, "sync", "--no-update"}, os.Environ()); err != nil {
-				cio.printf("%s re-exec warning: %v\n", stamp, err)
-			}
-		}
-	}
-
+func applySyncedFiles(cio *IO, stamp string, payload core.SyncResult) error {
 	etc := paths.NebulaEtc()
 	var changed []string
+	cfgContent := ""
+	if payload.Config != nil {
+		cfgContent = *payload.Config
+	}
 	for _, f := range []struct {
 		name    string
 		content string
 	}{
 		{"ca.crt", payload.CA},
 		{"host.crt", payload.Cert},
-		{"config.yml", strPtrVal(payload.Config)},
+		{"config.yml", cfgContent},
 	} {
 		if f.content == "" && f.name == "config.yml" {
 			continue
@@ -1003,8 +902,7 @@ func cmdSync(args []string, cio *IO) error {
 	if neb, err := exec.LookPath("nebula"); err == nil {
 		system.FirewallAllow(neb) // brew upgrades move Cellar path
 	}
-	label := system.NebulaLabel("")
-	if len(changed) > 0 && label != "" && system.LaunchdLoaded(label) {
+	if label := system.NebulaLabel(""); len(changed) > 0 && label != "" && system.LaunchdLoaded(label) {
 		system.Restart(label)
 	}
 	if len(changed) > 0 {
@@ -1015,18 +913,85 @@ func cmdSync(args []string, cio *IO) error {
 	return nil
 }
 
-func strPtrVal(p *string) string {
-	if p == nil {
-		return ""
+func cmdSync(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
+	noUpdate := fs.Bool("no-update", false, "skip binary/git self-update")
+	waitSec := fs.Int("wait", 0, "retry until the lighthouse answers")
+	rebuild := fs.Bool("rebuild", false, "(lighthouse) force rebuild & republish binaries")
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
+		return err
 	}
-	return *p
+	if len(pos) > 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(pos, " "))
+	}
+	if !system.IsRoot() {
+		return fmt.Errorf("fleet sync runs as root (launchd does this every 5 minutes; or: sudo fleet sync)")
+	}
+	node, err := client.LoadNode()
+	if err != nil {
+		return err
+	}
+	stamp := time.Now().Format("2006-01-02T15:04:05")
+	isLighthouse := strings.HasPrefix(node.API, "http://127.0.0.1")
+	node = backfillSyncNode(node, isLighthouse)
+
+	if !*noUpdate && isLighthouse && node.Repo != "" {
+		updated, err := system.SelfUpdateLighthouse(system.LighthouseUpdateOpts{
+			RepoDir:     node.Repo,
+			StateDir:    node.StateDir,
+			Owner:       node.Owner,
+			TargetBin:   paths.InstalledBinaryPath(),
+			SymlinkPath: paths.SymlinkPath(),
+			LocalAPI:    node.API,
+			Rebuild:     *rebuild,
+		})
+		if err != nil {
+			cio.printf("%s lighthouse build/update warning: %v\n", stamp, err)
+		} else if updated {
+			cio.printf("%s code updated and binaries published\n", stamp)
+			reexecSyncUpdated(cio, stamp, node.Repo)
+		}
+	}
+
+	if node.Owner != "" {
+		if mcpUpdated, err := mcpinstall.SyncOwnerConfigs(node.Owner); err == nil && len(mcpUpdated) > 0 {
+			names := make([]string, len(mcpUpdated))
+			for i, p := range mcpUpdated {
+				names[i] = filepath.Base(p)
+			}
+			cio.printf("%s updated MCP/hook configs: %s\n", stamp, strings.Join(names, ", "))
+		}
+	}
+
+	payload, ok, err := waitSyncPayload(cio, node.API, stamp, *waitSec)
+	if err != nil || !ok {
+		return err
+	}
+
+	if !*noUpdate && !isLighthouse && payload.BinarySHA256 != "" {
+		updated, err := system.SelfUpdateClient(system.ClientUpdateOpts{
+			APIURL:      node.API,
+			ExpectedSHA: payload.BinarySHA256,
+			TargetBin:   paths.InstalledBinaryPath(),
+			SymlinkPath: paths.SymlinkPath(),
+		})
+		if err != nil {
+			cio.printf("%s binary update warning: %v\n", stamp, err)
+		} else if updated {
+			cio.printf("%s updated binary to %s\n", stamp, payload.BinaryVersion)
+			reexecSyncUpdated(cio, stamp, "")
+		}
+	}
+
+	return applySyncedFiles(cio, stamp, payload)
 }
 
 func cmdStatus(args []string, cio *IO) error {
 	if len(args) > 0 {
-		return userErr("usage: fleet status")
+		return fmt.Errorf("usage: fleet status")
 	}
-	node, err := loadNode()
+	node, err := client.LoadNode()
 	if err != nil {
 		return err
 	}
@@ -1038,8 +1003,8 @@ func cmdStatus(args []string, cio *IO) error {
 		nebLabel = "nebula (not installed)"
 	}
 	isLighthouse := strings.HasPrefix(node.API, "http://127.0.0.1")
-	for _, label := range []string{nebLabel, paths.SyncLabel, paths.ServeLabel, paths.DdnsLabel} {
-		if (label == paths.ServeLabel || label == paths.DdnsLabel) && !isLighthouse {
+	for _, label := range []string{nebLabel, paths.SyncLabel, paths.ServeLabel, paths.DDNSLabel} {
+		if (label == paths.ServeLabel || label == paths.DDNSLabel) && !isLighthouse {
 			continue
 		}
 		st := "NOT loaded"
@@ -1077,69 +1042,109 @@ func formatWaitDuration(secs int) string {
 	return fmt.Sprintf("%dh", hours)
 }
 
-func cmdAgents(args []string, cio *IO) error {
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		switch args[0] {
-		case "wait":
-			fs := flag.NewFlagSet("agents wait", flag.ContinueOnError)
-			session := fs.String("session", "", "session_id to wait on")
-			harness := fs.String("harness", "", "harness override")
-			timeout := fs.Float64("timeout", 0.0, "max wait seconds (0 = wait indefinitely)")
-			pollTimeout := fs.Float64("poll-timeout", 50.0, "per-request long-poll seconds")
-			pos, err := parseFlagsInterspersed(fs, args[1:])
-			if err != nil {
-				return err
-			}
-			if len(pos) > 0 || *session == "" {
-				return userErr("usage: fleet agents wait --session SESSION_ID [--harness H] [--timeout S]")
-			}
-			if *harness != "" && !paths.ValidHarness(*harness) {
-				return userErr("unknown harness %q", *harness)
-			}
-			rc, err := waiter.WaitForInboxCLI(waiter.WaitCLIOpts{
-				SessionID:   *session,
-				Harness:     *harness,
-				MaxWait:     *timeout,
-				PollTimeout: *pollTimeout,
-				Stdout:      cio.Stdout,
-				WatchParent: true,
-			})
-			if err != nil {
-				return err
-			}
-			if rc != 0 {
-				return userErr("wait failed")
-			}
-			return nil
-		case "rename":
-			if len(args) != 3 {
-				return userErr("usage: fleet agents rename TARGET NAME")
-			}
-			api, err := apiURL()
-			if err != nil {
-				return err
-			}
-			var infoResp struct {
-				Agent agents.SessionDetail `json:"agent"`
-			}
-			if err := client.Call(api, "GET", "/v1/agents/"+url.PathEscape(args[1]), nil, 30*time.Second, nil, &infoResp); err != nil {
-				return err
-			}
-			var res struct {
-				SessionID string `json:"session_id"`
-				Name      string `json:"name"`
-			}
-			if err := client.Call(api, "POST", "/v1/agents/rename", map[string]string{
-				"session_id": infoResp.Agent.SessionID,
-				"name":       args[2],
-			}, 30*time.Second, nil, &res); err != nil {
-				return err
-			}
-			cio.printf("%s -> %s\n", res.SessionID, res.Name)
-			return nil
-		}
+func cmdAgentsWait(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("agents wait", flag.ContinueOnError)
+	session := fs.String("session", "", "session_id to wait on")
+	harness := fs.String("harness", "", "harness override")
+	timeout := fs.Float64("timeout", 0.0, "max wait seconds (0 = wait indefinitely)")
+	pollTimeout := fs.Float64("poll-timeout", 50.0, "per-request long-poll seconds")
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
+		return err
 	}
+	if len(pos) > 0 || *session == "" {
+		return fmt.Errorf("usage: fleet agents wait --session SESSION_ID [--harness H] [--timeout S]")
+	}
+	if *harness != "" && !paths.ValidHarness(*harness) {
+		return fmt.Errorf("unknown harness %q", *harness)
+	}
+	rc, err := waiter.WaitForInboxCLI(waiter.WaitCLIOpts{
+		SessionID:   *session,
+		Harness:     *harness,
+		MaxWait:     *timeout,
+		PollTimeout: *pollTimeout,
+		Stdout:      cio.Stdout,
+		WatchParent: true,
+	})
+	if err != nil {
+		return err
+	}
+	if rc != 0 {
+		return fmt.Errorf("wait failed")
+	}
+	return nil
+}
 
+func cmdAgentsRename(args []string, cio *IO) error {
+	if len(args) != 2 {
+		return fmt.Errorf("usage: fleet agents rename TARGET NAME")
+	}
+	api, err := client.ResolveAPI("")
+	if err != nil {
+		return err
+	}
+	var infoResp struct {
+		Agent agents.SessionDetail `json:"agent"`
+	}
+	if err := client.Call(api, "GET", "/v1/agents/"+url.PathEscape(args[0]), nil, 30*time.Second, nil, &infoResp); err != nil {
+		return err
+	}
+	var res struct {
+		SessionID string `json:"session_id"`
+		Name      string `json:"name"`
+	}
+	if err := client.Call(api, "POST", "/v1/agents/rename", map[string]string{
+		"session_id": infoResp.Agent.SessionID,
+		"name":       args[1],
+	}, 30*time.Second, nil, &res); err != nil {
+		return err
+	}
+	cio.printf("%s -> %s\n", res.SessionID, res.Name)
+	return nil
+}
+
+func formatAgentState(ag agents.Session) string {
+	switch {
+	case !ag.Live:
+		return ag.State + " (stale)"
+	case ag.State == "waiting_permission" || ag.State == "waiting_question":
+		var tags []string
+		if ag.WaitingSeconds != nil {
+			tags = append(tags, formatWaitDuration(*ag.WaitingSeconds))
+		}
+		if ag.Listening {
+			tags = append(tags, "listening")
+		}
+		if len(tags) > 0 {
+			return fmt.Sprintf("%s (%s)", ag.State, strings.Join(tags, ", "))
+		}
+	case ag.Listening:
+		return ag.State + " (listening)"
+	}
+	return ag.State
+}
+
+func formatAgentTitle(ag agents.Session) string {
+	baseTitle := strings.TrimSpace(strings.ReplaceAll(cmp.Or(ag.Title, ag.Summary), "\n", " "))
+	if len(ag.PendingAction) == 0 {
+		return agents.TruncateRunes(baseTitle, 48)
+	}
+	tool := strings.TrimSpace(ag.PendingAction["tool"])
+	detail := strings.TrimSpace(strings.ReplaceAll(ag.PendingAction["detail"], "\n", " "))
+	snippet := ""
+	switch {
+	case tool != "" && detail != "":
+		snippet = fmt.Sprintf("[%s: %s]", tool, detail)
+	case tool != "" || detail != "":
+		snippet = fmt.Sprintf("[%s]", cmp.Or(tool, detail))
+	}
+	if snippet != "" && baseTitle != "" {
+		return agents.TruncateRunes(snippet+" "+baseTitle, 60)
+	}
+	return agents.TruncateRunes(cmp.Or(snippet, baseTitle), 60)
+}
+
+func cmdAgentsList(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("agents", flag.ContinueOnError)
 	all := fs.Bool("all", false, "include stale and exited sessions")
 	waiting := fs.Bool("waiting", false, "show only sessions waiting on permission or user input")
@@ -1151,9 +1156,9 @@ func cmdAgents(args []string, cio *IO) error {
 		return err
 	}
 	if len(pos) > 0 {
-		return userErr("unknown agents subcommand or argument: %s", strings.Join(pos, " "))
+		return fmt.Errorf("unknown agents subcommand or argument: %s", strings.Join(pos, " "))
 	}
-	api, err := apiURL()
+	api, err := client.ResolveAPI("")
 	if err != nil {
 		return err
 	}
@@ -1190,81 +1195,35 @@ func cmdAgents(args []string, cio *IO) error {
 	}
 	rows := [][]string{{"NAME", "DEVICE", "HARNESS", "REPO", "STATE", "LAST SEEN", "TITLE", "SESSION"}}
 	for _, ag := range resp.Agents {
-		stLabel := ag.State
-		if !ag.Live {
-			stLabel = ag.State + " (stale)"
-		} else if ag.State == "waiting_permission" || ag.State == "waiting_question" {
-			var tags []string
-			if ag.WaitingSeconds != nil {
-				tags = append(tags, formatWaitDuration(*ag.WaitingSeconds))
-			}
-			if ag.Listening {
-				tags = append(tags, "listening")
-			}
-			if len(tags) > 0 {
-				stLabel = fmt.Sprintf("%s (%s)", ag.State, strings.Join(tags, ", "))
-			}
-		} else if ag.Listening {
-			stLabel = ag.State + " (listening)"
-		}
-
 		repoLabel := ag.Repo
 		if ag.Repo != "" && ag.Branch != "" {
 			repoLabel = ag.Repo + "@" + ag.Branch
 		}
-		if repoLabel == "" {
-			repoLabel = "-"
-		}
-
-		baseTitle := ag.Title
-		if baseTitle == "" {
-			baseTitle = ag.Summary
-		}
-		baseTitle = strings.TrimSpace(strings.ReplaceAll(baseTitle, "\n", " "))
-
-		var titleText string
-		if len(ag.PendingAction) > 0 {
-			tool := strings.TrimSpace(ag.PendingAction["tool"])
-			detail := strings.TrimSpace(strings.ReplaceAll(ag.PendingAction["detail"], "\n", " "))
-			snippet := ""
-			if tool != "" && detail != "" {
-				snippet = fmt.Sprintf("[%s: %s]", tool, detail)
-			} else if tool != "" || detail != "" {
-				p := tool
-				if p == "" {
-					p = detail
-				}
-				snippet = fmt.Sprintf("[%s]", p)
-			}
-			if snippet != "" && baseTitle != "" {
-				titleText = agents.TruncateRunes(snippet+" "+baseTitle, 60)
-			} else {
-				s := snippet
-				if s == "" {
-					s = baseTitle
-				}
-				titleText = agents.TruncateRunes(s, 60)
-			}
-		} else {
-			titleText = agents.TruncateRunes(baseTitle, 48)
-		}
-
-		name := ag.Name
-		if name == "" {
-			name = "-"
-		}
 		ls := ag.UpdatedAt
 		rows = append(rows, []string{
-			name, ag.Device, ag.Harness, repoLabel, stLabel, ago(&ls), titleText, ag.SessionID,
+			cmp.Or(ag.Name, "-"), ag.Device, ag.Harness, cmp.Or(repoLabel, "-"),
+			formatAgentState(ag), ago(&ls), formatAgentTitle(ag), ag.SessionID,
 		})
 	}
 	printTable(cio.Stdout, rows)
 	return nil
 }
 
+func cmdAgents(args []string, cio *IO) error {
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		switch args[0] {
+		case "wait":
+			return cmdAgentsWait(args[1:], cio)
+		case "rename":
+			return cmdAgentsRename(args[1:], cio)
+		}
+	}
+	return cmdAgentsList(args, cio)
+}
+
 func cmdMCP(args []string, cio *IO) error {
 	if len(args) == 0 {
-		return userErr("usage: fleet mcp install|uninstall|status|serve")
+		return fmt.Errorf("usage: fleet mcp install|uninstall|status|serve")
 	}
 	switch args[0] {
 	case "install":
@@ -1321,7 +1280,7 @@ func cmdMCP(args []string, cio *IO) error {
 			return err
 		}
 		if !paths.ValidHarness(*harness) {
-			return userErr("usage: fleet mcp serve --harness claude|codex|antigravity")
+			return fmt.Errorf("usage: fleet mcp serve --harness claude|codex|antigravity")
 		}
 		_, err := mcp.ServeStdio(mcp.ServeOpts{
 			Harness: *harness,
@@ -1330,7 +1289,7 @@ func cmdMCP(args []string, cio *IO) error {
 		})
 		return err
 	default:
-		return userErr("unknown mcp subcommand %q", args[0])
+		return fmt.Errorf("unknown mcp subcommand %q", args[0])
 	}
 }
 
@@ -1341,7 +1300,7 @@ func cmdAgentHook(args []string, cio *IO) error {
 		return err
 	}
 	if !paths.ValidHarness(*harness) {
-		return userErr("usage: fleet agent-hook --harness claude|codex|antigravity")
+		return fmt.Errorf("usage: fleet agent-hook --harness claude|codex|antigravity")
 	}
 	_, err := hooks.RunHook(*harness, cio.Stdin, cio.Stdout, "")
 	return err
@@ -1355,19 +1314,13 @@ func ddnsPreflight(name, zoneID, profile string) (ddns.Route53, error) {
 		return ddns.Route53{}, err
 	}
 	if _, err := exec.LookPath("aws"); err != nil {
-		return ddns.Route53{}, userErr("aws CLI not found: brew install awscli")
+		return ddns.Route53{}, fmt.Errorf("aws CLI not found: brew install awscli")
 	}
 	out, _ := exec.Command("aws", "configure", "list-profiles").Output()
 	profiles := strings.Fields(string(out))
-	found := false
-	for _, p := range profiles {
-		if p == profile {
-			found = true
-			break
-		}
-	}
+	found := slices.Contains(profiles, profile)
 	if !found {
-		return ddns.Route53{}, userErr(
+		return ddns.Route53{}, fmt.Errorf(
 			"no AWS profile %q. Create an IAM user whose only policy is the output of\n  fleet ddns policy --zone-id %s --name %s\nthen store its access key with: aws configure --profile %s",
 			profile, zid, name, profile,
 		)
@@ -1389,10 +1342,10 @@ func ddnsActivate(cio *IO, fleet *core.Fleet, cfg ddns.Route53, binPath, stateDi
 	if err != nil {
 		return err
 	}
-	if err := fleet.SetDdns(cfg); err != nil {
+	if err := fleet.SetDDNS(cfg); err != nil {
 		return err
 	}
-	if err := system.InstallDdnsDaemon(binPath, currentUsername(), stateDir, workDir); err != nil {
+	if err := system.InstallDDNSDaemon(binPath, currentUsername(), stateDir, workDir); err != nil {
 		return err
 	}
 	state := fmt.Sprintf("already %s", ip)
@@ -1407,143 +1360,151 @@ func ddnsActivate(cio *IO, fleet *core.Fleet, cfg ddns.Route53, binPath, stateDi
 	return nil
 }
 
+func loadDDNSConfig() (ddns.Route53, error) {
+	fleet, err := core.Open("")
+	if err != nil {
+		return ddns.Route53{}, err
+	}
+	defer func() { _ = fleet.Close() }()
+	cfg, err := fleet.DDNSConfig()
+	if err != nil {
+		return ddns.Route53{}, err
+	}
+	if cfg == nil {
+		return ddns.Route53{}, fmt.Errorf("DNS updates aren't configured (fleet ddns setup)")
+	}
+	return *cfg, nil
+}
+
+func cmdDDNSSetup(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("ddns setup", flag.ContinueOnError)
+	zoneID := fs.String("zone-id", "", "Route 53 hosted zone id")
+	profile := fs.String("profile", "fleet-ddns", "AWS profile")
+	nameFlag := fs.String("name", "", "record to manage")
+	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+		return err
+	}
+	if *zoneID == "" {
+		return fmt.Errorf("usage: fleet ddns setup --zone-id Z... [--profile fleet-ddns] [--name HOST]")
+	}
+	if err := requireNotRoot("ddns setup"); err != nil {
+		return err
+	}
+	fleet, err := core.Open("")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fleet.Close() }()
+	settings, err := fleet.Settings()
+	if err != nil {
+		return err
+	}
+	host := settings["lighthouse_host"]
+	name := cmp.Or(*nameFlag, host)
+	if name == "" {
+		return fmt.Errorf("run on the lighthouse after `fleet init`, or pass --name")
+	}
+	if host != "" && strings.TrimRight(name, ".") != host {
+		cio.printf("warning: devices connect to %s, not %s\n", host, name)
+	}
+	cfg, err := ddnsPreflight(name, *zoneID, *profile)
+	if err != nil {
+		return err
+	}
+	instBin, err := ensureInstalledSelf()
+	if err != nil {
+		return err
+	}
+	return ddnsActivate(cio, fleet, cfg, instBin, paths.StateDir(), "")
+}
+
+func cmdDDNSRun(cio *IO) error {
+	cfg, err := loadDDNSConfig()
+	if err != nil {
+		return err
+	}
+	stamp := time.Now().Format("2006-01-02T15:04:05")
+	before, ip, changed, err := ddns.Sync(cfg, nil, nil, "", nil)
+	if err != nil {
+		return fmt.Errorf("%s %w", stamp, err)
+	}
+	if changed {
+		prev := "none"
+		if before != nil {
+			prev = *before
+		}
+		cio.printf("%s %s: %s -> %s\n", stamp, cfg.Name, prev, ip)
+	}
+	return nil
+}
+
+func cmdDDNSStatus(cio *IO) error {
+	cfg, err := loadDDNSConfig()
+	if err != nil {
+		return err
+	}
+	pubIP, err := ddns.PublicIPv4(nil)
+	if err != nil {
+		return err
+	}
+	cur, err := ddns.CurrentRecord(cfg, nil)
+	if err != nil {
+		return err
+	}
+	curStr := "no record"
+	if cur != nil {
+		curStr = *cur
+	}
+	ns0 := ""
+	if len(cfg.Nameservers) > 0 {
+		ns0 = cfg.Nameservers[0]
+	}
+	cio.printf("record:      %s (zone %s, profile %s)\n", cfg.Name, cfg.ZoneID, cfg.Profile)
+	cio.printf("public IP:   %s\n", pubIP)
+	cio.printf("DNS answer:  %s  (from %s)\n", curStr, ns0)
+	loaded := "NOT loaded"
+	if system.LaunchdLoaded(paths.DDNSLabel) {
+		loaded = "loaded"
+	}
+	cio.printf("%-44s %s\n", paths.DDNSLabel+":", loaded)
+	return nil
+}
+
+func cmdDDNSPolicy(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("ddns policy", flag.ContinueOnError)
+	zoneID := fs.String("zone-id", "", "Route 53 hosted zone id")
+	name := fs.String("name", "", "DNS record name")
+	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+		return err
+	}
+	if *zoneID == "" || *name == "" {
+		return fmt.Errorf("usage: fleet ddns policy --zone-id Z... --name HOST")
+	}
+	p, err := ddns.Policy(*zoneID, *name)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(cio.Stdout)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	return enc.Encode(p)
+}
+
 func cmdDDNS(args []string, cio *IO) error {
 	if len(args) == 0 {
-		return userErr("usage: fleet ddns setup|run|status|policy")
+		return fmt.Errorf("usage: fleet ddns setup|run|status|policy")
 	}
 	switch args[0] {
 	case "setup":
-		fs := flag.NewFlagSet("ddns setup", flag.ContinueOnError)
-		zoneID := fs.String("zone-id", "", "Route 53 hosted zone id")
-		profile := fs.String("profile", "fleet-ddns", "AWS profile")
-		nameFlag := fs.String("name", "", "record to manage")
-		if _, err := parseFlagsInterspersed(fs, args[1:]); err != nil {
-			return err
-		}
-		if *zoneID == "" {
-			return userErr("usage: fleet ddns setup --zone-id Z... [--profile fleet-ddns] [--name HOST]")
-		}
-		if err := requireNotRoot("ddns setup"); err != nil {
-			return err
-		}
-		fleet, err := core.Open("")
-		if err != nil {
-			return err
-		}
-		defer func() { _ = fleet.Close() }()
-		settings, err := fleet.Settings()
-		if err != nil {
-			return err
-		}
-		host := settings["lighthouse_host"]
-		name := *nameFlag
-		if name == "" {
-			name = host
-		}
-		if name == "" {
-			return userErr("run on the lighthouse after `fleet init`, or pass --name")
-		}
-		if host != "" && strings.TrimRight(name, ".") != host {
-			cio.printf("warning: devices connect to %s, not %s\n", host, name)
-		}
-		cfg, err := ddnsPreflight(name, *zoneID, *profile)
-		if err != nil {
-			return err
-		}
-		instBin, err := ensureInstalledSelf()
-		if err != nil {
-			return err
-		}
-		return ddnsActivate(cio, fleet, cfg, instBin, paths.StateDir(), "")
+		return cmdDDNSSetup(args[1:], cio)
 	case "run":
-		fleet, err := core.Open("")
-		if err != nil {
-			return err
-		}
-		defer func() { _ = fleet.Close() }()
-		cfg, err := fleet.DdnsConfig()
-		if err != nil {
-			return err
-		}
-		if cfg == nil {
-			return userErr("DNS updates aren't configured (fleet ddns setup)")
-		}
-		stamp := time.Now().Format("2006-01-02T15:04:05")
-		before, ip, changed, err := ddns.Sync(*cfg, nil, nil, "", nil)
-		if err != nil {
-			return userErr("%s %v", stamp, err)
-		}
-		if changed {
-			prev := "none"
-			if before != nil {
-				prev = *before
-			}
-			cio.printf("%s %s: %s -> %s\n", stamp, cfg.Name, prev, ip)
-		}
-		return nil
+		return cmdDDNSRun(cio)
 	case "status":
-		fleet, err := core.Open("")
-		if err != nil {
-			return err
-		}
-		defer func() { _ = fleet.Close() }()
-		cfg, err := fleet.DdnsConfig()
-		if err != nil {
-			return err
-		}
-		if cfg == nil {
-			return userErr("DNS updates aren't configured (fleet ddns setup)")
-		}
-		pubIP, err := ddns.PublicIPv4(nil)
-		if err != nil {
-			return err
-		}
-		cur, err := ddns.CurrentRecord(*cfg, nil)
-		if err != nil {
-			return err
-		}
-		curStr := "no record"
-		if cur != nil {
-			curStr = *cur
-		}
-		ns0 := ""
-		if len(cfg.Nameservers) > 0 {
-			ns0 = cfg.Nameservers[0]
-		}
-		cio.printf("record:      %s (zone %s, profile %s)\n", cfg.Name, cfg.ZoneID, cfg.Profile)
-		cio.printf("public IP:   %s\n", pubIP)
-		cio.printf("DNS answer:  %s  (from %s)\n", curStr, ns0)
-		loaded := "NOT loaded"
-		if system.LaunchdLoaded(paths.DdnsLabel) {
-			loaded = "loaded"
-		}
-		cio.printf("%-44s %s\n", paths.DdnsLabel+":", loaded)
-		return nil
+		return cmdDDNSStatus(cio)
 	case "policy":
-		fs := flag.NewFlagSet("ddns policy", flag.ContinueOnError)
-		zoneID := fs.String("zone-id", "", "Route 53 hosted zone id")
-		name := fs.String("name", "", "DNS record name")
-		if _, err := parseFlagsInterspersed(fs, args[1:]); err != nil {
-			return err
-		}
-		if *zoneID == "" || *name == "" {
-			return userErr("usage: fleet ddns policy --zone-id Z... --name HOST")
-		}
-		p, err := ddns.Policy(*zoneID, *name)
-		if err != nil {
-			return err
-		}
-		var buf bytes.Buffer
-		enc := json.NewEncoder(&buf)
-		enc.SetEscapeHTML(false)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(p); err != nil {
-			return err
-		}
-		cio.printf("%s", buf.String())
-		return nil
+		return cmdDDNSPolicy(args[1:], cio)
 	default:
-		return userErr("unknown ddns subcommand %q", args[0])
+		return fmt.Errorf("unknown ddns subcommand %q", args[0])
 	}
 }
 
@@ -1569,6 +1530,44 @@ Commands:
 `
 }
 
+func dispatchCommand(cmd string, rest []string, cio *IO) (bool, error) {
+	switch cmd {
+	case "version", "--version", "-V":
+		cio.printf("%s\n", version.String())
+		return true, nil
+	case "init":
+		return true, cmdInit(rest, cio)
+	case "join":
+		return true, cmdJoin(rest, cio)
+	case "approve":
+		return true, cmdApprove(rest, cio)
+	case "approve-mobile":
+		return true, cmdApproveMobile(rest, cio)
+	case "ls":
+		return true, cmdLS(rest, cio)
+	case "revoke":
+		return true, cmdRevoke(rest, cio)
+	case "set":
+		return true, cmdSet(rest, cio)
+	case "sync":
+		return true, cmdSync(rest, cio)
+	case "serve":
+		return true, server.Serve(paths.APIPort(), "0.0.0.0")
+	case "status":
+		return true, cmdStatus(rest, cio)
+	case "ddns":
+		return true, cmdDDNS(rest, cio)
+	case "agents":
+		return true, cmdAgents(rest, cio)
+	case "mcp":
+		return true, cmdMCP(rest, cio)
+	case "agent-hook":
+		return true, cmdAgentHook(rest, cio)
+	default:
+		return false, nil
+	}
+}
+
 // Run dispatches CLI args using cio and returns an exit code (0 on success).
 func Run(args []string, cio *IO) int {
 	if cio == nil {
@@ -1578,46 +1577,11 @@ func Run(args []string, cio *IO) int {
 		_, _ = io.WriteString(cio.Stdout, usageText())
 		return 0
 	}
-	cmd := args[0]
-	rest := args[1:]
-
-	var err error
-	switch cmd {
-	case "version", "--version", "-V":
-		cio.printf("%s\n", version.String())
-	case "init":
-		err = cmdInit(rest, cio)
-	case "join":
-		err = cmdJoin(rest, cio)
-	case "approve":
-		err = cmdApprove(rest, cio)
-	case "approve-mobile":
-		err = cmdApproveMobile(rest, cio)
-	case "ls":
-		err = cmdLS(rest, cio)
-	case "revoke":
-		err = cmdRevoke(rest, cio)
-	case "set":
-		err = cmdSet(rest, cio)
-	case "sync":
-		err = cmdSync(rest, cio)
-	case "serve":
-		err = server.Serve(paths.APIPort(), "0.0.0.0")
-	case "status":
-		err = cmdStatus(rest, cio)
-	case "ddns":
-		err = cmdDDNS(rest, cio)
-	case "agents":
-		err = cmdAgents(rest, cio)
-	case "mcp":
-		err = cmdMCP(rest, cio)
-	case "agent-hook":
-		err = cmdAgentHook(rest, cio)
-	default:
-		_, _ = fmt.Fprintf(cio.Stderr, "error: unknown command %q\n\n%s", cmd, usageText())
+	ok, err := dispatchCommand(args[0], args[1:], cio)
+	if !ok {
+		_, _ = fmt.Fprintf(cio.Stderr, "error: unknown command %q\n\n%s", args[0], usageText())
 		return 2
 	}
-
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			_, _ = io.WriteString(cio.Stdout, usageText())
@@ -1633,6 +1597,3 @@ func Run(args []string, cio *IO) int {
 func Main(args []string) int {
 	return Run(args, defaultIO())
 }
-
-// Ensure strconv is referenced if unused on future edits.
-var _ = strconv.Itoa

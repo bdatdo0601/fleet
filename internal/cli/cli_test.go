@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/bdatdo0601/fleet/internal/agents"
+	"github.com/bdatdo0601/fleet/internal/client"
 	"github.com/bdatdo0601/fleet/internal/codes"
 	"github.com/bdatdo0601/fleet/internal/core"
 	"github.com/bdatdo0601/fleet/internal/pki"
@@ -47,7 +48,7 @@ func setupCLIServer(t *testing.T) (*core.Fleet, *httptest.Server, string) {
 	srv := httptest.NewServer(server.NewHandler(f, true))
 	t.Cleanup(srv.Close)
 
-	nodeBytes, _ := json.Marshal(NodeConfig{Name: "mini", API: srv.URL})
+	nodeBytes, _ := json.Marshal(client.NodeConfig{Name: "mini", API: srv.URL})
 	_ = os.WriteFile(filepath.Join(pkiDir, "fleet.json"), nodeBytes, 0o644)
 	return f, srv, tmp
 }
