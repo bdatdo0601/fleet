@@ -144,6 +144,7 @@ func EnsureNebula() error {
 }
 
 // FirewallAllow permits binaries through the macOS Application Firewall when enabled.
+// Removes any stale rule first so updated ad-hoc code signatures are refreshed.
 func FirewallAllow(binaries ...string) {
 	if _, err := os.Stat(ALF); err != nil {
 		return
@@ -162,6 +163,7 @@ func FirewallAllow(binaries ...string) {
 		} else if abs, err := filepath.Abs(bin); err == nil {
 			real = abs
 		}
+		_, _, _, _ = Sudo(false, ALF, "--remove", real)
 		_, _, _, _ = Sudo(false, ALF, "--add", real)
 		_, _, _, _ = Sudo(false, ALF, "--unblockapp", real)
 	}
@@ -277,6 +279,28 @@ func BuildDaemonPlist(opts DaemonOpts) (string, error) {
 	return b.String(), nil
 }
 
+func reloadDaemon(label, plistPath string) error {
+	_, _, _, _ = Sudo(false, "launchctl", "bootout", "system/"+label)
+	for i := 0; i < 20; i++ {
+		if !LaunchdLoaded(label) {
+			break
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	var lastStderr string
+	var lastErr error
+	for i := 0; i < 5; i++ {
+		_, stderrStr, rc, err := Sudo(false, "launchctl", "bootstrap", "system", plistPath)
+		if err == nil && rc == 0 {
+			return nil
+		}
+		lastStderr = stderrStr
+		lastErr = err
+		time.Sleep(300 * time.Millisecond)
+	}
+	return fmt.Errorf("launchctl bootstrap %s failed: %v (%s)", plistPath, lastErr, strings.TrimSpace(lastStderr))
+}
+
 // InstallDaemon writes the LaunchDaemon plist and loads/restarts it in launchd.
 func InstallDaemon(opts DaemonOpts) error {
 	plist, err := BuildDaemonPlist(opts)
@@ -284,21 +308,37 @@ func InstallDaemon(opts DaemonOpts) error {
 		return err
 	}
 	plistPath := filepath.Join(LaunchDaemonsDir, opts.Label+".plist")
-	if _, err := WriteRootFile(plistPath, plist, 0o644); err != nil {
+	changed, err := WriteRootFile(plistPath, plist, 0o644)
+	if err != nil {
 		return err
 	}
 	if opts.ReloadDetached {
 		return ReloadDaemonDetached(opts.Label, plistPath)
 	}
-	_, _, _, _ = Sudo(false, "launchctl", "bootout", "system/"+opts.Label)
-	_, _, _, err = Sudo(true, "launchctl", "bootstrap", "system", plistPath)
-	return err
+	if !changed && LaunchdLoaded(opts.Label) {
+		Restart(opts.Label)
+		return nil
+	}
+	return reloadDaemon(opts.Label, plistPath)
 }
 
 // ReloadDaemonDetached reloads a LaunchDaemon in a detached session after a 1s delay
 // so a running sync daemon does not SIGTERM itself mid-execution.
 func ReloadDaemonDetached(label, plistPath string) error {
-	script := `sleep 1; launchctl bootout "system/$1" >/dev/null 2>&1 || true; launchctl bootstrap system "$2" >/dev/null 2>&1 || true`
+	script := `sleep 1
+launchctl bootout "system/$1" >/dev/null 2>&1 || true
+i=0
+while [ "$i" -lt 20 ] && launchctl print "system/$1" >/dev/null 2>&1; do
+  sleep 0.15
+  i=$((i + 1))
+done
+i=0
+while [ "$i" -lt 5 ]; do
+  launchctl bootstrap system "$2" >/dev/null 2>&1 && exit 0
+  sleep 0.3
+  i=$((i + 1))
+done
+exit 1`
 	var name string
 	var args []string
 	if IsRoot() {
@@ -464,9 +504,36 @@ func EnsureSymlink(target, linkPath string) error {
 	return err
 }
 
+func ensureExecDir(dir string) error {
+	var missing []string
+	cur := dir
+	for {
+		if _, err := os.Stat(cur); err == nil {
+			break
+		}
+		missing = append(missing, cur)
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		cur = parent
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	for _, d := range missing {
+		_ = os.Chmod(d, 0o755)
+		if IsRoot() {
+			_ = os.Chown(d, 0, 0)
+		}
+	}
+	_ = os.Chmod(dir, 0o755)
+	return nil
+}
+
 func copyFileAtomic(src, dst string, mode os.FileMode) error {
 	dir := filepath.Dir(dst)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := ensureExecDir(dir); err != nil {
 		return err
 	}
 	in, err := os.Open(src)
@@ -821,14 +888,21 @@ func SelfUpdateLighthouse(opts LighthouseUpdateOpts) (bool, error) {
 	}
 
 	if !opts.SkipDaemonControl {
-		if err := InstallServeDaemon(targetBin, owner, stateDir, opts.RepoDir); err != nil {
+		ensureServeRunning := func() {
+			if LaunchdLoaded(paths.ServeLabel) {
+				Restart(paths.ServeLabel)
+			} else {
+				_ = InstallServeDaemon(targetBin, owner, stateDir, stateDir)
+			}
+		}
+		if err := InstallServeDaemon(targetBin, owner, stateDir, stateDir); err != nil {
 			_ = RollbackBinary(targetBin, prevBin)
-			Restart(paths.ServeLabel)
+			ensureServeRunning()
 			cleanupTmp()
 			return false, err
 		}
 		if LaunchdLoaded(paths.DdnsLabel) {
-			_ = InstallDdnsDaemon(targetBin, owner, stateDir, opts.RepoDir)
+			_ = InstallDdnsDaemon(targetBin, owner, stateDir, stateDir)
 		}
 		localAPI := opts.LocalAPI
 		if localAPI == "" {
@@ -836,7 +910,7 @@ func SelfUpdateLighthouse(opts LighthouseUpdateOpts) (bool, error) {
 		}
 		if !waitHealthy(localAPI, opts.HealthcheckTimeout, opts.HealthcheckFn) {
 			_ = RollbackBinary(targetBin, prevBin)
-			Restart(paths.ServeLabel)
+			ensureServeRunning()
 			cleanupTmp()
 			return false, fmt.Errorf("new fleet serve failed health check; rolled back")
 		}

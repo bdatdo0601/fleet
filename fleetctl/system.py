@@ -86,6 +86,7 @@ def firewall_allow(*binaries: str | None) -> None:
     for binary in binaries:
         if binary:
             real = os.path.realpath(binary)
+            sudo(ALF, "--remove", real, check=False)
             sudo(ALF, "--add", real, check=False)
             sudo(ALF, "--unblockapp", real, check=False)
 
@@ -120,7 +121,10 @@ def _reload_daemon_detached(label: str, plist_path: Path) -> None:
     """Reload a LaunchDaemon after a 1s delay in a detached session so `fleet sync` won't SIGTERM itself."""
     script = (
         'sleep 1; launchctl bootout "system/$1" >/dev/null 2>&1 || true; '
-        'launchctl bootstrap system "$2" >/dev/null 2>&1 || true'
+        'i=0; while [ "$i" -lt 20 ] && launchctl print "system/$1" >/dev/null 2>&1; do '
+        'sleep 0.15; i=$((i + 1)); done; '
+        'i=0; while [ "$i" -lt 5 ]; do launchctl bootstrap system "$2" >/dev/null 2>&1 && exit 0; '
+        'sleep 0.3; i=$((i + 1)); done; exit 1'
     )
     cmd = ["sh", "-c", script, "_", label, str(plist_path)]
     if not is_root():
@@ -132,6 +136,22 @@ def _reload_daemon_detached(label: str, plist_path: Path) -> None:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+
+
+def _reload_daemon(label: str, plist_path: Path) -> None:
+    sudo("launchctl", "bootout", f"system/{label}", check=False)
+    for _ in range(20):
+        if not launchd_loaded(label):
+            break
+        time.sleep(0.15)
+    for attempt in range(5):
+        try:
+            sudo("launchctl", "bootstrap", "system", str(plist_path), check=True)
+            return
+        except subprocess.CalledProcessError:
+            if attempt == 4:
+                raise
+            time.sleep(0.3)
 
 
 def install_daemon(
@@ -167,12 +187,13 @@ def install_daemon(
     if keepalive:
         plist["KeepAlive"] = True
     path = LAUNCH_DAEMONS / f"{label}.plist"
-    write_root_file(path, plistlib.dumps(plist).decode())
+    changed = write_root_file(path, plistlib.dumps(plist).decode())
     if reload_detached:
         _reload_daemon_detached(label, path)
+    elif not changed and launchd_loaded(label):
+        restart(label)
     else:
-        sudo("launchctl", "bootout", f"system/{label}", check=False)
-        sudo("launchctl", "bootstrap", "system", str(path))
+        _reload_daemon(label, path)
 
 
 # Daemons go through bin/fleet (python3 from PATH) rather than sys.executable,
@@ -235,7 +256,12 @@ def go_arch() -> str:
 def git_head_sha(repo: Path = REPO) -> str:
     if not (repo / ".git").exists():
         return ""
-    proc = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10)
+    proc = subprocess.run(
+        ["git", "-c", "safe.directory=*", "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
     return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
@@ -289,11 +315,27 @@ def ensure_symlink(target: Path, link: Path) -> None:
         sudo("ln", "-sfn", str(target), str(link))
 
 
+def _ensure_exec_dir(path: Path) -> None:
+    missing: list[Path] = []
+    cur = path
+    while not cur.exists():
+        missing.append(cur)
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    path.mkdir(parents=True, exist_ok=True)
+    for d in reversed(missing):
+        d.chmod(0o755)
+        if os.geteuid() == 0:
+            os.chown(d, 0, 0)
+    path.chmod(0o755)
+
+
 def install_binary_atomic(src: Path, target: Path, link: Path | None = None) -> Path | None:
     """Smoke-test `src`, preserve `.prev` backup if `target` exists, atomically install, symlink, and allowlist."""
     smoke_test_binary(src)
     prev_path: Path | None = None
-    target.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_exec_dir(target.parent)
     if target.exists():
         cand = target.with_name(target.name + ".prev")
         prev_tmp = target.with_name(f".{target.name}.prev.{os.getpid()}.tmp")
@@ -481,9 +523,9 @@ def lighthouse_build_and_migrate(
                 prev_link_target = Path(os.readlink(eff_link))
 
         prev_bin = install_binary_atomic(tmp_bins[host_arch], eff_target, eff_link)
-        install_go_serve_daemon(eff_target, eff_owner, eff_state, repo)
+        install_go_serve_daemon(eff_target, eff_owner, eff_state, eff_state)
         if ddns_was_loaded:
-            install_go_ddns_daemon(eff_target, eff_owner, eff_state, repo)
+            install_go_ddns_daemon(eff_target, eff_owner, eff_state, eff_state)
 
         checker = healthcheck_fn if callable(healthcheck_fn) else wait_serve_healthy
         if not checker(eff_api):
@@ -495,12 +537,12 @@ def lighthouse_build_and_migrate(
                     ensure_symlink(prev_link_target, eff_link)
             if prev_serve_plist is not None:
                 write_root_file(serve_plist, prev_serve_plist)
-                sudo("launchctl", "bootout", f"system/{SERVE_LABEL}", check=False)
-                sudo("launchctl", "bootstrap", "system", str(serve_plist), check=False)
+                with contextlib.suppress(subprocess.CalledProcessError):
+                    _reload_daemon(SERVE_LABEL, serve_plist)
             if ddns_was_loaded and prev_ddns_plist is not None:
                 write_root_file(ddns_plist, prev_ddns_plist)
-                sudo("launchctl", "bootout", f"system/{DDNS_LABEL}", check=False)
-                sudo("launchctl", "bootstrap", "system", str(ddns_plist), check=False)
+                with contextlib.suppress(subprocess.CalledProcessError):
+                    _reload_daemon(DDNS_LABEL, ddns_plist)
             raise RuntimeError("new fleet serve failed health check; rolled back")
 
         binaries_meta: dict[str, dict] = {}
