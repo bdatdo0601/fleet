@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import pwd
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -63,3 +64,34 @@ def launcher_path() -> str:
         return env_bin
     brew_bin = Path("/opt/homebrew/bin/fleet")
     return str(brew_bin) if brew_bin.exists() else str(REPO / "bin" / "fleet")
+
+
+DEFAULT_INSTALLED_BINARY = Path("/usr/local/libexec/fleet/fleet")
+DEFAULT_BREW_SYMLINK = Path("/opt/homebrew/bin/fleet")
+DEFAULT_LOCAL_SYMLINK = Path("/usr/local/bin/fleet")
+
+
+def installed_binary() -> Path:
+    """Root-owned Go binary path used after migration."""
+    return Path(os.environ.get("FLEET_INSTALL_BIN", str(DEFAULT_INSTALLED_BINARY)))
+
+
+def symlink_path() -> Path:
+    """PATH symlink pointing at installed_binary()."""
+    if env_sym := os.environ.get("FLEET_BIN_SYMLINK"):
+        return Path(env_sym)
+    if DEFAULT_BREW_SYMLINK.parent.is_dir():
+        return DEFAULT_BREW_SYMLINK
+    return DEFAULT_LOCAL_SYMLINK
+
+
+def state_dir_for_owner(owner: str) -> Path:
+    """Resolve lighthouse state_dir for `owner` even when running as root."""
+    if env_dir := os.environ.get("FLEET_STATE_DIR"):
+        return Path(env_dir)
+    if owner and owner != "root":
+        try:
+            return Path(pwd.getpwnam(owner).pw_dir) / ".fleet"
+        except KeyError:
+            pass
+    return state_dir()

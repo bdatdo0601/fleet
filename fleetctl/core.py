@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import re
 from pathlib import Path
 
@@ -136,10 +137,52 @@ class Fleet:
         return dev is not None and dev.grp in ("admin", "lighthouse")
 
     # operations ----------------------------------------------------------
-    def sync(self, dev: Device) -> dict:
-        self.registry.touch(dev.name)
-        return {"name": dev.name, "ip": dev.ip, "kind": dev.kind, "ca": self.ca_pem(),
-                "cert": dev.cert, "config": self.config_for(dev)}  # fmt: skip
+    def binary_for_platform(self, os_name: str, arch_name: str) -> tuple[Path, str, str] | None:
+        if os_name not in ("darwin", "linux") or arch_name not in ("arm64", "amd64"):
+            return None
+        bin_dir = self.root / "bin"
+        manifest_path = bin_dir / "manifest.json"
+        if not manifest_path.is_file():
+            return None
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (OSError, ValueError):
+            return None
+        entry = (manifest.get("binaries") or {}).get(f"{os_name}/{arch_name}")
+        if not isinstance(entry, dict):
+            return None
+        fname = str(entry.get("file") or "")
+        sha = str(entry.get("sha256") or "")
+        if not fname or not sha or Path(fname).name != fname or ".." in fname:
+            return None
+        artifact = bin_dir / fname
+        if not artifact.is_file():
+            return None
+        commit = str(manifest.get("commit") or "")
+        ver = f"go/{commit[:7]}" if commit else str(manifest.get("version") or "")
+        return artifact, sha, ver
+
+    def sync(
+        self,
+        dev: Device,
+        client_version: str | None = None,
+        os_name: str = "",
+        arch_name: str = "",
+    ) -> dict:
+        self.registry.touch(dev.name, client_version=client_version)
+        result: dict = {
+            "name": dev.name,
+            "ip": dev.ip,
+            "kind": dev.kind,
+            "ca": self.ca_pem(),
+            "cert": dev.cert,
+            "config": self.config_for(dev),
+        }
+        if os_name and arch_name and (bin_info := self.binary_for_platform(os_name, arch_name)):
+            _, sha, ver = bin_info
+            result["binary_sha256"] = sha
+            result["binary_version"] = ver
+        return result
 
     def approve(self, *, name: str, pubkey: str, kind: str, group: str, passphrase: str,
                 replace: bool = False) -> dict:  # fmt: skip
@@ -198,8 +241,19 @@ class Fleet:
         self.registry.revoke(name)
 
     def list(self) -> list[dict]:
-        return [{"name": d.name, "ip": d.ip, "kind": d.kind, "group": d.grp, "not_after": d.not_after,
-                 "last_seen": d.last_seen, "revoked_at": d.revoked_at} for d in self.registry.devices()]  # fmt: skip
+        return [
+            {
+                "name": d.name,
+                "ip": d.ip,
+                "kind": d.kind,
+                "group": d.grp,
+                "not_after": d.not_after,
+                "last_seen": d.last_seen,
+                "revoked_at": d.revoked_at,
+                "client_version": d.client_version,
+            }
+            for d in self.registry.devices()
+        ]
 
     def active_device_names(self) -> set[str]:
         return {d.name for d in self.registry.devices() if d.active}

@@ -17,19 +17,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import codes, ddns, hooks, mcp, mcp_install, pki, system, waiter
-from .client import ApiError, call
+from .client import ApiError, call, download
 from .core import Fleet, FleetError
 from .paths import (
     DDNS_LABEL,
     HARNESSES,
     LIGHTHOUSE_IP,
+    REPO,
     SERVE_LABEL,
     SYNC_LABEL,
     api_port,
+    installed_binary,
     nebula_etc,
     node_file,
     pending_dir,
     state_dir,
+    state_dir_for_owner,
+    symlink_path,
 )  # fmt: skip
 
 
@@ -239,10 +243,18 @@ def print_mobile(resp: dict) -> None:
 
 def cmd_ls(_: argparse.Namespace) -> None:
     data = call(api(), "GET", "/v1/devices")
-    rows = [("NAME", "IP", "KIND", "GROUP", "LAST SEEN", "EXPIRES", "STATUS")]
+    rows = [("NAME", "IP", "KIND", "GROUP", "LAST SEEN", "EXPIRES", "CLIENT", "STATUS")]
     for d in data["devices"]:
-        rows.append((d["name"], d["ip"], d["kind"], d["group"], ago(d["last_seen"]), d["not_after"][:10],
-                     "revoked" if d["revoked_at"] else "active"))  # fmt: skip
+        rows.append((
+            d["name"],
+            d["ip"],
+            d["kind"],
+            d["group"],
+            ago(d["last_seen"]),
+            d["not_after"][:10],
+            d.get("client_version") or "-",
+            "revoked" if d["revoked_at"] else "active",
+        ))
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
     for r in rows:
         print("  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip())
@@ -274,22 +286,66 @@ def cmd_set(a: argparse.Namespace) -> None:
         info(f"{a.name} is now {a.group}; it picks up its new certificate on its next sync (<= 5 min)")
 
 
+def _backfill_node_metadata(node: dict, is_lighthouse: bool) -> dict:
+    updated = dict(node)
+    changed = False
+    if not updated.get("owner"):
+        owner = system.repo_owner()
+        if owner and owner != "root":
+            updated["owner"] = owner
+            changed = True
+    if is_lighthouse:
+        if not updated.get("repo"):
+            updated["repo"] = str(REPO)
+            changed = True
+        if not updated.get("state_dir"):
+            updated["state_dir"] = str(state_dir_for_owner(str(updated.get("owner") or "")))
+            changed = True
+    if changed:
+        system.write_root_file(node_file(), json.dumps(updated, indent=2) + "\n")
+    return updated
+
+
 def cmd_sync(a: argparse.Namespace) -> None:
     if not system.is_root():
         raise UserError("fleet sync runs as root (launchd does this every 5 minutes; or: sudo fleet sync)")
     node = load_node()
     stamp = datetime.now().isoformat(timespec="seconds")
+    is_lighthouse = node["api"].startswith("http://127.0.0.1")
+    node = _backfill_node_metadata(node, is_lighthouse)
+
     if not a.no_update and system.self_update():
         print(f"{stamp} code updated from git")
-        if node["api"].startswith("http://127.0.0.1"):
+        if is_lighthouse:
             system.restart(SERVE_LABEL)
             time.sleep(2)  # let the restarted server bind before we call it
+
+    if not a.no_update and is_lighthouse:
+        status, detail = system.lighthouse_build_and_migrate(
+            repo=Path(node.get("repo") or REPO),
+            st_dir=Path(node.get("state_dir") or state_dir_for_owner(str(node.get("owner") or ""))),
+            owner=str(node.get("owner") or ""),
+            local_api=node["api"],
+        )
+        if status == "missing_go":
+            print(f"{stamp} {detail}")
+        elif status == "failed":
+            print(f"{stamp} Go build/migration failed (staying on Python): {detail}", file=sys.stderr)
+        elif status == "updated":
+            print(f"{stamp} migrated lighthouse to Go ({detail[:7]})")
+            target = installed_binary()
+            os.execv(str(target), [str(target), "sync", "--no-update"])  # noqa: S606 - trusted Go binary
+
     if mcp_updated := mcp_install.sync_owner_configs():
         print(f"{stamp} updated MCP/hook configs: {', '.join(p.name for p in mcp_updated)}")
+
+    arch = system.go_arch()
+    sync_path = f"/v1/sync?os=darwin&arch={urllib.parse.quote(arch, safe='')}"
+    headers = {"X-Fleet-Client": system.python_client_id()}
     deadline = time.monotonic() + (a.wait if a.wait else 0)
     while True:
         try:
-            payload = call(node["api"], "GET", "/v1/sync", timeout=15)
+            payload = call(node["api"], "GET", sync_path, timeout=15, headers=headers)
             break
         except ApiError as e:
             if "HTTP 403" in str(e):
@@ -298,6 +354,33 @@ def cmd_sync(a: argparse.Namespace) -> None:
                 print(f"{stamp} lighthouse unreachable, keeping current config: {e}")
                 return
             time.sleep(1)
+
+    expected_sha = str(payload.get("binary_sha256") or "")
+    if not a.no_update and not is_lighthouse and expected_sha:
+        target = installed_binary()
+        cur_info = system.file_sha256(target)
+        if cur_info is None or cur_info[0].lower() != expected_sha.lower():
+            with tempfile.TemporaryDirectory() as tmp:
+                dl_path = Path(tmp) / "fleet.new"
+                try:
+                    got_sha, _ = download(
+                        node["api"],
+                        f"/v1/binary?os=darwin&arch={urllib.parse.quote(arch, safe='')}",
+                        dl_path,
+                        timeout=60,
+                        headers=headers,
+                    )
+                    dl_path.chmod(0o755)
+                    if got_sha.lower() != expected_sha.lower():
+                        raise RuntimeError(f"SHA mismatch: expected {expected_sha}, got {got_sha}")
+                    system.install_binary_atomic(dl_path, target, symlink_path())
+                    system.install_go_sync_daemon(target, reload_detached=True)
+                    ver_label = payload.get("binary_version") or expected_sha[:12]
+                    print(f"{stamp} migrated client to Go ({ver_label})")
+                    os.execv(str(target), [str(target), "sync", "--no-update"])  # noqa: S606 - trusted Go binary
+                except (ApiError, OSError, RuntimeError) as e:
+                    print(f"{stamp} Go binary update failed (staying on Python): {e}", file=sys.stderr)
+
     changed = [p.name for p, content in (
         (nebula_etc() / "ca.crt", payload["ca"]),
         (nebula_etc() / "host.crt", payload["cert"]),

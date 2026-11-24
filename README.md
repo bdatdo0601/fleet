@@ -11,9 +11,12 @@ into it from anywhere. No third-party servers are involved.
  laptop   (admin)   ─┐                   ▼
  office   (managed) ─┼── Nebula ──► home Mac (lighthouse) 10.213.0.1   relay + CA
  phone    (admin)   ─┘   tunnels   ├─ ~/.fleet/fleet.db  registry (SQLite): devices, IPs, certs, revocations
+                                   ├─ ~/.fleet/bin/      cross-compiled Go binaries + manifest.json
                                    └─ fleet serve :7443  API reachable only from inside the mesh
- every Mac: `fleet sync` (launchd, every 5 min) pulls its config, cert and revocations from the
-            API, updates this repo's code with `git pull`, and restarts nebula only if something changed
+ lighthouse: `fleet sync` pulls git, cross-compiles darwin/arm64 + darwin/amd64, verifies `fleet serve` health,
+             and publishes binaries to ~/.fleet/bin/
+ every Mac:  `fleet sync` (launchd, every 5 min) pulls its config, cert, revocations, and updated `fleet` binary
+             over Nebula, and restarts nebula only if something changed
 ```
 
 - **No IPs to choose and no device files.** The registry assigns the next free IP in `10.213.0.0/16`,
@@ -24,7 +27,8 @@ into it from anywhere. No third-party servers are involved.
   needs the CA passphrase, which you type each time; it is never stored.
 - **Central policy.** Firewall rules and revocations live on the lighthouse, and every Mac picks up
   changes within about 5 minutes.
-- **Stdlib only.** Python 3.9+ and the `nebula` / `nebula-cert` binaries from Homebrew. Nothing else to install.
+- **Single Go binary.** Compiled with `CGO_ENABLED=0` (pure-Go SQLite, embedded templates) plus `nebula` / `nebula-cert`
+  from Homebrew. Only the lighthouse builds from git (`brew install go`); other Macs self-update over the mesh.
 
 ## Contents
 
@@ -41,18 +45,19 @@ into it from anywhere. No third-party servers are involved.
 | New Mac | `fleet join NAME` | Prints a join request, waits for you to paste the approval, then installs everything |
 | Admin device | `fleet approve [--group admin\|managed] [--replace]` | Turns a pasted join request into the response to paste back |
 | Admin device | `fleet approve-mobile NAME` | Signs a public key from the Mobile Nebula app |
-| Admin device | `fleet ls` | Lists devices: IP, group, last check-in, cert expiry, status |
+| Admin device | `fleet ls` | Lists devices: IP, group, last check-in, cert expiry, client runtime, status |
 | Admin device | `fleet revoke NAME` | Cuts a device off everywhere within about 5 minutes |
 | Admin device | `fleet set NAME --group G` | Moves a device to another group (re-signs its cert, also used to renew one) |
 | Any Mac | `fleet agents [--all] [--waiting]` | Lists live AI agent sessions (`claude`, `codex`, `antigravity`), including sessions blocked on permission or question prompts |
 | Any Mac | `fleet mcp status\|install\|uninstall` | Checks or manages MCP + lifecycle hook configs for installed agent harnesses |
 | Any Mac | `fleet status` | Shows the services, whether the lighthouse is reachable, and this device's IP |
+| Any Mac | `fleet version` | Prints the compiled binary version, git commit, and platform |
 
 ## Setup
 
 ### 1. Prerequisites (lighthouse)
 
-- **An always-on Mac** with Homebrew, `git` and `python3` 3.9+. Homebrew's Python works, and so does the one in the Xcode Command Line Tools.
+- **An always-on Mac** with Homebrew, `git`, and Go (`brew install go`).
   In Energy settings, turn on "Prevent automatic sleeping" and "Start up automatically after a power failure".
 - **Router:** reserve the Mac's LAN IP and forward **UDP 443** to it. Check for CGNAT: the router's WAN IP must equal
   `curl ifconfig.me`. If they differ, port forwarding can't work, and the lighthouse has to run somewhere with a public IP.
@@ -61,11 +66,20 @@ into it from anywhere. No third-party servers are involved.
 
 ### 2. Install
 
+On the lighthouse:
 ```bash
 git clone https://github.com/bdatdo0601/fleet.git ~/fleet
-ln -s ~/fleet/bin/fleet /opt/homebrew/bin/fleet
+cd ~/fleet
+CGO_ENABLED=0 go build -o /tmp/fleet ./cmd/fleet
+sudo install -d -m 755 /usr/local/libexec/fleet
+sudo install -m 755 /tmp/fleet /usr/local/libexec/fleet/fleet
+rm /tmp/fleet
+ln -s /usr/local/libexec/fleet/fleet /opt/homebrew/bin/fleet
 ```
-Do the same on every Mac that will join. `fleet sync` updates each clone with `git pull --ff-only` every 5 minutes.
+`fleet sync` on the lighthouse updates its clone with `git pull --ff-only`, builds `darwin/arm64` and `darwin/amd64`
+into `~/.fleet/bin/` (use `sudo fleet sync --rebuild` to force a rebuild), verifies `fleet serve` health, and serves
+verified binaries to other Macs over Nebula (`GET /v1/binary`). Existing Macs migrating from the Python `fleetctl`
+package automatically switch on their next `fleet sync` once `go` is installed on the lighthouse.
 
 ### 3. DNS updates (Route 53, optional)
 
@@ -210,9 +224,10 @@ on the lighthouse across all active Macs (`admin` and `managed` alike).
   each approval and is used only in memory.
 - **Paste channels:** both ends show a **request id** and a **CA id**. Compare them to detect a block
   that was swapped in transit.
-- **Code updates run as root.** `fleet sync` runs this repo's code as root, so anyone who can push
-  to the repo (or modify a machine's clone) can get root on every Mac that follows it. If you fork
-  this repo, protect your account with 2FA, and review anything before merging.
+- **Code updates run as root.** `fleet sync` on the lighthouse builds from this repo (and managed Macs
+  download SHA-256-verified binaries from the lighthouse and apply them as root), so anyone who can push
+  to the repo can get root on every Mac that follows it. If you fork this repo, protect your account with 2FA,
+  and review anything before merging.
 
 ## FAQ
 
@@ -268,6 +283,10 @@ Not yet. `fleet join` / `sync` assume macOS (Homebrew and launchd). Phones work 
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests      # uses the real nebula/nebula-cert binaries; ~1 min
+go test -race ./...                                     # uses the real nebula/nebula-cert binaries
+go vet ./...
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build ./cmd/fleet
+CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build ./cmd/fleet
+FLEET_FORCE_PYTHON=1 python3 -m unittest discover -s tests
 uvx ruff check . && shellcheck bin/fleet bin/ssh-harden
 ```

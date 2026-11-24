@@ -181,11 +181,37 @@ def make_handler(fleet: Fleet, quiet: bool = False) -> type[BaseHTTPRequestHandl
                 if caller is None:
                     raise FleetError("not a member of this fleet", 403)
                 path_only, _, query_str = self.path.partition("?")
+                query = urllib.parse.parse_qs(query_str)
                 route = (method, path_only)
                 if route == ("GET", "/v1/sync"):
-                    return self._send(200, fleet.sync(caller))
+                    client_ver = self.headers.get("X-Fleet-Client")
+                    os_name = (query.get("os") or [""])[0]
+                    arch_name = (query.get("arch") or [""])[0]
+                    return self._send(200, fleet.sync(
+                        caller, client_version=client_ver, os_name=os_name, arch_name=arch_name,
+                    ))  # fmt: skip
+                if route == ("GET", "/v1/binary"):
+                    os_name = (query.get("os") or [""])[0]
+                    arch_name = (query.get("arch") or [""])[0]
+                    bin_info = fleet.binary_for_platform(os_name, arch_name)
+                    if bin_info is None:
+                        raise FleetError("no published binary for requested platform", 404)
+                    artifact, sha_hex, ver = bin_info
+                    data = artifact.read_bytes()
+                    try:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/octet-stream")
+                        self.send_header("Content-Length", str(len(data)))
+                        self.send_header("X-Fleet-SHA256", sha_hex)
+                        if ver:
+                            self.send_header("X-Fleet-Version", ver)
+                        self.end_headers()
+                        self.wfile.write(data)
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    return
                 if path_only == "/v1/agents" or path_only.startswith("/v1/agents/"):
-                    if self._dispatch_agents(caller.name, method, path_only, urllib.parse.parse_qs(query_str)):
+                    if self._dispatch_agents(caller.name, method, path_only, query):
                         return
                     raise FleetError("not found", 404)
                 if not fleet.is_admin(caller):

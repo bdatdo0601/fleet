@@ -17,17 +17,18 @@ CREATE TABLE IF NOT EXISTS settings (
   value TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS devices (
-  name        TEXT PRIMARY KEY,
-  ip          TEXT NOT NULL UNIQUE,
-  kind        TEXT NOT NULL CHECK (kind IN ('lighthouse', 'mac', 'mobile')),
-  grp         TEXT NOT NULL,
-  pubkey      TEXT NOT NULL,
-  cert        TEXT NOT NULL,
-  fingerprint TEXT NOT NULL,
-  not_after   TEXT NOT NULL,
-  created_at  TEXT NOT NULL,
-  revoked_at  TEXT,
-  last_seen   TEXT
+  name           TEXT PRIMARY KEY,
+  ip             TEXT NOT NULL UNIQUE,
+  kind           TEXT NOT NULL CHECK (kind IN ('lighthouse', 'mac', 'mobile')),
+  grp            TEXT NOT NULL,
+  pubkey         TEXT NOT NULL,
+  cert           TEXT NOT NULL,
+  fingerprint    TEXT NOT NULL,
+  not_after      TEXT NOT NULL,
+  created_at     TEXT NOT NULL,
+  revoked_at     TEXT,
+  last_seen      TEXT,
+  client_version TEXT
 );
 -- Every certificate ever replaced or revoked. Rendered into pki.blocklist everywhere.
 CREATE TABLE IF NOT EXISTS revoked_certs (
@@ -56,6 +57,7 @@ class Device:
     created_at: str
     revoked_at: str | None
     last_seen: str | None
+    client_version: str | None = None
 
     @property
     def active(self) -> bool:
@@ -70,6 +72,9 @@ class Registry:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(devices)").fetchall()}
+        if "client_version" not in cols:
+            self.conn.execute("ALTER TABLE devices ADD COLUMN client_version TEXT")
 
     def close(self) -> None:
         self.conn.close()
@@ -164,6 +169,12 @@ class Registry:
         rows = self.conn.execute("SELECT fingerprint FROM revoked_certs ORDER BY fingerprint")
         return [r["fingerprint"] for r in rows]
 
-    def touch(self, name: str) -> None:
+    def touch(self, name: str, client_version: str | None = None) -> None:
         with self.lock:
-            self.conn.execute("UPDATE devices SET last_seen = ? WHERE name = ?", (now(), name))
+            if client_version:
+                self.conn.execute(
+                    "UPDATE devices SET last_seen = ?, client_version = ? WHERE name = ?",
+                    (now(), client_version, name),
+                )
+            else:
+                self.conn.execute("UPDATE devices SET last_seen = ? WHERE name = ?", (now(), name))
