@@ -79,17 +79,37 @@ type LighthouseInfo struct {
 
 // ApproveResult is returned by POST /v1/approve and POST /v1/set-group.
 type ApproveResult struct {
-	Name       string          `json:"name"`
-	IP         string          `json:"ip"`
-	Kind       string          `json:"kind"`
-	Group      string          `json:"group"`
-	CA         string          `json:"ca"`
-	Cert       string          `json:"cert"`
-	CAID       string          `json:"ca_id"`
-	NotAfter   string          `json:"not_after"`
-	Config     *string         `json:"config,omitempty"`
-	API        string          `json:"api,omitempty"`
-	Lighthouse *LighthouseInfo `json:"lighthouse,omitempty"`
+	Name          string          `json:"name"`
+	IP            string          `json:"ip"`
+	Kind          string          `json:"kind"`
+	Group         string          `json:"group"`
+	CA            string          `json:"ca"`
+	Cert          string          `json:"cert"`
+	CAID          string          `json:"ca_id"`
+	NotAfter      string          `json:"not_after"`
+	Config        *string         `json:"config,omitempty"`
+	API           string          `json:"api,omitempty"`
+	ResponseBlock string          `json:"response_block,omitempty"`
+	Lighthouse    *LighthouseInfo `json:"lighthouse,omitempty"`
+}
+
+// CAInfo holds metadata about the fleet's Certificate Authority.
+type CAInfo struct {
+	CAID        string `json:"ca_id"`
+	Fingerprint string `json:"fingerprint"`
+	NotAfter    string `json:"not_after"`
+}
+
+// DecodedJoinBlock represents a parsed join request block or Mobile Nebula public key.
+type DecodedJoinBlock struct {
+	Kind            string `json:"kind"`
+	Name            string `json:"name,omitempty"`
+	Pubkey          string `json:"pubkey"`
+	RequestID       string `json:"request_id"`
+	Existing        bool   `json:"existing"`
+	ExistingIP      string `json:"existing_ip,omitempty"`
+	ExistingGroup   string `json:"existing_group,omitempty"`
+	ExistingRevoked bool   `json:"existing_revoked,omitempty"`
 }
 
 // DeviceItem is one entry in GET /v1/devices.
@@ -332,17 +352,30 @@ func (f *Fleet) CAPem() (string, error) {
 	return string(b), nil
 }
 
-// CAID returns the short verification ID derived from the CA certificate fingerprint.
-func (f *Fleet) CAID() (string, error) {
+// CAInfo returns the CA verification ID, fingerprint, and expiration timestamp.
+func (f *Fleet) CAInfo() (CAInfo, error) {
 	caPEM, err := f.CAPem()
 	if err != nil {
-		return "", err
+		return CAInfo{}, err
 	}
 	meta, err := pki.Info(caPEM)
 	if err != nil {
+		return CAInfo{}, err
+	}
+	return CAInfo{
+		CAID:        codes.ShortID(meta.Fingerprint),
+		Fingerprint: meta.Fingerprint,
+		NotAfter:    meta.NotAfter,
+	}, nil
+}
+
+// CAID returns the short verification ID derived from the CA certificate fingerprint.
+func (f *Fleet) CAID() (string, error) {
+	info, err := f.CAInfo()
+	if err != nil {
 		return "", err
 	}
-	return codes.ShortID(meta.Fingerprint), nil
+	return info.CAID, nil
 }
 
 // ConfigFor renders the Nebula config YAML for dev, or returns nil for mobile devices.
@@ -562,6 +595,20 @@ func (f *Fleet) buildApproveResult(opts ApproveOpts, dev *registry.Device, ip, c
 		}
 		res.Config = cfg
 		res.API = fmt.Sprintf("http://%s:%d", paths.LighthouseIP, paths.APIPort())
+		block, err := codes.Encode(codes.Response, map[string]any{
+			"name":   res.Name,
+			"ip":     res.IP,
+			"kind":   res.Kind,
+			"ca":     res.CA,
+			"cert":   res.Cert,
+			"config": res.Config,
+			"api":    res.API,
+			"ca_id":  res.CAID,
+		})
+		if err != nil {
+			return ApproveResult{}, err
+		}
+		res.ResponseBlock = block
 		return res, nil
 	}
 	s, err := f.Settings()
@@ -719,4 +766,74 @@ func (f *Fleet) existing(name string) (*registry.Device, error) {
 		return nil, newFleetErr(fmt.Sprintf("no device named %s", name), 404)
 	}
 	return dev, nil
+}
+
+// RevokedCerts returns all revoked or replaced certificates in the PKI blocklist.
+func (f *Fleet) RevokedCerts() ([]registry.RevokedCert, error) {
+	return f.Registry.RevokedCerts()
+}
+
+// DeviceConfig returns the rendered Nebula config YAML for the named device.
+func (f *Fleet) DeviceConfig(name string) (string, error) {
+	dev, err := f.existing(name)
+	if err != nil {
+		return "", err
+	}
+	if dev.Kind == "mobile" {
+		return "", newFleetErr("mobile devices do not use a server-rendered Nebula config", 400)
+	}
+	cfg, err := f.ConfigFor(dev)
+	if err != nil {
+		return "", err
+	}
+	if cfg == nil {
+		return "", newFleetErr("config unavailable", 404)
+	}
+	return *cfg, nil
+}
+
+// DecodeJoinBlock parses either a FLEET JOIN REQUEST block or a Mobile Nebula X25519 public key.
+func (f *Fleet) DecodeJoinBlock(raw string) (DecodedJoinBlock, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return DecodedJoinBlock{}, newFleetErr("join block or public key is required", 400)
+	}
+	var out DecodedJoinBlock
+	if strings.Contains(trimmed, "BEGIN "+codes.Request) {
+		var req struct {
+			Name   string `json:"name"`
+			Pubkey string `json:"pubkey"`
+		}
+		if err := codes.Decode(codes.Request, trimmed, &req); err != nil {
+			return DecodedJoinBlock{}, newFleetErr(err.Error(), 400)
+		}
+		pk, err := pki.NormalizePubkey(req.Pubkey)
+		if err != nil {
+			return DecodedJoinBlock{}, newFleetErr(err.Error(), 400)
+		}
+		out.Kind = "mac"
+		out.Name = strings.TrimSpace(req.Name)
+		out.Pubkey = pk
+	} else {
+		pk, err := pki.NormalizePubkey(trimmed)
+		if err != nil {
+			return DecodedJoinBlock{}, newFleetErr("expected a FLEET JOIN REQUEST block or NEBULA X25519 PUBLIC KEY", 400)
+		}
+		out.Kind = "mobile"
+		out.Pubkey = pk
+	}
+	out.RequestID = codes.ShortID(out.Pubkey)
+	if out.Name != "" {
+		dev, err := f.Registry.Get(out.Name)
+		if err != nil {
+			return DecodedJoinBlock{}, err
+		}
+		if dev != nil {
+			out.Existing = true
+			out.ExistingIP = dev.IP
+			out.ExistingGroup = dev.Grp
+			out.ExistingRevoked = dev.RevokedAt != nil
+		}
+	}
+	return out, nil
 }

@@ -1,0 +1,365 @@
+export const state = {
+  overview: null,
+  caller: null,
+  isAdmin: false,
+  route: "overview",
+  modalOpen: false,
+  editing: false,
+};
+
+export async function api(method, path, body) {
+  const opts = {
+    method,
+    headers: {},
+    credentials: "same-origin",
+  };
+  if (body !== undefined) {
+    opts.headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(body);
+  }
+  const resp = await fetch(path, opts);
+  const text = await resp.text();
+  let data = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = null;
+    }
+  }
+  if (!resp.ok) {
+    const msg = (data && data.error) || `${resp.status} ${resp.statusText}`;
+    const err = new Error(msg);
+    err.status = resp.status;
+    throw err;
+  }
+  return data;
+}
+
+export function el(tag, props, ...children) {
+  const node = document.createElement(tag);
+  if (props) {
+    for (const [key, val] of Object.entries(props)) {
+      if (val === null || val === undefined || val === false) {
+        continue;
+      }
+      if (key === "className") {
+        node.className = val;
+      } else if (key === "text") {
+        node.textContent = String(val);
+      } else if (key === "dataset" && typeof val === "object") {
+        for (const [dk, dv] of Object.entries(val)) {
+          if (dv !== undefined && dv !== null) {
+            node.dataset[dk] = String(dv);
+          }
+        }
+      } else if (key.startsWith("on") && typeof val === "function") {
+        node.addEventListener(key.slice(2).toLowerCase(), val);
+      } else if (val === true) {
+        node.setAttribute(key, "");
+      } else if (key === "value" && (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || tag === "input" || tag === "textarea" || tag === "select")) {
+        node.value = String(val);
+      } else if (key === "checked" && (tag === "INPUT" || tag === "input")) {
+        node.checked = Boolean(val);
+      } else {
+        node.setAttribute(key, String(val));
+      }
+    }
+  }
+  const appendChild = (child) => {
+    if (child === null || child === undefined || child === false) {
+      return;
+    }
+    if (Array.isArray(child)) {
+      for (const nested of child) {
+        appendChild(nested);
+      }
+      return;
+    }
+    if (child instanceof Node) {
+      node.appendChild(child);
+    } else {
+      node.appendChild(document.createTextNode(String(child)));
+    }
+  };
+  for (const c of children) {
+    appendChild(c);
+  }
+  return node;
+}
+
+export function clear(node) {
+  while (node.firstChild) {
+    node.removeChild(node.firstChild);
+  }
+}
+
+export function toast(message, kind = "info") {
+  const container = document.getElementById("toast-container");
+  if (!container) {
+    return;
+  }
+  const cls = kind === "ok" ? "toast toast-ok" : kind === "warn" ? "toast toast-warn" : kind === "error" ? "toast toast-error" : "toast";
+  const box = el("div", { className: cls, text: message });
+  container.appendChild(box);
+  setTimeout(() => {
+    box.remove();
+  }, 4000);
+}
+
+export async function copyText(text, triggerBtn) {
+  const val = String(text ?? "");
+  let copied = false;
+  if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {
+    try {
+      await navigator.clipboard.writeText(val);
+      copied = true;
+    } catch {
+      copied = false;
+    }
+  }
+  if (!copied) {
+    const ta = document.createElement("textarea");
+    ta.value = val;
+    ta.className = "offscreen-copy";
+    ta.setAttribute("readonly", "");
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    try {
+      copied = document.execCommand("copy");
+    } catch {
+      copied = false;
+    }
+    ta.remove();
+  }
+  if (copied) {
+    if (triggerBtn) {
+      const orig = triggerBtn.textContent;
+      triggerBtn.textContent = "Copied";
+      setTimeout(() => {
+        triggerBtn.textContent = orig;
+      }, 1200);
+    }
+    toast("Copied to clipboard", "ok");
+  } else {
+    toast("Copy failed — select and copy manually", "warn");
+  }
+}
+
+let modalCleanup = null;
+
+export function closeModal() {
+  const backdrop = document.getElementById("modal-backdrop");
+  const body = document.getElementById("modal-body");
+  if (backdrop) {
+    backdrop.classList.add("hidden");
+  }
+  if (body) {
+    clear(body);
+  }
+  state.modalOpen = false;
+  if (modalCleanup) {
+    const fn = modalCleanup;
+    modalCleanup = null;
+    fn();
+  }
+}
+
+export function openModal(title, contentEl, opts = {}) {
+  const backdrop = document.getElementById("modal-backdrop");
+  const titleEl = document.getElementById("modal-title");
+  const body = document.getElementById("modal-body");
+  if (!backdrop || !titleEl || !body) {
+    return;
+  }
+  if (modalCleanup) {
+    modalCleanup();
+    modalCleanup = null;
+  }
+  titleEl.textContent = title;
+  clear(body);
+  if (contentEl) {
+    body.appendChild(contentEl);
+  }
+  modalCleanup = opts.onClose || null;
+  state.modalOpen = true;
+  backdrop.classList.remove("hidden");
+}
+
+export function confirmDialog(title, message, confirmLabel = "Confirm", danger = false) {
+  return new Promise((resolve) => {
+    const backdrop = document.getElementById("modal-backdrop");
+    const titleEl = document.getElementById("modal-title");
+    const body = document.getElementById("modal-body");
+
+    let savedTitle = null;
+    let savedFrag = null;
+    let savedCleanup = null;
+    if (state.modalOpen && titleEl && body) {
+      savedTitle = titleEl.textContent;
+      savedFrag = document.createDocumentFragment();
+      while (body.firstChild) {
+        savedFrag.appendChild(body.firstChild);
+      }
+      savedCleanup = modalCleanup;
+      modalCleanup = null;
+    }
+
+    const restoreSavedModal = () => {
+      if (!savedFrag || !titleEl || !body) {
+        return;
+      }
+      titleEl.textContent = savedTitle || "";
+      clear(body);
+      body.appendChild(savedFrag);
+      savedFrag = null;
+      modalCleanup = savedCleanup;
+      savedCleanup = null;
+      state.modalOpen = true;
+      if (backdrop) {
+        backdrop.classList.remove("hidden");
+      }
+    };
+
+    let settled = false;
+    const finish = (val) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (!val && savedFrag) {
+        restoreSavedModal();
+        resolve(false);
+        return;
+      }
+      savedFrag = null;
+      if (val && savedCleanup) {
+        savedCleanup();
+        savedCleanup = null;
+      }
+      resolve(val);
+    };
+
+    const box = el(
+      "div",
+      { className: "form-grid" },
+      el("p", { className: "m-0", text: message }),
+      el(
+        "div",
+        { className: "actions-row flex-end mt-2" },
+        el("button", {
+          type: "button",
+          className: "btn",
+          text: "Cancel",
+          onclick: () => {
+            const hadSaved = Boolean(savedFrag);
+            finish(false);
+            if (!hadSaved) {
+              closeModal();
+            }
+          },
+        }),
+        el("button", {
+          type: "button",
+          className: danger ? "btn btn-danger" : "btn btn-primary",
+          text: confirmLabel,
+          onclick: () => {
+            finish(true);
+            closeModal();
+          },
+        }),
+      ),
+    );
+    openModal(title, box, { onClose: () => finish(false) });
+  });
+}
+
+export function relTime(iso) {
+  if (!iso) {
+    return "never";
+  }
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) {
+    return iso;
+  }
+  const secs = Math.max(Math.floor((Date.now() - ms) / 1000), 0);
+  if (secs < 45) {
+    return "just now";
+  }
+  const units = [
+    ["d", 86400],
+    ["h", 3600],
+    ["m", 60],
+  ];
+  for (const [label, size] of units) {
+    if (secs >= size) {
+      return `${Math.floor(secs / size)}${label} ago`;
+    }
+  }
+  return `${secs}s ago`;
+}
+
+export function formatDuration(secs) {
+  const s = Math.max(Math.floor(Number(secs) || 0), 0);
+  if (s < 60) {
+    return `${s}s`;
+  }
+  const mins = Math.floor(s / 60);
+  if (mins < 60) {
+    return `${mins}m`;
+  }
+  const hrs = Math.floor(mins / 60);
+  const rem = mins % 60;
+  if (hrs < 24) {
+    return rem > 0 ? `${hrs}h${rem}m` : `${hrs}h`;
+  }
+  const days = Math.floor(hrs / 24);
+  const remH = hrs % 24;
+  return remH > 0 ? `${days}d${remH}h` : `${days}d`;
+}
+
+export function shortDate(iso) {
+  if (!iso) {
+    return "-";
+  }
+  return String(iso).slice(0, 10);
+}
+
+export function daysUntil(iso) {
+  if (!iso) {
+    return null;
+  }
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) {
+    return null;
+  }
+  return Math.floor((ms - Date.now()) / 86400000);
+}
+
+export function formatBytes(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) {
+    return `${n} B`;
+  }
+  if (n < 1024 * 1024) {
+    return `${(n / 1024).toFixed(1)} KB`;
+  }
+  return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+export function makeCopyBtn(text, label = "Copy") {
+  return el("button", {
+    type: "button",
+    className: "btn btn-sm",
+    text: label,
+    onclick: (ev) => {
+      ev.stopPropagation();
+      copyText(text, ev.currentTarget);
+    },
+  });
+}
+
+export function badge(text, variant = "neutral") {
+  return el("span", { className: `badge badge-${variant}`, text });
+}

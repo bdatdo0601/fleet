@@ -184,6 +184,14 @@ Each certificate carries one group. The CA signs it into the certificate, so a d
 - **Logs:** `/var/log/fleet-sync.log` (every Mac), `~/.fleet/serve.log` and `~/.fleet/ddns.log` (lighthouse),
   `/opt/homebrew/var/log/nebula.log`.
 
+## Web UI
+
+`fleet serve` embeds and serves a mesh-only management console at `http://10.213.0.1:7443/` (also reachable at `http://127.0.0.1:7443/` on the lighthouse and from Mobile Nebula browsers on phones/tablets).
+
+- **Same Nebula identity model:** Access is verified by mesh source IP (`fleet.Identify`) with anti-CSRF/anti-DNS-rebinding `Host` and `Origin` checks. Strangers and revoked devices receive `403`.
+- **Role-scoped UI:** `admin` devices (`laptop`, `phone`, `ipadpro`, `mini`) see the full console — **Overview**, **Devices & PKI** (approve Mac/mobile blocks, change groups/renew certs, revoke, inspect configs & blocklist), **Agents & Messages**, **Shared Memory & Curator**, and **Lighthouse System** (PKI, published binaries, Route 53 DDNS check/sync/IAM policy, and service logs). `managed` devices see **Overview**, **Agents & Messages**, and **Shared Memory**.
+- **Single binary:** All HTML/CSS/JS assets are embedded directly via `go:embed` with zero external CDN or Node runtime dependencies, so `fleet sync` updates the UI automatically with `fleet serve`.
+
 ## Agent sessions (MCP)
 
 `fleet serve` also brokers live session discovery, transcript/git inspection, and peer messaging in `~/.fleet/agents.db`

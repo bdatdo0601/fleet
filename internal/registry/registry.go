@@ -440,6 +440,36 @@ func (r *Registry) Blocklist() ([]string, error) {
 	return fps, rows.Err()
 }
 
+// RevokedCert represents an entry in the PKI blocklist table.
+type RevokedCert struct {
+	Fingerprint string `json:"fingerprint"`
+	Name        string `json:"name"`
+	RevokedAt   string `json:"revoked_at"`
+	Reason      string `json:"reason"`
+}
+
+// RevokedCerts returns all revoked or replaced certificates sorted newest first.
+func (r *Registry) RevokedCerts() ([]RevokedCert, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rows, err := r.db.Query(
+		"SELECT fingerprint, name, revoked_at, reason FROM revoked_certs ORDER BY revoked_at DESC, fingerprint ASC",
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := []RevokedCert{}
+	for rows.Next() {
+		var rc RevokedCert
+		if err := rows.Scan(&rc.Fingerprint, &rc.Name, &rc.RevokedAt, &rc.Reason); err != nil {
+			return nil, err
+		}
+		out = append(out, rc)
+	}
+	return out, rows.Err()
+}
+
 // Touch updates last_seen (and client_version when non-empty) on a device.
 func (r *Registry) Touch(name, clientVersion string) error {
 	r.mu.Lock()

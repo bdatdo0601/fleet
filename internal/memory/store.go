@@ -920,11 +920,13 @@ func buildFilterWhere(f SearchFilter) (string, []any, error) {
 	return strings.Join(clauses, " AND "), args, nil
 }
 
-func clampLimit(limit, def, maxVal int) int {
+const maxQueryLimit = 200
+
+func clampLimit(limit, def int) int {
 	if limit <= 0 {
 		return def
 	}
-	return min(limit, maxVal)
+	return min(limit, maxQueryLimit)
 }
 
 func queryItems(db *sql.DB, q string, args []any, withScore bool) ([]Item, error) {
@@ -971,7 +973,7 @@ func (s *Store) listLocked(f SearchFilter) ([]Item, error) {
 	if err != nil {
 		return nil, err
 	}
-	limit := clampLimit(f.Limit, 20, 100)
+	limit := clampLimit(f.Limit, 20)
 	args = append(args, limit)
 	q := "SELECT " + itemSelectCols + " FROM memories m WHERE " + where + " ORDER BY m.updated_at DESC, m.id DESC LIMIT ?"
 	return queryItems(s.db, q, args, false)
@@ -1013,7 +1015,7 @@ func (s *Store) Search(f SearchFilter) ([]Item, error) {
 	if len(tokens) == 0 {
 		return s.listLocked(f)
 	}
-	limit := clampLimit(f.Limit, 20, 100)
+	limit := clampLimit(f.Limit, 20)
 	items, err := s.searchFTSLocked(f, strings.Join(tokens, " "), limit)
 	if err != nil {
 		return nil, err
@@ -1091,7 +1093,7 @@ func (s *Store) Delete(scope, key string, hard bool, device, harness, sessionID,
 }
 
 func (s *Store) historyLocked(scope, key string, limit int) ([]Revision, error) {
-	limit = clampLimit(limit, 30, 200)
+	limit = clampLimit(limit, 30)
 	var rows *sql.Rows
 	var err error
 	if scope != "" && key != "" {
@@ -1352,7 +1354,7 @@ func (s *Store) GetProposal(id int64) (Proposal, error) {
 func (s *Store) ListProposals(status string, limit int) ([]Proposal, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	limit = clampLimit(limit, 50, 200)
+	limit = clampLimit(limit, 50)
 	var rows *sql.Rows
 	var err error
 	if status != "" {
@@ -1716,10 +1718,48 @@ func (s *Store) ResetFailedJobs() (int, error) {
 	return int(n), err
 }
 
-// JobCounts returns counts of pending jobs, exhausted/failed jobs, and pending proposals.
-func (s *Store) JobCounts() (pending, failed, proposals int, err error) {
+// Stats summarizes memory entry counts, revisions, curation queue, and scopes.
+type Stats struct {
+	Active           int      `json:"active"`
+	Archived         int      `json:"archived"`
+	Superseded       int      `json:"superseded"`
+	AlwaysCount      int      `json:"always_count"`
+	SearchableCount  int      `json:"searchable_count"`
+	TotalRevisions   int      `json:"total_revisions"`
+	PendingProposals int      `json:"pending_proposals"`
+	PendingJobs      int      `json:"pending_jobs"`
+	FailedJobs       int      `json:"failed_jobs"`
+	Scopes           []string `json:"scopes"`
+}
+
+func (s *Store) listScopesLocked() ([]string, error) {
+	rows, err := s.db.Query(
+		`SELECT DISTINCT scope FROM memories
+		 ORDER BY CASE WHEN scope = 'global' THEN 0 ELSE 1 END, scope ASC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	scopes := []string{}
+	for rows.Next() {
+		var sc string
+		if err := rows.Scan(&sc); err != nil {
+			return nil, err
+		}
+		scopes = append(scopes, sc)
+	}
+	return scopes, rows.Err()
+}
+
+// ListScopes returns all distinct memory scopes with global first.
+func (s *Store) ListScopes() ([]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.listScopesLocked()
+}
+
+func (s *Store) jobCountsLocked() (pending, failed, proposals int, err error) {
 	if err = s.db.QueryRow("SELECT COUNT(*) FROM curation_jobs WHERE status IN ('pending', 'running') OR (status = 'failed' AND attempts < 3)").Scan(&pending); err != nil {
 		return 0, 0, 0, err
 	}
@@ -1730,4 +1770,46 @@ func (s *Store) JobCounts() (pending, failed, proposals int, err error) {
 		return 0, 0, 0, err
 	}
 	return pending, failed, proposals, nil
+}
+
+// JobCounts returns counts of pending jobs, exhausted/failed jobs, and pending proposals.
+func (s *Store) JobCounts() (pending, failed, proposals int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.jobCountsLocked()
+}
+
+// Stats returns aggregate counts and scopes across memory.db.
+func (s *Store) Stats() (Stats, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var st Stats
+	if err := s.db.QueryRow(`
+		SELECT
+			COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status = 'archived' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status = 'superseded' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status = 'active' AND tier = 'always' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status = 'active' AND tier = 'searchable' THEN 1 ELSE 0 END), 0)
+		FROM memories`,
+	).Scan(&st.Active, &st.Archived, &st.Superseded, &st.AlwaysCount, &st.SearchableCount); err != nil {
+		return Stats{}, err
+	}
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM memory_revisions").Scan(&st.TotalRevisions); err != nil {
+		return Stats{}, err
+	}
+	pending, failed, proposals, err := s.jobCountsLocked()
+	if err != nil {
+		return Stats{}, err
+	}
+	st.PendingJobs = pending
+	st.FailedJobs = failed
+	st.PendingProposals = proposals
+	scopes, err := s.listScopesLocked()
+	if err != nil {
+		return Stats{}, err
+	}
+	st.Scopes = scopes
+	return st, nil
 }

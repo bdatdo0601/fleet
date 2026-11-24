@@ -1295,11 +1295,7 @@ func (h *Hub) Heartbeat(p HeartbeatParams) (HeartbeatResult, error) {
 	return h.finishHeartbeatLocked(p.Device, sessionID, fullRaw, effName, effTitle, p.DrainInbox)
 }
 
-// RenameSession sets an explicit custom friendly handle on a session belonging to device.
-func (h *Hub) RenameSession(device, sessionID, newName string) (string, error) {
-	if !strings.HasPrefix(sessionID, device+":") {
-		return "", newAgentErr("session belongs to another device", 403)
-	}
+func validateSessionName(newName string) (string, error) {
 	raw := strings.ToLower(strings.TrimSpace(newName))
 	if strings.HasPrefix(raw, "repo:") || strings.HasPrefix(raw, "device:") {
 		return "", newAgentErr("invalid session name", 400)
@@ -1308,13 +1304,29 @@ func (h *Hub) RenameSession(device, sessionID, newName string) (string, error) {
 	if slug == "" || slug == "all" {
 		return "", newAgentErr("session name must contain letters or digits and cannot be reserved", 400)
 	}
+	return slug, nil
+}
+
+func (h *Hub) renameSessionRow(sessionID, newName, deviceFilter string) (string, error) {
+	slug, err := validateSessionName(newName)
+	if err != nil {
+		return "", err
+	}
 	nowISO := registry.NowISO()
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	res, err := h.db.Exec(
-		"UPDATE agent_sessions SET name = ?, custom_name = 1, updated_at = ? WHERE device = ? AND session_id = ?",
-		slug, nowISO, device, sessionID,
-	)
+	var res sql.Result
+	if deviceFilter != "" {
+		res, err = h.db.Exec(
+			"UPDATE agent_sessions SET name = ?, custom_name = 1, updated_at = ? WHERE device = ? AND session_id = ?",
+			slug, nowISO, deviceFilter, sessionID,
+		)
+	} else {
+		res, err = h.db.Exec(
+			"UPDATE agent_sessions SET name = ?, custom_name = 1, updated_at = ? WHERE session_id = ?",
+			slug, nowISO, sessionID,
+		)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -1326,6 +1338,19 @@ func (h *Hub) RenameSession(device, sessionID, newName string) (string, error) {
 		return "", newAgentErr(fmt.Sprintf("no agent session %q", sessionID), 404)
 	}
 	return slug, nil
+}
+
+// RenameSession sets an explicit custom friendly handle on a session belonging to device.
+func (h *Hub) RenameSession(device, sessionID, newName string) (string, error) {
+	if !strings.HasPrefix(sessionID, device+":") {
+		return "", newAgentErr("session belongs to another device", 403)
+	}
+	return h.renameSessionRow(sessionID, newName, device)
+}
+
+// RenameSessionAny sets an explicit custom friendly handle on any session (for admin callers).
+func (h *Hub) RenameSessionAny(sessionID, newName string) (string, error) {
+	return h.renameSessionRow(sessionID, newName, "")
 }
 
 func (h *Hub) collectStringsLocked(query string, args ...any) ([]string, error) {
@@ -1380,6 +1405,33 @@ func (h *Hub) Deregister(device string, sessionID, harness *string, pid *int) er
 		return nil
 	}
 	return newAgentErr("session_id or (harness, pid) is required", 400)
+}
+
+// DeregisterAny marks any session as exited and wakes waiters (for admin callers).
+func (h *Hub) DeregisterAny(sessionID string) error {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return newAgentErr("session_id is required", 400)
+	}
+	nowISO := registry.NowISO()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	res, err := h.db.Exec(
+		"UPDATE agent_sessions SET state = 'exited', state_changed_at = ?, pending_action_json = '', updated_at = ? WHERE session_id = ?",
+		nowISO, nowISO, sessionID,
+	)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return newAgentErr(fmt.Sprintf("no agent session %q", sessionID), 404)
+	}
+	h.sessionSubs.notify(sessionID)
+	return nil
 }
 
 type callerCand struct {
@@ -1820,6 +1872,39 @@ func (h *Hub) SendMessageWithReport(device, fromSession, to, body string, thread
 		return SendResult{}, err
 	}
 	return SendResult{Message: msg, DeliveryReport: report}, nil
+}
+
+// ListMessages returns recent peer messages across the fleet, optionally filtered by session, thread, or device.
+func (h *Hub) ListMessages(session, thread, device string, limit int) ([]Message, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	limit = max(1, min(limit, 200))
+
+	var clauses []string
+	var args []any
+	if s := strings.TrimSpace(session); s != "" {
+		clauses = append(clauses, "(m.from_session = ? OR m.to_session = ?)")
+		args = append(args, s, s)
+	}
+	if t := strings.TrimSpace(thread); t != "" {
+		clauses = append(clauses, "m.thread_id = ?")
+		args = append(args, t)
+	}
+	if d := strings.TrimSpace(device); d != "" {
+		clauses = append(clauses, "(m.from_device = ? OR m.to_device = ?)")
+		args = append(args, d, d)
+	}
+	q := msgSelectSQL
+	if len(clauses) > 0 {
+		q += "WHERE " + strings.Join(clauses, " AND ") + " "
+	}
+	q += "ORDER BY m.id DESC LIMIT ?"
+	args = append(args, limit)
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.queryMessagesLocked(q, args...)
 }
 
 // AckMessages marks messageIDs as read for sessionID.

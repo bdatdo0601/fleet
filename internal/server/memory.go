@@ -143,8 +143,30 @@ func registerMemoryRoutes(
 		return nil
 	}))
 
+	mux.HandleFunc("GET /v1/memory/scopes", route(false, func(w http.ResponseWriter, _ *http.Request, _ *registry.Device) error {
+		scopes, err := fleet.Memory.ListScopes()
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"scopes": scopes})
+		return nil
+	}))
+
 	registerMemoryHistoryRoutes(mux, fleet, route)
+	registerMemoryProposalRoutes(mux, fleet, route)
 	registerMemoryCuratorRoutes(mux, fleet, route)
+}
+
+func parseProposalDecision(raw string) (bool, error) {
+	dec := strings.ToLower(strings.TrimSpace(raw))
+	switch dec {
+	case "approve", "approved":
+		return true, nil
+	case "reject", "rejected":
+		return false, nil
+	default:
+		return false, &memory.MemoryError{Msg: "decision must be approve or reject", Status: http.StatusBadRequest}
+	}
 }
 
 func registerMemoryHistoryRoutes(
@@ -199,7 +221,13 @@ func registerMemoryHistoryRoutes(
 		writeJSON(w, http.StatusOK, map[string]any{"memory": item})
 		return nil
 	}))
+}
 
+func registerMemoryProposalRoutes(
+	mux *http.ServeMux,
+	fleet *core.Fleet,
+	route func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc,
+) {
 	mux.HandleFunc("GET /v1/memory/proposals", route(false, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
 		if idStr := strings.TrimSpace(r.URL.Query().Get("id")); idStr != "" {
 			id, err := strconv.ParseInt(idStr, 10, 64)
@@ -230,16 +258,58 @@ func registerMemoryHistoryRoutes(
 		if err := readJSONBody(r, &req); err != nil {
 			return err
 		}
-		dec := strings.ToLower(strings.TrimSpace(req.Decision))
-		if dec != "approve" && dec != "approved" && dec != "reject" && dec != "rejected" {
-			return &memory.MemoryError{Msg: "decision must be approve or reject", Status: http.StatusBadRequest}
+		approve, err := parseProposalDecision(req.Decision)
+		if err != nil {
+			return err
 		}
-		approve := dec == "approve" || dec == "approved"
 		prop, item, err := fleet.Memory.ResolveProposal(req.ID, approve, c.Name)
 		if err != nil {
 			return err
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"proposal": prop, "memory": item})
+		return nil
+	}))
+
+	mux.HandleFunc("POST /v1/memory/proposals/batch", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
+		var req struct {
+			IDs        []int64 `json:"ids"`
+			AllPending bool    `json:"all_pending"`
+			Decision   string  `json:"decision"`
+		}
+		if err := readJSONBody(r, &req); err != nil {
+			return err
+		}
+		approve, err := parseProposalDecision(req.Decision)
+		if err != nil {
+			return err
+		}
+		ids := req.IDs
+		if req.AllPending {
+			pending, lErr := fleet.Memory.ListProposals("pending", 200)
+			if lErr != nil {
+				return lErr
+			}
+			ids = make([]int64, 0, len(pending))
+			for _, p := range pending {
+				ids = append(ids, p.ID)
+			}
+		} else if len(ids) == 0 {
+			return &memory.MemoryError{Msg: "ids or all_pending is required", Status: http.StatusBadRequest}
+		}
+
+		type resolvedItem struct {
+			Proposal memory.Proposal `json:"proposal"`
+			Memory   *memory.Item    `json:"memory,omitempty"`
+		}
+		resolved := make([]resolvedItem, 0, len(ids))
+		for _, id := range ids {
+			prop, item, rErr := fleet.Memory.ResolveProposal(id, approve, c.Name)
+			if rErr != nil {
+				return rErr
+			}
+			resolved = append(resolved, resolvedItem{Proposal: prop, Memory: item})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"resolved": resolved, "count": len(resolved)})
 		return nil
 	}))
 }

@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fleet Console</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="topbar-left">
+        <a href="#overview" class="brand">
+          <img src="/assets/favicon.svg" alt="" class="brand-icon">
+          <span>fleet</span>
+        </a>
+        <nav id="main-nav" class="main-nav" aria-label="Primary"></nav>
+      </div>
+      <div class="topbar-right">
+        <div id="status-pills" class="status-pills"></div>
+        <div id="caller-badge" class="caller-badge">connecting…</div>
+        <label class="refresh-control" title="Auto-refresh interval">
+          <span class="sr-only">Auto refresh</span>
+          <select id="refresh-select" aria-label="Auto refresh">
+            <option value="0">Auto: Off</option>
+            <option value="5000">Auto: 5s</option>
+            <option value="15000">Auto: 15s</option>
+            <option value="30000">Auto: 30s</option>
+          </select>
+        </label>
+        <button id="refresh-btn" type="button" class="btn btn-sm">Refresh</button>
+        <button id="theme-btn" type="button" class="btn btn-sm" title="Toggle theme">Theme</button>
+      </div>
+    </header>
+
+    <main id="app-main" class="main-content" tabindex="-1">
+      <div class="loading-box">Loading fleet console…</div>
+    </main>
+  </div>
+
+  <div id="modal-backdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal">
+      <div class="modal-header">
+        <h2 id="modal-title" class="modal-title"></h2>
+        <button id="modal-close" type="button" class="btn btn-sm btn-ghost" aria-label="Close">Close</button>
+      </div>
+      <div id="modal-body" class="modal-body"></div>
+    </div>
+  </div>
+
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+  <script type="module" src="/assets/app.js"></script>
+</body>
+</html>

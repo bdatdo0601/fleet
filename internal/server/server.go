@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/bdatdo0601/fleet/internal/agents"
 	"github.com/bdatdo0601/fleet/internal/core"
+	"github.com/bdatdo0601/fleet/internal/paths"
 	"github.com/bdatdo0601/fleet/internal/registry"
 )
 
@@ -57,6 +59,7 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 	w.WriteHeader(status)
 	_, _ = w.Write(data)
@@ -127,11 +130,67 @@ func optInt(p *int, def int) int {
 	return *p
 }
 
-// NewHandler returns the HTTP handler for the lighthouse API.
-func NewHandler(fleet *core.Fleet, quiet bool) http.Handler {
-	mux := http.NewServeMux()
-	route := func(adminOnly bool, fn func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc {
+func hostWithoutPort(rawHost string) string {
+	if h, _, err := net.SplitHostPort(rawHost); err == nil {
+		return strings.Trim(h, "[]")
+	}
+	return strings.Trim(rawHost, "[]")
+}
+
+func allowedRequestHost(rawHost string, fleet *core.Fleet) bool {
+	host := strings.ToLower(strings.TrimSpace(hostWithoutPort(rawHost)))
+	if host == "" || host == "localhost" {
+		return true
+	}
+	if addr, err := netip.ParseAddr(host); err == nil {
+		if addr.IsLoopback() {
+			return true
+		}
+		if meshPrefix, pErr := netip.ParsePrefix(paths.MeshCIDR); pErr == nil && meshPrefix.Contains(addr) {
+			return true
+		}
+	}
+	if settings, err := fleet.Settings(); err == nil {
+		for _, k := range []string{"lighthouse_host", "lighthouse_lan_ip"} {
+			if v := strings.ToLower(strings.TrimSpace(settings[k])); v != "" && host == v {
+				return true
+			}
+		}
+	}
+	if lh, err := fleet.Registry.Lighthouse(); err == nil && lh != nil {
+		name := strings.ToLower(strings.TrimSpace(lh.Name))
+		if name != "" && (host == name || host == name+".local") {
+			return true
+		}
+	}
+	return false
+}
+
+func checkBrowserOrigin(r *http.Request, fleet *core.Fleet) error {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
+		if sfs := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))); sfs != "" && sfs != "same-origin" && sfs != "none" {
+			return &core.FleetError{Msg: "cross-site request blocked", Status: http.StatusForbidden}
+		}
+	}
+	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil || u.Host == "" || !strings.EqualFold(u.Host, r.Host) {
+			return &core.FleetError{Msg: "cross-origin request blocked", Status: http.StatusForbidden}
+		}
+	}
+	if !allowedRequestHost(r.Host, fleet) {
+		return &core.FleetError{Msg: "disallowed Host header", Status: http.StatusForbidden}
+	}
+	return nil
+}
+
+func makeAuthRoute(fleet *core.Fleet, quiet bool) func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc {
+	return func(adminOnly bool, fn func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.Header().Set("X-Frame-Options", "DENY")
+			w.Header().Set("Referrer-Policy", "no-referrer")
+
 			peerIP := clientIP(r.RemoteAddr)
 			if !quiet {
 				_, _ = fmt.Fprintf(os.Stderr, "%s %s %s\n", peerIP, r.Method, r.URL.RequestURI())
@@ -149,48 +208,22 @@ func NewHandler(fleet *core.Fleet, quiet bool) http.Handler {
 				writeJSON(w, http.StatusForbidden, map[string]string{"error": fmt.Sprintf("%s is not an admin device", caller.Name)})
 				return
 			}
+			if err := checkBrowserOrigin(r, fleet); err != nil {
+				handleError(w, r, err, quiet)
+				return
+			}
 			if err := fn(w, r, caller); err != nil && !errors.Is(err, context.Canceled) {
 				handleError(w, r, err, quiet)
 			}
 		}
 	}
+}
 
-	mux.HandleFunc("GET /v1/sync", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
-		q := r.URL.Query()
-		res, err := fleet.Sync(c, r.Header.Get("X-Fleet-Client"), q.Get("os"), q.Get("arch"))
-		if err != nil {
-			return err
-		}
-		writeJSON(w, http.StatusOK, res)
-		return nil
-	}))
-	mux.HandleFunc("GET /v1/binary", route(false, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
-		q := r.URL.Query()
-		binPath, shaHex, ver, err := fleet.BinaryForPlatform(q.Get("os"), q.Get("arch"))
-		if err != nil {
-			return err
-		}
-		f, err := os.Open(binPath)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = f.Close() }()
-		info, err := f.Stat()
-		if err != nil {
-			return err
-		}
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("X-Fleet-SHA256", shaHex)
-		if ver != "" {
-			w.Header().Set("X-Fleet-Version", ver)
-		}
-		http.ServeContent(w, r, filepath.Base(binPath), info.ModTime(), f)
-		return nil
-	}))
-
-	registerAgentRoutes(mux, fleet, route)
-	registerMemoryRoutes(mux, fleet, route)
-
+func registerDeviceRoutes(
+	mux *http.ServeMux,
+	fleet *core.Fleet,
+	route func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc,
+) {
 	mux.HandleFunc("GET /v1/devices", route(true, func(w http.ResponseWriter, _ *http.Request, _ *registry.Device) error {
 		devs, err := fleet.List()
 		if err != nil {
@@ -244,6 +277,53 @@ func NewHandler(fleet *core.Fleet, quiet bool) http.Handler {
 		writeJSON(w, http.StatusOK, res)
 		return nil
 	}))
+}
+
+// NewHandler returns the HTTP handler for the lighthouse API.
+func NewHandler(fleet *core.Fleet, quiet bool) http.Handler {
+	startedAt := time.Now().UTC()
+	mux := http.NewServeMux()
+	route := makeAuthRoute(fleet, quiet)
+
+	mux.HandleFunc("GET /v1/sync", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
+		q := r.URL.Query()
+		res, err := fleet.Sync(c, r.Header.Get("X-Fleet-Client"), q.Get("os"), q.Get("arch"))
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, res)
+		return nil
+	}))
+	mux.HandleFunc("GET /v1/binary", route(false, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		q := r.URL.Query()
+		binPath, shaHex, ver, err := fleet.BinaryForPlatform(q.Get("os"), q.Get("arch"))
+		if err != nil {
+			return err
+		}
+		f, err := os.Open(binPath)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = f.Close() }()
+		info, err := f.Stat()
+		if err != nil {
+			return err
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("X-Fleet-SHA256", shaHex)
+		if ver != "" {
+			w.Header().Set("X-Fleet-Version", ver)
+		}
+		http.ServeContent(w, r, filepath.Base(binPath), info.ModTime(), f)
+		return nil
+	}))
+
+	registerAgentRoutes(mux, fleet, route)
+	registerMemoryRoutes(mux, fleet, route)
+	registerAdminRoutes(mux, fleet, startedAt, route)
+	registerWebRoutes(mux, route)
+	registerDeviceRoutes(mux, fleet, route)
+
 	mux.HandleFunc("/", route(false, func(w http.ResponseWriter, _ *http.Request, _ *registry.Device) error {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 		return nil
@@ -307,6 +387,13 @@ func registerAgentRoutes(
 		if err := readJSONBody(r, &req); err != nil {
 			return err
 		}
+		if core.IsAdmin(c) && req.SessionID != nil && *req.SessionID != "" && !strings.HasPrefix(*req.SessionID, c.Name+":") {
+			if err := fleet.Agents.DeregisterAny(*req.SessionID); err != nil {
+				return err
+			}
+			writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+			return nil
+		}
 		if err := fleet.Agents.Deregister(c.Name, req.SessionID, req.Harness, req.PID); err != nil {
 			return err
 		}
@@ -321,6 +408,18 @@ func registerAgentMessageRoutes(
 	fleet *core.Fleet,
 	route func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc,
 ) {
+	mux.HandleFunc("GET /v1/agents/messages", route(false, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		q := r.URL.Query()
+		msgs, err := fleet.Agents.ListMessages(q.Get("session"), q.Get("thread"), q.Get("device"), queryInt(r, "limit"))
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"messages": msgs})
+		return nil
+	}))
+	mux.HandleFunc("POST /v1/agents/messages", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
+		return handleAgentMessagesPost(w, r, fleet, c.Name)
+	}))
 	mux.HandleFunc("POST /v1/agents/send", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
 		req, fromSID, err := decodeCaller[struct {
 			callerReq
@@ -384,20 +483,58 @@ func registerAgentMessageRoutes(
 		return nil
 	}))
 	mux.HandleFunc("POST /v1/agents/rename", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
-		req, sid, err := decodeCaller[struct {
-			callerReq
-			Name string `json:"name"`
-		}](r, fleet, c.Name)
-		if err != nil {
-			return err
-		}
-		slug, err := fleet.Agents.RenameSession(c.Name, sid, req.Name)
-		if err != nil {
-			return err
-		}
-		writeJSON(w, http.StatusOK, map[string]string{"session_id": sid, "name": slug})
-		return nil
+		return handleAgentRename(w, r, fleet, c)
 	}))
+}
+
+func handleAgentMessagesPost(w http.ResponseWriter, r *http.Request, fleet *core.Fleet, dev string) error {
+	var req struct {
+		To       string  `json:"to"`
+		Body     string  `json:"body"`
+		ThreadID *string `json:"thread_id"`
+		ReplyTo  *int64  `json:"reply_to"`
+	}
+	if err := readJSONBody(r, &req); err != nil {
+		return err
+	}
+	known, err := fleet.ActiveDeviceNames()
+	if err != nil {
+		return err
+	}
+	res, err := fleet.Agents.SendMessageWithReport(dev, dev+":web:ui", req.To, req.Body, req.ThreadID, req.ReplyTo, known)
+	if err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, res)
+	return nil
+}
+
+func handleAgentRename(w http.ResponseWriter, r *http.Request, fleet *core.Fleet, c *registry.Device) error {
+	var req struct {
+		callerReq
+		Name string `json:"name"`
+	}
+	if err := readJSONBody(r, &req); err != nil {
+		return err
+	}
+	if core.IsAdmin(c) && req.SessionID != nil && *req.SessionID != "" && !strings.HasPrefix(*req.SessionID, c.Name+":") {
+		slug, err := fleet.Agents.RenameSessionAny(*req.SessionID, req.Name)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"session_id": *req.SessionID, "name": slug})
+		return nil
+	}
+	sid, err := fleet.Agents.ResolveCallerSession(c.Name, req.Harness, req.SessionID, req.CWD, req.PID)
+	if err != nil {
+		return err
+	}
+	slug, err := fleet.Agents.RenameSession(c.Name, sid, req.Name)
+	if err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"session_id": sid, "name": slug})
+	return nil
 }
 
 func handleAgentAsk(w http.ResponseWriter, r *http.Request, fleet *core.Fleet, dev string) error {
