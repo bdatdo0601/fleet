@@ -434,15 +434,24 @@ func buildChatPayload(cfg CuratorConfig, messages []map[string]string, responseF
 	return payload
 }
 
-func (c *Curator) doChatRequest(ctx context.Context, cfg CuratorConfig, payload map[string]any) (string, int, string, error) {
+const decisionMaxTokens = 4096
+
+type chatResult struct {
+	content      string
+	finishReason string
+	status       int
+	rawBody      string
+}
+
+func (c *Curator) doChatRequest(ctx context.Context, cfg CuratorConfig, payload map[string]any) (chatResult, error) {
 	bodyBytes, err := json.Marshal(payload)
 	if err != nil {
-		return "", 0, "", err
+		return chatResult{}, err
 	}
 	endpoint := strings.TrimRight(cfg.BaseURL, "/") + "/chat/completions"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
 	if err != nil {
-		return "", 0, "", err
+		return chatResult{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if cfg.APIKey != "" {
@@ -455,32 +464,39 @@ func (c *Curator) doChatRequest(ctx context.Context, cfg CuratorConfig, payload 
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", 0, "", err
+		return chatResult{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
 	if err != nil {
-		return "", resp.StatusCode, "", err
+		return chatResult{status: resp.StatusCode}, err
 	}
+	raw := string(respBytes)
 	if resp.StatusCode >= 400 {
-		return "", resp.StatusCode, string(respBytes), fmt.Errorf("curator HTTP %d: %s", resp.StatusCode, TruncateRunes(strings.TrimSpace(string(respBytes)), 240))
+		return chatResult{status: resp.StatusCode, rawBody: raw}, fmt.Errorf("curator HTTP %d: %s", resp.StatusCode, TruncateRunes(strings.TrimSpace(raw), 240))
 	}
 
 	var parsed struct {
 		Choices []struct {
-			Message struct {
+			FinishReason string `json:"finish_reason"`
+			Message      struct {
 				Content string `json:"content"`
 			} `json:"message"`
 		} `json:"choices"`
 	}
 	if err := json.Unmarshal(respBytes, &parsed); err != nil {
-		return "", resp.StatusCode, string(respBytes), fmt.Errorf("decode curator response: %w", err)
+		return chatResult{status: resp.StatusCode, rawBody: raw}, fmt.Errorf("decode curator response: %w", err)
 	}
 	if len(parsed.Choices) == 0 {
-		return "", resp.StatusCode, string(respBytes), errors.New("curator returned no choices")
+		return chatResult{status: resp.StatusCode, rawBody: raw}, errors.New("curator returned no choices")
 	}
-	return parsed.Choices[0].Message.Content, resp.StatusCode, string(respBytes), nil
+	return chatResult{
+		content:      parsed.Choices[0].Message.Content,
+		finishReason: parsed.Choices[0].FinishReason,
+		status:       resp.StatusCode,
+		rawBody:      raw,
+	}, nil
 }
 
 // TestConnection verifies credentials, endpoint reachability, and model JSON support.
@@ -489,11 +505,11 @@ func (c *Curator) TestConnection(ctx context.Context, cfg CuratorConfig) error {
 		{"role": "system", "content": "Return valid json only."},
 		{"role": "user", "content": `Reply with valid json: {"ok":true}`},
 	}
-	payload := buildChatPayload(cfg, msgs, map[string]any{"type": "json_object"}, 24)
-	_, status, rawErr, err := c.doChatRequest(ctx, cfg, payload)
-	if err != nil && (status == 400 || status == 404) && strings.Contains(strings.ToLower(rawErr), "response_format") {
-		payloadNoRF := buildChatPayload(cfg, msgs, nil, 24)
-		_, _, _, err = c.doChatRequest(ctx, cfg, payloadNoRF)
+	payload := buildChatPayload(cfg, msgs, map[string]any{"type": "json_object"}, 128)
+	res, err := c.doChatRequest(ctx, cfg, payload)
+	if err != nil && (res.status == 400 || res.status == 404) && strings.Contains(strings.ToLower(res.rawBody), "response_format") {
+		payloadNoRF := buildChatPayload(cfg, msgs, nil, 128)
+		_, err = c.doChatRequest(ctx, cfg, payloadNoRF)
 	}
 	if err != nil {
 		return newMemoryErr("curator preflight failed: "+err.Error(), 400)
@@ -514,6 +530,19 @@ func stripCodeFences(s string) string {
 	return strings.TrimSpace(s)
 }
 
+func (c *Curator) requestDecision(ctx context.Context, cfg CuratorConfig, msgs []map[string]string) (chatResult, error) {
+	payload := buildChatPayload(cfg, msgs, decisionJSONSchema, decisionMaxTokens)
+	res, err := c.doChatRequest(ctx, cfg, payload)
+	if err != nil && (res.status == 400 || res.status == 404) {
+		low := strings.ToLower(res.rawBody)
+		if strings.Contains(low, "response_format") || strings.Contains(low, "json_schema") || strings.Contains(low, "provider") || strings.Contains(low, "parameters") {
+			fallbackPayload := buildChatPayload(cfg, msgs, map[string]any{"type": "json_object"}, decisionMaxTokens)
+			return c.doChatRequest(ctx, cfg, fallbackPayload)
+		}
+	}
+	return res, err
+}
+
 func (c *Curator) callDecisionLLM(ctx context.Context, cfg CuratorConfig, prompt string) (CuratorDecision, error) {
 	sys := `You curate a fleet-wide engineering memory store shared by multiple coding agents.
 Decide how to handle the CANDIDATE memory relative to EXISTING matches and STANDING global rules:
@@ -523,29 +552,32 @@ Decide how to handle the CANDIDATE memory relative to EXISTING matches and STAND
 - "promote_global": candidate is non-global preference/feedback expressing a cross-repo workflow rule -> set scope="global", tier="always", target_key=short slug, summary, body.
 - "update": keep in current scope, optionally refining concise summary (<=200 chars) or kind/tier; preserve detailed body for project/reference notes.
 - "keep": already clean as-is.
+For "keep", "archive", or "update" when the existing body does not need rewriting, set "body": "" (the server preserves the existing body). Keep "body" concise when actually rewriting, merging, or generalizing for "promote_global".
 Return valid JSON matching the schema.`
 
 	msgs := []map[string]string{
 		{"role": "system", "content": sys},
 		{"role": "user", "content": prompt},
 	}
-	payload := buildChatPayload(cfg, msgs, decisionJSONSchema, 700)
-	text, status, rawErr, err := c.doChatRequest(ctx, cfg, payload)
-	if err != nil && (status == 400 || status == 404) {
-		low := strings.ToLower(rawErr)
-		if strings.Contains(low, "response_format") || strings.Contains(low, "json_schema") || strings.Contains(low, "provider") || strings.Contains(low, "parameters") {
-			fallbackPayload := buildChatPayload(cfg, msgs, map[string]any{"type": "json_object"}, 700)
-			text, _, _, err = c.doChatRequest(ctx, cfg, fallbackPayload)
-		}
+	res, err := c.requestDecision(ctx, cfg, msgs)
+	if err == nil && (res.finishReason == "length" || strings.TrimSpace(res.content) == "") {
+		msgs = append(msgs, map[string]string{
+			"role":    "user",
+			"content": `Previous output hit length limit; return compact valid JSON with body="" unless rewriting.`,
+		})
+		res, err = c.requestDecision(ctx, cfg, msgs)
 	}
 	if err != nil {
 		return CuratorDecision{}, err
 	}
+	if strings.TrimSpace(res.content) == "" {
+		return CuratorDecision{}, fmt.Errorf("curator returned empty response (finish_reason=%s)", cmp.Or(res.finishReason, "unknown"))
+	}
 
 	var dec CuratorDecision
-	cleaned := stripCodeFences(text)
+	cleaned := stripCodeFences(res.content)
 	if err := json.Unmarshal([]byte(cleaned), &dec); err != nil {
-		return CuratorDecision{}, fmt.Errorf("parse curator json: %w", err)
+		return CuratorDecision{}, fmt.Errorf("parse curator json (finish_reason=%s): %w", cmp.Or(res.finishReason, "unknown"), err)
 	}
 	dec.Action = cmp.Or(strings.ToLower(strings.TrimSpace(dec.Action)), "keep")
 	return dec, nil
@@ -904,6 +936,7 @@ func (c *Curator) RunPending(ctx context.Context, limit int, dryRun, includeAll 
 	if dryRun {
 		return c.dryRunEvaluate(ctx, cfg, limit, includeAll)
 	}
+	_, _ = c.store.ResetFailedJobs()
 	if includeAll {
 		if _, err := c.store.EnqueueAllActive([]string{"preference", "feedback"}); err != nil {
 			return nil, err

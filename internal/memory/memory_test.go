@@ -411,3 +411,122 @@ func TestCuratorOpenRouterProposalMergeAndWorker(t *testing.T) {
 		t.Fatalf("worker merge failed: dup=%+v merged=%+v fallback=%v", det.Item, merged.Item, sawSchemaFallback)
 	}
 }
+
+func TestCuratorLengthRetryAndFailedJobReset(t *testing.T) {
+	st := openTestStore(t)
+	cur := NewCurator(st, filepath.Join(t.TempDir(), "curator.json"))
+
+	var mu sync.Mutex
+	var calls int
+	var alwaysLength bool
+	var sawMaxTokens4096 bool
+	var sawEmptyBodyGuidance bool
+
+	llmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&req)
+
+		msgs := req["messages"].([]any)
+		sysMsg := msgs[0].(map[string]any)["content"].(string)
+		userMsg := msgs[1].(map[string]any)["content"].(string)
+
+		if !strings.Contains(userMsg, "CANDIDATE:") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{{"finish_reason": "stop", "message": map[string]any{"content": `{"ok":true}`}}},
+			})
+			return
+		}
+
+		mu.Lock()
+		calls++
+		callNum := calls
+		forceLen := alwaysLength
+		if mt, ok := req["max_tokens"].(float64); ok && int(mt) == 4096 {
+			sawMaxTokens4096 = true
+		}
+		if strings.Contains(sysMsg, `set "body": ""`) {
+			sawEmptyBodyGuidance = true
+		}
+		mu.Unlock()
+
+		finishReason := "stop"
+		content := `{"action":"update","target_key":"","scope":"repo:app","kind":"feedback","tier":"searchable","summary":"Concise summary","body":"","reason":"compact"}`
+		if forceLen || callNum == 1 {
+			finishReason = "length"
+			content = `{"action":"update","body":"truncated`
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"finish_reason": finishReason, "message": map[string]any{"content": content}}},
+		})
+	}))
+	defer llmSrv.Close()
+
+	if _, err := cur.Configure(context.Background(), CuratorConfig{
+		Enabled:  true,
+		Provider: "openrouter",
+		BaseURL:  llmSrv.URL,
+		Model:    DefaultOpenRouterModel,
+		APIKey:   "sk-or-v1-secretkey12345678",
+	}, true); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Insert a long memory and verify length finish_reason retries compactly and preserves original body.
+	origBody := strings.Repeat("Long detailed rule body.\n", 80)
+	up, err := st.Upsert(UpsertParams{
+		Scope:  "repo:app",
+		Key:    "long-rule",
+		Kind:   "feedback",
+		Body:   origBody,
+		Source: "fleet",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reps, err := cur.RunPending(context.Background(), 10, false, false)
+	if err != nil || len(reps) != 1 || reps[0].Action != "update" || !reps[0].Applied {
+		t.Fatalf("expected length retry to succeed with update, got %+v err=%v", reps, err)
+	}
+	if !sawMaxTokens4096 || !sawEmptyBodyGuidance || calls != 2 {
+		t.Fatalf("expected max_tokens=4096, guidance, and 2 calls (1 retry); got mt=%v guidance=%v calls=%d",
+			sawMaxTokens4096, sawEmptyBodyGuidance, calls)
+	}
+	det, err := st.Get("repo:app", "long-rule", false)
+	if err != nil || det.Item.Summary != "Concise summary" || det.Item.Body != strings.TrimSpace(origBody) {
+		t.Fatalf("expected preserved original body after compact update, got %+v err=%v", det.Item, err)
+	}
+
+	// 2. If retry still truncates, surface finish_reason=length and verify RunPending resets exhausted failed jobs.
+	mu.Lock()
+	alwaysLength = true
+	calls = 0
+	mu.Unlock()
+
+	if _, err := st.db.Exec(
+		"INSERT INTO curation_jobs(memory_id, status, attempts, last_error, created_at, updated_at) VALUES (?, 'failed', 3, 'old failure', '2026-11-24T00:00:00+00:00', '2026-11-24T00:00:00+00:00')",
+		up.Item.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	repsFail, err := cur.RunPending(context.Background(), 10, false, false)
+	if err != nil || len(repsFail) != 3 || repsFail[0].Action != "error" || !strings.Contains(repsFail[0].Error, "finish_reason=length") {
+		t.Fatalf("expected failed retries surfacing finish_reason=length, got %+v err=%v", repsFail, err)
+	}
+	_, failedCount, _, _ := st.JobCounts()
+	if failedCount != 1 {
+		t.Fatalf("expected 1 exhausted failed job, got %d", failedCount)
+	}
+
+	// Now allow success and verify RunPending resets and picks up the exhausted failed job.
+	mu.Lock()
+	alwaysLength = false
+	mu.Unlock()
+	repsRecovered, err := cur.RunPending(context.Background(), 10, false, false)
+	if err != nil || len(repsRecovered) != 1 || repsRecovered[0].Action != "update" {
+		t.Fatalf("expected RunPending to reset and recover exhausted failed job, got %+v err=%v", repsRecovered, err)
+	}
+}

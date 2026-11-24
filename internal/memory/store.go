@@ -1635,6 +1635,21 @@ func (s *Store) EnqueueAllActive(kinds []string) (int, error) {
 	return len(ids), nil
 }
 
+// ResetFailedJobs resets failed curation jobs back to pending so manual runs can retry them.
+func (s *Store) ResetFailedJobs() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(
+		"UPDATE curation_jobs SET status = 'pending', attempts = 0, last_error = '', updated_at = ? WHERE status = 'failed'",
+		registry.NowISO(),
+	)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
+}
+
 // JobCounts returns counts of pending jobs, exhausted/failed jobs, and pending proposals.
 func (s *Store) JobCounts() (pending, failed, proposals int, err error) {
 	s.mu.Lock()
