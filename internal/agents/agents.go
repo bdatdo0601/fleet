@@ -222,15 +222,18 @@ type HeartbeatParams struct {
 	GitStatus     *string           `json:"git_status"`
 	Tail          []TailItem        `json:"tail"`
 	DrainInbox    bool              `json:"drain_inbox"`
+	IncludeMemory bool              `json:"include_memory,omitempty"`
+	MemoryRepo    string            `json:"memory_repo,omitempty"`
 }
 
 // HeartbeatResult is returned by Heartbeat.
 type HeartbeatResult struct {
-	SessionID string    `json:"session_id"`
-	FullRawID string    `json:"full_raw_id"`
-	Name      string    `json:"name"`
-	Title     string    `json:"title"`
-	Unread    []Message `json:"unread"`
+	SessionID     string    `json:"session_id"`
+	FullRawID     string    `json:"full_raw_id"`
+	Name          string    `json:"name"`
+	Title         string    `json:"title"`
+	Unread        []Message `json:"unread"`
+	MemoryContext string    `json:"memory_context,omitempty"`
 }
 
 // WaitParams controls WaitForMessages.

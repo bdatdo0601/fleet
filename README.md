@@ -49,6 +49,7 @@ into it from anywhere. No third-party servers are involved.
 | Admin device | `fleet revoke NAME` | Cuts a device off everywhere within about 5 minutes |
 | Admin device | `fleet set NAME --group G` | Moves a device to another group (re-signs its cert, also used to renew one) |
 | Any Mac | `fleet agents [--all] [--waiting]` | Lists live AI agent sessions (`claude`, `codex`, `antigravity`), including sessions blocked on permission or question prompts |
+| Any Mac / Admin | `fleet memory ...` | Manages shared agent memory (`ls`, `search`, `set`, `import`, `promote`, `review`, `curator setup`) |
 | Any Mac | `fleet mcp status\|install\|uninstall` | Checks or manages MCP + lifecycle hook configs for installed agent harnesses |
 | Any Mac | `fleet status` | Shows the services, whether the lighthouse is reachable, and this device's IP |
 | Any Mac | `fleet version` | Prints the compiled binary version, git commit, and platform |
@@ -212,6 +213,16 @@ on the lighthouse across all active Macs (`admin` and `managed` alike).
 - **CLI inspection:** Run `fleet agents` (or `fleet agents --waiting` / `--state ...`) from any Mac to view active
   sessions, names, listener status, wait durations, pending prompts, titles, and repos; `fleet agents rename <target> <name>`
   to rename a session; or `fleet agents wait --session <id>` to block until unread messages arrive.
+
+## Shared agent memory
+
+`fleet serve` stores a shared, cross-harness agent memory space in `~/.fleet/memory.db` (SQLite + FTS5 + revision history) on the lighthouse, scoped by `global`, `repo:<name>` (resolved from `git origin` so checkouts and worktrees share one scope), and `device:<name>`.
+
+- **Automatic `SessionStart` injection:** Every new `claude`, `codex`, or `antigravity` session receives standing `always` preferences and a compact index of recent `searchable` notes at `SessionStart`, cached locally in `~/.fleet-cache/` for offline fallback.
+- **Cross-harness MCP tools:** All three harnesses expose `fleet_memory_search`, `fleet_memory_get`, `fleet_memory_set`, and `fleet_memory_delete`.
+- **One-way local backup:** `fleet memory import` (and automatic `fleet sync`) harvests local `~/.claude/projects/*/memory/*.md` (and `~/.codex/memories/*.md`) up to the lighthouse without overwriting `human`-edited or `locked` entries.
+- **Async LLM curator (optional):** Configure an OpenRouter or OpenAI-compatible curator on the lighthouse from an admin Mac using 1Password (`fleet memory curator setup --provider openrouter --model openai/gpt-6-luna --op-ref "op://Vault/OpenRouter/credential"`) to deduplicate, filter noise, and propose `global` promotions (`fleet memory review` / `approve` / `reject`).
+- **Human CLI curation:** `fleet memory ls|search|get|set|edit|rm|promote|history|revert|context`.
 
 ## Security model
 

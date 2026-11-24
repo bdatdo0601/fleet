@@ -18,6 +18,7 @@ import (
 	"github.com/bdatdo0601/fleet/internal/agents"
 	"github.com/bdatdo0601/fleet/internal/client"
 	"github.com/bdatdo0601/fleet/internal/hooks"
+	"github.com/bdatdo0601/fleet/internal/memory"
 	"github.com/bdatdo0601/fleet/internal/paths"
 	"github.com/bdatdo0601/fleet/internal/version"
 	"github.com/bdatdo0601/fleet/internal/waiter"
@@ -44,7 +45,7 @@ type ToolDef struct {
 	InputSchema toolInputSchema `json:"inputSchema"`
 }
 
-// Tools defines the 7 MCP tools exposed to agent harnesses.
+// Tools defines the 11 MCP tools exposed to agent harnesses.
 var Tools = []ToolDef{
 	{
 		Name: "fleet_list_agents",
@@ -136,6 +137,63 @@ var Tools = []ToolDef{
 				"action":     {Type: "string", Enum: []string{"status", "start", "stop"}, Description: "Listener action (default status)."},
 				"session_id": {Type: "string", Description: "Caller session_id if explicitly provided."},
 			},
+		},
+	},
+	{
+		Name:        "fleet_memory_search",
+		Description: "Search shared fleet memories across devices and harnesses using FTS5, or list recent memories. Defaults to global + current repository scopes.",
+		InputSchema: toolInputSchema{
+			Type: "object",
+			Properties: map[string]toolSchemaProp{
+				"query": {Type: "string", Description: "Search keywords (empty lists recent active memories)."},
+				"scope": {Type: "string", Description: "Scope filter: 'current' (default: global + current repo), 'global', 'repo:<name>', 'device:<name>', or 'all'."},
+				"kind":  {Type: "string", Enum: memory.ValidKinds, Description: "Optional memory kind filter."},
+				"tier":  {Type: "string", Enum: memory.ValidTiers, Description: "Optional injection tier filter."},
+				"limit": {Type: "integer", Description: "Maximum results to return (default 20, max 100)."},
+			},
+		},
+	},
+	{
+		Name:        "fleet_memory_get",
+		Description: "Fetch the full body and optional revision history of a shared fleet memory entry.",
+		InputSchema: toolInputSchema{
+			Type: "object",
+			Properties: map[string]toolSchemaProp{
+				"scope":           {Type: "string", Description: "Memory scope ('global', 'repo:<name>', or 'device:<name>'). Defaults to 'global' (or parse '<scope>/<key>')."},
+				"key":             {Type: "string", Description: "Memory key slug (or '<scope>/<key>')."},
+				"include_history": {Type: "boolean", Description: "Include recent revision history."},
+			},
+			Required: []string{"key"},
+		},
+	},
+	{
+		Name:        "fleet_memory_set",
+		Description: "Create or update a durable shared fleet memory on the lighthouse. Save standing cross-fleet preferences in scope='global' (tier='always'), or repo conventions/facts in scope='repo:<name>' (default). Never save ephemeral task state.",
+		InputSchema: toolInputSchema{
+			Type: "object",
+			Properties: map[string]toolSchemaProp{
+				"key":        {Type: "string", Description: "Short stable slug (e.g. 'prefer-few-prs')."},
+				"body":       {Type: "string", Description: "Durable preference rule, convention, or reference text."},
+				"scope":      {Type: "string", Description: "Target scope ('global', 'repo:<name>', or 'device:<name>'). Defaults to current repo (or 'global')."},
+				"kind":       {Type: "string", Enum: memory.ValidKinds, Description: "Memory category: preference, feedback, project, or reference."},
+				"tier":       {Type: "string", Enum: memory.ValidTiers, Description: "'always' (auto-injected at SessionStart) or 'searchable' (index + FTS5)."},
+				"summary":    {Type: "string", Description: "Optional concise single-line summary (<=200 chars) for SessionStart injection."},
+				"session_id": {Type: "string", Description: "Caller session_id if explicitly provided."},
+			},
+			Required: []string{"key", "body"},
+		},
+	},
+	{
+		Name:        "fleet_memory_delete",
+		Description: "Archive (soft-delete) an obsolete or mistaken shared fleet memory entry.",
+		InputSchema: toolInputSchema{
+			Type: "object",
+			Properties: map[string]toolSchemaProp{
+				"scope":      {Type: "string", Description: "Memory scope ('global', 'repo:<name>', or 'device:<name>'). Defaults to current repo (or 'global')."},
+				"key":        {Type: "string", Description: "Memory key slug to archive."},
+				"session_id": {Type: "string", Description: "Caller session_id if explicitly provided."},
+			},
+			Required: []string{"key"},
 		},
 	},
 }
@@ -471,6 +529,9 @@ func callTool(name string, rawArgs json.RawMessage, apiURL, harness string, ppid
 			return nil, err
 		}
 		return callListenTool(api, harness, cwd, ppid, listener, a.Action, a.SessionID)
+
+	case "fleet_memory_search", "fleet_memory_get", "fleet_memory_set", "fleet_memory_delete":
+		return callMemoryTool(name, rawArgs, api, harness, cwd)
 
 	default:
 		return nil, fmt.Errorf("unknown tool %q", name)

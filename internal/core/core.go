@@ -16,6 +16,7 @@ import (
 	"github.com/bdatdo0601/fleet/internal/agents"
 	"github.com/bdatdo0601/fleet/internal/codes"
 	"github.com/bdatdo0601/fleet/internal/ddns"
+	"github.com/bdatdo0601/fleet/internal/memory"
 	"github.com/bdatdo0601/fleet/internal/paths"
 	"github.com/bdatdo0601/fleet/internal/pki"
 	"github.com/bdatdo0601/fleet/internal/registry"
@@ -123,13 +124,15 @@ type ApproveOpts struct {
 	Replace    bool   `json:"replace"`
 }
 
-// Fleet coordinates CA keys, the device registry, and the agent session hub.
+// Fleet coordinates CA keys, the device registry, the agent session hub, and shared memory.
 type Fleet struct {
 	Root             string
 	CAKey            string
 	CACrt            string
 	Registry         *registry.Registry
 	Agents           *agents.Hub
+	Memory           *memory.Store
+	Curator          *memory.Curator
 	approveMu        sync.Mutex
 	IdentifyOverride func(peerIP string) *registry.Device // optional hook for tests
 }
@@ -148,12 +151,21 @@ func Open(root string) (*Fleet, error) {
 		_ = reg.Close()
 		return nil, err
 	}
+	mem, err := memory.Open(filepath.Join(root, "memory.db"))
+	if err != nil {
+		_ = hub.Close()
+		_ = reg.Close()
+		return nil, err
+	}
+	curator := memory.NewCurator(mem, filepath.Join(root, "curator.json"))
 	return &Fleet{
 		Root:     root,
 		CAKey:    filepath.Join(root, "ca.key"),
 		CACrt:    filepath.Join(root, "ca.crt"),
 		Registry: reg,
 		Agents:   hub,
+		Memory:   mem,
+		Curator:  curator,
 	}, nil
 }
 
@@ -227,9 +239,12 @@ func Initialize(opts InitOpts) (*Fleet, error) {
 	return f, nil
 }
 
-// Close closes both underlying SQLite databases.
+// Close stops background workers and closes underlying SQLite databases.
 func (f *Fleet) Close() error {
 	var errs []error
+	if f.Curator != nil {
+		f.Curator.Stop()
+	}
 	if f.Registry != nil {
 		if err := f.Registry.Close(); err != nil {
 			errs = append(errs, err)
@@ -237,6 +252,11 @@ func (f *Fleet) Close() error {
 	}
 	if f.Agents != nil {
 		if err := f.Agents.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if f.Memory != nil {
+		if err := f.Memory.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}

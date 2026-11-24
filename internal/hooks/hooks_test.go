@@ -14,6 +14,7 @@ import (
 
 	"github.com/bdatdo0601/fleet/internal/agents"
 	"github.com/bdatdo0601/fleet/internal/core"
+	"github.com/bdatdo0601/fleet/internal/memory"
 	"github.com/bdatdo0601/fleet/internal/pki"
 	"github.com/bdatdo0601/fleet/internal/server"
 )
@@ -118,6 +119,7 @@ func TestTitleExtractionAllThreeHarnesses(t *testing.T) {
 
 func TestHookLifecycleAllHarnesses(t *testing.T) {
 	tmp := t.TempDir()
+	t.Setenv("FLEET_CACHE_DIR", filepath.Join(tmp, "cache"))
 	pubFile := filepath.Join(tmp, "mini.pub")
 	if err := pki.Keygen(filepath.Join(tmp, "mini.key"), pubFile); err != nil {
 		t.Skip("nebula-cert not installed")
@@ -200,4 +202,82 @@ func TestHookLifecycleAllHarnesses(t *testing.T) {
 	if err != nil || rc != 0 || strings.TrimSpace(offlineOut.String()) != "{}" {
 		t.Fatalf("expected fail-open {}, got rc=%d err=%v out=%q", rc, err, offlineOut.String())
 	}
+}
+
+func TestSessionStartMemoryInjectionAndOfflineCache(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_CACHE_DIR", filepath.Join(tmp, "cache"))
+	pubFile := filepath.Join(tmp, "mini.pub")
+	if err := pki.Keygen(filepath.Join(tmp, "mini.key"), pubFile); err != nil {
+		t.Skip("nebula-cert not installed")
+	}
+	miniPub, _ := os.ReadFile(pubFile)
+	f, err := core.Initialize(core.InitOpts{
+		Root: filepath.Join(tmp, "state"), Host: "h.example.com", Port: 443,
+		Passphrase: "correct horse battery staple", LighthousePubkey: string(miniPub),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	srv := httptest.NewServer(server.NewHandler(f, true))
+	t.Cleanup(srv.Close)
+
+	if _, err := f.Memory.Upsert(memory.UpsertParams{
+		Scope:  "global",
+		Key:    "prefer-few-prs",
+		Kind:   "preference",
+		Tier:   "always",
+		Body:   "Keep PR count minimal and avoid sweeping changes.",
+		Source: "human",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	repoDir := filepath.Join(tmp, "demo-repo")
+	_ = os.MkdirAll(repoDir, 0o755)
+	if _, err := f.Memory.Upsert(memory.UpsertParams{
+		Scope:  "repo:demo-repo",
+		Key:    "build-check",
+		Kind:   "project",
+		Tier:   "searchable",
+		Body:   "Run make check before pushing.",
+		Source: "fleet",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Online SessionStart for claude, codex, and antigravity receives memory and saves cache.
+	for _, tc := range []struct {
+		harness string
+		payload string
+	}{
+		{"claude", `{"hook_event_name":"SessionStart","session_id":"c-mem-1","cwd":` + mustHookJSON(repoDir) + `}`},
+		{"codex", `{"hook_event_name":"SessionStart","session_id":"x-mem-1","cwd":` + mustHookJSON(repoDir) + `}`},
+		{"antigravity", `{"hookEventName":"SessionStart","conversationId":"a-mem-1","cwd":` + mustHookJSON(repoDir) + `}`},
+	} {
+		var out bytes.Buffer
+		rc, runErr := RunHook(tc.harness, strings.NewReader(tc.payload), &out, srv.URL)
+		if runErr != nil || rc != 0 {
+			t.Fatalf("%s SessionStart failed: rc=%d err=%v", tc.harness, rc, runErr)
+		}
+		if !strings.Contains(out.String(), "[Fleet Memory]") || !strings.Contains(out.String(), "prefer-few-prs") {
+			t.Fatalf("%s expected memory in SessionStart output, got %s", tc.harness, out.String())
+		}
+	}
+
+	// Offline SessionStart falls back to cached memory context.
+	var cachedOut bytes.Buffer
+	rc, err := RunHook("claude", strings.NewReader(`{"hook_event_name":"SessionStart","session_id":"c-off","cwd":`+mustHookJSON(repoDir)+`}`), &cachedOut, "http://127.0.0.1:1")
+	if err != nil || rc != 0 {
+		t.Fatalf("offline SessionStart failed: rc=%d err=%v", rc, err)
+	}
+	if !strings.Contains(cachedOut.String(), "[Fleet Memory]") || !strings.Contains(cachedOut.String(), "prefer-few-prs") {
+		t.Fatalf("expected offline cached memory on SessionStart, got %s", cachedOut.String())
+	}
+}
+
+func mustHookJSON(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
 }

@@ -25,6 +25,7 @@ import (
 
 	"github.com/bdatdo0601/fleet/internal/agents"
 	"github.com/bdatdo0601/fleet/internal/client"
+	"github.com/bdatdo0601/fleet/internal/memory"
 	"github.com/bdatdo0601/fleet/internal/paths"
 )
 
@@ -792,7 +793,7 @@ func formatAntigravityOutput(event, contextText, unreadText string, canInject bo
 	}
 }
 
-func formatHookOutput(harness, event, sessionID string, unread []agents.Message, canInject bool, sessionName string) map[string]any {
+func formatHookOutput(harness, event, sessionID string, unread []agents.Message, canInject bool, sessionName, memoryContext string) map[string]any {
 	unreadText := ""
 	if len(unread) > 0 {
 		unreadText = FormatUnread(sessionID, unread, sessionName, "")
@@ -800,6 +801,9 @@ func formatHookOutput(harness, event, sessionID string, unread []agents.Message,
 	var parts []string
 	if event == "SessionStart" && sessionID != "" {
 		parts = append(parts, sessionStartMessage(harness, sessionID, sessionName))
+	}
+	if event == "SessionStart" && memoryContext != "" {
+		parts = append(parts, memoryContext)
 	}
 	if unreadText != "" {
 		parts = append(parts, unreadText)
@@ -858,11 +862,14 @@ func RunHook(harness string, stdin io.Reader, stdout io.Writer, apiURL string) (
 		return 0, nil
 	}
 
-	var repo, branch, gitStatus, tailSummary, title string
+	var repo, branch, gitStatus, tailSummary, title, memRepo string
 	var tail []agents.TailItem
 	var isExplicitName bool
 	var wg sync.WaitGroup
 	wg.Go(func() { repo, branch, gitStatus = GitContext(cwd) })
+	if event == "SessionStart" {
+		wg.Go(func() { memRepo = memory.CanonicalRepo(cwd) })
+	}
 	wg.Go(func() { tailSummary, tail = ReadTranscriptTail(harness, transcriptPath, cwd, 20) })
 	wg.Go(func() { title, isExplicitName = ReadSessionTitle(harness, rawID, transcriptPath, "", "") })
 	wg.Wait()
@@ -872,7 +879,7 @@ func RunHook(harness string, stdin io.Reader, stdout io.Writer, apiURL string) (
 		summary = agents.TruncateRunes(trimmed, 160)
 	}
 
-	var sessionID, sessionName string
+	var sessionID, sessionName, memoryContext string
 	var unread []agents.Message
 	if api, err := client.ResolveAPI(apiURL); err == nil {
 		var pidPtr *int
@@ -894,13 +901,21 @@ func RunHook(harness string, stdin io.Reader, stdout io.Writer, apiURL string) (
 			Harness: harness, RawID: rawID, PID: pidPtr, CWD: cwd, Repo: repo, Branch: branch,
 			State: state, PendingAction: pendingAction, Title: titlePtr, Name: namePtr,
 			ExplicitName: isExplicitName, Summary: sumPtr, GitStatus: &gitStatus, Tail: tail, DrainInbox: canInject,
+			IncludeMemory: event == "SessionStart", MemoryRepo: memRepo,
 		}, 2*time.Second, nil, &resp)
 		if err == nil {
-			sessionID, sessionName, unread = resp.SessionID, resp.Name, resp.Unread
+			sessionID, sessionName, unread, memoryContext = resp.SessionID, resp.Name, resp.Unread, resp.MemoryContext
+		}
+	}
+	if event == "SessionStart" {
+		if memoryContext != "" {
+			_ = memory.SaveContextCache(paths.CacheDir(), memRepo, memoryContext, nil, nil)
+		} else {
+			memoryContext = memory.LoadContextCache(paths.CacheDir(), memRepo)
 		}
 	}
 
-	output := formatHookOutput(harness, event, sessionID, unread, canInject, sessionName)
+	output := formatHookOutput(harness, event, sessionID, unread, canInject, sessionName, memoryContext)
 	b, _ := json.Marshal(output)
 	_, _ = stdout.Write(append(b, '\n'))
 	return 0, nil

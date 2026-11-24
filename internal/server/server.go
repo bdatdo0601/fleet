@@ -2,6 +2,7 @@
 package server
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -108,11 +109,8 @@ func rawAgentTarget(r *http.Request) string {
 	return strings.TrimPrefix(r.URL.Path, "/v1/agents/")
 }
 
-func optBool(p *bool, def bool) bool {
-	if p == nil {
-		return def
-	}
-	return *p
+func optBoolDefaultTrue(p *bool) bool {
+	return p == nil || *p
 }
 
 func optFloat(p *float64, def float64) float64 {
@@ -191,6 +189,7 @@ func NewHandler(fleet *core.Fleet, quiet bool) http.Handler {
 	}))
 
 	registerAgentRoutes(mux, fleet, route)
+	registerMemoryRoutes(mux, fleet, route)
 
 	mux.HandleFunc("GET /v1/devices", route(true, func(w http.ResponseWriter, _ *http.Request, _ *registry.Device) error {
 		devs, err := fleet.List()
@@ -291,6 +290,11 @@ func registerAgentRoutes(
 		if err != nil {
 			return err
 		}
+		if req.IncludeMemory && fleet.Memory != nil {
+			if ctxRes, mErr := fleet.Memory.RenderContext(cmp.Or(req.MemoryRepo, req.Repo), c.Name); mErr == nil {
+				res.MemoryContext = ctxRes.Rendered
+			}
+		}
 		writeJSON(w, http.StatusOK, res)
 		return nil
 	}))
@@ -348,7 +352,7 @@ func registerAgentMessageRoutes(
 		if err != nil {
 			return err
 		}
-		msgs, err := fleet.Agents.FetchInbox(c.Name, sid, optBool(req.UnreadOnly, true), optBool(req.MarkRead, true), 50)
+		msgs, err := fleet.Agents.FetchInbox(c.Name, sid, optBoolDefaultTrue(req.UnreadOnly), optBoolDefaultTrue(req.MarkRead), 50)
 		if err != nil {
 			return err
 		}
@@ -435,7 +439,7 @@ func handleAgentWait(w http.ResponseWriter, r *http.Request, fleet *core.Fleet, 
 	}
 	res, err := fleet.Agents.WaitForMessages(r.Context(), agents.WaitParams{
 		Device: dev, SessionID: sid, Timeout: optFloat(req.Timeout, 55.0),
-		MarkRead: optBool(req.MarkRead, true), Limit: optInt(req.Limit, 50), RequireFullID: req.RequireFullID,
+		MarkRead: optBoolDefaultTrue(req.MarkRead), Limit: optInt(req.Limit, 50), RequireFullID: req.RequireFullID,
 	})
 	if err != nil {
 		return err
@@ -478,6 +482,11 @@ func Serve(port int, host string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	if fleet.Curator != nil {
+		fleet.Curator.Start(ctx)
+		defer fleet.Curator.Stop()
+	}
 
 	errCh := make(chan error, 1)
 	go func() {

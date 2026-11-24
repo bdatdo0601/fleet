@@ -88,6 +88,25 @@ func StateDirForOwner(owner string) string {
 	return StateDir()
 }
 
+// CacheDir returns the per-user fleet cache directory (~/.fleet-cache or FLEET_CACHE_DIR).
+func CacheDir() string {
+	if v := os.Getenv("FLEET_CACHE_DIR"); v != "" {
+		return v
+	}
+	return filepath.Join(homeDir(), ".fleet-cache")
+}
+
+// CacheDirForOwner returns FLEET_CACHE_DIR if set, otherwise <owner_home>/.fleet-cache (falling back to CacheDir).
+func CacheDirForOwner(owner string) string {
+	if v := os.Getenv("FLEET_CACHE_DIR"); v != "" {
+		return v
+	}
+	if h := HomeForUser(owner); h != "" {
+		return filepath.Join(h, ".fleet-cache")
+	}
+	return CacheDir()
+}
+
 // NebulaEtc returns the directory the Homebrew nebula service loads configs and PKI from.
 func NebulaEtc() string {
 	if v := os.Getenv("FLEET_NEBULA_ETC"); v != "" {

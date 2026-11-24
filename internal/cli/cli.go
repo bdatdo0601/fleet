@@ -32,6 +32,7 @@ import (
 	"github.com/bdatdo0601/fleet/internal/hooks"
 	"github.com/bdatdo0601/fleet/internal/mcp"
 	"github.com/bdatdo0601/fleet/internal/mcpinstall"
+	"github.com/bdatdo0601/fleet/internal/memory"
 	"github.com/bdatdo0601/fleet/internal/paths"
 	"github.com/bdatdo0601/fleet/internal/pki"
 	"github.com/bdatdo0601/fleet/internal/server"
@@ -46,6 +47,8 @@ type IO struct {
 	Stdout        io.Writer
 	Stderr        io.Writer
 	AskPassphrase func(newPass bool) (string, error)
+	AskSecret     func(prompt string) (string, error)
+	ReadOPRef     func(ref string) (string, error)
 	ConfirmFn     func(question string) error
 	br            *bufio.Reader
 	brSrc         io.Reader
@@ -125,6 +128,48 @@ func (cio *IO) askPassphrase(newPass bool) (string, error) {
 		}
 	}
 	return pw, nil
+}
+
+func (cio *IO) askSecret(prompt string) (string, error) {
+	if cio.AskSecret != nil {
+		return cio.AskSecret(prompt)
+	}
+	_, _ = fmt.Fprint(cio.Stderr, prompt)
+	if f, ok := cio.Stdin.(*os.File); ok && term.IsTerminal(int(f.Fd())) {
+		b, err := term.ReadPassword(int(f.Fd()))
+		_, _ = fmt.Fprintln(cio.Stderr)
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(b)), nil
+	}
+	ln, err := cio.stdinReader().ReadString('\n')
+	if err != nil && len(ln) == 0 {
+		return "", err
+	}
+	return strings.TrimSpace(ln), nil
+}
+
+func (cio *IO) readOPRef(ref string) (string, error) {
+	if cio.ReadOPRef != nil {
+		return cio.ReadOPRef(ref)
+	}
+	if _, err := exec.LookPath("op"); err != nil {
+		return "", fmt.Errorf("1Password CLI (`op`) not found: install with `brew install 1password-cli`")
+	}
+	out, err := exec.Command("op", "read", ref).Output()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && len(exitErr.Stderr) > 0 {
+			return "", fmt.Errorf("op read %s: %s", ref, strings.TrimSpace(string(exitErr.Stderr)))
+		}
+		return "", fmt.Errorf("op read %s: %w", ref, err)
+	}
+	val := strings.TrimSpace(string(out))
+	if val == "" {
+		return "", fmt.Errorf("op read %s returned empty secret", ref)
+	}
+	return val, nil
 }
 
 func (cio *IO) paste(prompt, endMarker string) (string, error) {
@@ -913,6 +958,17 @@ func applySyncedFiles(cio *IO, stamp string, payload core.SyncResult) error {
 	return nil
 }
 
+func harvestSyncedOwnerMemories(cio *IO, stamp string, node client.NodeConfig) {
+	if node.Owner == "" {
+		return
+	}
+	if hRep, hErr := memory.HarvestForOwner(node.Owner, node.API); hErr != nil {
+		cio.printf("%s memory harvest warning: %v\n", stamp, hErr)
+	} else if hRep.Created+hRep.Updated > 0 {
+		cio.printf("%s harvested memories: +%d created, ~%d updated\n", stamp, hRep.Created, hRep.Updated)
+	}
+}
+
 func cmdSync(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
 	noUpdate := fs.Bool("no-update", false, "skip binary/git self-update")
@@ -984,7 +1040,11 @@ func cmdSync(args []string, cio *IO) error {
 		}
 	}
 
-	return applySyncedFiles(cio, stamp, payload)
+	if err := applySyncedFiles(cio, stamp, payload); err != nil {
+		return err
+	}
+	harvestSyncedOwnerMemories(cio, stamp, node)
+	return nil
 }
 
 func cmdStatus(args []string, cio *IO) error {
@@ -1524,6 +1584,7 @@ Commands:
   ddns            (lighthouse) keep the public DNS name pointed at home
   status          show this machine's fleet status
   agents          list active AI agent sessions across the fleet
+  memory          manage shared fleet agent memory and LLM curation
   mcp             manage MCP and lifecycle hooks for claude, codex, and antigravity
   agent-hook      (internal) handle a harness lifecycle hook
   version         print fleet version
@@ -1559,6 +1620,8 @@ func dispatchCommand(cmd string, rest []string, cio *IO) (bool, error) {
 		return true, cmdDDNS(rest, cio)
 	case "agents":
 		return true, cmdAgents(rest, cio)
+	case "memory":
+		return true, cmdMemory(rest, cio)
 	case "mcp":
 		return true, cmdMCP(rest, cio)
 	case "agent-hook":

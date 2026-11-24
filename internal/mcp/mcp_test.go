@@ -158,3 +158,69 @@ func TestMCPCodexAutoListenAndSetName(t *testing.T) {
 		t.Fatalf("unexpected codex listen states: %v / %v / %v", st0, st1, st2)
 	}
 }
+
+func TestMCPMemoryToolsRoundtrip(t *testing.T) {
+	_, srv := setupMCPServer(t)
+
+	reqs := []string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fleet_memory_set","arguments":{"scope":"global","key":"small-prs","kind":"preference","tier":"always","body":"Prefer small focused changes and few PRs."}}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"fleet_memory_search","arguments":{"query":"focused changes","scope":"global"}}}`,
+		`{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"fleet_memory_get","arguments":{"scope":"global","key":"small-prs","include_history":true}}}`,
+		`{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"fleet_memory_delete","arguments":{"scope":"global","key":"small-prs"}}}`,
+		`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"fleet_memory_search","arguments":{"query":"focused changes","scope":"global"}}}`,
+	}
+
+	var out bytes.Buffer
+	rc, err := ServeStdio(ServeOpts{
+		Harness:           "antigravity",
+		Stdin:             strings.NewReader(strings.Join(reqs, "\n") + "\n"),
+		Stdout:            &out,
+		APIURL:            srv.URL,
+		HeartbeatInterval: 60.0,
+	})
+	if err != nil || rc != 0 {
+		t.Fatalf("ServeStdio memory roundtrip failed: rc=%d err=%v", rc, err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 7 {
+		t.Fatalf("expected 7 responses, got %d (%s)", len(lines), out.String())
+	}
+
+	parseToolJSON := func(idx int) map[string]any {
+		var r map[string]any
+		if err := json.Unmarshal([]byte(lines[idx]), &r); err != nil {
+			t.Fatalf("line %d json: %v", idx, err)
+		}
+		res := r["result"].(map[string]any)
+		if isErr, _ := res["isError"].(bool); isErr {
+			t.Fatalf("line %d returned tool error: %v", idx, res)
+		}
+		txt := res["content"].([]any)[0].(map[string]any)["text"].(string)
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(txt), &payload); err != nil {
+			t.Fatalf("line %d inner json %q: %v", idx, txt, err)
+		}
+		return payload
+	}
+
+	if !strings.Contains(lines[1], "fleet_memory_set") {
+		t.Fatalf("expected fleet_memory_set in tools/list: %s", lines[1])
+	}
+	if setRes := parseToolJSON(2); setRes["action"] != "created" {
+		t.Fatalf("expected created action, got %+v", setRes)
+	}
+	if search1 := parseToolJSON(3); len(search1["memories"].([]any)) != 1 {
+		t.Fatalf("expected 1 search result, got %+v", search1)
+	}
+	if getRes := parseToolJSON(4); getRes["memory"].(map[string]any)["key"] != "small-prs" || len(getRes["history"].([]any)) != 1 {
+		t.Fatalf("unexpected get response: %+v", getRes)
+	}
+	if delRes := parseToolJSON(5); delRes["ok"] != true {
+		t.Fatalf("unexpected delete response: %+v", delRes)
+	}
+	if search2 := parseToolJSON(6); len(search2["memories"].([]any)) != 0 {
+		t.Fatalf("expected 0 results after archive, got %+v", search2)
+	}
+}
