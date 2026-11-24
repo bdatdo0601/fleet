@@ -7,8 +7,11 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/bdatdo0601/fleet/internal/memory"
 )
 
 func TestCLIMemoryWorkflowCuratorSetupAndImport(t *testing.T) {
@@ -50,7 +53,7 @@ func TestCLIMemoryWorkflowCuratorSetupAndImport(t *testing.T) {
 	}))
 	defer llmSrv.Close()
 
-	// 1. Setup curator via 1Password op-ref + openrouter.
+	// 1. Setup curator via 1Password op-ref + openrouter (--review-global to test review queue).
 	rc, out, errOut := runCLI("sk-or-v1-testsecret4321",
 		"memory", "curator", "setup",
 		"--provider", "openrouter",
@@ -58,8 +61,9 @@ func TestCLIMemoryWorkflowCuratorSetupAndImport(t *testing.T) {
 		"--model", "openai/gpt-6-luna",
 		"--op-ref", "op://Private/OpenRouter/api_key",
 		"--zdr",
+		"--review-global",
 	)
-	if rc != 0 || !strings.Contains(out, "sk-or-v1...4321") || strings.Contains(out, "testsecret") {
+	if rc != 0 || !strings.Contains(out, "sk-or-v1...4321") || strings.Contains(out, "testsecret") || !strings.Contains(out, "review queue") {
 		t.Fatalf("curator setup failed: rc=%d out=%q err=%q", rc, out, errOut)
 	}
 
@@ -81,7 +85,7 @@ Plan fewest PRs possible.
 		t.Fatalf("memory import failed: rc=%d out=%q err=%q", rc, out, errOut)
 	}
 
-	// 3. Run curator -> queues global promotion -> review + approve.
+	// 3. Run curator -> queues global promotion -> review list + single ID detail + approve.
 	rc, out, errOut = runCLI("", "memory", "curator", "run")
 	if rc != 0 || !strings.Contains(out, "promote_global") {
 		t.Fatalf("curator run failed: rc=%d out=%q err=%q", rc, out, errOut)
@@ -90,9 +94,39 @@ Plan fewest PRs possible.
 	if rc != 0 || !strings.Contains(out, "prefer-few-prs") {
 		t.Fatalf("memory review failed: rc=%d out=%q err=%q", rc, out, errOut)
 	}
+	rc, out, errOut = runCLI("", "memory", "review", "1")
+	if rc != 0 || !strings.Contains(out, "Plan fewest PRs possible.") || !strings.Contains(out, "id:       #1") {
+		t.Fatalf("memory review <id> failed: rc=%d out=%q err=%q", rc, out, errOut)
+	}
 	rc, out, errOut = runCLI("", "memory", "approve", "1")
 	if rc != 0 || !strings.Contains(out, "global/prefer-few-prs") {
 		t.Fatalf("memory approve failed: rc=%d out=%q err=%q", rc, out, errOut)
+	}
+
+	// Test multi-ID reject and --all approve.
+	p2, _ := f.Memory.CreateProposal(memory.ProposalParams{
+		Action: "promote_global", TargetScope: "global", TargetKey: "prop-two",
+		Kind: "preference", Tier: "always", Body: "Proposal two body", Reason: "r2",
+	})
+	p3, _ := f.Memory.CreateProposal(memory.ProposalParams{
+		Action: "promote_global", TargetScope: "global", TargetKey: "prop-three",
+		Kind: "preference", Tier: "always", Body: "Proposal three body", Reason: "r3",
+	})
+	rc, out, errOut = runCLI("", "memory", "reject", formatInt64(p2.ID), formatInt64(p3.ID))
+	if rc != 0 || !strings.Contains(out, "rejected #") || strings.Count(out, "rejected #") != 2 {
+		t.Fatalf("multi-ID reject failed: rc=%d out=%q err=%q", rc, out, errOut)
+	}
+	p4, _ := f.Memory.CreateProposal(memory.ProposalParams{
+		Action: "promote_global", TargetScope: "global", TargetKey: "prop-four",
+		Kind: "preference", Tier: "always", Body: "Proposal four body", Reason: "r4",
+	})
+	p5, _ := f.Memory.CreateProposal(memory.ProposalParams{
+		Action: "promote_global", TargetScope: "global", TargetKey: "prop-five",
+		Kind: "preference", Tier: "always", Body: "Proposal five body", Reason: "r5",
+	})
+	rc, out, errOut = runCLI("", "memory", "approve", "--all")
+	if rc != 0 || !strings.Contains(out, formatInt64(p4.ID)) || !strings.Contains(out, formatInt64(p5.ID)) {
+		t.Fatalf("approve --all failed: rc=%d out=%q err=%q", rc, out, errOut)
 	}
 
 	// 4. Set, get, update, history, revert, promote, search, context, rm.
@@ -127,4 +161,8 @@ Plan fewest PRs possible.
 	if props, pErr := f.Memory.ListProposals("pending", 10); pErr != nil || len(props) != 0 {
 		t.Fatalf("expected 0 pending proposals after approve, got %+v err=%v", props, pErr)
 	}
+}
+
+func formatInt64(v int64) string {
+	return strconv.FormatInt(v, 10)
 }

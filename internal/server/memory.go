@@ -201,6 +201,18 @@ func registerMemoryHistoryRoutes(
 	}))
 
 	mux.HandleFunc("GET /v1/memory/proposals", route(false, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		if idStr := strings.TrimSpace(r.URL.Query().Get("id")); idStr != "" {
+			id, err := strconv.ParseInt(idStr, 10, 64)
+			if err != nil || id <= 0 {
+				return &memory.MemoryError{Msg: "invalid proposal id", Status: http.StatusBadRequest}
+			}
+			prop, err := fleet.Memory.GetProposal(id)
+			if err != nil {
+				return err
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"proposal": prop})
+			return nil
+		}
 		q := r.URL.Query()
 		props, err := fleet.Memory.ListProposals(q.Get("status"), queryInt(r, "limit"))
 		if err != nil {

@@ -334,7 +334,23 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	_, _ = db.Exec("UPDATE curation_jobs SET status = 'pending' WHERE status = 'running'")
+	dedupePendingProposals(db)
 	return &Store{Path: path, db: db}, nil
+}
+
+func dedupePendingProposals(db *sql.DB) {
+	_, _ = db.Exec(`DELETE FROM memory_proposals
+		WHERE status = 'pending' AND source_memory_id > 0 AND id NOT IN (
+			SELECT MAX(id) FROM memory_proposals
+			WHERE status = 'pending' AND source_memory_id > 0
+			GROUP BY source_memory_id, action, target_scope
+		)`)
+	_, _ = db.Exec(`DELETE FROM memory_proposals
+		WHERE status = 'pending' AND id NOT IN (
+			SELECT MAX(id) FROM memory_proposals
+			WHERE status = 'pending'
+			GROUP BY target_scope, target_key
+		)`)
 }
 
 // Close closes the underlying SQLite connection.
@@ -1048,16 +1064,27 @@ func (s *Store) Delete(scope, key string, hard bool, device, harness, sessionID,
 	}
 
 	rev := existing.Revision + 1
-	if _, err := tx.Exec(
-		"UPDATE memories SET status = 'archived', revision = ?, updated_at = ? WHERE id = ?",
-		rev, now, existing.ID,
-	); err != nil {
-		return err
+	src := "fleet"
+	if harness == "" || harness == "cli" {
+		src = "human"
+		if _, err := tx.Exec(
+			"UPDATE memories SET status = 'archived', source = 'human', locked = 1, revision = ?, updated_at = ? WHERE id = ?",
+			rev, now, existing.ID,
+		); err != nil {
+			return err
+		}
+	} else {
+		if _, err := tx.Exec(
+			"UPDATE memories SET status = 'archived', revision = ?, updated_at = ? WHERE id = ?",
+			rev, now, existing.ID,
+		); err != nil {
+			return err
+		}
 	}
 	if _, err := tx.Exec("DELETE FROM curation_jobs WHERE memory_id = ?", existing.ID); err != nil {
 		return err
 	}
-	if err := insertRevisionTx(tx, existing.ID, existing.Scope, existing.Key, rev, existing.Kind, existing.Tier, "archived", existing.Summary, existing.Body, "human", device, harness, sessionID, cmp.Or(reason, "archived"), now); err != nil {
+	if err := insertRevisionTx(tx, existing.ID, existing.Scope, existing.Key, rev, existing.Kind, existing.Tier, "archived", existing.Summary, existing.Body, src, device, harness, sessionID, cmp.Or(reason, "archived"), now); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -1219,7 +1246,18 @@ func (s *Store) Promote(fromScope, fromKey, toScope, toKey, tier, summary, devic
 	return ur.Item, nil
 }
 
-// CreateProposal stores a curator proposal for human review.
+const proposalSelectCols = "id, action, source_memory_id, target_scope, target_key, kind, tier, summary, body, reason, status, model, created_at, resolved_at"
+
+func scanProposal(scanner interface{ Scan(...any) error }) (Proposal, error) {
+	var p Proposal
+	err := scanner.Scan(
+		&p.ID, &p.Action, &p.SourceMemoryID, &p.TargetScope, &p.TargetKey,
+		&p.Kind, &p.Tier, &p.Summary, &p.Body, &p.Reason, &p.Status, &p.Model, &p.CreatedAt, &p.ResolvedAt,
+	)
+	return p, err
+}
+
+// CreateProposal stores (or updates an existing pending) curator proposal for human review.
 func (s *Store) CreateProposal(p ProposalParams) (Proposal, error) {
 	ts, err := NormalizeScope(p.TargetScope)
 	if err != nil {
@@ -1238,35 +1276,76 @@ func (s *Store) CreateProposal(p ProposalParams) (Proposal, error) {
 		return Proposal{}, err
 	}
 	now := registry.NowISO()
-	summary := DeriveSummary(p.Summary, p.Body)
+	action := cmp.Or(p.Action, "promote_global")
+	body := strings.TrimSpace(p.Body)
+	summary := DeriveSummary(p.Summary, body)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	var existingID int64
+	err = s.db.QueryRow(
+		`SELECT id FROM memory_proposals
+		 WHERE status = 'pending'
+		   AND ((? > 0 AND source_memory_id = ? AND action = ? AND target_scope = ?)
+		        OR (target_scope = ? AND target_key = ?))
+		 ORDER BY id DESC LIMIT 1`,
+		p.SourceMemoryID, p.SourceMemoryID, action, ts, ts, tk,
+	).Scan(&existingID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return Proposal{}, err
+	}
+
+	if existingID > 0 {
+		if _, err := s.db.Exec(
+			`UPDATE memory_proposals
+			 SET target_scope = ?, target_key = ?, kind = ?, tier = ?, summary = ?, body = ?, reason = ?, model = ?, created_at = ?
+			 WHERE id = ?`,
+			ts, tk, kind, tier, summary, body, p.Reason, p.Model, now, existingID,
+		); err != nil {
+			return Proposal{}, err
+		}
+		return Proposal{
+			ID: existingID, Action: action, SourceMemoryID: p.SourceMemoryID,
+			TargetScope: ts, TargetKey: tk, Kind: kind, Tier: tier,
+			Summary: summary, Body: body, Reason: p.Reason, Status: "pending",
+			Model: p.Model, CreatedAt: now,
+		}, nil
+	}
+
 	res, err := s.db.Exec(
 		`INSERT INTO memory_proposals
 		 (action, source_memory_id, target_scope, target_key, kind, tier, summary, body, reason, status, model, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
-		cmp.Or(p.Action, "promote_global"), p.SourceMemoryID, ts, tk, kind, tier, summary, strings.TrimSpace(p.Body), p.Reason, p.Model, now,
+		action, p.SourceMemoryID, ts, tk, kind, tier, summary, body, p.Reason, p.Model, now,
 	)
 	if err != nil {
 		return Proposal{}, err
 	}
 	id, _ := res.LastInsertId()
 	return Proposal{
-		ID:             id,
-		Action:         cmp.Or(p.Action, "promote_global"),
-		SourceMemoryID: p.SourceMemoryID,
-		TargetScope:    ts,
-		TargetKey:      tk,
-		Kind:           kind,
-		Tier:           tier,
-		Summary:        summary,
-		Body:           strings.TrimSpace(p.Body),
-		Reason:         p.Reason,
-		Status:         "pending",
-		Model:          p.Model,
-		CreatedAt:      now,
+		ID: id, Action: action, SourceMemoryID: p.SourceMemoryID,
+		TargetScope: ts, TargetKey: tk, Kind: kind, Tier: tier,
+		Summary: summary, Body: body, Reason: p.Reason, Status: "pending",
+		Model: p.Model, CreatedAt: now,
 	}, nil
+}
+
+// GetProposal returns a single curator proposal by ID.
+func (s *Store) GetProposal(id int64) (Proposal, error) {
+	if id <= 0 {
+		return Proposal{}, newMemoryErr("invalid proposal id", 400)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, err := scanProposal(s.db.QueryRow("SELECT "+proposalSelectCols+" FROM memory_proposals WHERE id = ?", id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Proposal{}, newMemoryErr(fmt.Sprintf("proposal %d not found", id), 404)
+	}
+	if err != nil {
+		return Proposal{}, err
+	}
+	return p, nil
 }
 
 // ListProposals returns curator proposals filtered by status (default all if empty).
@@ -1278,14 +1357,12 @@ func (s *Store) ListProposals(status string, limit int) ([]Proposal, error) {
 	var err error
 	if status != "" {
 		rows, err = s.db.Query(
-			`SELECT id, action, source_memory_id, target_scope, target_key, kind, tier, summary, body, reason, status, model, created_at, resolved_at
-			 FROM memory_proposals WHERE status = ? ORDER BY id DESC LIMIT ?`,
+			"SELECT "+proposalSelectCols+" FROM memory_proposals WHERE status = ? ORDER BY id DESC LIMIT ?",
 			status, limit,
 		)
 	} else {
 		rows, err = s.db.Query(
-			`SELECT id, action, source_memory_id, target_scope, target_key, kind, tier, summary, body, reason, status, model, created_at, resolved_at
-			 FROM memory_proposals ORDER BY id DESC LIMIT ?`,
+			"SELECT "+proposalSelectCols+" FROM memory_proposals ORDER BY id DESC LIMIT ?",
 			limit,
 		)
 	}
@@ -1295,12 +1372,9 @@ func (s *Store) ListProposals(status string, limit int) ([]Proposal, error) {
 	defer func() { _ = rows.Close() }()
 	out := []Proposal{}
 	for rows.Next() {
-		var p Proposal
-		if err := rows.Scan(
-			&p.ID, &p.Action, &p.SourceMemoryID, &p.TargetScope, &p.TargetKey,
-			&p.Kind, &p.Tier, &p.Summary, &p.Body, &p.Reason, &p.Status, &p.Model, &p.CreatedAt, &p.ResolvedAt,
-		); err != nil {
-			return nil, err
+		p, scanErr := scanProposal(rows)
+		if scanErr != nil {
+			return nil, scanErr
 		}
 		out = append(out, p)
 	}
@@ -1312,15 +1386,7 @@ func (s *Store) ResolveProposal(id int64, approve bool, device string) (Proposal
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var p Proposal
-	err := s.db.QueryRow(
-		`SELECT id, action, source_memory_id, target_scope, target_key, kind, tier, summary, body, reason, status, model, created_at, resolved_at
-		 FROM memory_proposals WHERE id = ?`,
-		id,
-	).Scan(
-		&p.ID, &p.Action, &p.SourceMemoryID, &p.TargetScope, &p.TargetKey,
-		&p.Kind, &p.Tier, &p.Summary, &p.Body, &p.Reason, &p.Status, &p.Model, &p.CreatedAt, &p.ResolvedAt,
-	)
+	p, err := scanProposal(s.db.QueryRow("SELECT "+proposalSelectCols+" FROM memory_proposals WHERE id = ?", id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Proposal{}, nil, newMemoryErr(fmt.Sprintf("proposal %d not found", id), 404)
 	}

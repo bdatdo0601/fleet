@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -33,9 +34,9 @@ Subcommands:
   revert    TARGET --rev N [--scope S]
   context   [--repo R] [--device D]
   import    [--dry-run] [--force]
-  review    [--all]
-  approve   ID
-  reject    ID
+  review    [ID] [--all]
+  approve   [--all | ID ...]
+  reject    [--all | ID ...]
   curator   setup|status|run|disable
 `
 }
@@ -591,12 +592,28 @@ func cmdMemoryReview(args []string, cio *IO) error {
 	if err != nil {
 		return err
 	}
-	if len(pos) > 0 {
-		return fmt.Errorf("usage: fleet memory review [--all]")
+	if len(pos) > 1 {
+		return fmt.Errorf("usage: fleet memory review [ID] [--all]")
 	}
 	api, err := client.ResolveAPI("")
 	if err != nil {
 		return err
+	}
+	if len(pos) == 1 {
+		id, err := strconv.ParseInt(pos[0], 10, 64)
+		if err != nil || id <= 0 {
+			return fmt.Errorf("invalid proposal id %q", pos[0])
+		}
+		var resp struct {
+			Proposal memory.Proposal `json:"proposal"`
+		}
+		if err := client.Call(api, http.MethodGet, "/v1/memory/proposals?id="+strconv.FormatInt(id, 10), nil, 15*time.Second, nil, &resp); err != nil {
+			return err
+		}
+		p := resp.Proposal
+		cio.printf("id:       #%d\naction:   %s\ntarget:   %s/%s\nkind:     %s\ntier:     %s\nstatus:   %s\nmodel:    %s\ncreated:  %s\nreason:   %s\nsummary:  %s\n\n%s\n",
+			p.ID, p.Action, p.TargetScope, p.TargetKey, p.Kind, p.Tier, p.Status, cmp.Or(p.Model, "-"), p.CreatedAt, p.Reason, p.Summary, p.Body)
+		return nil
 	}
 	qs := "?status=pending"
 	if *all {
@@ -623,32 +640,70 @@ func cmdMemoryReview(args []string, cio *IO) error {
 	return nil
 }
 
-func cmdMemoryResolve(args []string, decision string, cio *IO) error {
-	if len(args) != 1 {
-		return fmt.Errorf("usage: fleet memory %s ID", decision)
+func fetchPendingProposalIDs(api string) ([]int64, error) {
+	var resp struct {
+		Proposals []memory.Proposal `json:"proposals"`
 	}
-	id, err := strconv.ParseInt(args[0], 10, 64)
-	if err != nil || id <= 0 {
-		return fmt.Errorf("invalid proposal id %q", args[0])
+	if err := client.Call(api, http.MethodGet, "/v1/memory/proposals?status=pending&limit=200", nil, 15*time.Second, nil, &resp); err != nil {
+		return nil, err
+	}
+	ids := make([]int64, 0, len(resp.Proposals))
+	for _, p := range resp.Proposals {
+		ids = append(ids, p.ID)
+	}
+	slices.Sort(ids)
+	return ids, nil
+}
+
+func cmdMemoryResolve(args []string, decision string, cio *IO) error {
+	fs := flag.NewFlagSet("memory "+decision, flag.ContinueOnError)
+	all := fs.Bool("all", false, "resolve all pending proposals")
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
+		return err
+	}
+	if (*all && len(pos) > 0) || (!*all && len(pos) == 0) {
+		return fmt.Errorf("usage: fleet memory %s [--all | ID ...]", decision)
 	}
 	api, err := client.ResolveAPI("")
 	if err != nil {
 		return err
 	}
-	var resp struct {
-		Proposal memory.Proposal `json:"proposal"`
-		Memory   *memory.Item    `json:"memory"`
+	var ids []int64
+	if *all {
+		if ids, err = fetchPendingProposalIDs(api); err != nil {
+			return err
+		}
+		if len(ids) == 0 {
+			cio.printf("no pending proposals\n")
+			return nil
+		}
+	} else {
+		ids = make([]int64, 0, len(pos))
+		for _, raw := range pos {
+			id, pErr := strconv.ParseInt(raw, 10, 64)
+			if pErr != nil || id <= 0 {
+				return fmt.Errorf("invalid proposal id %q", raw)
+			}
+			ids = append(ids, id)
+		}
 	}
-	if err := client.Call(api, http.MethodPost, "/v1/memory/proposals/resolve", map[string]any{
-		"id": id, "decision": decision,
-	}, 15*time.Second, nil, &resp); err != nil {
-		return err
+	for _, id := range ids {
+		var resp struct {
+			Proposal memory.Proposal `json:"proposal"`
+			Memory   *memory.Item    `json:"memory"`
+		}
+		if err := client.Call(api, http.MethodPost, "/v1/memory/proposals/resolve", map[string]any{
+			"id": id, "decision": decision,
+		}, 15*time.Second, nil, &resp); err != nil {
+			return err
+		}
+		if resp.Memory != nil {
+			cio.printf("%s #%d -> %s/%s (rev=%d)\n", resp.Proposal.Status, resp.Proposal.ID, resp.Memory.Scope, resp.Memory.Key, resp.Memory.Revision)
+		} else {
+			cio.printf("%s #%d\n", resp.Proposal.Status, resp.Proposal.ID)
+		}
 	}
-	if resp.Memory != nil {
-		cio.printf("%s #%d -> %s/%s (rev=%d)\n", resp.Proposal.Status, resp.Proposal.ID, resp.Memory.Scope, resp.Memory.Key, resp.Memory.Revision)
-		return nil
-	}
-	cio.printf("%s #%d\n", resp.Proposal.Status, resp.Proposal.ID)
 	return nil
 }
 
@@ -667,7 +722,11 @@ func printCuratorStatus(cio *IO, st memory.CuratorStatus) {
 		if st.Provider == "openrouter" {
 			cio.printf("privacy:     data_collection=%s, zdr=%v\n", cmp.Or(st.DataCollection, "deny"), st.ZDR)
 		}
-		cio.printf("auto-global: %v\n", st.AutoGlobal)
+		gMode := "auto-apply (opt-out)"
+		if st.ReviewGlobal {
+			gMode = "review queue (opt-in)"
+		}
+		cio.printf("global mode: %s\n", gMode)
 	}
 	cio.printf("queue:       %d pending, %d failed, %d proposal(s) awaiting review\n", st.PendingJobs, st.FailedJobs, st.PendingProposals)
 	cio.printf("processed:   %d\n", st.ProcessedCount)
@@ -687,7 +746,7 @@ func cmdMemoryCuratorSetup(args []string, cio *IO) error {
 	opRef := fs.String("op-ref", "", "1Password secret reference (e.g. op://Vault/OpenRouter/credential)")
 	apiKeyStdin := fs.Bool("api-key-stdin", false, "read API key from stdin")
 	zdr := fs.Bool("zdr", false, "require OpenRouter Zero Data Retention routing")
-	autoGlobal := fs.Bool("auto-global", false, "auto-apply global promotions instead of queueing for review")
+	reviewGlobal := fs.Bool("review-global", false, "queue global promotions for manual review instead of auto-applying")
 	keepAlive := fs.String("keep-alive", "", "Ollama keep_alive duration (e.g. 2m)")
 	numCtx := fs.Int("num-ctx", 0, "Ollama context length")
 	noTest := fs.Bool("no-test", false, "skip preflight test request before saving")
@@ -733,16 +792,16 @@ func cmdMemoryCuratorSetup(args []string, cio *IO) error {
 
 	var st memory.CuratorStatus
 	if err := client.Call(api, http.MethodPost, "/v1/memory/curator", map[string]any{
-		"enabled":     true,
-		"provider":    *provider,
-		"base_url":    *baseURL,
-		"model":       *model,
-		"api_key":     apiKey,
-		"zdr":         *zdr,
-		"auto_global": *autoGlobal,
-		"keep_alive":  *keepAlive,
-		"num_ctx":     *numCtx,
-		"test":        !*noTest,
+		"enabled":       true,
+		"provider":      *provider,
+		"base_url":      *baseURL,
+		"model":         *model,
+		"api_key":       apiKey,
+		"zdr":           *zdr,
+		"review_global": *reviewGlobal,
+		"keep_alive":    *keepAlive,
+		"num_ctx":       *numCtx,
+		"test":          !*noTest,
 	}, 45*time.Second, nil, &st); err != nil {
 		return err
 	}

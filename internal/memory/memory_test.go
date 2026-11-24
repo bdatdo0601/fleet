@@ -338,21 +338,22 @@ func TestCuratorOpenRouterProposalMergeAndWorker(t *testing.T) {
 
 	// Configure with openrouter provider pointed at mock server (force OpenRouter privacy headers via openrouter provider).
 	status, err := cur.Configure(context.Background(), CuratorConfig{
-		Enabled:  true,
-		Provider: "openrouter",
-		BaseURL:  llmSrv.URL,
-		Model:    DefaultOpenRouterModel,
-		APIKey:   "sk-or-v1-secretkey12345678",
-		ZDR:      true,
+		Enabled:      true,
+		Provider:     "openrouter",
+		BaseURL:      llmSrv.URL,
+		Model:        DefaultOpenRouterModel,
+		APIKey:       "sk-or-v1-secretkey12345678",
+		ZDR:          true,
+		ReviewGlobal: true,
 	}, true)
 	if err != nil {
 		t.Fatalf("Configure failed: %v", err)
 	}
-	if status.APIKeyHint != "sk-or-v1...5678" || !status.Enabled {
+	if status.APIKeyHint != "sk-or-v1...5678" || !status.Enabled || !status.ReviewGlobal || status.AutoGlobal {
 		t.Fatalf("unexpected curator status: %+v", status)
 	}
 
-	// Add repo feedback -> curator queues promote_global into memory_proposals when AutoGlobal=false.
+	// Add repo feedback -> curator queues promote_global into memory_proposals when ReviewGlobal=true.
 	if _, err := st.Upsert(UpsertParams{
 		Scope: "repo:iron-fillet", Key: "prefer-few-prs", Kind: "feedback",
 		Body: "Keep PR count minimal", Source: "fleet",
@@ -528,5 +529,170 @@ func TestCuratorLengthRetryAndFailedJobReset(t *testing.T) {
 	repsRecovered, err := cur.RunPending(context.Background(), 10, false, false)
 	if err != nil || len(repsRecovered) != 1 || repsRecovered[0].Action != "update" {
 		t.Fatalf("expected RunPending to reset and recover exhausted failed job, got %+v err=%v", repsRecovered, err)
+	}
+}
+
+func TestCuratorOptOutDefaultAndPermanentDelete(t *testing.T) {
+	st := openTestStore(t)
+	cur := NewCurator(st, filepath.Join(t.TempDir(), "curator.json"))
+
+	llmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		userMsg := req["messages"].([]any)[1].(map[string]any)["content"].(string)
+		content := `{"ok":true}`
+		if strings.Contains(userMsg, "CANDIDATE:") {
+			content = `{"action":"promote_global","target_key":"prefer-few-prs","scope":"global","kind":"feedback","tier":"always","summary":"Prefer minimal PRs","body":"Plan fewest PRs possible.","reason":"Cross-fleet rule"}`
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"finish_reason": "stop", "message": map[string]any{"content": content}}},
+		})
+	}))
+	defer llmSrv.Close()
+
+	// Default ReviewGlobal=false (opt-out mode) auto-applies global promotions immediately.
+	stCfg, err := cur.Configure(context.Background(), CuratorConfig{
+		Enabled:  true,
+		Provider: "openrouter",
+		BaseURL:  llmSrv.URL,
+		Model:    DefaultOpenRouterModel,
+		APIKey:   "sk-or-v1-secretkey12345678",
+	}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stCfg.AutoGlobal || stCfg.ReviewGlobal {
+		t.Fatalf("expected opt-out auto_global=true by default, got %+v", stCfg)
+	}
+
+	if _, err := st.Upsert(UpsertParams{
+		Scope: "repo:iron-fillet", Key: "prefer-few-prs", Kind: "feedback",
+		Body: "Plan fewest PRs possible.", Source: "fleet",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	reps, err := cur.RunPending(context.Background(), 10, false, false)
+	if err != nil || len(reps) != 1 || !reps[0].Applied || reps[0].QueuedProposalID != 0 {
+		t.Fatalf("expected immediate auto-apply promote_global, got %+v err=%v", reps, err)
+	}
+	det, err := st.Get("global", "prefer-few-prs", false)
+	if err != nil || det.Item.Tier != "always" || det.Item.Status != "active" {
+		t.Fatalf("expected active global/prefer-few-prs, got %+v err=%v", det.Item, err)
+	}
+
+	// Human soft-delete locks the archived entry so curator never resurrects or proposes it again.
+	if err := st.Delete("global", "prefer-few-prs", false, "laptop", "", "", "opt_out"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.EnqueueAllActive([]string{"feedback"}); err != nil {
+		t.Fatal(err)
+	}
+	repsAfterOptOut, err := cur.RunPending(context.Background(), 10, false, false)
+	if err != nil || len(repsAfterOptOut) != 1 || repsAfterOptOut[0].Applied || repsAfterOptOut[0].QueuedProposalID != 0 {
+		t.Fatalf("expected opted-out archive respected, got %+v err=%v", repsAfterOptOut, err)
+	}
+	detAfter, err := st.Get("global", "prefer-few-prs", false)
+	if err != nil || detAfter.Item.Status != "archived" || !detAfter.Item.Locked {
+		t.Fatalf("expected global/prefer-few-prs to remain archived & locked, got %+v err=%v", detAfter.Item, err)
+	}
+	if props, _ := st.ListProposals("pending", 10); len(props) != 0 {
+		t.Fatalf("expected 0 pending proposals after opt-out, got %+v", props)
+	}
+}
+
+func TestProposalDedupeAndLookup(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "memory.db")
+	st, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Same source_memory_id with a changed target_key updates in place instead of inserting duplicate.
+	p1, err := st.CreateProposal(ProposalParams{
+		Action:         "promote_global",
+		SourceMemoryID: 42,
+		TargetScope:    "global",
+		TargetKey:      "prefer-few-prs",
+		Kind:           "feedback",
+		Tier:           "always",
+		Summary:        "v1",
+		Body:           "Body v1",
+		Reason:         "r1",
+		Model:          "m1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2, err := st.CreateProposal(ProposalParams{
+		Action:         "promote_global",
+		SourceMemoryID: 42,
+		TargetScope:    "global",
+		TargetKey:      "minimize-pr-count",
+		Kind:           "feedback",
+		Tier:           "always",
+		Summary:        "v2",
+		Body:           "Body v2",
+		Reason:         "r2",
+		Model:          "m1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p2.ID != p1.ID || p2.TargetKey != "minimize-pr-count" || p2.Body != "Body v2" {
+		t.Fatalf("expected in-place update on same source_memory_id, got p1=%+v p2=%+v", p1, p2)
+	}
+
+	// Same (target_scope, target_key) even from another source updates in place.
+	p3, err := st.CreateProposal(ProposalParams{
+		Action:         "promote_global",
+		SourceMemoryID: 99,
+		TargetScope:    "global",
+		TargetKey:      "minimize-pr-count",
+		Kind:           "feedback",
+		Tier:           "always",
+		Summary:        "v3",
+		Body:           "Body v3",
+		Reason:         "r3",
+		Model:          "m1",
+	})
+	if err != nil || p3.ID != p1.ID || p3.Summary != "v3" {
+		t.Fatalf("expected in-place update on same target, got %+v err=%v", p3, err)
+	}
+
+	got, err := st.GetProposal(p1.ID)
+	if err != nil || got.Body != "Body v3" {
+		t.Fatalf("GetProposal failed: %+v err=%v", got, err)
+	}
+	if _, err := st.GetProposal(99999); err == nil {
+		t.Fatal("expected 404 for unknown proposal id")
+	}
+
+	// Insert raw duplicate pending rows directly and verify Open() deduplicates them on startup.
+	_, err = st.db.Exec(
+		`INSERT INTO memory_proposals (action, source_memory_id, target_scope, target_key, kind, tier, summary, body, reason, status, model, created_at)
+		 VALUES
+		   ('promote_global', 42, 'global', 'old-slug', 'feedback', 'always', 'dup1', 'b', 'r', 'pending', 'm1', '2026-11-24T00:00:00+00:00'),
+		   ('promote_global', 77, 'global', 'shared-browser', 'feedback', 'always', 'old', 'b', 'r', 'pending', 'm1', '2026-11-24T00:00:00+00:00'),
+		   ('promote_global', 77, 'global', 'shared-browser-2', 'feedback', 'always', 'newest', 'b2', 'r', 'pending', 'm1', '2026-11-24T00:01:00+00:00')`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = st.Close()
+
+	st2, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st2.Close() }()
+
+	props, err := st2.ListProposals("pending", 20)
+	if err != nil || len(props) != 2 {
+		t.Fatalf("expected 2 deduplicated pending proposals on reopen, got %+v err=%v", props, err)
+	}
+	if props[0].TargetKey != "shared-browser-2" {
+		t.Fatalf("expected newest row kept for source 77, got %+v", props[0])
 	}
 }

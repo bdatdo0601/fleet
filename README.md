@@ -221,7 +221,7 @@ on the lighthouse across all active Macs (`admin` and `managed` alike).
 - **Automatic `SessionStart` injection:** Every new `claude`, `codex`, or `antigravity` session receives standing `always` preferences and a compact index of recent `searchable` notes at `SessionStart`, cached locally in `~/.fleet-cache/` for offline fallback.
 - **Cross-harness MCP tools:** All three harnesses expose `fleet_memory_search`, `fleet_memory_get`, `fleet_memory_set`, and `fleet_memory_delete`.
 - **One-way local backup:** `fleet memory import` (and automatic `fleet sync`) harvests local `~/.claude/projects/*/memory/*.md` (and `~/.codex/memories/*.md`) up to the lighthouse without overwriting `human`-edited or `locked` entries.
-- **Async LLM curator (optional):** Configure an OpenRouter or OpenAI-compatible curator on the lighthouse from an admin Mac using 1Password (`fleet memory curator setup --provider openrouter --model openai/gpt-6-luna --op-ref "op://Vault/OpenRouter/credential"`) to deduplicate, filter noise, and propose `global` promotions (`fleet memory review` / `approve` / `reject`).
+- **Async LLM curator (optional):** Configure an OpenRouter or OpenAI-compatible curator on the lighthouse from an admin Mac using 1Password (`fleet memory curator setup --provider openrouter --model openai/gpt-6-luna --op-ref "op://Vault/OpenRouter/credential"`). It runs automatically in the background to filter noise, merge duplicates, and auto-apply `global` promotions by default (opt out of any rule with `fleet memory rm`, or pass `--review-global` during setup to stage `global` promotions into `fleet memory review` / `approve` / `reject`).
 - **Human CLI curation:** `fleet memory ls|search|get|set|edit|rm|promote|history|revert|context`.
 
 ## Security model

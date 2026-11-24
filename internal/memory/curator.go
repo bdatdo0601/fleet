@@ -36,7 +36,7 @@ type CuratorConfig struct {
 	APIKey         string `json:"api_key,omitempty"`
 	ZDR            bool   `json:"zdr,omitempty"`
 	DataCollection string `json:"data_collection,omitempty"`
-	AutoGlobal     bool   `json:"auto_global,omitempty"`
+	ReviewGlobal   bool   `json:"review_global,omitempty"`
 	KeepAlive      string `json:"keep_alive,omitempty"`
 	NumCtx         int    `json:"num_ctx,omitempty"`
 	UpdatedAt      string `json:"updated_at,omitempty"`
@@ -53,6 +53,7 @@ type CuratorStatus struct {
 	ZDR              bool   `json:"zdr"`
 	DataCollection   string `json:"data_collection,omitempty"`
 	AutoGlobal       bool   `json:"auto_global"`
+	ReviewGlobal     bool   `json:"review_global"`
 	KeepAlive        string `json:"keep_alive,omitempty"`
 	NumCtx           int    `json:"num_ctx,omitempty"`
 	PendingJobs      int    `json:"pending_jobs"`
@@ -313,7 +314,8 @@ func (c *Curator) Status() CuratorStatus {
 		APIKeyHint:       MaskAPIKey(cfg.APIKey),
 		ZDR:              cfg.ZDR,
 		DataCollection:   cfg.DataCollection,
-		AutoGlobal:       cfg.AutoGlobal,
+		AutoGlobal:       !cfg.ReviewGlobal,
+		ReviewGlobal:     cfg.ReviewGlobal,
 		KeepAlive:        cfg.KeepAlive,
 		NumCtx:           cfg.NumCtx,
 		PendingJobs:      pending,
@@ -698,11 +700,24 @@ func normalizeDecisionFields(cand Item, dec CuratorDecision) (targetScope, targe
 }
 
 func (c *Curator) applyPromoteGlobal(cand Item, cfg CuratorConfig, dec CuratorDecision, targetKey, kind, summary, body string) (CurateActionReport, error) {
-	if !cfg.AutoGlobal {
+	if cfg.ReviewGlobal {
 		return c.queueProposal(cand, "promote_global", "global", targetKey, kind, "always", summary, body, cmp.Or(dec.Reason, "cross-fleet preference candidate"), cfg.Model)
 	}
-	if detail, err := c.store.Get("global", targetKey, false); err == nil && isProtectedTarget(&detail.Item) {
-		return c.queueProposal(cand, "promote_global", "global", targetKey, kind, "always", summary, body, "target global entry is locked/human-edited", cfg.Model)
+	if detail, err := c.store.Get("global", targetKey, false); err == nil {
+		if detail.Item.Status == "archived" && isProtectedTarget(&detail.Item) {
+			return CurateActionReport{
+				MemoryScope: cand.Scope,
+				MemoryKey:   cand.Key,
+				Action:      "keep",
+				TargetScope: "global",
+				TargetKey:   targetKey,
+				Applied:     false,
+				Reason:      "opted out (archived by human)",
+			}, nil
+		}
+		if isProtectedTarget(&detail.Item) {
+			return c.queueProposal(cand, "promote_global", "global", targetKey, kind, "always", summary, body, "target global entry is locked/human-edited", cfg.Model)
+		}
 	}
 	ur, err := c.store.Upsert(UpsertParams{
 		Scope:         "global",
