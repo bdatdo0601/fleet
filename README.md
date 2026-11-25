@@ -214,7 +214,8 @@ on the lighthouse across all active Macs (`admin` and `managed` alike).
   `next_hook`, `waiting_user`, `queued_idle`, or `offline`), and `fleet_send_message` / `fleet_ask_agent` report delivery
   state immediately (`fleet_ask_agent` fails fast on `queued_idle` and `waiting_user` unless `wait_if_idle=true`). Codex
   listens automatically inside its MCP server via `codex queue`; Claude Code listens automatically inside its MCP server
-  via Claude's local messaging socket (`CLAUDE_CODE_MESSAGING_SOCKET`); and Antigravity App runs a single global `fleet`
+  via Claude's local messaging socket (`CLAUDE_CODE_MESSAGING_SOCKET`, with `fleet mcp install` / `fleet sync` defaulting
+  `crossSessionInbound` to `"accept"` when unset); and Antigravity App runs a single global `fleet`
   sidecar (`fleet agents relay --harness antigravity`) that pushes messages via `agentapi`, with lifecycle hooks and
   manual `fleet agents wait` as fallbacks.
 - **Tools exposed to agents:** `fleet_list_agents` (supports `state="waiting"`), `fleet_inspect_agent`, `fleet_send_message`,

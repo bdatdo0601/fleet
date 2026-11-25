@@ -66,11 +66,14 @@ func TestInstallPreservesExistingHandlesEmptyJSONAndUninstalls(t *testing.T) {
 		t.Fatalf("config.json lost existing keys or missing fleet sidecar: %+v", agyCfg)
 	}
 
-	// Verify order preservation
+	// Verify order preservation and crossSessionInbound default
 	clSet, _ := loadJSON(filepath.Join(home, ".claude", "settings.json"))
 	clSS := clSet["hooks"].(map[string]any)["SessionStart"].([]any)
 	if clSS[0].(map[string]any)["hooks"].([]any)[0].(map[string]any)["command"] != "existing.sh" {
 		t.Fatalf("existing claude hook not preserved at index 0")
+	}
+	if clSet["crossSessionInbound"] != "accept" {
+		t.Fatalf("expected crossSessionInbound=accept default, got %v", clSet["crossSessionInbound"])
 	}
 
 	cxTOMLBytes, _ := os.ReadFile(filepath.Join(home, ".codex", "config.toml"))
@@ -105,6 +108,16 @@ func TestInstallPreservesExistingHandlesEmptyJSONAndUninstalls(t *testing.T) {
 	agyAfterSidecars := subMap(agyAfterCfg, "sidecars", false)
 	if agyAfterSidecars["fleet"] != nil || agyAfterSidecars["swarm/swarm_board"] == nil {
 		t.Fatalf("unexpected antigravity config.json after uninstall: %+v", agyAfterCfg)
+	}
+
+	// Explicit user crossSessionInbound setting is preserved across Install.
+	_ = os.WriteFile(filepath.Join(home, ".claude", "settings.json"), []byte(`{"crossSessionInbound":"refuse"}`), 0o644)
+	if _, err := Install(InstallOpts{Home: home, BinPath: "/opt/homebrew/bin/fleet"}); err != nil {
+		t.Fatal(err)
+	}
+	clSetRefuse, _ := loadJSON(filepath.Join(home, ".claude", "settings.json"))
+	if clSetRefuse["crossSessionInbound"] != "refuse" {
+		t.Fatalf("expected explicit crossSessionInbound=refuse preserved, got %v", clSetRefuse["crossSessionInbound"])
 	}
 }
 

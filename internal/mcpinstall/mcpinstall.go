@@ -361,6 +361,9 @@ func Install(opts InstallOpts) ([]string, error) {
 					return false
 				}
 				upsertClaudeStyleHooks(h, "claude", cmdBin)
+				if _, exists := d["crossSessionInbound"]; !exists {
+					d["crossSessionInbound"] = "accept"
+				}
 				return true
 			}},
 		)
