@@ -31,16 +31,19 @@ func TestInstallPreservesExistingHandlesEmptyJSONAndUninstalls(t *testing.T) {
 			"[projects.\"/Users/x/repo\"]\ntrust_level = \"trusted\"\n",
 	), 0o644)
 
-	// Empty 0-byte Antigravity mcp_config.json
+	// Empty 0-byte Antigravity mcp_config.json + existing config.json with unrelated sidecar/settings
 	_ = os.MkdirAll(filepath.Join(home, ".gemini", "config"), 0o755)
 	_ = os.WriteFile(filepath.Join(home, ".gemini", "config", "mcp_config.json"), nil, 0o644)
+	_ = os.WriteFile(filepath.Join(home, ".gemini", "config", "config.json"), []byte(
+		`{"plugins":{"swarm":{"enabled":true}},"sidecars":{"swarm/swarm_board":{"projectId":"p1","enabled":true}},"userSettings":{"fastMode":true}}`,
+	), 0o644)
 
 	changed, err := Install(InstallOpts{Home: home, BinPath: "/opt/homebrew/bin/fleet"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(changed) != 6 {
-		t.Fatalf("expected 6 changed files, got %d (%v)", len(changed), changed)
+	if len(changed) != 8 {
+		t.Fatalf("expected 8 changed files, got %d (%v)", len(changed), changed)
 	}
 	// Idempotent second run
 	changed2, err := Install(InstallOpts{Home: home, BinPath: "/opt/homebrew/bin/fleet"})
@@ -50,6 +53,17 @@ func TestInstallPreservesExistingHandlesEmptyJSONAndUninstalls(t *testing.T) {
 	st := Status(home)
 	if !st["claude"] || !st["codex"] || !st["antigravity"] {
 		t.Fatalf("unexpected status: %+v", st)
+	}
+
+	// Verify Antigravity sidecar.json and preserved config.json
+	sidecarCfg, _ := loadJSON(filepath.Join(home, ".gemini", "config", "sidecars", "fleet", "sidecar.json"))
+	if sidecarCfg["command"] != "/opt/homebrew/bin/fleet" || sidecarCfg["restart_policy"] != "always" {
+		t.Fatalf("unexpected sidecar.json: %+v", sidecarCfg)
+	}
+	agyCfg, _ := loadJSON(filepath.Join(home, ".gemini", "config", "config.json"))
+	agySidecars := subMap(agyCfg, "sidecars", false)
+	if agySidecars["swarm/swarm_board"] == nil || subMap(agySidecars, "fleet", false)["enabled"] != true || subMap(agyCfg, "userSettings", false)["fastMode"] != true {
+		t.Fatalf("config.json lost existing keys or missing fleet sidecar: %+v", agyCfg)
 	}
 
 	// Verify order preservation
@@ -83,6 +97,14 @@ func TestInstallPreservesExistingHandlesEmptyJSONAndUninstalls(t *testing.T) {
 	cxAfterTOML, _ := os.ReadFile(filepath.Join(home, ".codex", "config.toml"))
 	if strings.Contains(string(cxAfterTOML), "[mcp_servers.fleet]") || !strings.Contains(string(cxAfterTOML), `trusted_hash = "sha256:abc"`) {
 		t.Fatalf("unexpected codex config.toml after uninstall:\n%s", string(cxAfterTOML))
+	}
+	if _, err := os.Stat(filepath.Join(home, ".gemini", "config", "sidecars", "fleet", "sidecar.json")); !os.IsNotExist(err) {
+		t.Fatalf("expected sidecar.json removed on uninstall, err=%v", err)
+	}
+	agyAfterCfg, _ := loadJSON(filepath.Join(home, ".gemini", "config", "config.json"))
+	agyAfterSidecars := subMap(agyAfterCfg, "sidecars", false)
+	if agyAfterSidecars["fleet"] != nil || agyAfterSidecars["swarm/swarm_board"] == nil {
+		t.Fatalf("unexpected antigravity config.json after uninstall: %+v", agyAfterCfg)
 	}
 }
 

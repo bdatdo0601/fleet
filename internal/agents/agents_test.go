@@ -260,3 +260,118 @@ func TestSlugifyAndNormalize(t *testing.T) {
 		t.Fatalf("expected unknown harness error, got %v", err)
 	}
 }
+
+func TestWaitForHarnessMessagesRelayAndCleanup(t *testing.T) {
+	hub := openTestHub(t)
+	_, _ = hub.Heartbeat(HeartbeatParams{Device: "mini", Harness: "claude", RawID: "sender-1", CWD: "/s"})
+	_, _ = hub.Heartbeat(HeartbeatParams{Device: "mini", Harness: "antigravity", RawID: "agy-live", CWD: "/a1", State: "idle"})
+	_, _ = hub.Heartbeat(HeartbeatParams{Device: "mini", Harness: "antigravity", RawID: "agy-stale", CWD: "/a2", State: "idle"})
+	_, _ = hub.Heartbeat(HeartbeatParams{Device: "mini", Harness: "antigravity", RawID: "agy-excl", CWD: "/a3", State: "idle"})
+
+	// Age agy-stale beyond AgentActiveSeconds (>300s) so it is non-live.
+	hub.mu.Lock()
+	oldTS := time.Now().UTC().Add(-600 * time.Second).Format("2006-01-02T15:04:05+00:00")
+	_, _ = hub.db.Exec("UPDATE agent_sessions SET updated_at = ? WHERE session_id = ?", oldTS, "mini:antigravity:agy-stale")
+	hub.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	resCh := make(chan HarnessWaitResult, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		res, err := hub.WaitForHarnessMessages(ctx, HarnessWaitParams{
+			Device:        "mini",
+			Harness:       "antigravity",
+			Timeout:       5.0,
+			MarkRead:      true,
+			RequireFullID: true,
+			ExcludeIDs:    []string{"mini:antigravity:agy-excl"},
+		})
+		if err != nil {
+			errCh <- err
+			return
+		}
+		resCh <- res
+	}()
+
+	var liveSess SessionDetail
+	for range 40 {
+		s, _ := hub.GetSession("agy-live")
+		if s.Listening && s.Delivery == "immediate" {
+			liveSess = s
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if !liveSess.Listening || liveSess.Delivery != "immediate" {
+		t.Fatalf("expected agy-live listening=true delivery=immediate, got %+v", liveSess)
+	}
+
+	// Send broadcast and direct messages to excluded, stale, and live sessions.
+	_, _ = hub.SendMessageWithReport("mini", "mini:claude:sender-1", "*", "broadcast hello", nil, nil, nil)
+	_, _ = hub.SendMessageWithReport("mini", "mini:claude:sender-1", "mini:antigravity:agy-excl", "skip excluded", nil, nil, nil)
+	_, _ = hub.SendMessageWithReport("mini", "mini:claude:sender-1", "mini:antigravity:agy-stale", "direct to stale", nil, nil, nil)
+
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	case res := <-resCh:
+		got := map[string][]string{}
+		for _, b := range res.Batches {
+			for _, m := range b.Messages {
+				got[b.SessionID] = append(got[b.SessionID], m.Body)
+			}
+		}
+		if len(got["mini:antigravity:agy-excl"]) != 0 {
+			t.Fatalf("excluded session should not appear: %+v", got)
+		}
+		if len(got["mini:antigravity:agy-live"]) != 1 || got["mini:antigravity:agy-live"][0] != "broadcast hello" {
+			t.Fatalf("expected broadcast on agy-live, got %+v", got)
+		}
+		// Non-live session receives direct message only, not broadcast.
+		if len(got["mini:antigravity:agy-stale"]) != 1 || got["mini:antigravity:agy-stale"][0] != "direct to stale" {
+			t.Fatalf("expected direct-only on agy-stale, got %+v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitForHarnessMessages did not wake on message")
+	}
+
+	// Verify Ask does not fail fast when relay is active, and context cancellation cleans up harnessRelays and harnessSubs.
+	// Ack excluded session's message first so the inbox is completely drained.
+	_, _ = hub.FetchInbox("mini", "mini:antigravity:agy-excl", true, true, 50)
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	done2 := make(chan error, 1)
+	go func() {
+		_, err := hub.WaitForHarnessMessages(ctx2, HarnessWaitParams{
+			Device: "mini", Harness: "antigravity", Timeout: 10.0, ExcludeIDs: []string{"mini:antigravity:agy-live"},
+		})
+		done2 <- err
+	}()
+	for range 40 {
+		hub.mu.Lock()
+		cnt := hub.harnessRelays["mini:antigravity"]
+		hub.mu.Unlock()
+		if cnt > 0 {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	askRes, err := hub.Ask(context.Background(), AskParams{
+		Device: "mini", FromSession: "mini:claude:sender-1", To: "mini:antigravity:agy-live",
+		Body: "quick ping", Timeout: 0.12, WaitIfIdle: false,
+	})
+	if err != nil || !askRes.TimedOut || askRes.Delivery != "immediate" {
+		t.Fatalf("expected Ask to wait (and time out) with active relay, got %+v, err=%v", askRes, err)
+	}
+	cancel()
+	cancel2()
+	if err := <-done2; !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	hub.mu.Lock()
+	relaysLeft := hub.harnessRelays["mini:antigravity"]
+	subsLeft := len(hub.harnessSubs["mini:antigravity"])
+	hub.mu.Unlock()
+	if relaysLeft != 0 || subsLeft != 0 {
+		t.Fatalf("harness relay leak: relays=%d subs=%d", relaysLeft, subsLeft)
+	}
+}

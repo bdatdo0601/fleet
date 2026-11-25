@@ -4,6 +4,7 @@ package cli
 import (
 	"bufio"
 	"cmp"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -13,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"os/user"
 	"path/filepath"
 	"runtime"
@@ -1143,6 +1145,35 @@ func cmdAgentsWait(args []string, cio *IO) error {
 	return nil
 }
 
+func cmdAgentsRelay(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("agents relay", flag.ContinueOnError)
+	harness := fs.String("harness", "antigravity", "harness name (antigravity)")
+	pollTimeout := fs.Float64("poll-timeout", 50.0, "per-request long-poll seconds")
+	agentAPI := fs.String("agentapi", "", "path to agentapi executable")
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf("usage: fleet agents relay [--harness antigravity] [--poll-timeout S] [--agentapi PATH]")
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	rc, err := waiter.RunAntigravityRelay(ctx, waiter.RelayOpts{
+		Harness:     *harness,
+		AgentAPIBin: *agentAPI,
+		PollTimeout: *pollTimeout,
+		Stderr:      cio.Stderr,
+	})
+	if err != nil {
+		return err
+	}
+	if rc != 0 {
+		return fmt.Errorf("relay failed")
+	}
+	return nil
+}
+
 func cmdAgentsRename(args []string, cio *IO) error {
 	if len(args) != 2 {
 		return fmt.Errorf("usage: fleet agents rename TARGET NAME")
@@ -1282,6 +1313,8 @@ func cmdAgents(args []string, cio *IO) error {
 		switch args[0] {
 		case "wait":
 			return cmdAgentsWait(args[1:], cio)
+		case "relay":
+			return cmdAgentsRelay(args[1:], cio)
 		case "rename":
 			return cmdAgentsRename(args[1:], cio)
 		}

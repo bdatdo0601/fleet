@@ -464,6 +464,9 @@ func registerAgentMessageRoutes(
 	mux.HandleFunc("POST /v1/agents/wait", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
 		return handleAgentWait(w, r, fleet, c.Name)
 	}))
+	mux.HandleFunc("POST /v1/agents/wait-harness", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
+		return handleAgentWaitHarness(w, r, fleet, c.Name)
+	}))
 	mux.HandleFunc("POST /v1/agents/ack", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
 		req, sid, err := decodeCaller[struct {
 			callerReq
@@ -577,6 +580,34 @@ func handleAgentWait(w http.ResponseWriter, r *http.Request, fleet *core.Fleet, 
 	res, err := fleet.Agents.WaitForMessages(r.Context(), agents.WaitParams{
 		Device: dev, SessionID: sid, Timeout: optFloat(req.Timeout, 55.0),
 		MarkRead: optBoolDefaultTrue(req.MarkRead), Limit: optInt(req.Limit, 50), RequireFullID: req.RequireFullID,
+	})
+	if err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, res)
+	return nil
+}
+
+func handleAgentWaitHarness(w http.ResponseWriter, r *http.Request, fleet *core.Fleet, dev string) error {
+	var req struct {
+		Harness       string   `json:"harness"`
+		Timeout       *float64 `json:"timeout"`
+		MarkRead      *bool    `json:"mark_read"`
+		Limit         *int     `json:"limit"`
+		RequireFullID bool     `json:"require_full_id"`
+		ExcludeIDs    []string `json:"exclude_ids"`
+	}
+	if err := readJSONBody(r, &req); err != nil {
+		return err
+	}
+	res, err := fleet.Agents.WaitForHarnessMessages(r.Context(), agents.HarnessWaitParams{
+		Device:        dev,
+		Harness:       req.Harness,
+		Timeout:       optFloat(req.Timeout, 55.0),
+		MarkRead:      req.MarkRead != nil && *req.MarkRead,
+		Limit:         optInt(req.Limit, 50),
+		RequireFullID: req.RequireFullID,
+		ExcludeIDs:    req.ExcludeIDs,
 	})
 	if err != nil {
 		return err

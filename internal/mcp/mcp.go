@@ -209,6 +209,10 @@ type ServeOpts struct {
 	HeartbeatInterval float64
 	AutoListen        *bool // nil defaults to true
 	CodexRunQueueFn   waiter.RunQueueFn
+	ClaudeSendFn      waiter.SendClaudeSocketFn
+	ClaudeSocketPath  string
+	ClaudeSocketToken string
+	ClaudeCacheDir    string
 }
 
 func sendHeartbeat(apiURL, harness string, ppid int, cwd, knownFullID string) string {
@@ -308,13 +312,13 @@ func callJSON(api, method, path string, body any, timeout time.Duration) (any, e
 	return out, nil
 }
 
-func callListenTool(api, harness, cwd string, ppid int, listener *waiter.CodexQueueListener, action, explicitSID string) (any, error) {
+func callListenTool(api, harness, cwd string, ppid int, listener waiter.SessionListener, action, explicitSID string) (any, error) {
 	action = cmp.Or(action, "status")
 	if action != "status" && action != "start" && action != "stop" {
 		return nil, fmt.Errorf("invalid action %q", action)
 	}
-	if harness == "codex" {
-		return callCodexListen(api, cwd, ppid, listener, action, explicitSID), nil
+	if listener != nil {
+		return callSessionListener(api, harness, cwd, ppid, listener, action, explicitSID), nil
 	}
 	sid, err := resolveSIDNonDestructive(api, harness, cwd, ppid, explicitSID)
 	if err != nil {
@@ -329,9 +333,22 @@ func callListenTool(api, harness, cwd string, ppid int, listener *waiter.CodexQu
 		listening = sess.Listening
 		delivery = cmp.Or(sess.Delivery, "offline")
 	}
-	hint := "Run this command in the background with run_command(WaitMsBeforeAsync=500, IsDaemon=false), and re-run it after handling each incoming message."
-	if harness == "claude" {
-		hint = "Run this command in the background with Bash(run_in_background=true), and re-run it after handling each incoming message."
+	if harness == "antigravity" {
+		out := map[string]any{
+			"harness": harness, "mode": "antigravity_sidecar", "action": action,
+			"session_id": sid, "name": sessName, "listening": listening, "delivery": delivery,
+		}
+		if listening {
+			out["instruction"] = "Antigravity fleet sidecar is actively delivering incoming messages via agentapi."
+		} else {
+			out["command"] = "fleet agents wait --session " + sid
+			out["instruction"] = "Antigravity fleet sidecar is not active (restart Antigravity App after running `fleet mcp install`, or run the fallback wait command when using standalone `agy` CLI)."
+		}
+		return out, nil
+	}
+	hint := "Run this command in the background with Bash(run_in_background=true), and re-run it after handling each incoming message."
+	if harness != "claude" {
+		hint = "Run this command in the background with run_command(WaitMsBeforeAsync=500, IsDaemon=false), and re-run it after handling each incoming message."
 	}
 	return map[string]any{
 		"harness": harness, "mode": "background_command", "action": action,
@@ -340,21 +357,19 @@ func callListenTool(api, harness, cwd string, ppid int, listener *waiter.CodexQu
 	}, nil
 }
 
-func callCodexListen(api, cwd string, ppid int, listener *waiter.CodexQueueListener, action, explicitSID string) map[string]any {
-	st := waiter.ListenerStatus{SessionID: explicitSID}
-	if listener != nil {
-		switch action {
-		case "start":
-			st = listener.Start()
-		case "stop":
-			st = listener.Pause()
-		default:
-			st = listener.Status()
-		}
+func callSessionListener(api, harness, cwd string, ppid int, listener waiter.SessionListener, action, explicitSID string) map[string]any {
+	var st waiter.ListenerStatus
+	switch action {
+	case "start":
+		st = listener.Start()
+	case "stop":
+		st = listener.Pause()
+	default:
+		st = listener.Status()
 	}
 	sid := cmp.Or(explicitSID, st.SessionID)
 	if sid == "" {
-		if resolved, err := resolveSIDNonDestructive(api, "codex", cwd, ppid, ""); err == nil {
+		if resolved, err := resolveSIDNonDestructive(api, harness, cwd, ppid, ""); err == nil {
 			sid = resolved
 		}
 	}
@@ -370,12 +385,16 @@ func callCodexListen(api, cwd string, ppid int, listener *waiter.CodexQueueListe
 		listening = sess.Listening
 		delivery = cmp.Or(sess.Delivery, delivery)
 	}
-	return map[string]any{
-		"harness": "codex", "mode": "mcp_codex_queue", "action": action,
+	out := map[string]any{
+		"harness": harness, "mode": listener.Mode(), "action": action,
 		"running": st.Running, "enabled": st.Enabled, "session_id": sid,
 		"full_raw_id": st.FullRawID, "delivered_count": st.DeliveredCount,
 		"last_error": st.LastError, "name": sessName, "listening": listening, "delivery": delivery,
 	}
+	if st.Socket != "" {
+		out["socket"] = st.Socket
+	}
+	return out
 }
 
 func callListAgents(api string, rawArgs json.RawMessage) (any, error) {
@@ -458,7 +477,7 @@ func callAskAgent(api, harness, cwd string, ppid int, rawArgs json.RawMessage) (
 	return callJSON(api, "POST", "/v1/agents/ask", body, time.Duration(httpTimeout*float64(time.Second)))
 }
 
-func callTool(name string, rawArgs json.RawMessage, apiURL, harness string, ppid int, cwd string, listener *waiter.CodexQueueListener) (any, error) {
+func callTool(name string, rawArgs json.RawMessage, apiURL, harness string, ppid int, cwd string, listener waiter.SessionListener) (any, error) {
 	api, err := client.ResolveAPI(apiURL)
 	if err != nil {
 		return nil, err
@@ -568,7 +587,7 @@ type toolCallResult struct {
 	IsError bool          `json:"isError"`
 }
 
-func dispatchRPC(req rpcRequest, opts ServeOpts, ppid int, cwd string, listener *waiter.CodexQueueListener) rpcResponse {
+func dispatchRPC(req rpcRequest, opts ServeOpts, ppid int, cwd string, listener waiter.SessionListener) rpcResponse {
 	switch req.Method {
 	case "initialize":
 		var p struct {
@@ -611,7 +630,7 @@ func dispatchRPC(req rpcRequest, opts ServeOpts, ppid int, cwd string, listener 
 	}
 }
 
-func startBackgroundWorkers(opts ServeOpts, ppid int, cwd string, stopCh <-chan struct{}) (chan struct{}, *waiter.CodexQueueListener) {
+func startBackgroundWorkers(opts ServeOpts, ppid int, cwd string, stopCh <-chan struct{}) (chan struct{}, waiter.SessionListener) {
 	hbInterval := opts.HeartbeatInterval
 	if hbInterval <= 0 {
 		hbInterval = HeartbeatIntervalSeconds
@@ -634,12 +653,24 @@ func startBackgroundWorkers(opts ServeOpts, ppid int, cwd string, stopCh <-chan 
 			}
 		}()
 	}
-	var listener *waiter.CodexQueueListener
-	if opts.Harness == "codex" && (opts.AutoListen == nil || *opts.AutoListen) {
-		listener = waiter.NewCodexQueueListener(waiter.CodexListenerOpts{
-			APIURL: opts.APIURL, PPID: ppid, CWD: cwd, RunQueueFn: opts.CodexRunQueueFn,
-		})
-		listener.Start()
+	var listener waiter.SessionListener
+	if opts.AutoListen == nil || *opts.AutoListen {
+		switch opts.Harness {
+		case "codex":
+			l := waiter.NewCodexQueueListener(waiter.CodexListenerOpts{
+				APIURL: opts.APIURL, PPID: ppid, CWD: cwd, RunQueueFn: opts.CodexRunQueueFn,
+			})
+			l.Start()
+			listener = l
+		case "claude":
+			l := waiter.NewClaudeSocketListener(waiter.ClaudeListenerOpts{
+				APIURL: opts.APIURL, PPID: ppid, CWD: cwd,
+				CacheDir: opts.ClaudeCacheDir, SocketPath: opts.ClaudeSocketPath,
+				Token: opts.ClaudeSocketToken, SendFn: opts.ClaudeSendFn,
+			})
+			l.Start()
+			listener = l
+		}
 	}
 	return hbDone, listener
 }
@@ -658,6 +689,9 @@ func ServeStdio(opts ServeOpts) (int, error) {
 		stdout = os.Stdout
 	}
 	ppid := os.Getppid()
+	if opts.Harness == "claude" {
+		ppid = hooks.ClaudeProcessPID()
+	}
 	cwd := opts.CWD
 	if cwd == "" {
 		cwd, _ = os.Getwd()

@@ -257,6 +257,34 @@ type WaitResult struct {
 	Exited    bool      `json:"exited"`
 }
 
+// HarnessWaitParams controls WaitForHarnessMessages.
+type HarnessWaitParams struct {
+	Device        string
+	Harness       string
+	Timeout       float64
+	MarkRead      bool
+	Limit         int
+	RequireFullID bool
+	ExcludeIDs    []string
+}
+
+// SessionMessages groups unread messages for a single session returned by WaitForHarnessMessages.
+type SessionMessages struct {
+	SessionID string    `json:"session_id"`
+	FullRawID string    `json:"full_raw_id"`
+	Name      string    `json:"name"`
+	Title     string    `json:"title"`
+	Messages  []Message `json:"messages"`
+}
+
+// HarnessWaitResult is returned by WaitForHarnessMessages.
+type HarnessWaitResult struct {
+	Device   string            `json:"device"`
+	Harness  string            `json:"harness"`
+	Batches  []SessionMessages `json:"batches"`
+	TimedOut bool              `json:"timed_out"`
+}
+
 // AskParams controls Ask.
 type AskParams struct {
 	Device       string
@@ -566,17 +594,20 @@ func (m subMap) notify(key string) {
 
 // Hub is the SQLite agent session registry and cross-node message broker.
 type Hub struct {
-	Path        string
-	mu          sync.Mutex
-	db          *sql.DB
-	lastPrune   time.Time
-	waiters     map[string]int
-	waitSeenAt  map[string]time.Time
-	promotedTo  map[string]string
-	sessionSubs subMap
-	threadSubs  subMap
-	closed      bool
-	doneCh      chan struct{}
+	Path               string
+	mu                 sync.Mutex
+	db                 *sql.DB
+	lastPrune          time.Time
+	waiters            map[string]int
+	waitSeenAt         map[string]time.Time
+	harnessRelays      map[string]int
+	harnessRelaySeenAt map[string]time.Time
+	promotedTo         map[string]string
+	sessionSubs        subMap
+	harnessSubs        subMap
+	threadSubs         subMap
+	closed             bool
+	doneCh             chan struct{}
 }
 
 // Open opens or initializes agents.db at path, creating its parent directory and running migrations.
@@ -587,14 +618,17 @@ func Open(path string) (*Hub, error) {
 	}
 	_ = os.Chmod(path, 0o600)
 	return &Hub{
-		Path:        path,
-		db:          db,
-		waiters:     map[string]int{},
-		waitSeenAt:  map[string]time.Time{},
-		promotedTo:  map[string]string{},
-		sessionSubs: subMap{},
-		threadSubs:  subMap{},
-		doneCh:      make(chan struct{}),
+		Path:               path,
+		db:                 db,
+		waiters:            map[string]int{},
+		waitSeenAt:         map[string]time.Time{},
+		harnessRelays:      map[string]int{},
+		harnessRelaySeenAt: map[string]time.Time{},
+		promotedTo:         map[string]string{},
+		sessionSubs:        subMap{},
+		harnessSubs:        subMap{},
+		threadSubs:         subMap{},
+		doneCh:             make(chan struct{}),
 	}, nil
 }
 
@@ -627,6 +661,15 @@ func (h *Hub) notifyBroadcastLocked(fromSession string, toDevice *string) {
 			}
 		}
 		h.sessionSubs.notify(sid)
+	}
+	for key := range h.harnessSubs {
+		if toDevice != nil {
+			dev, _, _ := strings.Cut(key, ":")
+			if dev != *toDevice {
+				continue
+			}
+		}
+		h.harnessSubs.notify(key)
 	}
 }
 
@@ -705,6 +748,18 @@ func (h *Hub) migrateSessionIdentityLocked(execer interface {
 	return nil
 }
 
+func deviceHarnessKey(sessionID string) string {
+	dev, rest, ok := strings.Cut(sessionID, ":")
+	if !ok || dev == "" {
+		return ""
+	}
+	har, _, ok := strings.Cut(rest, ":")
+	if !ok || har == "" {
+		return ""
+	}
+	return dev + ":" + har
+}
+
 func (h *Hub) isListeningLocked(sessionID, state string, live bool, now time.Time) bool {
 	if !live || state == "exited" {
 		return false
@@ -712,11 +767,18 @@ func (h *Hub) isListeningLocked(sessionID, state string, live bool, now time.Tim
 	if h.waiters[sessionID] > 0 {
 		return true
 	}
-	seen, ok := h.waitSeenAt[sessionID]
-	if !ok {
-		return false
+	if seen, ok := h.waitSeenAt[sessionID]; ok && state == "working" && now.Sub(seen).Seconds() <= WaiterRearmGraceSeconds {
+		return true
 	}
-	return state == "working" && now.Sub(seen).Seconds() <= WaiterRearmGraceSeconds
+	if key := deviceHarnessKey(sessionID); key != "" {
+		if h.harnessRelays[key] > 0 {
+			return true
+		}
+		if seen, ok := h.harnessRelaySeenAt[key]; ok && now.Sub(seen).Seconds() <= WaiterRearmGraceSeconds {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Hub) serializeSessionLocked(r *sessionRow, nowUTC time.Time, nowMono time.Time) Session {
@@ -952,33 +1014,41 @@ func (h *Hub) markReadLocked(sessionID string, ids ...int64) error {
 	return tx.Commit()
 }
 
-func (h *Hub) fetchInboxLocked(device, sessionID string, unreadOnly, markRead bool, limit int) ([]Message, error) {
+func (h *Hub) fetchInboxFilteredLocked(device, sessionID string, unreadOnly, markRead, directOnly bool, limit int) ([]Message, error) {
 	if !strings.HasPrefix(sessionID, device+":") {
 		return nil, newAgentErr("session belongs to another device", 403)
 	}
 	limit = max(1, min(limit, 200))
-	var repo, startedAt string
-	err := h.db.QueryRow("SELECT repo, started_at FROM agent_sessions WHERE session_id = ?", sessionID).Scan(&repo, &startedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		repo = ""
-		startedAt = "1970-01-01T00:00:00+00:00"
-	} else if err != nil {
-		return nil, err
-	}
 	unreadFlag := 0
 	if unreadOnly {
 		unreadFlag = 1
 	}
-	messages, err := h.queryMessagesLocked(
-		msgSelectSQL+"WHERE m.from_session != ? "+
-			"AND (m.to_session = ? OR (m.to_session IS NULL "+
-			"  AND (m.to_device IS NULL OR m.to_device = ?) "+
-			"  AND (m.to_repo IS NULL OR (m.to_repo = ? AND ? != '')) "+
-			"  AND m.created_at >= ?)) "+
-			"AND (? = 0 OR m.id NOT IN (SELECT message_id FROM agent_reads WHERE session_id = ?)) "+
-			"ORDER BY m.id ASC LIMIT ?",
-		sessionID, sessionID, device, repo, repo, startedAt, unreadFlag, sessionID, limit,
-	)
+	var query string
+	var args []any
+	if directOnly {
+		query = msgSelectSQL + "WHERE m.from_session != ? AND m.to_session = ? " +
+			"AND (? = 0 OR m.id NOT IN (SELECT message_id FROM agent_reads WHERE session_id = ?)) " +
+			"ORDER BY m.id ASC LIMIT ?"
+		args = []any{sessionID, sessionID, unreadFlag, sessionID, limit}
+	} else {
+		var repo, startedAt string
+		err := h.db.QueryRow("SELECT repo, started_at FROM agent_sessions WHERE session_id = ?", sessionID).Scan(&repo, &startedAt)
+		if errors.Is(err, sql.ErrNoRows) {
+			repo = ""
+			startedAt = "1970-01-01T00:00:00+00:00"
+		} else if err != nil {
+			return nil, err
+		}
+		query = msgSelectSQL + "WHERE m.from_session != ? " +
+			"AND (m.to_session = ? OR (m.to_session IS NULL " +
+			"  AND (m.to_device IS NULL OR m.to_device = ?) " +
+			"  AND (m.to_repo IS NULL OR (m.to_repo = ? AND ? != '')) " +
+			"  AND m.created_at >= ?)) " +
+			"AND (? = 0 OR m.id NOT IN (SELECT message_id FROM agent_reads WHERE session_id = ?)) " +
+			"ORDER BY m.id ASC LIMIT ?"
+		args = []any{sessionID, sessionID, device, repo, repo, startedAt, unreadFlag, sessionID, limit}
+	}
+	messages, err := h.queryMessagesLocked(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -992,6 +1062,10 @@ func (h *Hub) fetchInboxLocked(device, sessionID string, unreadOnly, markRead bo
 		}
 	}
 	return messages, nil
+}
+
+func (h *Hub) fetchInboxLocked(device, sessionID string, unreadOnly, markRead bool, limit int) ([]Message, error) {
+	return h.fetchInboxFilteredLocked(device, sessionID, unreadOnly, markRead, false, limit)
 }
 
 func (h *Hub) queryMessagesLocked(query string, args ...any) ([]Message, error) {
@@ -1114,6 +1188,9 @@ func (h *Hub) resolvePromotedLocked(sid string) string {
 
 func (h *Hub) finishHeartbeatLocked(device, sessionID, fullRaw, name, title string, drain bool) (HeartbeatResult, error) {
 	h.sessionSubs.notify(sessionID)
+	if key := deviceHarnessKey(sessionID); key != "" {
+		h.harnessSubs.notify(key)
+	}
 	unread := []Message{}
 	if drain {
 		var err error
@@ -1700,7 +1777,7 @@ func (h *Hub) directDeliveryReportLocked(sid string, nowUTC, nowMono time.Time) 
 		}
 	}
 	woke := 0
-	if h.waiters[sid] > 0 {
+	if h.waiters[sid] > 0 || h.harnessRelays[deviceHarnessKey(sid)] > 0 {
 		woke = 1
 	}
 	var warning *string
@@ -1856,6 +1933,9 @@ func (h *Hub) sendMessageAndReportLocked(device, fromSession, to, body string, t
 	}
 	if toSession != nil && *toSession != "" {
 		h.sessionSubs.notify(*toSession)
+		if key := deviceHarnessKey(*toSession); key != "" {
+			h.harnessSubs.notify(key)
+		}
 	} else {
 		h.notifyBroadcastLocked(fromSession, toDevice)
 	}
@@ -2040,6 +2120,102 @@ func (h *Hub) WaitForMessages(ctx context.Context, p WaitParams) (WaitResult, er
 		}
 		if err := h.waitOnChannelLocked(ctx, subCh, remaining); err != nil {
 			return WaitResult{}, err
+		}
+	}
+}
+
+func (h *Hub) collectHarnessBatchesLocked(p HarnessWaitParams, excluded map[string]bool, limit int) ([]SessionMessages, error) {
+	rows, err := h.db.Query(
+		"SELECT "+sessionSelectCols+" FROM agent_sessions WHERE device = ? AND harness = ? AND state != 'exited' ORDER BY updated_at DESC",
+		p.Device, p.Harness,
+	)
+	if err != nil {
+		return nil, err
+	}
+	allRows, err := scanAllSessionRows(rows)
+	if err != nil {
+		return nil, err
+	}
+	nowUTC := time.Now().UTC().Truncate(time.Second)
+	var batches []SessionMessages
+	for i := range allRows {
+		r := &allRows[i]
+		if excluded[r.sessionID] {
+			continue
+		}
+		if p.RequireFullID && (r.fullRawID == "" || strings.HasPrefix(r.fullRawID, "pid-")) {
+			continue
+		}
+		age := max(int(nowUTC.Sub(parseTS(r.updatedAt)).Seconds()), 0)
+		live := isLiveRow(r.state, age)
+		msgs, err := h.fetchInboxFilteredLocked(p.Device, r.sessionID, true, p.MarkRead, !live, limit)
+		if err != nil {
+			return nil, err
+		}
+		if len(msgs) > 0 {
+			batches = append(batches, SessionMessages{
+				SessionID: r.sessionID, FullRawID: r.fullRawID, Name: r.name, Title: r.title, Messages: msgs,
+			})
+		}
+	}
+	return batches, nil
+}
+
+// WaitForHarnessMessages blocks until unread messages arrive for any session matching (Device, Harness),
+// timeout elapses, ctx is cancelled, or the hub closes.
+func (h *Hub) WaitForHarnessMessages(ctx context.Context, p HarnessWaitParams) (HarnessWaitResult, error) {
+	if !paths.ValidHarness(p.Harness) {
+		return HarnessWaitResult{}, newAgentErr(fmt.Sprintf("unknown harness %q", p.Harness), 400)
+	}
+	timeout := p.Timeout
+	if timeout == 0 {
+		timeout = 55.0
+	}
+	timeout = math.Max(0.05, math.Min(timeout, 60.0))
+	limit := p.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	excluded := make(map[string]bool, len(p.ExcludeIDs))
+	for _, id := range p.ExcludeIDs {
+		if id != "" {
+			excluded[id] = true
+		}
+	}
+	deadline := time.Now().Add(time.Duration(timeout * float64(time.Second)))
+	key := p.Device + ":" + p.Harness
+
+	h.mu.Lock()
+	h.harnessRelays[key]++
+	subCh := h.harnessSubs.subscribe(key)
+	defer func() {
+		h.harnessSubs.unsubscribe(key, subCh)
+		if c := h.harnessRelays[key] - 1; c <= 0 {
+			delete(h.harnessRelays, key)
+		} else {
+			h.harnessRelays[key] = c
+		}
+		h.harnessRelaySeenAt[key] = time.Now()
+		h.mu.Unlock()
+	}()
+
+	for {
+		if h.closed {
+			return HarnessWaitResult{Device: p.Device, Harness: p.Harness, Batches: []SessionMessages{}, TimedOut: true}, nil
+		}
+		batches, err := h.collectHarnessBatchesLocked(p, excluded, limit)
+		if err != nil {
+			return HarnessWaitResult{}, err
+		}
+		if len(batches) > 0 {
+			return HarnessWaitResult{Device: p.Device, Harness: p.Harness, Batches: batches}, nil
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return HarnessWaitResult{Device: p.Device, Harness: p.Harness, Batches: []SessionMessages{}, TimedOut: true}, nil
+		}
+		if err := h.waitOnChannelLocked(ctx, subCh, remaining); err != nil {
+			return HarnessWaitResult{}, err
 		}
 	}
 }

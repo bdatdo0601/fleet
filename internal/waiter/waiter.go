@@ -1,8 +1,9 @@
-// Package waiter implements real-time inbox polling for CLI watchers and Codex MCP queue delivery.
+// Package waiter implements real-time inbox polling for CLI watchers, MCP push listeners, and harness relays.
 package waiter
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -40,17 +41,24 @@ type WaitCLIOpts struct {
 
 // FindCodexBinary locates the codex executable on PATH or standard install dirs.
 func FindCodexBinary() string {
-	if p, err := exec.LookPath("codex"); err == nil {
+	return findExecutable("codex", []string{".local/bin/codex", "/opt/homebrew/bin/codex", "/usr/local/bin/codex"})
+}
+
+func findExecutable(name string, candidates []string) string {
+	if p, err := exec.LookPath(name); err == nil {
 		return p
 	}
 	home, _ := os.UserHomeDir()
-	for _, cand := range []string{
-		filepath.Join(home, ".local", "bin", "codex"),
-		"/opt/homebrew/bin/codex",
-		"/usr/local/bin/codex",
-	} {
-		if fi, err := os.Stat(cand); err == nil && !fi.IsDir() && fi.Mode()&0o111 != 0 {
-			return cand
+	for _, cand := range candidates {
+		p := cand
+		if !filepath.IsAbs(p) {
+			if home == "" {
+				continue
+			}
+			p = filepath.Join(home, p)
+		}
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() && fi.Mode()&0o111 != 0 {
+			return p
 		}
 	}
 	return ""
@@ -129,6 +137,13 @@ func inferHarness(sessionID, override string) string {
 	return "antigravity"
 }
 
+func clampPollTimeout(pt float64) float64 {
+	if pt <= 0 {
+		return 50.0
+	}
+	return max(0.05, min(pt, 60.0))
+}
+
 func nextBackoff(cur float64) float64 {
 	if cur < 5.0 {
 		return 5.0
@@ -159,6 +174,36 @@ func calcPollTimeout(pollTimeout float64, hasDeadline bool, deadline time.Time) 
 	return max(0.05, min(reqTimeout, rem)), true
 }
 
+func runCommandCapture(ctx context.Context, cmd []string, timeout time.Duration) (int, string) {
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	c := exec.CommandContext(runCtx, cmd[0], cmd[1:]...)
+	var stdout, stderr bytes.Buffer
+	c.Stdout = &stdout
+	c.Stderr = &stderr
+	if err := c.Run(); err != nil {
+		detail := cmp.Or(strings.TrimSpace(stderr.String()), strings.TrimSpace(stdout.String()), err.Error())
+		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
+			return exitErr.ExitCode(), detail
+		}
+		return 1, detail
+	}
+	return 0, strings.TrimSpace(stderr.String())
+}
+
+func ackMessages(ctx context.Context, api, harness, sessionID string, msgs []agents.Message) {
+	if len(msgs) == 0 || sessionID == "" {
+		return
+	}
+	ids := make([]int64, len(msgs))
+	for i, m := range msgs {
+		ids[i] = m.ID
+	}
+	_ = client.CallContext(ctx, api, "POST", "/v1/agents/ack", map[string]any{
+		"harness": harness, "session_id": sessionID, "message_ids": ids,
+	}, 5*time.Second, nil, nil)
+}
+
 // WaitForInboxCLI blocks on /v1/agents/wait until unread messages arrive, then prints and exits 0.
 func WaitForInboxCLI(opts WaitCLIOpts) (int, error) {
 	stdout := opts.Stdout
@@ -169,10 +214,7 @@ func WaitForInboxCLI(opts WaitCLIOpts) (int, error) {
 	if err != nil {
 		return 1, err
 	}
-	pollTimeout := opts.PollTimeout
-	if pollTimeout <= 0 {
-		pollTimeout = 50.0
-	}
+	pollTimeout := clampPollTimeout(opts.PollTimeout)
 	resolvedHarness := inferHarness(opts.SessionID, opts.Harness)
 	initialPPID := os.Getppid()
 	hasDeadline := opts.MaxWait > 0
@@ -239,27 +281,46 @@ func WaitForInboxCLI(opts WaitCLIOpts) (int, error) {
 	}
 }
 
-// RunQueueFn executes `codex queue ...` and returns (returncode, detail).
+// RunQueueFn executes a delivery CLI command and returns (returncode, detail).
 type RunQueueFn func(cmd []string) (int, string)
 
-// ListenerStatus summarizes CodexQueueListener state for `fleet_listen`.
+// SessionListener controls a background inbox push listener for an MCP-hosted session.
+type SessionListener interface {
+	Mode() string
+	Start() ListenerStatus
+	Pause() ListenerStatus
+	Stop() ListenerStatus
+	Status() ListenerStatus
+}
+
+// ListenerStatus summarizes background push-listener state for `fleet_listen`.
 type ListenerStatus struct {
 	Running        bool    `json:"running"`
 	Enabled        bool    `json:"enabled"`
 	SessionID      string  `json:"session_id"`
 	FullRawID      string  `json:"full_raw_id"`
+	Socket         string  `json:"socket,omitempty"`
 	DeliveredCount int     `json:"delivered_count"`
 	LastError      *string `json:"last_error"`
 }
 
-// CodexQueueListener runs inside `fleet mcp serve --harness codex` and pushes inbox messages via `codex queue`.
-type CodexQueueListener struct {
-	apiURL      string
-	ppid        int
-	cwd         string
-	codexBin    string
-	pollTimeout float64
-	runQueueFn  RunQueueFn
+type pushBackend interface {
+	mode() string
+	preStart() (string, bool)
+	prePoll(knownSID string) bool
+	canDeliver(resp agents.WaitResult) bool
+	deliver(resp agents.WaitResult) (string, bool)
+	onStop(sessionID string)
+}
+
+type sessionPushLoop struct {
+	harness       string
+	apiURL        string
+	ppid          int
+	cwd           string
+	pollTimeout   float64
+	requireFullID bool
+	backend       pushBackend
 
 	mu             sync.Mutex
 	enabled        bool
@@ -270,55 +331,30 @@ type CodexQueueListener struct {
 	doneCh         chan struct{}
 	sessionID      string
 	fullRawID      string
+	socket         string
 	deliveredCount int
 	lastError      *string
 }
 
-// CodexListenerOpts configures NewCodexQueueListener.
-type CodexListenerOpts struct {
-	APIURL      string
-	PPID        int
-	CWD         string
-	CodexBin    string
-	PollTimeout float64
-	RunQueueFn  RunQueueFn
-}
-
-// NewCodexQueueListener creates a listener for Codex MCP sessions.
-func NewCodexQueueListener(opts CodexListenerOpts) *CodexQueueListener {
-	pt := opts.PollTimeout
-	if pt <= 0 {
-		pt = 50.0
-	}
-	if pt < 0.05 {
-		pt = 0.05
-	} else if pt > 60.0 {
-		pt = 60.0
-	}
-	bin := opts.CodexBin
-	if bin == "" {
-		if opts.RunQueueFn != nil {
-			bin = "codex"
-		} else {
-			bin = FindCodexBinary()
-		}
-	}
-	return &CodexQueueListener{
-		apiURL:      opts.APIURL,
-		ppid:        opts.PPID,
-		cwd:         opts.CWD,
-		codexBin:    bin,
-		pollTimeout: pt,
-		runQueueFn:  opts.RunQueueFn,
-		wakeCh:      make(chan struct{}, 1),
+func newSessionPushLoop(harness, apiURL string, ppid int, cwd string, pollTimeout float64, requireFullID bool, backend pushBackend) *sessionPushLoop {
+	return &sessionPushLoop{
+		harness:       harness,
+		apiURL:        apiURL,
+		ppid:          ppid,
+		cwd:           cwd,
+		pollTimeout:   clampPollTimeout(pollTimeout),
+		requireFullID: requireFullID,
+		backend:       backend,
+		wakeCh:        make(chan struct{}, 1),
 	}
 }
 
-func (l *CodexQueueListener) Start() ListenerStatus {
+func (l *sessionPushLoop) Mode() string { return l.backend.mode() }
+
+func (l *sessionPushLoop) Start() ListenerStatus {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.codexBin == "" {
-		msg := "codex binary not found"
+	if msg, ok := l.backend.preStart(); !ok {
 		l.lastError = &msg
 		l.enabled = false
 		return l.statusLocked()
@@ -339,20 +375,18 @@ func (l *CodexQueueListener) Start() ListenerStatus {
 	return l.statusLocked()
 }
 
-func (l *CodexQueueListener) Pause() ListenerStatus {
+func (l *sessionPushLoop) Pause() ListenerStatus {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.enabled = false
 	return l.statusLocked()
 }
 
-func (l *CodexQueueListener) Stop() ListenerStatus {
+func (l *sessionPushLoop) Stop() ListenerStatus {
 	l.mu.Lock()
 	l.enabled = false
 	l.stopping = true
-	stopCh := l.stopCh
-	doneCh := l.doneCh
-	running := l.running
+	stopCh, doneCh, running, sid := l.stopCh, l.doneCh, l.running, l.sessionID
 	if stopCh != nil {
 		select {
 		case <-stopCh:
@@ -368,53 +402,29 @@ func (l *CodexQueueListener) Stop() ListenerStatus {
 		case <-time.After(1 * time.Second):
 		}
 	}
+	l.backend.onStop(sid)
 	return l.Status()
 }
 
-func (l *CodexQueueListener) Status() ListenerStatus {
+func (l *sessionPushLoop) Status() ListenerStatus {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.statusLocked()
 }
 
-func (l *CodexQueueListener) statusLocked() ListenerStatus {
+func (l *sessionPushLoop) statusLocked() ListenerStatus {
 	return ListenerStatus{
 		Running:        l.running && !l.stopping,
 		Enabled:        l.enabled,
 		SessionID:      l.sessionID,
 		FullRawID:      l.fullRawID,
+		Socket:         l.socket,
 		DeliveredCount: l.deliveredCount,
 		LastError:      l.lastError,
 	}
 }
 
-func (l *CodexQueueListener) invokeQueue(cmd []string) (int, string) {
-	if l.runQueueFn != nil {
-		return l.runQueueFn(cmd)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	c := exec.CommandContext(ctx, cmd[0], cmd[1:]...)
-	var stdout, stderr bytes.Buffer
-	c.Stdout = &stdout
-	c.Stderr = &stderr
-	if err := c.Run(); err != nil {
-		detail := strings.TrimSpace(stderr.String())
-		if detail == "" {
-			detail = strings.TrimSpace(stdout.String())
-		}
-		if detail == "" {
-			detail = err.Error()
-		}
-		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
-			return exitErr.ExitCode(), detail
-		}
-		return 1, detail
-	}
-	return 0, strings.TrimSpace(stderr.String())
-}
-
-func (l *CodexQueueListener) setError(msg string, disable bool) {
+func (l *sessionPushLoop) setError(msg string, disable bool) {
 	l.mu.Lock()
 	l.lastError = &msg
 	if disable {
@@ -423,39 +433,35 @@ func (l *CodexQueueListener) setError(msg string, disable bool) {
 	l.mu.Unlock()
 }
 
-func (l *CodexQueueListener) deliverMessages(api, bin string, resp agents.WaitResult) {
-	text := FormatWaitOutput(resp.SessionID, resp.Name, resp.Messages, "")
-	cmd := []string{bin, "queue", "--thread", resp.FullRawID, "--message", text, "--resume"}
-	rc, errDetail := l.invokeQueue(cmd)
-	if rc != 0 {
-		msg := errDetail
-		if msg == "" {
-			msg = fmt.Sprintf("codex queue exited with status %d", rc)
-		}
-		l.setError(msg, true)
-		return
-	}
-	ids := make([]int64, len(resp.Messages))
-	for i, m := range resp.Messages {
-		ids[i] = m.ID
-	}
-	_ = client.Call(api, "POST", "/v1/agents/ack", map[string]any{
-		"harness": "codex", "session_id": resp.SessionID, "message_ids": ids,
-	}, 5*time.Second, nil, nil)
+func (l *sessionPushLoop) setSocket(sock string) {
 	l.mu.Lock()
-	l.deliveredCount += len(resp.Messages)
-	l.lastError = nil
+	l.socket = sock
 	l.mu.Unlock()
 }
 
-func (l *CodexQueueListener) pollOnce(knownSID string) (string, agents.WaitResult, error) {
+func (l *sessionPushLoop) waitIdleOrWake(stopCh <-chan struct{}) bool {
+	t := time.NewTimer(250 * time.Millisecond)
+	defer t.Stop()
+	select {
+	case <-stopCh:
+		return false
+	case <-l.wakeCh:
+		return true
+	case <-t.C:
+		return true
+	}
+}
+
+func (l *sessionPushLoop) pollOnce(knownSID string) (string, agents.WaitResult, error) {
 	api, err := client.ResolveAPI(l.apiURL)
 	if err != nil {
 		return "", agents.WaitResult{}, err
 	}
 	payload := map[string]any{
-		"harness": "codex", "pid": l.ppid, "cwd": l.cwd, "timeout": l.pollTimeout,
-		"mark_read": false, "require_full_id": true,
+		"harness": l.harness, "pid": l.ppid, "cwd": l.cwd, "timeout": l.pollTimeout, "mark_read": false,
+	}
+	if l.requireFullID {
+		payload["require_full_id"] = true
 	}
 	if knownSID != "" {
 		payload["session_id"] = knownSID
@@ -465,7 +471,7 @@ func (l *CodexQueueListener) pollOnce(knownSID string) (string, agents.WaitResul
 	return api, resp, err
 }
 
-func (l *CodexQueueListener) loop(stopCh, doneCh chan struct{}) {
+func (l *sessionPushLoop) loop(stopCh, doneCh chan struct{}) {
 	defer func() {
 		l.mu.Lock()
 		l.running = false
@@ -481,24 +487,14 @@ func (l *CodexQueueListener) loop(stopCh, doneCh chan struct{}) {
 		default:
 		}
 		l.mu.Lock()
-		enabled, bin, knownSID := l.enabled, l.codexBin, l.sessionID
+		enabled, knownSID := l.enabled, l.sessionID
 		l.mu.Unlock()
 
-		if !enabled {
-			t := time.NewTimer(250 * time.Millisecond)
-			select {
-			case <-stopCh:
-				t.Stop()
+		if !enabled || !l.backend.prePoll(knownSID) {
+			if !l.waitIdleOrWake(stopCh) {
 				return
-			case <-l.wakeCh:
-				t.Stop()
-			case <-t.C:
 			}
 			continue
-		}
-		if bin == "" {
-			l.setError("codex binary not found", true)
-			return
 		}
 		api, resp, err := l.pollOnce(knownSID)
 		if err != nil {
@@ -531,8 +527,79 @@ func (l *CodexQueueListener) loop(stopCh, doneCh chan struct{}) {
 		}
 		stillEnabled := l.enabled
 		l.mu.Unlock()
-		if stillEnabled && len(resp.Messages) > 0 && resp.FullRawID != "" {
-			l.deliverMessages(api, bin, resp)
+		if stillEnabled && len(resp.Messages) > 0 && l.backend.canDeliver(resp) {
+			if errMsg, disable := l.backend.deliver(resp); errMsg != "" {
+				l.setError(errMsg, disable)
+			} else {
+				ackMessages(context.Background(), api, l.harness, resp.SessionID, resp.Messages)
+				l.mu.Lock()
+				l.deliveredCount += len(resp.Messages)
+				l.lastError = nil
+				l.mu.Unlock()
+			}
 		}
 	}
 }
+
+// CodexQueueListener runs inside `fleet mcp serve --harness codex` and pushes inbox messages via `codex queue`.
+type CodexQueueListener struct {
+	*sessionPushLoop
+	codexBin   string
+	runQueueFn RunQueueFn
+}
+
+// CodexListenerOpts configures NewCodexQueueListener.
+type CodexListenerOpts struct {
+	APIURL      string
+	PPID        int
+	CWD         string
+	CodexBin    string
+	PollTimeout float64
+	RunQueueFn  RunQueueFn
+}
+
+// NewCodexQueueListener creates a listener for Codex MCP sessions.
+func NewCodexQueueListener(opts CodexListenerOpts) *CodexQueueListener {
+	bin := opts.CodexBin
+	if bin == "" {
+		if opts.RunQueueFn != nil {
+			bin = "codex"
+		} else {
+			bin = FindCodexBinary()
+		}
+	}
+	l := &CodexQueueListener{codexBin: bin, runQueueFn: opts.RunQueueFn}
+	l.sessionPushLoop = newSessionPushLoop("codex", opts.APIURL, opts.PPID, opts.CWD, opts.PollTimeout, true, l)
+	return l
+}
+
+func (l *CodexQueueListener) mode() string { return "mcp_codex_queue" }
+
+func (l *CodexQueueListener) preStart() (string, bool) {
+	if l.codexBin == "" {
+		return "codex binary not found", false
+	}
+	return "", true
+}
+
+func (l *CodexQueueListener) prePoll(string) bool { return l.codexBin != "" }
+
+func (l *CodexQueueListener) canDeliver(resp agents.WaitResult) bool { return resp.FullRawID != "" }
+
+func (l *CodexQueueListener) deliver(resp agents.WaitResult) (string, bool) {
+	text := FormatWaitOutput(resp.SessionID, resp.Name, resp.Messages, "")
+	cmd := []string{l.codexBin, "queue", "--thread", resp.FullRawID, "--message", text, "--resume"}
+	var rc int
+	var errDetail string
+	if l.runQueueFn != nil {
+		rc, errDetail = l.runQueueFn(cmd)
+	} else {
+		rc, errDetail = runCommandCapture(context.Background(), cmd, 15*time.Second)
+	}
+	if rc != 0 {
+		return cmp.Or(errDetail, fmt.Sprintf("codex queue exited with status %d", rc)), true
+	}
+	return "", false
+}
+
+func (l *CodexQueueListener) onStop(string) {}

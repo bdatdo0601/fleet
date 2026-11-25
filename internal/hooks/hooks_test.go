@@ -155,8 +155,8 @@ func TestHookLifecycleAllHarnesses(t *testing.T) {
 	// Antigravity SessionStart -> PreInvocation -> Stop continue -> Stop allow
 	startResp := fire("antigravity", map[string]any{"hookEventName": "SessionStart", "conversationId": "40f94b03-1363", "cwd": tmp})
 	bStart, _ := json.Marshal(startResp)
-	if !strings.Contains(string(bStart), "mini:antigravity:40f94b03-136") {
-		t.Fatalf("expected session id in SessionStart: %s", bStart)
+	if !strings.Contains(string(bStart), "mini:antigravity:40f94b03-136") || strings.Contains(string(bStart), "fleet agents wait") {
+		t.Fatalf("unexpected antigravity SessionStart output: %s", bStart)
 	}
 
 	_, _ = f.Agents.SendMessageWithReport("mini", "mini:codex:sender-1", "mini:antigravity:40f94b03-136", "please check schema", nil, nil, nil)
@@ -283,4 +283,58 @@ func TestSessionStartMemoryInjectionAndOfflineCache(t *testing.T) {
 func mustHookJSON(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
+}
+
+func TestClaudeSocketHandoffSaveLoadAndSessionEnd(t *testing.T) {
+	tmp := t.TempDir()
+	cacheDir := filepath.Join(tmp, "cache")
+	t.Setenv("FLEET_CACHE_DIR", cacheDir)
+
+	pubFile := filepath.Join(tmp, "mini.pub")
+	if err := pki.Keygen(filepath.Join(tmp, "mini.key"), pubFile); err != nil {
+		t.Skip("nebula-cert not installed")
+	}
+	miniPub, _ := os.ReadFile(pubFile)
+	f, err := core.Initialize(core.InitOpts{
+		Root: filepath.Join(tmp, "state"), Host: "h.example.com", Port: 443,
+		Passphrase: "correct horse battery staple", LighthousePubkey: string(miniPub),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	srv := httptest.NewServer(server.NewHandler(f, true))
+	t.Cleanup(srv.Close)
+
+	sockPath := filepath.Join(tmp, "claude-4242.sock")
+	_ = os.WriteFile(sockPath, nil, 0o600)
+	t.Setenv("CLAUDE_PID", "4242")
+	t.Setenv("CLAUDE_CODE_MESSAGING_SOCKET", sockPath)
+	t.Setenv("CLAUDE_CODE_MESSAGING_TOKEN", "tok-secret")
+
+	var startOut bytes.Buffer
+	rc, err := RunHook("claude", strings.NewReader(`{"hook_event_name":"SessionStart","session_id":"cl-sock-1","cwd":`+mustHookJSON(tmp)+`}`), &startOut, srv.URL)
+	if err != nil || rc != 0 {
+		t.Fatalf("claude SessionStart failed: rc=%d err=%v", rc, err)
+	}
+	if strings.Contains(startOut.String(), "fleet agents wait") || !strings.Contains(startOut.String(), "local messaging socket") {
+		t.Fatalf("unexpected claude SessionStart text: %s", startOut.String())
+	}
+
+	info, ok := LoadClaudeSocket(cacheDir, 4242, "")
+	if !ok || info.Socket != sockPath || info.Token != "tok-secret" || info.SessionID != "mini:claude:cl-sock-1" {
+		t.Fatalf("expected saved socket info, got ok=%v info=%+v", ok, info)
+	}
+	if fi, err := os.Stat(claudePIDSocketPath(ClaudeSocketsDir(cacheDir), 4242)); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("expected 0600 socket handoff file, err=%v mode=%v", err, fi)
+	}
+
+	var endOut bytes.Buffer
+	rc, err = RunHook("claude", strings.NewReader(`{"hook_event_name":"SessionEnd","session_id":"cl-sock-1","cwd":`+mustHookJSON(tmp)+`}`), &endOut, srv.URL)
+	if err != nil || rc != 0 {
+		t.Fatalf("claude SessionEnd failed: rc=%d err=%v", rc, err)
+	}
+	if _, ok := LoadClaudeSocket(cacheDir, 4242, "mini:claude:cl-sock-1"); ok {
+		t.Fatal("expected socket handoff removed on SessionEnd")
+	}
 }

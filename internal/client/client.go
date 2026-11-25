@@ -93,6 +93,11 @@ func parseErrorMsg(statusCode int, statusText string, body []byte) string {
 
 // Call executes an HTTP JSON request against api+path and decodes the response into out (if non-nil).
 func Call(api, method, path string, body any, timeout time.Duration, headers map[string]string, out any) error {
+	return CallContext(context.Background(), api, method, path, body, timeout, headers, out)
+}
+
+// CallContext executes an HTTP JSON request with parent ctx against api+path and decodes the response into out (if non-nil).
+func CallContext(ctx context.Context, api, method, path string, body any, timeout time.Duration, headers map[string]string, out any) error {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
@@ -104,10 +109,10 @@ func Call(api, method, path string, body any, timeout time.Duration, headers map
 		}
 		reqBody = bytes.NewReader(b)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	url := strings.TrimRight(api, "/") + path
-	req, err := http.NewRequestWithContext(ctx, method, url, reqBody)
+	req, err := http.NewRequestWithContext(reqCtx, method, url, reqBody)
 	if err != nil {
 		return &APIError{Msg: fmt.Sprintf("can't reach the lighthouse at %s: %v", api, err)}
 	}

@@ -38,6 +38,7 @@ var claudeHookEvents = []hookEventSpec{
 	{"PermissionDenied", "*", 5},
 	{"Notification", "permission_prompt|elicitation_dialog|elicitation_url_dialog|agent_needs_input", 5},
 	{"Stop", "", 5},
+	{"SessionEnd", "", 3},
 }
 
 var codexHookEvents = []hookEventSpec{
@@ -407,6 +408,29 @@ func Install(opts InstallOpts) ([]string, error) {
 				}
 				return true
 			}},
+			jsonEditSpec{filepath.Join(".gemini", "config", "sidecars", "fleet", "sidecar.json"), func(d map[string]any) bool {
+				d["display_name"] = "Fleet Message Relay"
+				d["description"] = "Delivers incoming Fleet peer messages directly to Antigravity conversations via agentapi."
+				d["command"] = cmdBin
+				d["args"] = []string{"agents", "relay", "--harness", "antigravity"}
+				d["restart_policy"] = "always"
+				return true
+			}},
+			jsonEditSpec{filepath.Join(".gemini", "config", "config.json"), func(d map[string]any) bool {
+				sidecars := subMap(d, "sidecars", true)
+				if sidecars == nil {
+					return false
+				}
+				fleetSidecar := subMap(sidecars, "fleet", true)
+				if fleetSidecar == nil {
+					return false
+				}
+				if enabled, ok := fleetSidecar["enabled"].(bool); ok && enabled {
+					return false
+				}
+				fleetSidecar["enabled"] = true
+				return true
+			}},
 		)
 	}
 
@@ -417,15 +441,15 @@ func Install(opts InstallOpts) ([]string, error) {
 	return append(changed, edited...), nil
 }
 
-func deleteKey(root map[string]any, sub, key string) bool {
+func deleteFleetKey(root map[string]any, sub string) bool {
 	m := root
 	if sub != "" {
 		m = subMap(root, sub, false)
 	}
-	if _, ok := m[key]; !ok {
+	if _, ok := m["fleet"]; !ok {
 		return false
 	}
-	delete(m, key)
+	delete(m, "fleet")
 	return true
 }
 
@@ -448,7 +472,7 @@ func Uninstall(home string) ([]string, error) {
 		}
 	}
 	edited, err := applyEdits(targetHome, nil, nil, false, []jsonEditSpec{
-		{".claude.json", func(d map[string]any) bool { return deleteKey(d, "mcpServers", "fleet") }},
+		{".claude.json", func(d map[string]any) bool { return deleteFleetKey(d, "mcpServers") }},
 		{filepath.Join(".claude", "settings.json"), func(d map[string]any) bool {
 			h := subMap(d, "hooks", false)
 			return h != nil && removeClaudeStyleHooks(h, "claude")
@@ -457,11 +481,17 @@ func Uninstall(home string) ([]string, error) {
 			h := subMap(d, "hooks", false)
 			return h != nil && removeClaudeStyleHooks(h, "codex")
 		}},
-		{filepath.Join(".gemini", "config", "mcp_config.json"), func(d map[string]any) bool { return deleteKey(d, "mcpServers", "fleet") }},
-		{filepath.Join(".gemini", "config", "hooks.json"), func(d map[string]any) bool { return deleteKey(d, "", "fleet") }},
+		{filepath.Join(".gemini", "config", "mcp_config.json"), func(d map[string]any) bool { return deleteFleetKey(d, "mcpServers") }},
+		{filepath.Join(".gemini", "config", "hooks.json"), func(d map[string]any) bool { return deleteFleetKey(d, "") }},
+		{filepath.Join(".gemini", "config", "config.json"), func(d map[string]any) bool { return deleteFleetKey(d, "sidecars") }},
 	})
 	if err != nil {
 		return nil, err
+	}
+	sidecarFile := filepath.Join(targetHome, ".gemini", "config", "sidecars", "fleet", "sidecar.json")
+	if err := os.Remove(sidecarFile); err == nil {
+		changed = append(changed, sidecarFile)
+		_ = os.Remove(filepath.Dir(sidecarFile))
 	}
 	return append(changed, edited...), nil
 }
@@ -488,11 +518,22 @@ func Status(home string) map[string]bool {
 		return ok
 	}
 
+	hasAntigravitySidecar := func() bool {
+		if !hasKey(filepath.Join(".gemini", "config", "sidecars", "fleet", "sidecar.json"), "", "command") {
+			return false
+		}
+		d, _ := loadJSON(filepath.Join(targetHome, ".gemini", "config", "config.json"))
+		sidecars := subMap(d, "sidecars", false)
+		fleetCfg := subMap(sidecars, "fleet", false)
+		enabled, _ := fleetCfg["enabled"].(bool)
+		return enabled
+	}
+
 	codexTOMLRaw, _ := os.ReadFile(filepath.Join(targetHome, ".codex", "config.toml"))
 	return map[string]bool{
 		"claude":      hasKey(".claude.json", "mcpServers", "fleet") && hasFleetHook(filepath.Join(".claude", "settings.json"), "claude"),
 		"codex":       strings.Contains(string(codexTOMLRaw), "[mcp_servers.fleet]") && hasFleetHook(filepath.Join(".codex", "hooks.json"), "codex"),
-		"antigravity": hasKey(filepath.Join(".gemini", "config", "mcp_config.json"), "mcpServers", "fleet") && hasKey(filepath.Join(".gemini", "config", "hooks.json"), "", "fleet"),
+		"antigravity": hasKey(filepath.Join(".gemini", "config", "mcp_config.json"), "mcpServers", "fleet") && hasKey(filepath.Join(".gemini", "config", "hooks.json"), "", "fleet") && hasAntigravitySidecar(),
 	}
 }
 

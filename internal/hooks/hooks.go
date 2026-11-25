@@ -554,19 +554,15 @@ func sessionStartMessage(harness, sessionID, sessionName string) string {
 	}
 	switch harness {
 	case "antigravity":
-		lines = append(lines, fmt.Sprintf(
-			"To receive peer messages immediately while idle, on your first turn run "+
-				"`fleet agents wait --session %s` in the background via `run_command` "+
-				"(`WaitMsBeforeAsync=500`, `IsDaemon=false`), and re-run it after handling each incoming fleet message.",
-			sessionID,
-		))
+		lines = append(lines,
+			"The Antigravity `fleet` sidecar automatically delivers incoming peer messages to this session via `agentapi` "+
+				"(no background wait command needed; use `fleet_listen` to check delivery status).",
+		)
 	case "claude":
-		lines = append(lines, fmt.Sprintf(
-			"To receive peer messages immediately while idle, on your first turn run "+
-				"`fleet agents wait --session %s` in the background via Bash "+
-				"(`run_in_background=true`), and re-run it after handling each incoming fleet message.",
-			sessionID,
-		))
+		lines = append(lines,
+			"The fleet MCP server automatically listens in the background and delivers incoming peer messages to this "+
+				"session via Claude's local messaging socket (use `fleet_listen` to check status or pause/resume).",
+		)
 	case "codex":
 		lines = append(lines,
 			"The fleet MCP server automatically listens in the background and delivers incoming peer "+
@@ -841,7 +837,27 @@ func parseHookInput(harness string, stdin io.Reader) (in hookInput, event, rawID
 		}
 		return in, in.HookEventName, cmp.Or(in.ConversationID, "agy"), cmp.Or(in.CWD, fallbackWS, cwdDefault), in.TranscriptPath, in.LastUserInput
 	}
-	return in, in.SnakeEvent, cmp.Or(in.SessionID, fmt.Sprintf("pid-%d", os.Getppid())), cmp.Or(in.CWD, cwdDefault), in.SnakeTranscriptPath, in.Prompt
+	pid := os.Getppid()
+	if harness == "claude" {
+		pid = ClaudeProcessPID()
+	}
+	return in, in.SnakeEvent, cmp.Or(in.SessionID, fmt.Sprintf("pid-%d", pid)), cmp.Or(in.CWD, cwdDefault), in.SnakeTranscriptPath, in.Prompt
+}
+
+func syncClaudeMessagingSocket(event, sessionID string, claudePID int) {
+	if event == "SessionEnd" {
+		RemoveClaudeSocket("", claudePID, sessionID)
+		return
+	}
+	if sock := strings.TrimSpace(os.Getenv("CLAUDE_CODE_MESSAGING_SOCKET")); sock != "" {
+		_ = SaveClaudeSocket("", ClaudeSocketInfo{
+			Socket:    sock,
+			Token:     os.Getenv("CLAUDE_CODE_MESSAGING_TOKEN"),
+			SessionID: sessionID,
+			PID:       claudePID,
+			UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+		})
+	}
 }
 
 // RunHook processes a single lifecycle hook payload from stdin and writes harness JSON to stdout.
@@ -881,9 +897,16 @@ func RunHook(harness string, stdin io.Reader, stdout io.Writer, apiURL string) (
 
 	var sessionID, sessionName, memoryContext string
 	var unread []agents.Message
+	claudePID := 0
+	if harness == "claude" {
+		claudePID = ClaudeProcessPID()
+	}
 	if api, err := client.ResolveAPI(apiURL); err == nil {
 		var pidPtr *int
-		if harness != "antigravity" {
+		switch harness {
+		case "claude":
+			pidPtr = &claudePID
+		case "codex":
 			pidPtr = new(os.Getppid())
 		}
 		var titlePtr, namePtr, sumPtr *string
@@ -906,6 +929,9 @@ func RunHook(harness string, stdin io.Reader, stdout io.Writer, apiURL string) (
 		if err == nil {
 			sessionID, sessionName, unread, memoryContext = resp.SessionID, resp.Name, resp.Unread, resp.MemoryContext
 		}
+	}
+	if harness == "claude" {
+		syncClaudeMessagingSocket(event, sessionID, claudePID)
 	}
 	if event == "SessionStart" {
 		if memoryContext != "" {

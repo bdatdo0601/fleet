@@ -340,3 +340,79 @@ func TestMCPMemoryToolsResolveSessionRepoFromRootCWD(t *testing.T) {
 		t.Fatalf("expected global-only fallback without session_id on CWD=/, got %+v", s3)
 	}
 }
+
+func TestMCPClaudeAutoListenAndAntigravitySidecarStatus(t *testing.T) {
+	f, srv := setupMCPServer(t)
+	ppid := os.Getppid()
+	cwd, _ := os.Getwd()
+	_, _ = f.Agents.Heartbeat(agents.HeartbeatParams{
+		Device: "mini", Harness: "claude", RawID: "cl-mcp-1", PID: &ppid, CWD: cwd,
+	})
+	reqs := []string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fleet_listen","arguments":{"action":"status"}}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fleet_listen","arguments":{"action":"stop"}}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"fleet_listen","arguments":{"action":"start"}}}`,
+	}
+	auto := true
+	var out bytes.Buffer
+	rc, err := ServeStdio(ServeOpts{
+		Harness:           "claude",
+		Stdin:             strings.NewReader(strings.Join(reqs, "\n") + "\n"),
+		Stdout:            &out,
+		APIURL:            srv.URL,
+		HeartbeatInterval: 60.0,
+		AutoListen:        &auto,
+		ClaudeSocketPath:  filepath.Join(t.TempDir(), "claude.sock"),
+		ClaudeSocketToken: "tok",
+		ClaudeCacheDir:    t.TempDir(),
+		ClaudeSendFn:      func(string, string, string) error { return nil },
+	})
+	if err != nil || rc != 0 {
+		t.Fatalf("claude ServeStdio failed: rc=%d err=%v", rc, err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 4 {
+		t.Fatalf("expected 4 responses, got %d", len(lines))
+	}
+	parseText := func(idx int) map[string]any {
+		var r map[string]any
+		_ = json.Unmarshal([]byte(lines[idx]), &r)
+		txt := r["result"].(map[string]any)["content"].([]any)[0].(map[string]any)["text"].(string)
+		var d map[string]any
+		_ = json.Unmarshal([]byte(txt), &d)
+		return d
+	}
+	st0, st1, st2 := parseText(1), parseText(2), parseText(3)
+	if st0["mode"] != "mcp_claude_socket" || st0["enabled"] != true || st1["enabled"] != false || st2["enabled"] != true {
+		t.Fatalf("unexpected claude listen states: %v / %v / %v", st0, st1, st2)
+	}
+
+	// Antigravity fleet_listen reports sidecar status.
+	_, _ = f.Agents.Heartbeat(agents.HeartbeatParams{
+		Device: "mini", Harness: "antigravity", RawID: "agy-sidecar-1", CWD: cwd,
+	})
+	agyReqs := []string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fleet_listen","arguments":{"session_id":"mini:antigravity:agy-sidecar-1"}}}`,
+	}
+	var agyOut bytes.Buffer
+	rc, err = ServeStdio(ServeOpts{
+		Harness: "antigravity",
+		Stdin:   strings.NewReader(strings.Join(agyReqs, "\n") + "\n"),
+		Stdout:  &agyOut,
+		APIURL:  srv.URL,
+	})
+	if err != nil || rc != 0 {
+		t.Fatalf("antigravity ServeStdio failed: rc=%d err=%v", rc, err)
+	}
+	agyLines := strings.Split(strings.TrimSpace(agyOut.String()), "\n")
+	var agyR map[string]any
+	_ = json.Unmarshal([]byte(agyLines[1]), &agyR)
+	agyTxt := agyR["result"].(map[string]any)["content"].([]any)[0].(map[string]any)["text"].(string)
+	var agyData map[string]any
+	_ = json.Unmarshal([]byte(agyTxt), &agyData)
+	if agyData["mode"] != "antigravity_sidecar" || agyData["listening"] != false {
+		t.Fatalf("unexpected antigravity fleet_listen response: %+v", agyData)
+	}
+}
