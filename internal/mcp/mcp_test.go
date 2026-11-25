@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/bdatdo0601/fleet/internal/agents"
 	"github.com/bdatdo0601/fleet/internal/core"
+	"github.com/bdatdo0601/fleet/internal/memory"
 	"github.com/bdatdo0601/fleet/internal/pki"
 	"github.com/bdatdo0601/fleet/internal/server"
 )
@@ -222,5 +224,119 @@ func TestMCPMemoryToolsRoundtrip(t *testing.T) {
 	}
 	if search2 := parseToolJSON(6); len(search2["memories"].([]any)) != 0 {
 		t.Fatalf("expected 0 results after archive, got %+v", search2)
+	}
+}
+
+func TestMCPMemoryToolsResolveSessionRepoFromRootCWD(t *testing.T) {
+	f, srv := setupMCPServer(t)
+
+	repoDir := filepath.Join(t.TempDir(), "wt-alias")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"-C", repoDir, "init"},
+		{"-C", repoDir, "remote", "add", "origin", "git@github.com:example/iron-fillet.git"},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v (%s)", args, err, string(out))
+		}
+	}
+
+	if _, err := f.Agents.Heartbeat(agents.HeartbeatParams{
+		Device:  "mini",
+		Harness: "antigravity",
+		RawID:   "conv-mem-1",
+		CWD:     repoDir,
+		Repo:    "wt-alias",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, item := range []memory.UpsertParams{
+		{Scope: "global", Key: "g-pref", Kind: "preference", Tier: "always", Body: "global pref", Source: "human"},
+		{Scope: "repo:iron-fillet", Key: "r-note", Kind: "project", Tier: "searchable", Body: "iron-fillet note", Source: "fleet"},
+		{Scope: "repo:other", Key: "o-note", Kind: "project", Tier: "searchable", Body: "other repo note", Source: "fleet"},
+	} {
+		if _, err := f.Memory.Upsert(item); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	reqs := []string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fleet_memory_search","arguments":{"session_id":"mini:antigravity:conv-mem-1"}}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fleet_memory_set","arguments":{"key":"new-conv","body":"use moon","session_id":"mini:antigravity:conv-mem-1"}}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"fleet_memory_delete","arguments":{"key":"new-conv","session_id":"mini:antigravity:conv-mem-1"}}}`,
+		`{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"fleet_memory_search","arguments":{"session_id":"mini:antigravity:conv-mem-1"}}}`,
+		`{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"fleet_memory_search","arguments":{}}}`,
+	}
+
+	var out bytes.Buffer
+	rc, err := ServeStdio(ServeOpts{
+		Harness:           "antigravity",
+		Stdin:             strings.NewReader(strings.Join(reqs, "\n") + "\n"),
+		Stdout:            &out,
+		APIURL:            srv.URL,
+		CWD:               "/",
+		HeartbeatInterval: 60.0,
+	})
+	if err != nil || rc != 0 {
+		t.Fatalf("ServeStdio failed: rc=%d err=%v", rc, err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 6 {
+		t.Fatalf("expected 6 responses, got %d (%s)", len(lines), out.String())
+	}
+
+	parseToolJSON := func(idx int) map[string]any {
+		var r map[string]any
+		if err := json.Unmarshal([]byte(lines[idx]), &r); err != nil {
+			t.Fatalf("line %d json: %v", idx, err)
+		}
+		res := r["result"].(map[string]any)
+		if isErr, _ := res["isError"].(bool); isErr {
+			t.Fatalf("line %d returned tool error: %v", idx, res)
+		}
+		txt := res["content"].([]any)[0].(map[string]any)["text"].(string)
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(txt), &payload); err != nil {
+			t.Fatalf("line %d inner json %q: %v", idx, txt, err)
+		}
+		return payload
+	}
+	memoryKeys := func(payload map[string]any) map[string]bool {
+		got := map[string]bool{}
+		for _, raw := range payload["memories"].([]any) {
+			m := raw.(map[string]any)
+			got[m["scope"].(string)+"/"+m["key"].(string)] = true
+		}
+		return got
+	}
+
+	s1 := memoryKeys(parseToolJSON(1))
+	if !s1["global/g-pref"] || !s1["repo:iron-fillet/r-note"] || s1["repo:other/o-note"] {
+		t.Fatalf("unexpected initial search results: %+v", s1)
+	}
+
+	setRes := parseToolJSON(2)
+	setItem := setRes["memory"].(map[string]any)
+	if setRes["action"] != "created" || setItem["scope"] != "repo:iron-fillet" || setItem["key"] != "new-conv" {
+		t.Fatalf("expected repo:iron-fillet/new-conv created, got %+v", setRes)
+	}
+
+	delRes := parseToolJSON(3)
+	if delRes["ok"] != true {
+		t.Fatalf("expected delete ok=true, got %+v", delRes)
+	}
+
+	s2 := memoryKeys(parseToolJSON(4))
+	if s2["repo:iron-fillet/new-conv"] || !s2["repo:iron-fillet/r-note"] {
+		t.Fatalf("expected new-conv deleted after archive, got %+v", s2)
+	}
+
+	s3 := memoryKeys(parseToolJSON(5))
+	if !s3["global/g-pref"] || s3["repo:iron-fillet/r-note"] || s3["repo:other/o-note"] {
+		t.Fatalf("expected global-only fallback without session_id on CWD=/, got %+v", s3)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -13,8 +14,31 @@ import (
 	"github.com/bdatdo0601/fleet/internal/memory"
 )
 
-func defaultRepoScope(cwd string) string {
-	if repo := memory.CanonicalRepo(cwd); repo != "" {
+func resolveRepoSlug(api, cwd, sessionID string) string {
+	if sid := strings.TrimSpace(sessionID); sid != "" {
+		if sess := fetchAgentSession(api, sid); sess != nil {
+			if sess.CWD != "" {
+				if fi, err := os.Stat(sess.CWD); err == nil && fi.IsDir() {
+					if repo := memory.CanonicalRepo(sess.CWD); repo != "" {
+						return repo
+					}
+				}
+			}
+			if repo := memory.NormalizeSlug(sess.Repo, 80); repo != "" {
+				return repo
+			}
+			if sess.CWD != "" {
+				if repo := memory.CanonicalRepo(sess.CWD); repo != "" {
+					return repo
+				}
+			}
+		}
+	}
+	return memory.CanonicalRepo(cwd)
+}
+
+func defaultRepoScope(api, cwd, sessionID string) string {
+	if repo := resolveRepoSlug(api, cwd, sessionID); repo != "" {
 		return "repo:" + repo
 	}
 	return "global"
@@ -36,11 +60,12 @@ func splitScopeKey(scope, key, fallbackScope string) (string, string) {
 
 func callMemorySearch(api, cwd string, rawArgs json.RawMessage) (any, error) {
 	a, err := decodeArgs[struct {
-		Query string `json:"query"`
-		Scope string `json:"scope"`
-		Kind  string `json:"kind"`
-		Tier  string `json:"tier"`
-		Limit *int   `json:"limit"`
+		Query     string `json:"query"`
+		Scope     string `json:"scope"`
+		Kind      string `json:"kind"`
+		Tier      string `json:"tier"`
+		Limit     *int   `json:"limit"`
+		SessionID string `json:"session_id"`
 	}](rawArgs)
 	if err != nil {
 		return nil, err
@@ -52,7 +77,7 @@ func callMemorySearch(api, cwd string, rawArgs json.RawMessage) (any, error) {
 	scopeArg := strings.TrimSpace(a.Scope)
 	switch scopeArg {
 	case "", "current":
-		if repo := memory.CanonicalRepo(cwd); repo != "" {
+		if repo := resolveRepoSlug(api, cwd, a.SessionID); repo != "" {
 			q.Set("scopes", "global,repo:"+repo)
 		} else {
 			q.Set("scope", "global")
@@ -109,7 +134,7 @@ func callMemorySet(api, harness, cwd string, rawArgs json.RawMessage) (any, erro
 	if err != nil {
 		return nil, err
 	}
-	scope, key := splitScopeKey(a.Scope, a.Key, defaultRepoScope(cwd))
+	scope, key := splitScopeKey(a.Scope, a.Key, defaultRepoScope(api, cwd, a.SessionID))
 	body := map[string]any{
 		"scope":   scope,
 		"key":     key,
@@ -135,7 +160,7 @@ func callMemoryDelete(api, harness, cwd string, rawArgs json.RawMessage) (any, e
 	if err != nil {
 		return nil, err
 	}
-	scope, key := splitScopeKey(a.Scope, a.Key, defaultRepoScope(cwd))
+	scope, key := splitScopeKey(a.Scope, a.Key, defaultRepoScope(api, cwd, a.SessionID))
 	q := url.Values{}
 	q.Set("scope", scope)
 	q.Set("key", key)

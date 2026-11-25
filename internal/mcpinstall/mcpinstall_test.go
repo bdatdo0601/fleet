@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestInstallPreservesExistingHandlesEmptyJSONAndUninstalls(t *testing.T) {
@@ -82,5 +83,35 @@ func TestInstallPreservesExistingHandlesEmptyJSONAndUninstalls(t *testing.T) {
 	cxAfterTOML, _ := os.ReadFile(filepath.Join(home, ".codex", "config.toml"))
 	if strings.Contains(string(cxAfterTOML), "[mcp_servers.fleet]") || !strings.Contains(string(cxAfterTOML), `trusted_hash = "sha256:abc"`) {
 		t.Fatalf("unexpected codex config.toml after uninstall:\n%s", string(cxAfterTOML))
+	}
+}
+
+func TestParsePSMCPServers(t *testing.T) {
+	loc := time.FixedZone("EST", -5*3600)
+	binMod := time.Date(2026, 11, 24, 15, 50, 0, 0, loc)
+	psOutput := strings.Join([]string{
+		"58623 Mon Nov 23 15:13:46 2026 /opt/homebrew/Python -m fleetctl mcp serve --harness antigravity",
+		"60001 Tue Nov 24 14:00:00 2026 /opt/homebrew/bin/fleet mcp serve --harness claude",
+		"60002 Tue Nov 24 16:00:00 2026 /opt/homebrew/bin/fleet mcp serve --harness codex",
+		"60003 Tue Nov  3 09:05:00 2026 /usr/local/libexec/fleet/fleet.prev mcp serve --harness=antigravity",
+		"60004 Tue Nov 24 10:00:00 2026 /usr/local/bin/other-tool mcp serve --harness antigravity",
+		"60005 Tue Nov 24 10:00:00 2026 /opt/homebrew/bin/fleet mcp serve --harness claude",
+	}, "\n")
+
+	got := parsePSMCPServers(psOutput, binMod, 60005, loc)
+	if len(got) != 3 {
+		t.Fatalf("expected 3 stale servers, got %d: %+v", len(got), got)
+	}
+	if got[0].Harness != "antigravity" || got[0].PID != 58623 || !got[0].Legacy {
+		t.Fatalf("unexpected entry 0: %+v", got[0])
+	}
+	if got[1].Harness != "antigravity" || got[1].PID != 60003 || got[1].Legacy {
+		t.Fatalf("unexpected entry 1: %+v", got[1])
+	}
+	if got[2].Harness != "claude" || got[2].PID != 60001 || got[2].Legacy {
+		t.Fatalf("unexpected entry 2: %+v", got[2])
+	}
+	if w := FormatStaleWarning(got[0]); !strings.Contains(w, "pid 58623") || !strings.Contains(w, "legacy Python fleetctl") || !strings.Contains(w, "antigravity") {
+		t.Fatalf("unexpected warning string: %q", w)
 	}
 }

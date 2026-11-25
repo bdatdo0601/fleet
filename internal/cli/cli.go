@@ -969,6 +969,12 @@ func harvestSyncedOwnerMemories(cio *IO, stamp string, node client.NodeConfig) {
 	}
 }
 
+func warnStaleMCPServers(cio *IO, prefix, binPath string) {
+	for _, s := range mcpinstall.FindStaleMCPServers(binPath) {
+		cio.printf("%s: %s\n", prefix, mcpinstall.FormatStaleWarning(s))
+	}
+}
+
 func cmdSync(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
 	noUpdate := fs.Bool("no-update", false, "skip binary/git self-update")
@@ -1044,6 +1050,7 @@ func cmdSync(args []string, cio *IO) error {
 		return err
 	}
 	harvestSyncedOwnerMemories(cio, stamp, node)
+	warnStaleMCPServers(cio, stamp+" warning", paths.InstalledBinaryPath())
 	return nil
 }
 
@@ -1079,6 +1086,7 @@ func cmdStatus(args []string, cio *IO) error {
 	} else {
 		cio.printf("lighthouse:  reachable, this device is %s\n", syncRes.IP)
 	}
+	warnStaleMCPServers(cio, "mcp warning", "")
 	return nil
 }
 
@@ -1325,12 +1333,19 @@ func cmdMCP(args []string, cio *IO) error {
 		return nil
 	case "status":
 		st := mcpinstall.Status("")
+		staleByHarness := map[string][]mcpinstall.StaleMCPServer{}
+		for _, s := range mcpinstall.FindStaleMCPServers("") {
+			staleByHarness[s.Harness] = append(staleByHarness[s.Harness], s)
+		}
 		for _, h := range paths.Harnesses {
 			val := "not configured"
 			if st[h] {
 				val = "configured"
 			}
 			cio.printf("%-14s %s\n", h+":", val)
+			for _, s := range staleByHarness[h] {
+				cio.printf("  warning: %s\n", mcpinstall.FormatStaleWarning(s))
+			}
 		}
 		return nil
 	case "serve":

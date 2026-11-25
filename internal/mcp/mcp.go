@@ -145,11 +145,12 @@ var Tools = []ToolDef{
 		InputSchema: toolInputSchema{
 			Type: "object",
 			Properties: map[string]toolSchemaProp{
-				"query": {Type: "string", Description: "Search keywords (empty lists recent active memories)."},
-				"scope": {Type: "string", Description: "Scope filter: 'current' (default: global + current repo), 'global', 'repo:<name>', 'device:<name>', or 'all'."},
-				"kind":  {Type: "string", Enum: memory.ValidKinds, Description: "Optional memory kind filter."},
-				"tier":  {Type: "string", Enum: memory.ValidTiers, Description: "Optional injection tier filter."},
-				"limit": {Type: "integer", Description: "Maximum results to return (default 20, max 100)."},
+				"query":      {Type: "string", Description: "Search keywords (empty lists recent active memories)."},
+				"scope":      {Type: "string", Description: "Scope filter: 'current' (default: global + current repo), 'global', 'repo:<name>', 'device:<name>', or 'all'."},
+				"kind":       {Type: "string", Enum: memory.ValidKinds, Description: "Optional memory kind filter."},
+				"tier":       {Type: "string", Enum: memory.ValidTiers, Description: "Optional injection tier filter."},
+				"limit":      {Type: "integer", Description: "Maximum results to return (default 20, max 100)."},
+				"session_id": {Type: "string", Description: "Caller session_id if explicitly provided (used to resolve current repository scope when the MCP server cwd is not a git repo)."},
 			},
 		},
 	},
@@ -204,6 +205,7 @@ type ServeOpts struct {
 	Stdin             io.Reader
 	Stdout            io.Writer
 	APIURL            string
+	CWD               string
 	HeartbeatInterval float64
 	AutoListen        *bool // nil defaults to true
 	CodexRunQueueFn   waiter.RunQueueFn
@@ -656,7 +658,10 @@ func ServeStdio(opts ServeOpts) (int, error) {
 		stdout = os.Stdout
 	}
 	ppid := os.Getppid()
-	cwd, _ := os.Getwd()
+	cwd := opts.CWD
+	if cwd == "" {
+		cwd, _ = os.Getwd()
+	}
 
 	stopCh := make(chan struct{})
 	hbDone, listener := startBackgroundWorkers(opts, ppid, cwd, stopCh)

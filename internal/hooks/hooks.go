@@ -548,7 +548,7 @@ func sessionStartMessage(harness, sessionID, sessionName string) string {
 		fmt.Sprintf(
 			"Your fleet agent session ID is %s. "+
 				"Pass `%s` as `session_id` when calling `fleet_send_message`, `fleet_check_inbox`, "+
-				"`fleet_ask_agent`, `fleet_set_name`, or `fleet_listen`.",
+				"`fleet_ask_agent`, `fleet_set_name`, `fleet_listen`, or `fleet_memory_*` tools.",
 			idLabel, sessionID,
 		),
 	}
