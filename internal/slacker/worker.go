@@ -34,17 +34,18 @@ type LocalReceipt struct {
 
 // WorkerOpts configures RunWorker.
 type WorkerOpts struct {
-	APIURL        string
-	LocalStateDir string
-	PollTimeout   float64
-	UseTmux       bool
-	Policy        session.Policy
-	Once          bool
-	Stderr        io.Writer
-	Stdout        io.Writer
-	SessionExists func(harness, name string) (bool, string)
-	LaunchFn      func(job Job, useTmux bool, stdout, stderr io.Writer) (string, error)
-	KillFn        func(job Job, stdout, stderr io.Writer) (string, error)
+	APIURL           string
+	LocalStateDir    string
+	PollTimeout      float64
+	UseTmux          bool
+	Policy           session.Policy
+	Once             bool
+	RefreshShellPath bool
+	Stderr           io.Writer
+	Stdout           io.Writer
+	SessionExists    func(harness, name string) (bool, string)
+	LaunchFn         func(job Job, useTmux bool, stdout, stderr io.Writer) (string, error)
+	KillFn           func(job Job, stdout, stderr io.Writer) (string, error)
 }
 
 func expandHomePath(p string) (string, error) {
@@ -228,6 +229,9 @@ func processJob(ctx context.Context, api, localStateDir string, job Job, opts Wo
 		if job.Policy == "" && opts.Policy != "" {
 			job.Policy = string(opts.Policy)
 		}
+		if opts.RefreshShellPath {
+			paths.RefreshProcessPathFromLoginShell(ctx)
+		}
 		backend, err := launchFn(job, opts.UseTmux, opts.Stdout, opts.Stderr)
 		if err != nil {
 			rec.Status = "failed"
@@ -265,6 +269,10 @@ func RunWorker(ctx context.Context, opts WorkerOpts) error {
 		return err
 	}
 	defer func() { _ = os.Remove(lockPath) }()
+
+	if opts.RefreshShellPath {
+		paths.RefreshProcessPathFromLoginShell(ctx)
+	}
 
 	pollTimeout := opts.PollTimeout
 	if pollTimeout <= 0 {

@@ -33,6 +33,7 @@ const (
 	DefaultInstalledBinary = "/usr/local/libexec/fleet/fleet"
 	DefaultBrewSymlink     = "/opt/homebrew/bin/fleet"
 	DefaultLocalSymlink    = "/usr/local/bin/fleet"
+	StandardPathEnv        = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 )
 
 var (

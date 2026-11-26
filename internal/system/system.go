@@ -52,7 +52,7 @@ func ownerIDs(owner string) (*int, *int) {
 const (
 	LaunchDaemonsDir = "/Library/LaunchDaemons"
 	ALF              = "/usr/libexec/ApplicationFirewall/socketfilterfw"
-	StandardPathEnv  = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+	StandardPathEnv  = paths.StandardPathEnv
 )
 
 // IsRoot reports whether the current effective UID is 0.
@@ -236,6 +236,8 @@ type AgentOpts struct {
 	WorkDir   string
 	KeepAlive bool
 	ExtraPath string
+	PathEnv   string
+	Shell     string
 }
 
 type plistSpec struct {
@@ -340,17 +342,18 @@ func BuildAgentPlist(opts AgentOpts) (string, error) {
 	if home == "" {
 		return "", fmt.Errorf("cannot determine user home directory")
 	}
-	pathEnv := filepath.Join(home, ".local", "bin") + ":" + StandardPathEnv
-	if opts.ExtraPath != "" {
-		pathEnv = opts.ExtraPath + ":" + pathEnv
+	pathEnv := paths.MergePathEnv(opts.ExtraPath, opts.PathEnv, filepath.Join(home, ".local", "bin"), StandardPathEnv)
+	env := map[string]string{
+		"HOME": home,
+		"PATH": pathEnv,
+	}
+	if opts.Shell != "" {
+		env["SHELL"] = opts.Shell
 	}
 	return buildPlistXML(plistSpec{
-		Label: opts.Label,
-		Args:  opts.Args,
-		Env: map[string]string{
-			"HOME": home,
-			"PATH": pathEnv,
-		},
+		Label:         opts.Label,
+		Args:          opts.Args,
+		Env:           env,
 		KeepAlive:     opts.KeepAlive,
 		LogPath:       opts.LogPath,
 		WorkDir:       opts.WorkDir,
@@ -586,6 +589,20 @@ func UserAgentLoaded(label string) bool {
 
 // InstallUserAgent writes the per-user LaunchAgent plist and bootstraps it in gui/<uid>.
 func InstallUserAgent(opts AgentOpts) error {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		home = os.Getenv("HOME")
+	}
+	if opts.Shell == "" {
+		opts.Shell = paths.ResolveUserShell(context.Background(), "")
+	}
+	if opts.PathEnv == "" {
+		if probed, pErr := paths.LoginShellPath(context.Background(), opts.Shell, home, ""); pErr == nil && probed != "" {
+			opts.PathEnv = probed
+		} else {
+			opts.PathEnv = os.Getenv("PATH")
+		}
+	}
 	plist, err := BuildAgentPlist(opts)
 	if err != nil {
 		return err

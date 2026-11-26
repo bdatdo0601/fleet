@@ -688,12 +688,13 @@ func cmdSlackerWorker(args []string, cio *IO) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return slacker.RunWorker(ctx, slacker.WorkerOpts{
-		Once:        *once,
-		PollTimeout: *pollTimeout,
-		UseTmux:     *useTmux,
-		Policy:      pol,
-		Stdout:      cio.Stdout,
-		Stderr:      cio.Stderr,
+		Once:             *once,
+		PollTimeout:      *pollTimeout,
+		UseTmux:          *useTmux,
+		Policy:           pol,
+		RefreshShellPath: true,
+		Stdout:           cio.Stdout,
+		Stderr:           cio.Stderr,
 	})
 }
 

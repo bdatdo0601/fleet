@@ -23,6 +23,7 @@ import (
 
 	"github.com/bdatdo0601/fleet/internal/agents"
 	"github.com/bdatdo0601/fleet/internal/client"
+	"github.com/bdatdo0601/fleet/internal/paths"
 	"github.com/bdatdo0601/fleet/internal/registry"
 	"github.com/bdatdo0601/fleet/internal/session"
 )
@@ -1690,5 +1691,85 @@ func TestWorkerProcessesKillAndKillAllJobs(t *testing.T) {
 	gotAll, _ := store.GetJob(jAll.ID)
 	if gotKill.Status != "launched" || gotKill.Backend != "kill" || gotAll.Status != "launched" || gotAll.Backend != "kill-all" {
 		t.Fatalf("unexpected kill job receipts: kill=%+v killAll=%+v", gotKill, gotAll)
+	}
+}
+
+func TestWorkerRefreshShellPathBeforeLaunch(t *testing.T) {
+	home := t.TempDir()
+	customBin := filepath.Join(home, "custom-tools", "bin")
+	if err := os.MkdirAll(customBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("HOME", home)
+	t.Setenv("ZDOTDIR", "")
+	t.Setenv("PATH", paths.StandardPathEnv)
+
+	if _, err := os.Stat("/bin/zsh"); err == nil {
+		t.Setenv("SHELL", "/bin/zsh")
+		if err := os.WriteFile(filepath.Join(home, ".zshrc"), []byte("export PATH=\""+customBin+":$PATH\"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		fakeShell := filepath.Join(home, "fake-shell")
+		script := "#!/bin/sh\nprintf '\\n__FLEET_SHELL_PATH_START__" + customBin + ":/usr/bin__FLEET_SHELL_PATH_END__\\n'\n"
+		if err := os.WriteFile(fakeShell, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("SHELL", fakeShell)
+	}
+
+	store, err := Open(filepath.Join(home, "slacker.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/slacker/worker/poll":
+			j, _ := store.ClaimNextJob("laptop", 90*time.Second)
+			_ = json.NewEncoder(w).Encode(map[string]any{"job": j, "device": "laptop"})
+		case "/v1/slacker/worker/receipt":
+			var rec Receipt
+			_ = json.NewDecoder(r.Body).Decode(&rec)
+			j, _ := store.RecordReceipt("laptop", rec)
+			_ = json.NewEncoder(w).Encode(map[string]any{"job": j})
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	_, _, err = store.EnqueueJob(Job{
+		EventID: "EvRefresh", ChannelID: "C1", MessageTS: "22.1", Reaction: "claude", UserID: "U1",
+		TargetDevice: "laptop", RepoPath: home, Harness: "claude",
+		SessionName: DeterministicSessionName("C1", "22.1"), Prompt: "hello",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var launchedPath string
+	if err := RunWorker(context.Background(), WorkerOpts{
+		APIURL:           srv.URL,
+		LocalStateDir:    filepath.Join(home, "worker-state"),
+		Once:             true,
+		RefreshShellPath: true,
+		SessionExists:    func(string, string) (bool, string) { return false, "" },
+		LaunchFn: func(Job, bool, io.Writer, io.Writer) (string, error) {
+			launchedPath = os.Getenv("PATH")
+			return "tmux", nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	parts := strings.Split(launchedPath, string(os.PathListSeparator))
+	customIdx := slices.Index(parts, customBin)
+	brewIdx := slices.Index(parts, "/opt/homebrew/bin")
+	if customIdx < 0 {
+		t.Fatalf("expected %q in launched PATH %q", customBin, launchedPath)
+	}
+	if brewIdx < 0 || customIdx > brewIdx {
+		t.Fatalf("expected %q (idx %d) ahead of /opt/homebrew/bin (idx %d) in %q", customBin, customIdx, brewIdx, launchedPath)
 	}
 }

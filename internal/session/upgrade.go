@@ -415,6 +415,9 @@ func restoreOneTmuxTarget(spec Spec, self, pathEnv string, t *tmuxUpgradeTarget,
 			"-e", "FLEET_SESSION_NAME=" + t.name,
 			"-e", "FLEET_SESSION_POLICY=" + string(t.policy),
 		}
+		if shellEnv := os.Getenv("SHELL"); shellEnv != "" {
+			respawnArgs = append(respawnArgs, "-e", "SHELL="+shellEnv)
+		}
 		if spec.Name == HarnessAgy {
 			respawnArgs = append(respawnArgs, "-e", "AGY_SESSION_TARGET=tmux", "-e", "AGY_SESSION_NAME="+t.name)
 		}

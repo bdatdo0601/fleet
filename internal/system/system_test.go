@@ -217,3 +217,50 @@ gui/501/io.github.bdatdo0601.fleet.slacker-worker = {
 		t.Fatal("expected parseProcessStartTime(empty) to fail")
 	}
 }
+
+func TestBuildAgentPlistWithPathEnvAndShell(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	withShell, err := BuildAgentPlist(AgentOpts{
+		Label:     paths.SlackerWorkerLabel,
+		Args:      []string{"/usr/local/libexec/fleet/fleet", "slacker", "worker"},
+		LogPath:   "/tmp/slacker-worker.log",
+		WorkDir:   home,
+		KeepAlive: true,
+		ExtraPath: "/extra/bin",
+		PathEnv:   "/proto/shims:/opt/homebrew/bin:/extra/bin:/usr/bin",
+		Shell:     "/bin/zsh",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPath := "/extra/bin:/proto/shims:/opt/homebrew/bin:/usr/bin:" + filepath.Join(home, ".local", "bin") + ":/usr/local/bin:/bin:/usr/sbin:/sbin"
+	if !strings.Contains(withShell, "<string>"+wantPath+"</string>") {
+		t.Fatalf("unexpected PATH in plist:\nwant: %s\ngot:\n%s", wantPath, withShell)
+	}
+	if !strings.Contains(withShell, "<key>SHELL</key>\n\t\t<string>/bin/zsh</string>") {
+		t.Fatalf("expected SHELL=/bin/zsh in plist:\n%s", withShell)
+	}
+	if _, err := exec.LookPath("plutil"); err == nil {
+		pFile := filepath.Join(t.TempDir(), "agent.plist")
+		if err := os.WriteFile(pFile, []byte(withShell), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if out, err := exec.Command("plutil", "-lint", pFile).CombinedOutput(); err != nil {
+			t.Fatalf("plutil -lint failed: %v\n%s", err, string(out))
+		}
+	}
+
+	withoutShell, err := BuildAgentPlist(AgentOpts{
+		Label:   paths.SlackerWorkerLabel,
+		Args:    []string{"/usr/local/libexec/fleet/fleet", "slacker", "worker"},
+		PathEnv: "/proto/shims",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(withoutShell, "<key>SHELL</key>") {
+		t.Fatalf("did not expect SHELL key when Shell is empty:\n%s", withoutShell)
+	}
+}

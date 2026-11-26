@@ -202,8 +202,13 @@ func startRexSession(spec Spec, opts StartOpts, directory, self, pathEnv string,
 	rexArgs := []string{
 		"new", session, "-c", directory, "--window", opts.Name, "--json", "--",
 		"env", "PATH=" + pathEnv, "FLEET_SESSION_POLICY=" + string(pol),
-		self, "session", spec.Name, "__rex-run", opts.Name, "--policy", string(pol),
 	}
+	if shellEnv := os.Getenv("SHELL"); shellEnv != "" {
+		rexArgs = append(rexArgs, "SHELL="+shellEnv)
+	}
+	rexArgs = append(rexArgs,
+		self, "session", spec.Name, "__rex-run", opts.Name, "--policy", string(pol),
+	)
 	if promptFile != "" {
 		rexArgs = append(rexArgs, "--prompt-file", promptFile)
 	}
@@ -272,6 +277,9 @@ func startTmuxSession(spec Spec, opts StartOpts, directory, harnessBin, self, pa
 		"-e", "FLEET_SESSION_TARGET=tmux",
 		"-e", "FLEET_SESSION_NAME=" + opts.Name,
 		"-e", "FLEET_SESSION_POLICY=" + string(pol),
+	}
+	if shellEnv := os.Getenv("SHELL"); shellEnv != "" {
+		tmuxArgs = append(tmuxArgs, "-e", "SHELL="+shellEnv)
 	}
 	if spec.Name == HarnessAgy {
 		tmuxArgs = append(tmuxArgs, "-e", "AGY_SESSION_TARGET=tmux", "-e", "AGY_SESSION_NAME="+opts.Name)
