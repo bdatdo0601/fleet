@@ -12,8 +12,6 @@ import (
 	"time"
 
 	"github.com/bdatdo0601/fleet/internal/agents"
-	"github.com/bdatdo0601/fleet/internal/client"
-	"github.com/bdatdo0601/fleet/internal/usage"
 )
 
 // RelayOpts configures RunAntigravityRelay.
@@ -89,80 +87,15 @@ func RunAntigravityRelay(ctx context.Context, opts RelayOpts) (int, error) {
 	if harness != "antigravity" {
 		return 1, fmt.Errorf("unsupported relay harness %q", harness)
 	}
-	api, err := client.ResolveAPI(opts.APIURL)
-	if err != nil {
-		return 1, err
-	}
-	bin := opts.AgentAPIBin
-	if bin == "" {
-		if opts.RunSendFn != nil {
-			bin = "agentapi"
-		} else {
-			bin = FindAgentAPIBinary()
-		}
-	}
-	if bin == "" {
-		return 1, fmt.Errorf("agentapi binary not found (set ANTIGRAVITY_AGENTAPI_EXE or install Antigravity)")
-	}
-	stderr := opts.Stderr
-	if stderr == nil {
-		stderr = os.Stderr
-	}
-	errorBackoff := opts.ErrorBackoff
-	if errorBackoff <= 0 {
-		errorBackoff = 60 * time.Second
-	}
-	pollTimeout := clampPollTimeout(opts.PollTimeout)
-
-	lockPath, err := acquirePIDLock("relay-"+harness, opts.LockDir)
-	if err != nil {
-		return 1, err
-	}
-	defer releasePIDLock(lockPath)
-
-	if opts.RunSendFn == nil && os.Getenv("FLEET_DISABLE_USAGE_REPORTER") != "1" {
-		usage.StartPeriodicReporter(ctx, 10*time.Minute, api)
-	}
-
-	backedOff := map[string]time.Time{}
-	backoff := 2.0
-	for {
-		if ctx.Err() != nil {
-			return 0, nil
-		}
-		payload := map[string]any{
-			"harness":         harness,
-			"timeout":         pollTimeout,
-			"mark_read":       false,
-			"require_full_id": true,
-		}
-		if excluded := pruneBackedOff(backedOff, time.Now()); len(excluded) > 0 {
-			payload["exclude_ids"] = excluded
-		}
-		var resp agents.HarnessWaitResult
-		if err := client.CallContext(ctx, api, "POST", "/v1/agents/wait-harness", payload, time.Duration((pollTimeout+15.0)*float64(time.Second)), nil, &resp); err != nil {
-			if ctx.Err() != nil {
-				return 0, nil
-			}
-			_, _ = fmt.Fprintf(stderr, "fleet relay wait error: %v\n", err)
-			sleepFor := backoff
-			backoff = nextBackoff(backoff)
-			if !sleepOrCancel(ctx.Done(), sleepFor) {
-				return 0, nil
-			}
-			continue
-		}
-		backoff = 2.0
-		for _, batch := range resp.Batches {
-			if ctx.Err() != nil {
-				return 0, nil
-			}
-			if err := relayDeliverBatch(ctx, api, harness, bin, batch, opts.RunSendFn); err != nil {
-				_, _ = fmt.Fprintf(stderr, "fleet relay delivery failed for %s: %v\n", batch.SessionID, err)
-				backedOff[batch.SessionID] = time.Now().Add(errorBackoff)
-				continue
-			}
-			delete(backedOff, batch.SessionID)
-		}
-	}
+	return RunRelay(ctx, MultiRelayOpts{
+		Harnesses:        []string{harness},
+		APIURL:           opts.APIURL,
+		AgentAPIBin:      opts.AgentAPIBin,
+		PollTimeout:      opts.PollTimeout,
+		LockDir:          opts.LockDir,
+		Stderr:           opts.Stderr,
+		RunSendFn:        opts.RunSendFn,
+		ErrorBackoff:     opts.ErrorBackoff,
+		LivenessInterval: -1,
+	})
 }

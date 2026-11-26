@@ -1540,10 +1540,8 @@ func (s *Store) RenderContext(repo, device string) (ContextResult, error) {
 	saveScope := cmp.Or(repoScope, "global")
 	header := fmt.Sprintf("[Fleet Memory] (scopes: %s)", strings.Join(scopes, ", "))
 	footer := fmt.Sprintf(
-		"Memory tools: `fleet_memory_search` / `fleet_memory_get` for deeper repo/fleet notes; "+
-			"`fleet_memory_set` to save standing user preferences (`scope=\"global\"`, `tier=\"always\"`) "+
-			"or durable repo conventions (`scope=%q`, default). "+
-			"Never save ephemeral task state or code facts derivable from git; update existing keys instead of duplicating.",
+		"Fleet memory (`fleet-memory` skill): `fleet memory search|get|set|rm` — save standing preferences (`global`, `--tier always`) "+
+			"or durable repo notes (%q, `--source fleet`). Never save ephemeral task state or code facts derivable from git; update existing keys.",
 		saveScope,
 	)
 
@@ -1582,7 +1580,7 @@ func (s *Store) RenderContext(repo, device string) (ContextResult, error) {
 		}
 	}
 	if truncated {
-		body.WriteString("\n... (truncated; use `fleet_memory_search`)")
+		body.WriteString("\n... (truncated; use `fleet memory search`)")
 	}
 	body.WriteString("\n")
 	body.WriteString(footer)

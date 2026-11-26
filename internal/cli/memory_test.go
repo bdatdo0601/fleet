@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bdatdo0601/fleet/internal/agents"
 	"github.com/bdatdo0601/fleet/internal/memory"
 )
 
@@ -160,6 +161,41 @@ Plan fewest PRs possible.
 	}
 	if props, pErr := f.Memory.ListProposals("pending", 10); pErr != nil || len(props) != 0 {
 		t.Fatalf("expected 0 pending proposals after approve, got %+v err=%v", props, pErr)
+	}
+}
+
+func TestCLIMemoryJSONScopeCurrentAndFleetSource(t *testing.T) {
+	f, _, tmp := setupCLIServer(t)
+	repoDir := filepath.Join(tmp, "fleet-app")
+	_ = os.MkdirAll(repoDir, 0o755)
+	_, _ = f.Agents.Heartbeat(agents.HeartbeatParams{Device: "mini", Harness: "claude", RawID: "mem-cli-1", CWD: repoDir})
+
+	runCLI := func(args ...string) (int, string, string) {
+		var out, errBuf bytes.Buffer
+		rc := Run(args, &IO{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errBuf})
+		return rc, out.String(), errBuf.String()
+	}
+
+	// `set` with --source fleet --session resolves repo scope automatically and returns JSON.
+	rc, out, errOut := runCLI("memory", "set", "lint-cmd", "Run make check.", "--source", "fleet", "--session", "mini:claude:mem-cli-1", "--json")
+	if rc != 0 || !strings.Contains(out, `"scope": "repo:fleet-app"`) {
+		t.Fatalf("memory set --json failed: rc=%d out=%q err=%q", rc, out, errOut)
+	}
+	rc, out, errOut = runCLI("memory", "search", "make check", "--scope", "current", "--session", "mini:claude:mem-cli-1", "--json")
+	if rc != 0 || !strings.Contains(out, `"key": "lint-cmd"`) {
+		t.Fatalf("memory search --scope current --json failed: rc=%d out=%q err=%q", rc, out, errOut)
+	}
+	rc, out, errOut = runCLI("memory", "ls", "--scope", "current", "--session", "mini:claude:mem-cli-1", "--json")
+	if rc != 0 || !strings.Contains(out, `"key": "lint-cmd"`) {
+		t.Fatalf("memory ls --scope current --json failed: rc=%d out=%q err=%q", rc, out, errOut)
+	}
+	rc, out, errOut = runCLI("memory", "get", "repo:fleet-app/lint-cmd", "--json")
+	if rc != 0 || !strings.Contains(out, `"body": "Run make check."`) {
+		t.Fatalf("memory get --json failed: rc=%d out=%q err=%q", rc, out, errOut)
+	}
+	rc, out, errOut = runCLI("memory", "rm", "lint-cmd", "--session", "mini:claude:mem-cli-1", "--json")
+	if rc != 0 || !strings.Contains(out, `"removed": true`) {
+		t.Fatalf("memory rm --json failed: rc=%d out=%q err=%q", rc, out, errOut)
 	}
 }
 

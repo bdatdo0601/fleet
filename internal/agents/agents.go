@@ -284,6 +284,7 @@ type HarnessWaitParams struct {
 type SessionMessages struct {
 	SessionID string    `json:"session_id"`
 	FullRawID string    `json:"full_raw_id"`
+	PID       *int      `json:"pid,omitempty"`
 	Name      string    `json:"name"`
 	Title     string    `json:"title"`
 	Messages  []Message `json:"messages"`
@@ -2166,7 +2167,7 @@ func (h *Hub) collectHarnessBatchesLocked(p HarnessWaitParams, excluded map[stri
 		}
 		if len(msgs) > 0 {
 			batches = append(batches, SessionMessages{
-				SessionID: r.sessionID, FullRawID: r.fullRawID, Name: r.name, Title: r.title, Messages: msgs,
+				SessionID: r.sessionID, FullRawID: r.fullRawID, PID: r.pid, Name: r.name, Title: r.title, Messages: msgs,
 			})
 		}
 	}

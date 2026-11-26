@@ -470,6 +470,7 @@ type spawnRequest struct {
 	Devices  []string `json:"devices"`
 	Strategy string   `json:"strategy"`
 	Policy   string   `json:"policy"`
+	Model    string   `json:"model"`
 	RepoPath string   `json:"repo_path"`
 	Prompt   string   `json:"prompt"`
 	UseTmux  bool     `json:"use_tmux"`
@@ -481,14 +482,46 @@ func randomHex(nBytes int) string {
 	return hex.EncodeToString(b)
 }
 
-func registerAgentSpawnRoute(
-	mux *http.ServeMux,
-	fleet *core.Fleet,
-	route func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc,
-) {
-	var spawnMu sync.Mutex
+func resolveSpawnDevices(fleet *core.Fleet, caller *registry.Device, req spawnRequest, cfg slacker.Config) ([]string, error) {
+	var rawDevs []string
+	if len(req.Devices) > 0 {
+		rawDevs = req.Devices
+	} else if strings.TrimSpace(req.Device) != "" {
+		rawDevs = []string{req.Device}
+	}
+	seen := make(map[string]bool, len(rawDevs))
+	var devs []string
+	for _, d := range rawDevs {
+		d = strings.TrimSpace(d)
+		if d == "" || seen[d] {
+			continue
+		}
+		seen[d] = true
+		devs = append(devs, d)
+	}
+	if len(devs) > 0 {
+		activeDevs, aErr := fleet.ActiveDeviceNames()
+		if aErr != nil {
+			return nil, aErr
+		}
+		for _, d := range devs {
+			if !activeDevs[d] {
+				return nil, &core.FleetError{Msg: fmt.Sprintf("unknown or revoked device %q", d), Status: http.StatusBadRequest}
+			}
+			if !core.IsAdmin(caller) && caller != nil && d != caller.Name {
+				return nil, &core.FleetError{Msg: fmt.Sprintf("%s cannot spawn agents on %s", caller.Name, d), Status: http.StatusForbidden}
+			}
+		}
+		return devs, nil
+	}
+	if (!core.IsAdmin(caller) || len(cfg.DefaultDevices) == 0) && caller != nil && caller.Name != "" {
+		return []string{caller.Name}, nil
+	}
+	return nil, nil
+}
 
-	mux.HandleFunc("POST /v1/agents/spawn", route(true, func(w http.ResponseWriter, r *http.Request, caller *registry.Device) error {
+func handleAgentSpawn(fleet *core.Fleet, spawnMu *sync.Mutex) func(http.ResponseWriter, *http.Request, *registry.Device) error {
+	return func(w http.ResponseWriter, r *http.Request, caller *registry.Device) error {
 		var req spawnRequest
 		if err := readJSONBody(r, &req); err != nil {
 			return err
@@ -513,36 +546,11 @@ func registerAgentSpawnRoute(
 		if err != nil {
 			return err
 		}
-
-		var rawDevs []string
-		if len(req.Devices) > 0 {
-			rawDevs = req.Devices
-		} else if strings.TrimSpace(req.Device) != "" {
-			rawDevs = []string{req.Device}
-		}
-		seen := make(map[string]bool, len(rawDevs))
-		var devs []string
-		for _, d := range rawDevs {
-			d = strings.TrimSpace(d)
-			if d == "" || seen[d] {
-				continue
-			}
-			seen[d] = true
-			devs = append(devs, d)
-		}
-		if len(devs) > 0 {
-			activeDevs, aErr := fleet.ActiveDeviceNames()
-			if aErr != nil {
-				return aErr
-			}
-			for _, d := range devs {
-				if !activeDevs[d] {
-					return &core.FleetError{Msg: fmt.Sprintf("unknown or revoked device %q", d), Status: http.StatusBadRequest}
-				}
-			}
-		}
-
 		cfg, err := slacker.LoadConfig(fleet.SlackerConfigPath)
+		if err != nil {
+			return err
+		}
+		devs, err := resolveSpawnDevices(fleet, caller, req, cfg)
 		if err != nil {
 			return err
 		}
@@ -559,7 +567,6 @@ func registerAgentSpawnRoute(
 			RepoPath:  strings.TrimSpace(req.RepoPath),
 			UseTmux:   req.UseTmux,
 		}
-
 		loadFn := func(context.Context) (map[string]int, error) {
 			counts := map[string]int{}
 			if fleet.Agents != nil {
@@ -592,15 +599,14 @@ func registerAgentSpawnRoute(
 		inserted, job, err := fleet.Slacker.EnqueueJob(slacker.Job{
 			Account:      "ui",
 			EventID:      "ui-" + randomHex(8),
-			ChannelID:    "",
 			ChannelName:  "web-ui",
-			MessageTS:    "",
 			Reaction:     "spawn",
 			UserID:       callerName,
 			TargetDevice: targetDevice,
 			RepoPath:     resolvedRepo,
 			UseTmux:      req.UseTmux,
 			Policy:       cfg.EffectiveChannelPolicy(ch),
+			Model:        strings.TrimSpace(req.Model),
 			Harness:      harness,
 			SessionName:  sessName,
 			Prompt:       strings.TrimSpace(req.Prompt),
@@ -616,7 +622,16 @@ func registerAgentSpawnRoute(
 			"worker_online": workerOnline,
 		})
 		return nil
-	}))
+	}
+}
+
+func registerAgentSpawnRoute(
+	mux *http.ServeMux,
+	fleet *core.Fleet,
+	route func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc,
+) {
+	var spawnMu sync.Mutex
+	mux.HandleFunc("POST /v1/agents/spawn", route(false, handleAgentSpawn(fleet, &spawnMu)))
 
 	mux.HandleFunc("POST /v1/agents/kill", route(false, func(w http.ResponseWriter, r *http.Request, caller *registry.Device) error {
 		var req struct {

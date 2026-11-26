@@ -525,7 +525,7 @@ func FormatUnread(sessionID string, messages []agents.Message, sessionName, rear
 	}
 	lines := []string{
 		fmt.Sprintf("[Fleet Peer Messages for %s]", label),
-		"Reply using `fleet_send_message` (include `reply_to` / `thread_id` and `session_id` below):",
+		fmt.Sprintf("Reply with `fleet agents send <to> --session %s --reply-to <id> --thread <thread> --message ...` (see `fleet-agents` skill):", sessionID),
 	}
 	for _, m := range messages {
 		sender := m.FromSession
@@ -545,32 +545,19 @@ func sessionStartMessage(harness, sessionID, sessionName string) string {
 	if sessionName != "" {
 		idLabel = fmt.Sprintf("`%s` (name `%s`)", sessionID, sessionName)
 	}
-	lines := []string{
-		fmt.Sprintf(
-			"Your fleet agent session ID is %s. "+
-				"Pass `%s` as `session_id` when calling `fleet_send_message`, `fleet_check_inbox`, "+
-				"`fleet_ask_agent`, `fleet_set_name`, `fleet_listen`, or `fleet_memory_*` tools.",
-			idLabel, sessionID,
-		),
-	}
+	var relayNote string
 	switch harness {
 	case "antigravity":
-		lines = append(lines,
-			"The Antigravity `fleet` sidecar automatically delivers incoming peer messages to this session via `agentapi` "+
-				"(no background wait command needed; use `fleet_listen` to check delivery status).",
-		)
+		relayNote = "Antigravity's `fleet` sidecar delivers incoming peer messages automatically via `agentapi`."
 	case "claude":
-		lines = append(lines,
-			"The fleet MCP server automatically listens in the background and delivers incoming peer messages to this "+
-				"session via Claude's local messaging socket (use `fleet_listen` to check status or pause/resume).",
-		)
+		relayNote = "Fleet's local agent relay delivers incoming peer messages automatically via Claude's local messaging socket."
 	case "codex":
-		lines = append(lines,
-			"The fleet MCP server automatically listens in the background and delivers incoming peer "+
-				"messages to this session via `codex queue` (use `fleet_listen` to check status or pause/resume).",
-		)
+		relayNote = "Fleet's local agent relay delivers incoming peer messages automatically via `codex queue`."
 	}
-	return strings.Join(lines, "\n")
+	return fmt.Sprintf(
+		"Fleet session: %s. %s Use the `fleet-agents`, `fleet-memory`, or `fleet-slack` skills (pass `--session %s` to `fleet` CLI).",
+		idLabel, relayNote, sessionID,
+	)
 }
 
 func strVal(v any) string {

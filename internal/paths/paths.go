@@ -27,6 +27,7 @@ const (
 	DDNSLabel          = LabelPrefix + ".ddns"
 	SlackerLabel       = LabelPrefix + ".slacker"
 	SlackerWorkerLabel = LabelPrefix + ".slacker-worker"
+	AgentRelayLabel    = LabelPrefix + ".agent-relay"
 
 	SyncIntervalSeconds = 300
 
@@ -199,4 +200,9 @@ func SessionStateDir(harness string) string {
 // SlackerLocalStateDir returns the local worker state directory under LocalStateRoot.
 func SlackerLocalStateDir() string {
 	return filepath.Join(LocalStateRoot(), "fleet-slacker")
+}
+
+// AgentRelayStateDir returns the local agent relay state directory under LocalStateRoot.
+func AgentRelayStateDir() string {
+	return filepath.Join(LocalStateRoot(), "fleet-relay")
 }

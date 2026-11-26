@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bdatdo0601/fleet/internal/agents"
 	"github.com/bdatdo0601/fleet/internal/client"
 	"github.com/bdatdo0601/fleet/internal/memory"
 )
@@ -23,12 +24,12 @@ func memoryUsageText() string {
 	return `usage: fleet memory <subcommand> [options]
 
 Subcommands:
-  ls        [--scope S] [--kind K] [--tier T] [--all] [--limit N]
-  search    QUERY [--scope S] [--kind K] [--tier T] [--limit N]
-  get       TARGET [--scope S] [--history]
-  set       TARGET [BODY] [--scope S] [--kind K] [--tier T] [--summary S] [--lock] [--file PATH] [--stdin]
+  ls        [--scope S] [--kind K] [--tier T] [--session SID] [--all] [--limit N] [--json]
+  search    QUERY [--scope S] [--kind K] [--tier T] [--session SID] [--limit N] [--json]
+  get       TARGET [--scope S] [--history] [--json]
+  set       TARGET [BODY] [--scope S] [--kind K] [--tier T] [--summary S] [--source human|fleet] [--harness H] [--session SID] [--lock] [--file PATH] [--stdin] [--json]
   edit      TARGET [--scope S] [--kind K] [--tier T] [--summary S] [--lock]
-  rm        TARGET [--scope S] [--hard]
+  rm        TARGET [--scope S] [--session SID] [--hard] [--json]
   promote   TARGET [--to SCOPE[/KEY]] [--tier T] [--summary S] [--lock]
   history   [TARGET] [--scope S] [--limit N]
   revert    TARGET --rev N [--scope S]
@@ -39,6 +40,42 @@ Subcommands:
   reject    [--all | ID ...]
   curator   setup|status|run|disable
 `
+}
+
+func resolveMemoryRepoSlug(api, sessionID string) string {
+	if sid := strings.TrimSpace(sessionID); sid != "" && api != "" {
+		var resp struct {
+			Agent agents.SessionDetail `json:"agent"`
+		}
+		if err := client.Call(api, http.MethodGet, "/v1/agents/"+url.PathEscape(sid), nil, 10*time.Second, nil, &resp); err == nil {
+			if resp.Agent.CWD != "" {
+				if fi, err := os.Stat(resp.Agent.CWD); err == nil && fi.IsDir() {
+					if repo := memory.CanonicalRepo(resp.Agent.CWD); repo != "" {
+						return repo
+					}
+				}
+			}
+			if repo := memory.NormalizeSlug(resp.Agent.Repo, 80); repo != "" {
+				return repo
+			}
+			if resp.Agent.CWD != "" {
+				if repo := memory.CanonicalRepo(resp.Agent.CWD); repo != "" {
+					return repo
+				}
+			}
+		}
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		return memory.CanonicalRepo(cwd)
+	}
+	return ""
+}
+
+func defaultMemoryRepoScope(api, sessionID string) string {
+	if repo := resolveMemoryRepoSlug(api, sessionID); repo != "" {
+		return "repo:" + repo
+	}
+	return "global"
 }
 
 func parseMemoryTarget(target, explicitScope string) (string, string, error) {
@@ -72,39 +109,43 @@ func printMemoriesTable(cio *IO, items []memory.Item) {
 
 func cmdMemoryLS(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("memory ls", flag.ContinueOnError)
-	scope := fs.String("scope", "", "scope filter (global, repo:<name>, device:<name>)")
+	scope := fs.String("scope", "", "scope filter (current, global, repo:<name>, device:<name>, all)")
 	kind := fs.String("kind", "", "kind filter")
 	tier := fs.String("tier", "", "tier filter")
+	sessionFlag := fs.String("session", "", "caller session_id (for --scope current)")
 	all := fs.Bool("all", false, "include archived and superseded entries")
 	limit := fs.Int("limit", 30, "max entries")
+	jsonOut := fs.Bool("json", false, "output JSON")
 	pos, err := parseFlagsInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) > 0 {
-		return fmt.Errorf("usage: fleet memory ls [--scope S] [--kind K] [--tier T] [--all] [--limit N]")
+		return fmt.Errorf("usage: fleet memory ls [--scope S] [--kind K] [--tier T] [--session SID] [--all] [--limit N] [--json]")
 	}
-	return fetchAndPrintMemories(cio, "", *scope, *kind, *tier, *all, *limit)
+	return fetchAndPrintMemories(cio, "", *scope, *kind, *tier, *sessionFlag, *all, *limit, *jsonOut)
 }
 
 func cmdMemorySearch(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("memory search", flag.ContinueOnError)
-	scope := fs.String("scope", "", "scope filter")
+	scope := fs.String("scope", "", "scope filter (current, global, repo:<name>, device:<name>, all)")
 	kind := fs.String("kind", "", "kind filter")
 	tier := fs.String("tier", "", "tier filter")
+	sessionFlag := fs.String("session", "", "caller session_id (for --scope current)")
 	all := fs.Bool("all", false, "include archived entries")
 	limit := fs.Int("limit", 20, "max entries")
+	jsonOut := fs.Bool("json", false, "output JSON")
 	pos, err := parseFlagsInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) == 0 {
-		return fmt.Errorf("usage: fleet memory search QUERY [--scope S] [--kind K] [--tier T] [--limit N]")
+		return fmt.Errorf("usage: fleet memory search QUERY [--scope S] [--kind K] [--tier T] [--session SID] [--limit N] [--json]")
 	}
-	return fetchAndPrintMemories(cio, strings.Join(pos, " "), *scope, *kind, *tier, *all, *limit)
+	return fetchAndPrintMemories(cio, strings.Join(pos, " "), *scope, *kind, *tier, *sessionFlag, *all, *limit, *jsonOut)
 }
 
-func fetchAndPrintMemories(cio *IO, query, scope, kind, tier string, includeAll bool, limit int) error {
+func fetchAndPrintMemories(cio *IO, query, scope, kind, tier, sessionID string, includeAll bool, limit int, jsonOut bool) error {
 	api, err := client.ResolveAPI("")
 	if err != nil {
 		return err
@@ -113,8 +154,17 @@ func fetchAndPrintMemories(cio *IO, query, scope, kind, tier string, includeAll 
 	if query != "" {
 		q.Set("q", query)
 	}
-	if scope != "" {
-		q.Set("scope", scope)
+	switch strings.TrimSpace(scope) {
+	case "":
+	case "current":
+		if repo := resolveMemoryRepoSlug(api, sessionID); repo != "" {
+			q.Set("scopes", "global,repo:"+repo)
+		} else {
+			q.Set("scope", "global")
+		}
+	case "all":
+	default:
+		q.Set("scope", strings.TrimSpace(scope))
 	}
 	if kind != "" {
 		q.Set("kind", kind)
@@ -138,6 +188,9 @@ func fetchAndPrintMemories(cio *IO, query, scope, kind, tier string, includeAll 
 	if err := client.Call(api, http.MethodGet, "/v1/memory"+qs, nil, 15*time.Second, nil, &resp); err != nil {
 		return err
 	}
+	if jsonOut {
+		return writeJSONOut(cio.Stdout, resp)
+	}
 	printMemoriesTable(cio, resp.Memories)
 	return nil
 }
@@ -146,12 +199,13 @@ func cmdMemoryGet(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("memory get", flag.ContinueOnError)
 	scopeFlag := fs.String("scope", "", "memory scope")
 	histFlag := fs.Bool("history", false, "show revision history")
+	jsonOut := fs.Bool("json", false, "output JSON")
 	pos, err := parseFlagsInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) != 1 {
-		return fmt.Errorf("usage: fleet memory get TARGET [--scope S] [--history]")
+		return fmt.Errorf("usage: fleet memory get TARGET [--scope S] [--history] [--json]")
 	}
 	scope, key, err := parseMemoryTarget(pos[0], *scopeFlag)
 	if err != nil {
@@ -168,6 +222,9 @@ func cmdMemoryGet(args []string, cio *IO) error {
 	var detail memory.ItemDetail
 	if err := client.Call(api, http.MethodGet, "/v1/memory/item?"+q.Encode(), nil, 15*time.Second, nil, &detail); err != nil {
 		return err
+	}
+	if *jsonOut {
+		return writeJSONOut(cio.Stdout, detail)
 	}
 	it := detail.Item
 	cio.printf("scope:    %s\nkey:      %s\nkind:     %s\ntier:     %s\nstatus:   %s\nsource:   %s (rev %d, locked=%v)\nupdated:  %s (%s)\nsummary:  %s\n\n%s\n",
@@ -224,23 +281,23 @@ func isTerminalFile(f *os.File) bool {
 
 func cmdMemorySet(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("memory set", flag.ContinueOnError)
-	scopeFlag := fs.String("scope", "", "target scope (default global)")
+	scopeFlag := fs.String("scope", "", "target scope (default global, or current repo with --session/--source fleet)")
 	kind := fs.String("kind", "preference", "kind (preference|feedback|project|reference)")
 	tier := fs.String("tier", "", "tier (always|searchable)")
 	summary := fs.String("summary", "", "concise 1-line summary")
+	sourceFlag := fs.String("source", "human", "memory source (human|fleet)")
+	harnessFlag := fs.String("harness", "", "optional harness name")
+	sessionFlag := fs.String("session", "", "caller session_id (resolves default repo scope)")
 	lock := fs.Bool("lock", false, "lock against automated edits")
 	filePath := fs.String("file", "", "read body from file")
 	fromStdin := fs.Bool("stdin", false, "read body from stdin")
+	jsonOut := fs.Bool("json", false, "output JSON")
 	pos, err := parseFlagsInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) == 0 {
-		return fmt.Errorf("usage: fleet memory set TARGET [BODY] [--scope S] [--kind K] [--tier T] [--summary S] [--lock] [--file PATH] [--stdin]")
-	}
-	scope, key, err := parseMemoryTarget(pos[0], *scopeFlag)
-	if err != nil {
-		return err
+		return fmt.Errorf("usage: fleet memory set TARGET [BODY] [--scope S] [--kind K] [--tier T] [--summary S] [--source human|fleet] [--session SID] [--lock] [--file PATH] [--stdin] [--json]")
 	}
 	body, err := readBodyInput(pos[1:], *filePath, *fromStdin, cio)
 	if err != nil {
@@ -250,6 +307,18 @@ func cmdMemorySet(args []string, cio *IO) error {
 	if err != nil {
 		return err
 	}
+	scope, key, err := parseMemoryTarget(pos[0], *scopeFlag)
+	if err != nil {
+		return err
+	}
+	if *scopeFlag == "" && !strings.Contains(pos[0], "/") && (*sessionFlag != "" || *sourceFlag == "fleet") {
+		scope = defaultMemoryRepoScope(api, *sessionFlag)
+	}
+	source := cmp.Or(strings.TrimSpace(*sourceFlag), "human")
+	reason := "cli_set"
+	if source == "fleet" {
+		reason = "agent_set"
+	}
 	payload := map[string]any{
 		"scope":          scope,
 		"key":            key,
@@ -257,9 +326,15 @@ func cmdMemorySet(args []string, cio *IO) error {
 		"tier":           *tier,
 		"summary":        *summary,
 		"body":           body,
-		"source":         "human",
-		"reason":         "cli_set",
-		"enqueue_curate": false,
+		"source":         source,
+		"reason":         reason,
+		"enqueue_curate": source == "fleet",
+	}
+	if *harnessFlag != "" {
+		payload["harness"] = *harnessFlag
+	}
+	if *sessionFlag != "" {
+		payload["session_id"] = *sessionFlag
 	}
 	if *lock {
 		payload["locked"] = true
@@ -267,6 +342,9 @@ func cmdMemorySet(args []string, cio *IO) error {
 	var res memory.UpsertResult
 	if err := client.Call(api, http.MethodPost, "/v1/memory", payload, 15*time.Second, nil, &res); err != nil {
 		return err
+	}
+	if *jsonOut {
+		return writeJSONOut(cio.Stdout, res)
 	}
 	cio.printf("%s %s/%s (tier=%s rev=%d)\n", res.Action, res.Item.Scope, res.Item.Key, res.Item.Tier, res.Item.Revision)
 	return nil
@@ -354,28 +432,39 @@ func cmdMemoryEdit(args []string, cio *IO) error {
 func cmdMemoryRM(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("memory rm", flag.ContinueOnError)
 	scopeFlag := fs.String("scope", "", "memory scope")
+	sessionFlag := fs.String("session", "", "caller session_id (resolves default repo scope)")
 	hard := fs.Bool("hard", false, "permanently delete row (keeps audit revisions)")
+	jsonOut := fs.Bool("json", false, "output JSON")
 	pos, err := parseFlagsInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) != 1 {
-		return fmt.Errorf("usage: fleet memory rm TARGET [--scope S] [--hard]")
-	}
-	scope, key, err := parseMemoryTarget(pos[0], *scopeFlag)
-	if err != nil {
-		return err
+		return fmt.Errorf("usage: fleet memory rm TARGET [--scope S] [--session SID] [--hard] [--json]")
 	}
 	api, err := client.ResolveAPI("")
 	if err != nil {
 		return err
 	}
+	scope, key, err := parseMemoryTarget(pos[0], *scopeFlag)
+	if err != nil {
+		return err
+	}
+	if *scopeFlag == "" && !strings.Contains(pos[0], "/") && *sessionFlag != "" {
+		scope = defaultMemoryRepoScope(api, *sessionFlag)
+	}
 	q := url.Values{"scope": {scope}, "key": {key}}
 	if *hard {
 		q.Set("hard", "true")
 	}
+	if *sessionFlag != "" {
+		q.Set("session_id", *sessionFlag)
+	}
 	if err := client.Call(api, http.MethodDelete, "/v1/memory/item?"+q.Encode(), nil, 15*time.Second, nil, nil); err != nil {
 		return err
+	}
+	if *jsonOut {
+		return writeJSONOut(cio.Stdout, map[string]any{"removed": true, "scope": scope, "key": key})
 	}
 	cio.printf("removed %s/%s\n", scope, key)
 	return nil

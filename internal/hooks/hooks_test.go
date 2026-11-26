@@ -264,8 +264,8 @@ func TestSessionStartMemoryInjectionAndOfflineCache(t *testing.T) {
 		if !strings.Contains(out.String(), "[Fleet Memory]") || !strings.Contains(out.String(), "prefer-few-prs") {
 			t.Fatalf("%s expected memory in SessionStart output, got %s", tc.harness, out.String())
 		}
-		if !strings.Contains(out.String(), "fleet_memory_*") {
-			t.Fatalf("%s expected fleet_memory_* session_id hint in SessionStart output, got %s", tc.harness, out.String())
+		if !strings.Contains(out.String(), "fleet-memory") || !strings.Contains(out.String(), "--session") {
+			t.Fatalf("%s expected fleet-memory skill and --session hint in SessionStart output, got %s", tc.harness, out.String())
 		}
 	}
 

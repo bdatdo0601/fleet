@@ -1,4 +1,4 @@
-// Package mcpinstall manages idempotent MCP server and lifecycle hook configs for claude, codex, and antigravity.
+// Package mcpinstall manages idempotent skill, lifecycle hook, and sidecar configs for claude, codex, and antigravity.
 package mcpinstall
 
 import (
@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/bdatdo0601/fleet/internal/paths"
+	"github.com/bdatdo0601/fleet/internal/skills"
 )
 
 const (
@@ -280,7 +281,7 @@ func ensureCodexFeaturesHook(lines []string) []string {
 	return slices.Insert(lines, featIdx+1, "hooks = true")
 }
 
-func updateCodexTOML(raw, cmdBin string, remove bool) string {
+func updateCodexTOML(raw string, remove bool) string {
 	var lines []string
 	if raw != "" {
 		clean := strings.TrimSuffix(strings.ReplaceAll(raw, "\r\n", "\n"), "\n")
@@ -300,16 +301,71 @@ func updateCodexTOML(raw, cmdBin string, remove bool) string {
 	}
 
 	cleaned = ensureCodexFeaturesHook(cleaned)
-	if len(cleaned) > 0 && strings.TrimSpace(cleaned[len(cleaned)-1]) != "" {
-		cleaned = append(cleaned, "")
+	for len(cleaned) > 0 && strings.TrimSpace(cleaned[len(cleaned)-1]) == "" {
+		cleaned = cleaned[:len(cleaned)-1]
 	}
-	cmdQuoted, _ := json.Marshal(cmdBin)
-	cleaned = append(cleaned,
-		"[mcp_servers.fleet]",
-		fmt.Sprintf("command = %s", string(cmdQuoted)),
-		`args = ["mcp", "serve", "--harness", "codex"]`,
-	)
+	if len(cleaned) == 0 {
+		return ""
+	}
 	return strings.Join(cleaned, "\n") + "\n"
+}
+
+func skillDirsForHarnesses(home string, harnesses []string) []string {
+	var dirs []string
+	if slices.Contains(harnesses, "claude") {
+		dirs = append(dirs, filepath.Join(home, ".claude", "skills"))
+	}
+	if slices.Contains(harnesses, "codex") {
+		dirs = append(dirs, filepath.Join(home, ".codex", "skills"))
+	}
+	if slices.Contains(harnesses, "antigravity") {
+		dirs = append(dirs, filepath.Join(home, ".gemini", "config", "skills"))
+	}
+	return dirs
+}
+
+func installSkills(dirs []string, uid, gid *int) ([]string, error) {
+	all := skills.All()
+	var changed []string
+	for _, base := range dirs {
+		for _, sk := range all {
+			p := filepath.Join(base, sk.Name, "SKILL.md")
+			wrote, err := paths.WriteFileAtomic(p, sk.Content, 0o644, uid, gid)
+			if err != nil {
+				return nil, err
+			}
+			if wrote {
+				changed = append(changed, p)
+			}
+		}
+	}
+	return changed, nil
+}
+
+func removeSkills(dirs []string) []string {
+	var removed []string
+	for _, base := range dirs {
+		for _, name := range skills.Names {
+			dir := filepath.Join(base, name)
+			if pathExists(dir) && os.RemoveAll(dir) == nil {
+				removed = append(removed, dir)
+			}
+		}
+	}
+	return removed
+}
+
+func hasAllSkills(skillsDir string) bool {
+	for _, name := range skills.Names {
+		if !pathExists(filepath.Join(skillsDir, name, "SKILL.md")) {
+			return false
+		}
+	}
+	return true
+}
+
+func codexHooksEnabled(raw string) bool {
+	return tomlHooksRE.MatchString(raw) || strings.Contains(raw, "hooks = true")
 }
 
 type jsonEditSpec struct {
@@ -332,7 +388,8 @@ func applyEdits(home string, uid, gid *int, create bool, specs []jsonEditSpec) (
 	return changed, nil
 }
 
-// Install idempotently writes MCP and lifecycle hook configs for detected harnesses.
+// Install idempotently writes Fleet skill, lifecycle hook, and sidecar configs for detected harnesses,
+// and removes legacy global `fleet` MCP server entries to avoid context bloat.
 func Install(opts InstallOpts) ([]string, error) {
 	targetHome := opts.Home
 	if targetHome == "" {
@@ -346,45 +403,38 @@ func Install(opts InstallOpts) ([]string, error) {
 		cmdBin = paths.LauncherPath()
 	}
 	harnesses := DetectHarnesses(targetHome, opts.ForceAll)
-	var specs []jsonEditSpec
+	var createSpecs, cleanupSpecs []jsonEditSpec
 
 	if slices.Contains(harnesses, "claude") {
-		specs = append(specs,
-			jsonEditSpec{".claude.json", func(d map[string]any) bool {
-				srv := subMap(d, "mcpServers", true)
-				if srv == nil {
-					return false
-				}
-				srv["fleet"] = map[string]any{"type": "stdio", "command": cmdBin, "args": []string{"mcp", "serve", "--harness", "claude"}}
-				return true
-			}},
-			jsonEditSpec{filepath.Join(".claude", "settings.json"), func(d map[string]any) bool {
-				h := subMap(d, "hooks", true)
-				if h == nil {
-					return false
-				}
-				upsertClaudeStyleHooks(h, "claude", cmdBin)
-				wrapClaudeStatusLine(d, cmdBin)
-				if _, exists := d["crossSessionInbound"]; !exists {
-					d["crossSessionInbound"] = "accept"
-				}
-				return true
-			}},
-		)
+		cleanupSpecs = append(cleanupSpecs, jsonEditSpec{".claude.json", func(d map[string]any) bool {
+			return deleteFleetKey(d, "mcpServers")
+		}})
+		createSpecs = append(createSpecs, jsonEditSpec{filepath.Join(".claude", "settings.json"), func(d map[string]any) bool {
+			h := subMap(d, "hooks", true)
+			if h == nil {
+				return false
+			}
+			upsertClaudeStyleHooks(h, "claude", cmdBin)
+			wrapClaudeStatusLine(d, cmdBin)
+			if _, exists := d["crossSessionInbound"]; !exists {
+				d["crossSessionInbound"] = "accept"
+			}
+			return true
+		}})
 	}
 
 	var changed []string
 	if slices.Contains(harnesses, "codex") {
 		codexTOML := filepath.Join(targetHome, ".codex", "config.toml")
 		rawTOML, _ := os.ReadFile(codexTOML)
-		wrote, err := writeUserFile(codexTOML, updateCodexTOML(string(rawTOML), cmdBin, false), opts.UID, opts.GID)
+		wrote, err := writeUserFile(codexTOML, updateCodexTOML(string(rawTOML), false), opts.UID, opts.GID)
 		if err != nil {
 			return nil, err
 		}
 		if wrote {
 			changed = append(changed, codexTOML)
 		}
-		specs = append(specs, jsonEditSpec{filepath.Join(".codex", "hooks.json"), func(d map[string]any) bool {
+		createSpecs = append(createSpecs, jsonEditSpec{filepath.Join(".codex", "hooks.json"), func(d map[string]any) bool {
 			h := subMap(d, "hooks", true)
 			if h == nil {
 				return false
@@ -396,15 +446,10 @@ func Install(opts InstallOpts) ([]string, error) {
 
 	if slices.Contains(harnesses, "antigravity") {
 		handler := map[string]any{"type": "command", "command": cmdBin + " agent-hook --harness antigravity", "timeout": 5}
-		specs = append(specs,
-			jsonEditSpec{filepath.Join(".gemini", "config", "mcp_config.json"), func(d map[string]any) bool {
-				srv := subMap(d, "mcpServers", true)
-				if srv == nil {
-					return false
-				}
-				srv["fleet"] = map[string]any{"command": cmdBin, "args": []string{"mcp", "serve", "--harness", "antigravity"}}
-				return true
-			}},
+		cleanupSpecs = append(cleanupSpecs, jsonEditSpec{filepath.Join(".gemini", "config", "mcp_config.json"), func(d map[string]any) bool {
+			return deleteFleetKey(d, "mcpServers")
+		}})
+		createSpecs = append(createSpecs,
 			jsonEditSpec{filepath.Join(".gemini", "config", "hooks.json"), func(d map[string]any) bool {
 				d["fleet"] = map[string]any{
 					"SessionStart":  []any{handler},
@@ -441,11 +486,21 @@ func Install(opts InstallOpts) ([]string, error) {
 		)
 	}
 
-	edited, err := applyEdits(targetHome, opts.UID, opts.GID, true, specs)
+	cleaned, err := applyEdits(targetHome, opts.UID, opts.GID, false, cleanupSpecs)
 	if err != nil {
 		return nil, err
 	}
-	return append(changed, edited...), nil
+	edited, err := applyEdits(targetHome, opts.UID, opts.GID, true, createSpecs)
+	if err != nil {
+		return nil, err
+	}
+	skillFiles, err := installSkills(skillDirsForHarnesses(targetHome, harnesses), opts.UID, opts.GID)
+	if err != nil {
+		return nil, err
+	}
+	changed = append(changed, cleaned...)
+	changed = append(changed, edited...)
+	return append(changed, skillFiles...), nil
 }
 
 func shellQuote(s string) string {
@@ -529,7 +584,7 @@ func deleteFleetKey(root map[string]any, sub string) bool {
 	return true
 }
 
-// Uninstall removes fleet MCP and hook entries from all harness configs under home.
+// Uninstall removes fleet skills, MCP, and hook entries from all harness configs under home.
 func Uninstall(home string) ([]string, error) {
 	targetHome := home
 	if targetHome == "" {
@@ -541,7 +596,7 @@ func Uninstall(home string) ([]string, error) {
 	var changed []string
 	codexTOML := filepath.Join(targetHome, ".codex", "config.toml")
 	if raw, err := os.ReadFile(codexTOML); err == nil {
-		if wrote, err := writeUserFile(codexTOML, updateCodexTOML(string(raw), "", true), nil, nil); err != nil {
+		if wrote, err := writeUserFile(codexTOML, updateCodexTOML(string(raw), true), nil, nil); err != nil {
 			return nil, err
 		} else if wrote {
 			changed = append(changed, codexTOML)
@@ -575,7 +630,8 @@ func Uninstall(home string) ([]string, error) {
 		changed = append(changed, sidecarFile)
 		_ = os.Remove(filepath.Dir(sidecarFile))
 	}
-	return append(changed, edited...), nil
+	changed = append(changed, edited...)
+	return append(changed, removeSkills(skillDirsForHarnesses(targetHome, paths.Harnesses))...), nil
 }
 
 // Status reports {harness: configured} for all supported harnesses.
@@ -613,9 +669,9 @@ func Status(home string) map[string]bool {
 
 	codexTOMLRaw, _ := os.ReadFile(filepath.Join(targetHome, ".codex", "config.toml"))
 	return map[string]bool{
-		"claude":      hasKey(".claude.json", "mcpServers", "fleet") && hasFleetHook(filepath.Join(".claude", "settings.json"), "claude"),
-		"codex":       strings.Contains(string(codexTOMLRaw), "[mcp_servers.fleet]") && hasFleetHook(filepath.Join(".codex", "hooks.json"), "codex"),
-		"antigravity": hasKey(filepath.Join(".gemini", "config", "mcp_config.json"), "mcpServers", "fleet") && hasKey(filepath.Join(".gemini", "config", "hooks.json"), "", "fleet") && hasAntigravitySidecar(),
+		"claude":      hasFleetHook(filepath.Join(".claude", "settings.json"), "claude") && hasAllSkills(filepath.Join(targetHome, ".claude", "skills")),
+		"codex":       codexHooksEnabled(string(codexTOMLRaw)) && hasFleetHook(filepath.Join(".codex", "hooks.json"), "codex") && hasAllSkills(filepath.Join(targetHome, ".codex", "skills")),
+		"antigravity": hasKey(filepath.Join(".gemini", "config", "hooks.json"), "", "fleet") && hasAntigravitySidecar() && hasAllSkills(filepath.Join(targetHome, ".gemini", "config", "skills")),
 	}
 }
 

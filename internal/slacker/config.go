@@ -211,6 +211,7 @@ type Job struct {
 	RepoPath       string `json:"repo_path"`
 	UseTmux        bool   `json:"use_tmux"`
 	Policy         string `json:"policy,omitempty"`
+	Model          string `json:"model,omitempty"`
 	Harness        string `json:"harness"`
 	SessionName    string `json:"session_name"`
 	Prompt         string `json:"prompt"`

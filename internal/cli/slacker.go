@@ -39,9 +39,11 @@ Setup & Config:
                                         manage machine workspaces, routing defaults, channel, and emoji mappings
 
 Agent Read & Send:
+  channels  [--account ID] [--all] [--limit N] [--json]
+                                        list configured Slack accounts and mapped (or all) channels
   read      [--account ID] [--channel ID] [--thread TS] [--query Q] [--limit N] [--json]
                                         read Slack messages, threads, or search results
-  send      --channel ID [--account ID] [--thread TS] (--text TEXT | -)
+  send      --channel ID [--account ID] [--thread TS] (--text TEXT | -) [--json]
                                         send a Slack message or thread reply
 
 Runtime:
@@ -1097,6 +1099,62 @@ func cmdSlackerAccount(args []string, cio *IO) error {
 	return nil
 }
 
+func cmdSlackerChannels(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("slacker channels", flag.ContinueOnError)
+	acctFlag := fs.String("account", "", "Slack account ID (optional)")
+	includeAll := fs.Bool("all", false, "also query Slack users.conversations")
+	limit := fs.Int("limit", 100, "max channels when --all is set")
+	jsonOut := fs.Bool("json", false, "output raw JSON")
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf("usage: fleet slacker channels [--account ID] [--all] [--limit N] [--json]")
+	}
+	api, err := client.ResolveAPI("")
+	if err != nil {
+		return err
+	}
+	q := url.Values{}
+	if *acctFlag != "" {
+		q.Set("account", *acctFlag)
+	}
+	if *includeAll {
+		q.Set("include_all", "true")
+	}
+	if *limit > 0 {
+		q.Set("limit", strconv.Itoa(*limit))
+	}
+	qs := ""
+	if enc := q.Encode(); enc != "" {
+		qs = "?" + enc
+	}
+	var res struct {
+		Accounts       []slacker.AccountView      `json:"accounts"`
+		MappedChannels []slacker.ChannelMapping   `json:"mapped_channels"`
+		Account        string                     `json:"account,omitempty"`
+		Channels       []slacker.SlackChannelInfo `json:"channels,omitempty"`
+	}
+	if err := client.Call(api, http.MethodGet, "/v1/slacker/channels"+qs, nil, 15*time.Second, nil, &res); err != nil {
+		return err
+	}
+	if *jsonOut {
+		return writeJSONOut(cio.Stdout, res)
+	}
+	cio.printf("accounts: %d · mapped_channels: %d\n", len(res.Accounts), len(res.MappedChannels))
+	for _, ch := range res.MappedChannels {
+		cio.printf("  [%s] %s (%s) -> %s:%s\n", cmp.Or(ch.Account, slacker.DefaultAccountID), ch.ChannelID, cmp.Or(ch.ChannelName, "-"), cmp.Or(strings.Join(ch.Devices, ","), ch.Device, "default"), cmp.Or(ch.RepoPath, "<workspace>"))
+	}
+	if len(res.Channels) > 0 {
+		cio.printf("slack_channels (%s): %d\n", res.Account, len(res.Channels))
+		for _, ch := range res.Channels {
+			cio.printf("  %s  #%s  private=%v\n", ch.ID, ch.Name, ch.IsPrivate)
+		}
+	}
+	return nil
+}
+
 func cmdSlackerRead(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("slacker read", flag.ContinueOnError)
 	acctFlag := fs.String("account", "", "Slack account ID (optional; inferred from mapped channel if omitted)")
@@ -1164,6 +1222,7 @@ func cmdSlackerSend(args []string, cio *IO) error {
 	channel := fs.String("channel", "", "target Slack channel ID")
 	threadTS := fs.String("thread", "", "optional parent message timestamp (ts) for thread replies")
 	textFlag := fs.String("text", "", "message text (pass '-' positionally to read from stdin)")
+	jsonOut := fs.Bool("json", false, "output raw JSON")
 	pos, err := parseFlagsInterspersed(fs, args)
 	if err != nil {
 		return err
@@ -1176,10 +1235,10 @@ func cmdSlackerSend(args []string, cio *IO) error {
 		}
 		text = strings.TrimRight(string(raw), "\r\n")
 	} else if len(pos) > 0 {
-		return fmt.Errorf("usage: fleet slacker send --channel ID [--account ID] [--thread TS] (--text TEXT | -)")
+		return fmt.Errorf("usage: fleet slacker send --channel ID [--account ID] [--thread TS] (--text TEXT | -) [--json]")
 	}
 	if strings.TrimSpace(*channel) == "" || strings.TrimSpace(text) == "" {
-		return fmt.Errorf("usage: fleet slacker send --channel ID [--account ID] [--thread TS] (--text TEXT | -)")
+		return fmt.Errorf("usage: fleet slacker send --channel ID [--account ID] [--thread TS] (--text TEXT | -) [--json]")
 	}
 	api, err := client.ResolveAPI("")
 	if err != nil {
@@ -1199,6 +1258,9 @@ func cmdSlackerSend(args []string, cio *IO) error {
 	if err := client.Call(api, http.MethodPost, "/v1/slacker/send", body, 15*time.Second, nil, &posted); err != nil {
 		return err
 	}
+	if *jsonOut {
+		return writeJSONOut(cio.Stdout, posted)
+	}
 	cio.printf("sent account=%s channel=%s ts=%s\n", posted.Account, posted.Channel, posted.TS)
 	return nil
 }
@@ -1209,39 +1271,30 @@ func cmdSlacker(args []string, cio *IO) error {
 		return nil
 	}
 	sub, rest := args[0], args[1:]
+	handlers := map[string]func([]string, *IO) error{
+		"manifest": cmdSlackerManifest,
+		"setup":    cmdSlackerSetup,
+		"config":   cmdSlackerConfig,
+		"accounts": cmdSlackerAccounts,
+		"account":  cmdSlackerAccount,
+		"map":      cmdSlackerMap,
+		"channels": cmdSlackerChannels,
+		"read":     cmdSlackerRead,
+		"send":     cmdSlackerSend,
+		"jobs":     cmdSlackerJobs,
+		"retry":    func(a []string, c *IO) error { return cmdSlackerJobAction(a, "retry", c) },
+		"cancel":   func(a []string, c *IO) error { return cmdSlackerJobAction(a, "cancel", c) },
+		"listen":   cmdSlackerListen,
+		"worker":   cmdSlackerWorker,
+		"service":  cmdSlackerService,
+		"cleanup":  cmdSlackerCleanup,
+	}
+	if fn, ok := handlers[sub]; ok {
+		return fn(rest, cio)
+	}
 	switch sub {
-	case "manifest":
-		return cmdSlackerManifest(rest, cio)
-	case "setup":
-		return cmdSlackerSetup(rest, cio)
-	case "config":
-		return cmdSlackerConfig(rest, cio)
-	case "accounts":
-		return cmdSlackerAccounts(rest, cio)
-	case "account":
-		return cmdSlackerAccount(rest, cio)
-	case "map":
-		return cmdSlackerMap(rest, cio)
-	case "read":
-		return cmdSlackerRead(rest, cio)
-	case "send":
-		return cmdSlackerSend(rest, cio)
-	case "jobs":
-		return cmdSlackerJobs(rest, cio)
-	case "retry":
-		return cmdSlackerJobAction(rest, "retry", cio)
-	case "cancel":
-		return cmdSlackerJobAction(rest, "cancel", cio)
-	case "listen":
-		return cmdSlackerListen(rest, cio)
-	case "worker":
-		return cmdSlackerWorker(rest, cio)
-	case "service":
-		return cmdSlackerService(rest, cio)
 	case "install", "start", "stop", "status", "logs":
 		return cmdSlackerService(append([]string{sub}, rest...), cio)
-	case "cleanup":
-		return cmdSlackerCleanup(rest, cio)
 	default:
 		return fmt.Errorf("unknown slacker subcommand %q\n\n%s", sub, slackerUsageText())
 	}

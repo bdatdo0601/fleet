@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS slacker_jobs (
   repo_path        TEXT NOT NULL,
   use_tmux         INTEGER NOT NULL DEFAULT 0,
   policy           TEXT NOT NULL DEFAULT '',
+  model            TEXT NOT NULL DEFAULT '',
   harness          TEXT NOT NULL,
   session_name     TEXT NOT NULL,
   prompt           TEXT NOT NULL,
@@ -68,6 +69,7 @@ CREATE TABLE IF NOT EXISTS slacker_dispatch_state (
 var jobMigrations = []registry.ColumnMigration{
 	{Col: "account", Def: "TEXT NOT NULL DEFAULT 'default'"},
 	{Col: "policy", Def: "TEXT NOT NULL DEFAULT ''"},
+	{Col: "model", Def: "TEXT NOT NULL DEFAULT ''"},
 }
 
 // Store manages persisted Slacker jobs and runtime status in ~/.fleet/slacker.db.
@@ -196,7 +198,7 @@ func (s *Store) HasMessageJob(account, channelID, messageTS string) (bool, error
 }
 
 const jobSelectCols = `id, account, event_id, channel_id, channel_name, message_ts, thread_ts, reaction, user_id,
-  target_device, repo_path, use_tmux, policy, harness, session_name, prompt, permalink, status,
+  target_device, repo_path, use_tmux, policy, model, harness, session_name, prompt, permalink, status,
   attempt_count, claimed_by, claimed_at, lease_expires_at, receipt_id, backend, error, created_at, updated_at`
 
 func scanJobRow(sc interface{ Scan(...any) error }) (Job, error) {
@@ -204,7 +206,7 @@ func scanJobRow(sc interface{ Scan(...any) error }) (Job, error) {
 	var useTmux int
 	err := sc.Scan(
 		&j.ID, &j.Account, &j.EventID, &j.ChannelID, &j.ChannelName, &j.MessageTS, &j.ThreadTS, &j.Reaction, &j.UserID,
-		&j.TargetDevice, &j.RepoPath, &useTmux, &j.Policy, &j.Harness, &j.SessionName, &j.Prompt, &j.Permalink, &j.Status,
+		&j.TargetDevice, &j.RepoPath, &useTmux, &j.Policy, &j.Model, &j.Harness, &j.SessionName, &j.Prompt, &j.Permalink, &j.Status,
 		&j.AttemptCount, &j.ClaimedBy, &j.ClaimedAt, &j.LeaseExpiresAt, &j.ReceiptID, &j.Backend, &j.Error,
 		&j.CreatedAt, &j.UpdatedAt,
 	)
@@ -274,11 +276,11 @@ func (s *Store) enqueueJobTx(job Job, useTmuxInt int) (bool, Job, error) {
 	if _, err := tx.Exec(
 		`INSERT INTO slacker_jobs(
 			id, account, event_id, channel_id, channel_name, message_ts, thread_ts, reaction, user_id,
-			target_device, repo_path, use_tmux, policy, harness, session_name, prompt, permalink, status,
+			target_device, repo_path, use_tmux, policy, model, harness, session_name, prompt, permalink, status,
 			attempt_count, claimed_by, claimed_at, lease_expires_at, receipt_id, backend, error, created_at, updated_at
-		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', '', '', '', '', '', ?, ?)`,
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', '', '', '', '', '', ?, ?)`,
 		job.ID, job.Account, job.EventID, job.ChannelID, job.ChannelName, job.MessageTS, job.ThreadTS, job.Reaction, job.UserID,
-		job.TargetDevice, job.RepoPath, useTmuxInt, job.Policy, job.Harness, job.SessionName, job.Prompt, job.Permalink, job.Status,
+		job.TargetDevice, job.RepoPath, useTmuxInt, job.Policy, job.Model, job.Harness, job.SessionName, job.Prompt, job.Permalink, job.Status,
 		job.CreatedAt, job.UpdatedAt,
 	); err != nil {
 		return false, Job{}, err

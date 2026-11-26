@@ -11,10 +11,8 @@ import (
 	"fmt"
 	"io"
 	"maps"
-	"net/url"
 	"os"
 	"os/exec"
-	"os/signal"
 	"os/user"
 	"path/filepath"
 	"runtime"
@@ -26,7 +24,6 @@ import (
 
 	"golang.org/x/term"
 
-	"github.com/bdatdo0601/fleet/internal/agents"
 	"github.com/bdatdo0601/fleet/internal/client"
 	"github.com/bdatdo0601/fleet/internal/codes"
 	"github.com/bdatdo0601/fleet/internal/core"
@@ -41,7 +38,6 @@ import (
 	"github.com/bdatdo0601/fleet/internal/system"
 	"github.com/bdatdo0601/fleet/internal/usage"
 	"github.com/bdatdo0601/fleet/internal/version"
-	"github.com/bdatdo0601/fleet/internal/waiter"
 )
 
 // IO holds overridable streams and prompt hooks for CLI testing.
@@ -437,7 +433,10 @@ func activateNodeRuntime(cio *IO, owner, root, syncWorkDir string, serve bool) (
 		return "", err
 	}
 	if mcpUpdated, err := mcpinstall.Install(mcpinstall.InstallOpts{}); err == nil && len(mcpUpdated) > 0 {
-		cio.info(fmt.Sprintf("configured agent MCP & hooks (%d file(s))", len(mcpUpdated)))
+		cio.info(fmt.Sprintf("configured agent skills & hooks (%d file(s))", len(mcpUpdated)))
+	}
+	if _, rErr := installAgentRelayLaunchAgent(paths.LauncherPath(), mcpinstall.DetectHarnesses("", false)); rErr != nil {
+		cio.printf("warning: agent relay LaunchAgent: %v\n", rErr)
 	}
 	return instBin, nil
 }
@@ -1059,6 +1058,11 @@ func cmdSync(args []string, cio *IO) error {
 		} else if restarted {
 			cio.printf("%s restarted %s (binary updated)\n", stamp, paths.SlackerWorkerLabel)
 		}
+		if restarted, rErr := system.RestartStaleUserAgent(node.Owner, paths.AgentRelayLabel, paths.InstalledBinaryPath()); rErr != nil {
+			cio.printf("%s agent-relay restart warning: %v\n", stamp, rErr)
+		} else if restarted {
+			cio.printf("%s restarted %s (binary updated)\n", stamp, paths.AgentRelayLabel)
+		}
 		if ownerHome := paths.HomeForUser(node.Owner); ownerHome != "" {
 			syncItems := usage.CollectAll(context.Background(), usage.CollectOpts{
 				Home:      ownerHome,
@@ -1114,6 +1118,13 @@ func cmdStatus(args []string, cio *IO) error {
 		}
 		cio.printf("%-44s %s\n", paths.SlackerWorkerLabel+":", st)
 	}
+	if _, err := os.Stat(system.LaunchAgentPath(paths.AgentRelayLabel)); err == nil {
+		st := "NOT loaded"
+		if system.UserAgentLoaded(paths.AgentRelayLabel) {
+			st = "loaded"
+		}
+		cio.printf("%-44s %s\n", paths.AgentRelayLabel+":", st)
+	}
 	var syncRes core.SyncResult
 	if err := client.Call(node.API, "GET", "/v1/sync", nil, 10*time.Second, nil, &syncRes); err != nil {
 		cio.printf("lighthouse:  %v\n", err)
@@ -1126,240 +1137,115 @@ func cmdStatus(args []string, cio *IO) error {
 
 // agents & mcp ----------------------------------------------------------------
 
-func formatWaitDuration(secs int) string {
-	if secs < 0 {
-		secs = 0
+func installAgentRelayLaunchAgent(binPath string, harnesses []string) (bool, error) {
+	if !slices.Contains(harnesses, "claude") && !slices.Contains(harnesses, "codex") {
+		return false, nil
 	}
-	if secs < 60 {
-		return fmt.Sprintf("%ds", secs)
-	}
-	mins := secs / 60
-	if mins < 60 {
-		return fmt.Sprintf("%dm", mins)
-	}
-	hours, rem := mins/60, mins%60
-	if rem > 0 {
-		return fmt.Sprintf("%dh%dm", hours, rem)
-	}
-	return fmt.Sprintf("%dh", hours)
-}
-
-func cmdAgentsWait(args []string, cio *IO) error {
-	fs := flag.NewFlagSet("agents wait", flag.ContinueOnError)
-	session := fs.String("session", "", "session_id to wait on")
-	harness := fs.String("harness", "", "harness override")
-	timeout := fs.Float64("timeout", 0.0, "max wait seconds (0 = wait indefinitely)")
-	pollTimeout := fs.Float64("poll-timeout", 50.0, "per-request long-poll seconds")
-	pos, err := parseFlagsInterspersed(fs, args)
-	if err != nil {
-		return err
-	}
-	if len(pos) > 0 || *session == "" {
-		return fmt.Errorf("usage: fleet agents wait --session SESSION_ID [--harness H] [--timeout S]")
-	}
-	if *harness != "" && !paths.ValidHarness(*harness) {
-		return fmt.Errorf("unknown harness %q", *harness)
-	}
-	rc, err := waiter.WaitForInboxCLI(waiter.WaitCLIOpts{
-		SessionID:   *session,
-		Harness:     *harness,
-		MaxWait:     *timeout,
-		PollTimeout: *pollTimeout,
-		Stdout:      cio.Stdout,
-		WatchParent: true,
+	home, _ := os.UserHomeDir()
+	err := system.InstallUserAgent(system.AgentOpts{
+		Label:     paths.AgentRelayLabel,
+		Args:      []string{binPath, "agents", "relay", "--harness", "claude,codex"},
+		LogPath:   filepath.Join(paths.AgentRelayStateDir(), "relay.log"),
+		WorkDir:   home,
+		KeepAlive: true,
 	})
+	return err == nil, err
+}
+
+func cmdMCPInstall(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("mcp install", flag.ContinueOnError)
+	all := fs.Bool("all", false, "write configs for all harnesses")
+	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+		return err
+	}
+	if err := requireNotRoot("mcp install"); err != nil {
+		return err
+	}
+	updated, err := mcpinstall.Install(mcpinstall.InstallOpts{ForceAll: *all})
 	if err != nil {
 		return err
 	}
-	if rc != 0 {
-		return fmt.Errorf("wait failed")
+	for _, p := range updated {
+		cio.printf("updated %s\n", p)
+	}
+	harnesses := mcpinstall.DetectHarnesses("", *all)
+	if installed, rErr := installAgentRelayLaunchAgent(paths.LauncherPath(), harnesses); rErr != nil {
+		return rErr
+	} else if installed {
+		cio.printf("installed %s (claude,codex relay)\n", paths.AgentRelayLabel)
+	} else if len(updated) == 0 {
+		cio.printf("already up to date\n")
 	}
 	return nil
 }
 
-func cmdAgentsRelay(args []string, cio *IO) error {
-	fs := flag.NewFlagSet("agents relay", flag.ContinueOnError)
-	harness := fs.String("harness", "antigravity", "harness name (antigravity)")
-	pollTimeout := fs.Float64("poll-timeout", 50.0, "per-request long-poll seconds")
-	agentAPI := fs.String("agentapi", "", "path to agentapi executable")
-	pos, err := parseFlagsInterspersed(fs, args)
+func cmdMCPUninstall(cio *IO) error {
+	if err := requireNotRoot("mcp uninstall"); err != nil {
+		return err
+	}
+	removed, err := mcpinstall.Uninstall("")
 	if err != nil {
 		return err
 	}
-	if len(pos) > 0 {
-		return fmt.Errorf("usage: fleet agents relay [--harness antigravity] [--poll-timeout S] [--agentapi PATH]")
+	relayPlist := system.LaunchAgentPath(paths.AgentRelayLabel)
+	_, statErr := os.Stat(relayPlist)
+	if err := system.UninstallUserAgent(paths.AgentRelayLabel); err != nil {
+		return err
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	rc, err := waiter.RunAntigravityRelay(ctx, waiter.RelayOpts{
-		Harness:     *harness,
-		AgentAPIBin: *agentAPI,
-		PollTimeout: *pollTimeout,
-		Stderr:      cio.Stderr,
+	if statErr == nil {
+		removed = append(removed, relayPlist)
+	}
+	if len(removed) == 0 {
+		cio.printf("no fleet skills/hook entries found\n")
+		return nil
+	}
+	for _, p := range removed {
+		cio.printf("updated %s\n", p)
+	}
+	return nil
+}
+
+func cmdMCPStatus(cio *IO) error {
+	st := mcpinstall.Status("")
+	staleByHarness := map[string][]mcpinstall.StaleMCPServer{}
+	for _, s := range mcpinstall.FindStaleMCPServers("") {
+		staleByHarness[s.Harness] = append(staleByHarness[s.Harness], s)
+	}
+	for _, h := range paths.Harnesses {
+		val := "not configured"
+		if st[h] {
+			val = "configured"
+		}
+		cio.printf("%-14s %s\n", h+":", val)
+		for _, s := range staleByHarness[h] {
+			cio.printf("  warning: %s\n", mcpinstall.FormatStaleWarning(s))
+		}
+	}
+	if st["claude"] || st["codex"] || system.UserAgentLoaded(paths.AgentRelayLabel) {
+		rState := "NOT loaded"
+		if system.UserAgentLoaded(paths.AgentRelayLabel) {
+			rState = "loaded"
+		}
+		cio.printf("%-14s %s (%s)\n", "agent-relay:", rState, paths.AgentRelayLabel)
+	}
+	return nil
+}
+
+func cmdMCPServe(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("mcp serve", flag.ContinueOnError)
+	harness := fs.String("harness", "", "harness name")
+	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+		return err
+	}
+	if !paths.ValidHarness(*harness) {
+		return fmt.Errorf("usage: fleet mcp serve --harness claude|codex|antigravity")
+	}
+	_, err := mcp.ServeStdio(mcp.ServeOpts{
+		Harness: *harness,
+		Stdin:   cio.Stdin,
+		Stdout:  cio.Stdout,
 	})
-	if err != nil {
-		return err
-	}
-	if rc != 0 {
-		return fmt.Errorf("relay failed")
-	}
-	return nil
-}
-
-func cmdAgentsRename(args []string, cio *IO) error {
-	if len(args) != 2 {
-		return fmt.Errorf("usage: fleet agents rename TARGET NAME")
-	}
-	api, err := client.ResolveAPI("")
-	if err != nil {
-		return err
-	}
-	var infoResp struct {
-		Agent agents.SessionDetail `json:"agent"`
-	}
-	if err := client.Call(api, "GET", "/v1/agents/"+url.PathEscape(args[0]), nil, 30*time.Second, nil, &infoResp); err != nil {
-		return err
-	}
-	var res struct {
-		SessionID string `json:"session_id"`
-		Name      string `json:"name"`
-	}
-	if err := client.Call(api, "POST", "/v1/agents/rename", map[string]string{
-		"session_id": infoResp.Agent.SessionID,
-		"name":       args[1],
-	}, 30*time.Second, nil, &res); err != nil {
-		return err
-	}
-	cio.printf("%s -> %s\n", res.SessionID, res.Name)
-	return nil
-}
-
-func formatAgentState(ag agents.Session) string {
-	switch {
-	case !ag.Live:
-		return ag.State + " (stale)"
-	case ag.State == "waiting_permission" || ag.State == "waiting_question":
-		var tags []string
-		if ag.WaitingSeconds != nil {
-			tags = append(tags, formatWaitDuration(*ag.WaitingSeconds))
-		}
-		if ag.Listening {
-			tags = append(tags, "listening")
-		}
-		if len(tags) > 0 {
-			return fmt.Sprintf("%s (%s)", ag.State, strings.Join(tags, ", "))
-		}
-	case ag.Listening:
-		return ag.State + " (listening)"
-	}
-	return ag.State
-}
-
-func formatAgentTitle(ag agents.Session) string {
-	baseTitle := strings.TrimSpace(strings.ReplaceAll(cmp.Or(ag.Title, ag.Summary), "\n", " "))
-	if len(ag.PendingAction) == 0 {
-		return agents.TruncateRunes(baseTitle, 48)
-	}
-	tool := strings.TrimSpace(ag.PendingAction["tool"])
-	detail := strings.TrimSpace(strings.ReplaceAll(ag.PendingAction["detail"], "\n", " "))
-	snippet := ""
-	switch {
-	case tool != "" && detail != "":
-		snippet = fmt.Sprintf("[%s: %s]", tool, detail)
-	case tool != "" || detail != "":
-		snippet = fmt.Sprintf("[%s]", cmp.Or(tool, detail))
-	}
-	if snippet != "" && baseTitle != "" {
-		return agents.TruncateRunes(snippet+" "+baseTitle, 60)
-	}
-	return agents.TruncateRunes(cmp.Or(snippet, baseTitle), 60)
-}
-
-func cmdAgentsList(args []string, cio *IO) error {
-	fs := flag.NewFlagSet("agents", flag.ContinueOnError)
-	all := fs.Bool("all", false, "include stale and exited sessions")
-	waiting := fs.Bool("waiting", false, "show only sessions waiting on permission or user input")
-	state := fs.String("state", "", "filter by session state")
-	device := fs.String("device", "", "filter by fleet device name")
-	repo := fs.String("repo", "", "filter by repository name")
-	pos, err := parseFlagsInterspersed(fs, args)
-	if err != nil {
-		return err
-	}
-	if len(pos) > 0 {
-		return fmt.Errorf("unknown agents subcommand or argument: %s", strings.Join(pos, " "))
-	}
-	api, err := client.ResolveAPI("")
-	if err != nil {
-		return err
-	}
-	q := url.Values{}
-	if *all {
-		q.Set("include_stale", "true")
-	}
-	if *device != "" {
-		q.Set("device", *device)
-	}
-	if *repo != "" {
-		q.Set("repo", *repo)
-	}
-	stateFilter := *state
-	if *waiting {
-		stateFilter = "waiting"
-	}
-	if stateFilter != "" {
-		q.Set("state", stateFilter)
-	}
-	qs := ""
-	if enc := q.Encode(); enc != "" {
-		qs = "?" + enc
-	}
-	var resp struct {
-		Agents []agents.Session `json:"agents"`
-	}
-	if err := client.Call(api, "GET", "/v1/agents"+qs, nil, 30*time.Second, nil, &resp); err != nil {
-		return err
-	}
-	if len(resp.Agents) == 0 {
-		cio.printf("no active agent sessions\n")
-	} else {
-		rows := [][]string{{"NAME", "DEVICE", "HARNESS", "REPO", "STATE", "LAST SEEN", "TITLE", "SESSION"}}
-		for _, ag := range resp.Agents {
-			repoLabel := ag.Repo
-			if ag.Repo != "" && ag.Branch != "" {
-				repoLabel = ag.Repo + "@" + ag.Branch
-			}
-			ls := ag.UpdatedAt
-			rows = append(rows, []string{
-				cmp.Or(ag.Name, "-"), ag.Device, ag.Harness, cmp.Or(repoLabel, "-"),
-				formatAgentState(ag), ago(&ls), formatAgentTitle(ag), ag.SessionID,
-			})
-		}
-		printTable(cio.Stdout, rows)
-	}
-	var uResp struct {
-		Usage []agents.HarnessUsage `json:"usage"`
-	}
-	if uErr := client.Call(api, "GET", "/v1/usage", nil, 3*time.Second, nil, &uResp); uErr == nil {
-		if footer := formatCompactUsageFooter(uResp.Usage); footer != "" {
-			cio.printf("\n%s\n", footer)
-		}
-	}
-	return nil
-}
-
-func cmdAgents(args []string, cio *IO) error {
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		switch args[0] {
-		case "wait":
-			return cmdAgentsWait(args[1:], cio)
-		case "relay":
-			return cmdAgentsRelay(args[1:], cio)
-		case "rename":
-			return cmdAgentsRename(args[1:], cio)
-		}
-	}
-	return cmdAgentsList(args, cio)
+	return err
 }
 
 func cmdMCP(args []string, cio *IO) error {
@@ -1368,74 +1254,13 @@ func cmdMCP(args []string, cio *IO) error {
 	}
 	switch args[0] {
 	case "install":
-		fs := flag.NewFlagSet("mcp install", flag.ContinueOnError)
-		all := fs.Bool("all", false, "write configs for all harnesses")
-		if _, err := parseFlagsInterspersed(fs, args[1:]); err != nil {
-			return err
-		}
-		if err := requireNotRoot("mcp install"); err != nil {
-			return err
-		}
-		updated, err := mcpinstall.Install(mcpinstall.InstallOpts{ForceAll: *all})
-		if err != nil {
-			return err
-		}
-		if len(updated) == 0 {
-			cio.printf("already up to date\n")
-		} else {
-			for _, p := range updated {
-				cio.printf("updated %s\n", p)
-			}
-		}
-		return nil
+		return cmdMCPInstall(args[1:], cio)
 	case "uninstall":
-		if err := requireNotRoot("mcp uninstall"); err != nil {
-			return err
-		}
-		removed, err := mcpinstall.Uninstall("")
-		if err != nil {
-			return err
-		}
-		if len(removed) == 0 {
-			cio.printf("no fleet MCP/hook entries found\n")
-		} else {
-			for _, p := range removed {
-				cio.printf("updated %s\n", p)
-			}
-		}
-		return nil
+		return cmdMCPUninstall(cio)
 	case "status":
-		st := mcpinstall.Status("")
-		staleByHarness := map[string][]mcpinstall.StaleMCPServer{}
-		for _, s := range mcpinstall.FindStaleMCPServers("") {
-			staleByHarness[s.Harness] = append(staleByHarness[s.Harness], s)
-		}
-		for _, h := range paths.Harnesses {
-			val := "not configured"
-			if st[h] {
-				val = "configured"
-			}
-			cio.printf("%-14s %s\n", h+":", val)
-			for _, s := range staleByHarness[h] {
-				cio.printf("  warning: %s\n", mcpinstall.FormatStaleWarning(s))
-			}
-		}
-		return nil
+		return cmdMCPStatus(cio)
 	case "serve":
-		fs := flag.NewFlagSet("mcp serve", flag.ContinueOnError)
-		harness := fs.String("harness", "", "harness name")
-		if _, err := parseFlagsInterspersed(fs, args[1:]); err != nil {
-			return err
-		}
-		if !paths.ValidHarness(*harness) {
-			return fmt.Errorf("usage: fleet mcp serve --harness claude|codex|antigravity")
-		}
-		_, err := mcp.ServeStdio(mcp.ServeOpts{
-			Harness: *harness,
-			Stdin:   cio.Stdin,
-			Stdout:  cio.Stdout,
-		})
-		return err
+		return cmdMCPServe(args[1:], cio)
 	default:
 		return fmt.Errorf("unknown mcp subcommand %q", args[0])
 	}
@@ -1671,12 +1496,12 @@ Commands:
   serve           (lighthouse, launchd) run the API
   ddns            (lighthouse) keep the public DNS name pointed at home
   status          show this machine's fleet status
-  agents          list active AI agent sessions across the fleet
+  agents          list, inspect, message, spawn, or kill AI agent sessions across the fleet
   usage           show quota and usage status across claude, codex, and antigravity
   session         manage detached Claude, Antigravity (agy), and Codex sessions
   slacker         lighthouse Slack Socket Mode dispatcher & Mac task workers
   memory          manage shared fleet agent memory and LLM curation
-  mcp             manage MCP and lifecycle hooks for claude, codex, and antigravity
+  mcp             manage skills, lifecycle hooks, and agent relay for claude, codex, and antigravity
   agent-hook      (internal) handle a harness lifecycle hook
   version         print fleet version
 `

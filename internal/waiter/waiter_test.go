@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -15,6 +16,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 
 	"github.com/bdatdo0601/fleet/internal/agents"
 	"github.com/bdatdo0601/fleet/internal/core"
@@ -411,5 +414,137 @@ func TestAntigravityRelayDeliveryAndPerSessionBackoff(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("relay did not stop on context cancel")
+	}
+}
+
+func TestRunRelayClaudeCodexAndLivenessSweep(t *testing.T) {
+	f, srv, tmp := setupWaiterServer(t)
+	cacheDir := filepath.Join(tmp, "cache")
+	_, _ = f.Agents.Heartbeat(agents.HeartbeatParams{Device: "mini", Harness: "antigravity", RawID: "sender-a", CWD: "/s"})
+
+	claudePID := 4401
+	deadCodexPID := 4402
+	aliveCodexPID := 4403
+	codexUUID := "01a1ece5-f00c-7860-a0dc-6c1897e73f99"
+
+	_, _ = f.Agents.Heartbeat(agents.HeartbeatParams{Device: "mini", Harness: "claude", RawID: "cl-relay-1", PID: &claudePID, CWD: "/cl", State: "idle"})
+	_, _ = f.Agents.Heartbeat(agents.HeartbeatParams{Device: "mini", Harness: "codex", RawID: codexUUID, PID: &aliveCodexPID, CWD: "/cx", State: "idle"})
+	_, _ = f.Agents.Heartbeat(agents.HeartbeatParams{Device: "mini", Harness: "codex", RawID: "cx-dead-1", PID: &deadCodexPID, CWD: "/dead", State: "working"})
+
+	claudeSock := filepath.Join(tmp, "mock-claude.sock")
+	deadSock := filepath.Join(tmp, "mock-dead.sock")
+	_ = os.WriteFile(claudeSock, nil, 0o600)
+	_ = os.WriteFile(deadSock, nil, 0o600)
+
+	if err := hooks.SaveClaudeSocket(cacheDir, hooks.ClaudeSocketInfo{
+		Socket: claudeSock, Token: "t1", SessionID: "mini:claude:cl-relay-1", PID: claudePID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := hooks.SaveClaudeSocket(cacheDir, hooks.ClaudeSocketInfo{
+		Socket: deadSock, Token: "t2", SessionID: "mini:claude:cl-dead", PID: 4499,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Age cl-relay-1 by 90s so the liveness sweep refreshes its heartbeat while preserving State="idle".
+	db, err := sql.Open("sqlite", filepath.Join(f.Root, "agents.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldTS := time.Now().UTC().Add(-90 * time.Second).Format("2006-01-02T15:04:05+00:00")
+	if _, err := db.Exec("UPDATE agent_sessions SET updated_at = ? WHERE session_id = ?", oldTS, "mini:claude:cl-relay-1"); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	var mu sync.Mutex
+	var claudeTexts []string
+	var codexCmds [][]string
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	var stderr bytes.Buffer
+	go func() {
+		_, rErr := RunRelay(ctx, MultiRelayOpts{
+			Harnesses:        []string{"claude", "codex"},
+			APIURL:           srv.URL,
+			CodexBin:         "/usr/local/bin/codex",
+			CacheDir:         cacheDir,
+			PollTimeout:      0.5,
+			LockDir:          filepath.Join(tmp, "locks"),
+			Stderr:           &stderr,
+			LocalDevice:      "mini",
+			LivenessInterval: 100 * time.Millisecond,
+			SendClaudeFn: func(_, _, text string) error {
+				mu.Lock()
+				claudeTexts = append(claudeTexts, text)
+				mu.Unlock()
+				return nil
+			},
+			RunSendFn: func(cmd []string) (int, string) {
+				mu.Lock()
+				codexCmds = append(codexCmds, cmd)
+				mu.Unlock()
+				return 0, ""
+			},
+			PIDAliveFn: func(pid int) bool {
+				return pid != deadCodexPID
+			},
+		})
+		done <- rErr
+	}()
+
+	for range 40 {
+		s1, _ := f.Agents.GetSession("cl-relay-1")
+		s2, _ := f.Agents.GetSession("01a1ece5-f00")
+		if s1.Listening && s2.Listening {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	_, _ = f.Agents.SendMessageWithReport("mini", "mini:antigravity:sender-a", "cl-relay-1", "hello claude relay", nil, nil, nil)
+	_, _ = f.Agents.SendMessageWithReport("mini", "mini:antigravity:sender-a", "01a1ece5-f00", "hello codex relay", nil, nil, nil)
+
+	for range 60 {
+		mu.Lock()
+		gotBoth := len(claudeTexts) == 1 && len(codexCmds) == 1
+		mu.Unlock()
+		deadSess, _ := f.Agents.GetSession("cx-dead-1")
+		clSess, _ := f.Agents.GetSession("cl-relay-1")
+		if gotBoth && deadSess.State == "exited" && clSess.AgeSeconds < 30 {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+
+	mu.Lock()
+	ct := append([]string(nil), claudeTexts...)
+	cc := append([][]string(nil), codexCmds...)
+	mu.Unlock()
+	if len(ct) != 1 || !strings.Contains(ct[0], "hello claude relay") {
+		t.Fatalf("unexpected claude relay deliveries: %+v", ct)
+	}
+	if len(cc) != 1 || cc[0][1] != "queue" || cc[0][3] != codexUUID || !strings.Contains(cc[0][5], "hello codex relay") {
+		t.Fatalf("unexpected codex relay deliveries: %+v", cc)
+	}
+	if deadSess, _ := f.Agents.GetSession("cx-dead-1"); deadSess.State != "exited" {
+		t.Fatalf("expected dead codex PID to be deregistered, got %+v", deadSess)
+	}
+	if clSess, _ := f.Agents.GetSession("cl-relay-1"); clSess.State != "idle" || clSess.AgeSeconds >= 30 {
+		t.Fatalf("expected alive claude session refreshed as idle, got state=%s age=%d", clSess.State, clSess.AgeSeconds)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RunRelay exited with err: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunRelay did not stop on context cancel")
 	}
 }

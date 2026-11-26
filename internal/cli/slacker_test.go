@@ -157,13 +157,19 @@ func TestCLISlackerMultiAccountReadSend(t *testing.T) {
 
 	out.Reset()
 	errBuf.Reset()
+	if rc := Run([]string{"slacker", "channels", "--account", "work", "--json"}, &IO{Stdout: &out, Stderr: &errBuf}); rc != 0 || !strings.Contains(out.String(), `"channel_id": "CWORK"`) {
+		t.Fatalf("slacker channels --json failed: rc=%d out=%q err=%q", rc, out.String(), errBuf.String())
+	}
+
+	out.Reset()
+	errBuf.Reset()
 	if rc := Run([]string{"slacker", "read", "--account", "work", "--channel", "CWORK"}, &IO{Stdout: &out, Stderr: &errBuf}); rc != 0 || !strings.Contains(out.String(), "investigate queue") {
 		t.Fatalf("slacker read failed: rc=%d out=%q err=%q", rc, out.String(), errBuf.String())
 	}
 
 	out.Reset()
 	errBuf.Reset()
-	if rc := Run([]string{"slacker", "send", "--account", "work", "--channel", "CWORK", "--text", "all clear"}, &IO{Stdout: &out, Stderr: &errBuf}); rc != 0 || !strings.Contains(out.String(), "ts=11.2") {
+	if rc := Run([]string{"slacker", "send", "--account", "work", "--channel", "CWORK", "--text", "all clear", "--json"}, &IO{Stdout: &out, Stderr: &errBuf}); rc != 0 || !strings.Contains(out.String(), `"ts": "11.2"`) {
 		t.Fatalf("slacker send failed: rc=%d out=%q err=%q", rc, out.String(), errBuf.String())
 	}
 

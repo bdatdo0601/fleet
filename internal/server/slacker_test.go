@@ -443,12 +443,13 @@ func TestAgentSpawnEndpoint(t *testing.T) {
 		t.Fatalf("unexpected first spawn response: %+v", spawnRes)
 	}
 
-	// Second spawn targeting offline "bare" explicitly with custom name, policy=safe, empty prompt -> succeeds and reports worker_online=false.
+	// Second spawn targeting offline "bare" explicitly with custom name, policy=safe, model=pro, empty prompt -> succeeds and reports worker_online=false.
 	if err := client.Call(srv.URL, http.MethodPost, "/v1/agents/spawn", map[string]any{
 		"harness":   "agy",
 		"name":      "custom-ui-sess",
 		"device":    "bare",
 		"policy":    "safe",
+		"model":     "pro",
 		"repo_path": "/tmp/bare-repo",
 		"use_tmux":  true,
 	}, 5*time.Second, nil, &spawnRes); err != nil {
@@ -458,6 +459,7 @@ func TestAgentSpawnEndpoint(t *testing.T) {
 		spawnRes.Job.TargetDevice != "bare" ||
 		spawnRes.Job.SessionName != "custom-ui-sess" ||
 		spawnRes.Job.Policy != "safe" ||
+		spawnRes.Job.Model != "pro" ||
 		spawnRes.Job.RepoPath != "/tmp/bare-repo" ||
 		!spawnRes.Job.UseTmux {
 		t.Fatalf("unexpected second spawn response: %+v", spawnRes)
@@ -478,12 +480,20 @@ func TestAgentSpawnEndpoint(t *testing.T) {
 		}
 	}
 
-	// Managed (non-admin) device is forbidden (403).
+	// Managed (non-admin) device cannot spawn on another device (403), but CAN spawn on itself (200).
 	f.IdentifyOverride = func(string) *registry.Device { return laptop }
 	err := client.Call(srv.URL, http.MethodPost, "/v1/agents/spawn", map[string]any{
-		"harness": "claude", "repo_path": "fleet",
+		"harness": "claude", "device": "office", "repo_path": "fleet",
 	}, 5*time.Second, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "HTTP 403") {
-		t.Fatalf("managed POST /v1/agents/spawn expected HTTP 403, got %v", err)
+		t.Fatalf("managed POST /v1/agents/spawn on remote device expected HTTP 403, got %v", err)
+	}
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/agents/spawn", map[string]any{
+		"harness": "claude", "repo_path": "/tmp/self",
+	}, 5*time.Second, nil, &spawnRes); err != nil {
+		t.Fatalf("managed POST /v1/agents/spawn on self failed: %v", err)
+	}
+	if spawnRes.Job.TargetDevice != "laptop" || spawnRes.Job.RepoPath != "/tmp/self" {
+		t.Fatalf("expected managed self-spawn on laptop, got %+v", spawnRes.Job)
 	}
 }
