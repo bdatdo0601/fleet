@@ -35,7 +35,8 @@ Setup & Config:
   config                                show redacted Slacker configuration
   accounts                              list configured Slack accounts
   account   rm NAME                     delete a non-default Slack account and its mappings
-  map       channel|emoji|ls ...        manage channel and emoji mappings
+  map       workspace|default|channel|emoji|ls ...
+                                        manage machine workspaces, routing defaults, channel, and emoji mappings
 
 Agent Read & Send:
   read      [--account ID] [--channel ID] [--thread TS] [--query Q] [--limit N] [--json]
@@ -45,7 +46,7 @@ Agent Read & Send:
 
 Runtime:
   listen                                run the lighthouse Slack Socket Mode listener(s)
-  worker    [--once] [--poll-timeout S] [--use-tmux]
+  worker    [--once] [--poll-timeout S] [--use-tmux] [--policy bypass|auto|safe]
                                         pull and run jobs for this Mac as logged-in user
 
 Jobs & Services:
@@ -117,18 +118,37 @@ func readTokenPairFromOPItem(cio *IO, opItem string) (string, string, string, st
 	return appTok, userTok, appRef, userRef, nil
 }
 
+func parseCommaList(raw string) []string {
+	var out []string
+	for part := range strings.SplitSeq(raw, ",") {
+		if s := strings.TrimSpace(part); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 func parseChannelSpec(raw string) (slacker.ChannelMapping, error) {
 	cid, rest, ok := strings.Cut(raw, "=")
 	if !ok {
-		return slacker.ChannelMapping{}, fmt.Errorf("invalid --channel %q (expected CHANNEL_ID=DEVICE:REPO_PATH)", raw)
+		return slacker.ChannelMapping{}, fmt.Errorf("invalid --channel %q (expected CHANNEL_ID=DEVICE[,DEVICE2...]:[REPO_PATH])", raw)
 	}
-	dev, repo, ok := strings.Cut(rest, ":")
-	if !ok || strings.TrimSpace(cid) == "" || strings.TrimSpace(dev) == "" || strings.TrimSpace(repo) == "" {
-		return slacker.ChannelMapping{}, fmt.Errorf("invalid --channel %q (expected CHANNEL_ID=DEVICE:REPO_PATH)", raw)
+	devPart, repo, ok := strings.Cut(rest, ":")
+	if !ok || strings.TrimSpace(cid) == "" || strings.TrimSpace(devPart) == "" {
+		return slacker.ChannelMapping{}, fmt.Errorf("invalid --channel %q (expected CHANNEL_ID=DEVICE[,DEVICE2...]:[REPO_PATH])", raw)
+	}
+	devs := parseCommaList(devPart)
+	if len(devs) == 0 {
+		return slacker.ChannelMapping{}, fmt.Errorf("invalid --channel %q (expected at least one device)", raw)
+	}
+	singleDev := ""
+	if len(devs) == 1 {
+		singleDev = devs[0]
 	}
 	return slacker.ChannelMapping{
 		ChannelID: strings.TrimSpace(cid),
-		Device:    strings.TrimSpace(dev),
+		Device:    singleDev,
+		Devices:   devs,
 		RepoPath:  strings.TrimSpace(repo),
 	}, nil
 }
@@ -369,11 +389,39 @@ func printSlackerConfig(cio *IO, cfg slacker.ConfigView) {
 			id, a.Enabled, a.Configured, cmp.Or(a.AuthorizedUserID, "-"), cmp.Or(a.AuthorizedUser, a.TeamName, "-"),
 			cmp.Or(a.AppTokenHint, "-"), cmp.Or(a.UserTokenHint, "-"), cmp.Or(a.BotTokenHint, "-"), a.AllowUnmappedSend)
 	}
+	defDevs := "-"
+	if len(cfg.DefaultDevices) > 0 {
+		defDevs = strings.Join(cfg.DefaultDevices, ",")
+	}
+	cio.printf("default_routing: strategy=%s policy=%s devices=%s\n",
+		cmp.Or(cfg.DefaultStrategy, slacker.StrategyLeastAgents),
+		cmp.Or(cfg.DefaultPolicy, string(session.PolicyBypass)),
+		defDevs)
+	cio.printf("workspaces:      %d\n", len(cfg.Devices))
+	for _, dev := range slices.Sorted(maps.Keys(cfg.Devices)) {
+		cio.printf("  %s -> %s\n", dev, cfg.Devices[dev].WorkspaceDir)
+	}
 	cio.printf("channels:        %d\n", len(cfg.Channels))
 	for _, k := range slices.Sorted(maps.Keys(cfg.Channels)) {
 		ch := cfg.Channels[k]
 		acct := cmp.Or(ch.Account, slacker.DefaultAccountID)
-		cio.printf("  [%s] %s -> %s:%s (tmux=%v)\n", acct, ch.ChannelID, ch.Device, ch.RepoPath, ch.UseTmux)
+		devs := ch.Devices
+		if len(devs) == 0 && ch.Device != "" {
+			devs = []string{ch.Device}
+		}
+		target := "default"
+		if len(devs) > 0 {
+			target = strings.Join(devs, ",")
+		}
+		repo := cmp.Or(ch.RepoPath, "<workspace>")
+		extra := ""
+		if ch.Strategy != "" {
+			extra += " strategy=" + ch.Strategy
+		}
+		if ch.Policy != "" {
+			extra += " policy=" + ch.Policy
+		}
+		cio.printf("  [%s] %s -> %s:%s (tmux=%v%s)\n", acct, ch.ChannelID, target, repo, ch.UseTmux, extra)
 	}
 	cio.printf("emojis:          %d\n", len(cfg.Emojis))
 	for _, em := range slices.Sorted(maps.Keys(cfg.Emojis)) {
@@ -383,7 +431,7 @@ func printSlackerConfig(cio *IO, cfg slacker.ConfigView) {
 
 func cmdSlackerMap(args []string, cio *IO) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: fleet slacker map <ls|channel|emoji>")
+		return fmt.Errorf("usage: fleet slacker map <ls|workspace|default|channel|emoji>")
 	}
 	api, err := client.ResolveAPI("")
 	if err != nil {
@@ -396,6 +444,9 @@ func cmdSlackerMap(args []string, cio *IO) error {
 		return err
 	}
 	cfg := cur.Config
+	if cfg.Devices == nil {
+		cfg.Devices = map[string]slacker.DeviceConfig{}
+	}
 	if cfg.Channels == nil {
 		cfg.Channels = map[string]slacker.ChannelMapping{}
 	}
@@ -403,13 +454,69 @@ func cmdSlackerMap(args []string, cio *IO) error {
 		cfg.Emojis = map[string]string{}
 	}
 
+	payload := map[string]any{}
 	switch args[0] {
 	case "ls":
 		printSlackerConfig(cio, cfg)
 		return nil
+	case "workspace":
+		switch {
+		case len(args) == 3 && args[1] == "rm":
+			delete(cfg.Devices, strings.TrimSpace(args[2]))
+		case len(args) == 3:
+			dev := strings.TrimSpace(args[1])
+			dir := strings.TrimSpace(args[2])
+			if dev == "" || dir == "" {
+				return fmt.Errorf("usage: fleet slacker map workspace DEVICE DIR | rm DEVICE")
+			}
+			cfg.Devices[dev] = slacker.DeviceConfig{WorkspaceDir: dir}
+		default:
+			return fmt.Errorf("usage: fleet slacker map workspace DEVICE DIR | rm DEVICE")
+		}
+		payload["devices"] = cfg.Devices
+	case "default":
+		fs := flag.NewFlagSet("slacker map default", flag.ContinueOnError)
+		devicesFlag := fs.String("devices", "", "comma-separated default devices")
+		clearDevices := fs.Bool("clear-devices", false, "clear default devices")
+		strategyFlag := fs.String("strategy", "", "default routing strategy (least_agents|round_robin)")
+		policyFlag := fs.String("policy", "", "default permission policy (bypass|auto|safe)")
+		pos, pErr := parseFlagsInterspersed(fs, args[1:])
+		if pErr != nil {
+			return pErr
+		}
+		if len(pos) > 0 || (*devicesFlag == "" && !*clearDevices && *strategyFlag == "" && *policyFlag == "") {
+			return fmt.Errorf("usage: fleet slacker map default [--devices D1,D2] [--clear-devices] [--strategy least_agents|round_robin] [--policy bypass|auto|safe]")
+		}
+		if *clearDevices {
+			payload["default_devices"] = []string{}
+		} else if *devicesFlag != "" {
+			devs := parseCommaList(*devicesFlag)
+			if len(devs) == 0 {
+				return fmt.Errorf("--devices must include at least one device name (use --clear-devices to clear)")
+			}
+			payload["default_devices"] = devs
+		}
+		if *strategyFlag != "" {
+			strat, sErr := slacker.NormalizeStrategy(*strategyFlag)
+			if sErr != nil {
+				return sErr
+			}
+			payload["default_strategy"] = strat
+		}
+		if *policyFlag != "" {
+			pol, polErr := slacker.NormalizePolicy(*policyFlag)
+			if polErr != nil {
+				return polErr
+			}
+			payload["default_policy"] = pol
+		}
 	case "channel":
 		fs := flag.NewFlagSet("slacker map channel", flag.ContinueOnError)
 		accountFlag := fs.String("account", slacker.DefaultAccountID, "Slack account ID")
+		devicesFlag := fs.String("devices", "", "comma-separated target devices (defaults to global default_devices when omitted)")
+		strategyFlag := fs.String("strategy", "", "routing strategy override (least_agents|round_robin)")
+		policyFlag := fs.String("policy", "", "permission policy override (bypass|auto|safe)")
+		repoFlag := fs.String("repo", "", "repo path or subpath relative to machine workspace_dir")
 		chName := fs.String("name", "", "optional Slack channel name label")
 		useTmux := fs.Bool("tmux", false, "force tmux for this channel")
 		pos, pErr := parseFlagsInterspersed(fs, args[1:])
@@ -424,19 +531,47 @@ func cmdSlackerMap(args []string, cio *IO) error {
 			delete(cfg.Channels, pos[1])
 			delete(cfg.Channels, slacker.ChannelKey(acctID, pos[1]))
 		} else {
-			if len(pos) != 3 {
-				return fmt.Errorf("usage: fleet slacker map channel [--account ID] CHANNEL_ID DEVICE REPO_PATH [--name NAME] [--tmux] | rm [--account ID] CHANNEL_ID")
+			if len(pos) < 1 || len(pos) > 3 {
+				return fmt.Errorf("usage: fleet slacker map channel [--account ID] CHANNEL_ID [DEVICE[,DEVICE2...]] [REPO_PATH] [--devices D1,D2] [--strategy least_agents|round_robin] [--policy bypass|auto|safe] [--repo PATH] [--name NAME] [--tmux] | rm [--account ID] CHANNEL_ID")
+			}
+			var devs []string
+			if len(pos) >= 2 {
+				devs = parseCommaList(pos[1])
+			}
+			if *devicesFlag != "" {
+				devs = parseCommaList(*devicesFlag)
+			}
+			repo := strings.TrimSpace(*repoFlag)
+			if len(pos) == 3 {
+				repo = strings.TrimSpace(pos[2])
+			}
+			strat, sErr := slacker.NormalizeStrategy(*strategyFlag)
+			if sErr != nil {
+				return sErr
+			}
+			pol, polErr := slacker.NormalizePolicy(*policyFlag)
+			if polErr != nil {
+				return polErr
+			}
+			singleDev := ""
+			if len(devs) == 1 {
+				singleDev = devs[0]
 			}
 			key := slacker.ChannelKey(acctID, pos[0])
 			cfg.Channels[key] = slacker.ChannelMapping{
 				Account:     acctID,
 				ChannelID:   pos[0],
 				ChannelName: *chName,
-				Device:      pos[1],
-				RepoPath:    pos[2],
+				Device:      singleDev,
+				Devices:     devs,
+				Strategy:    strat,
+				Policy:      pol,
+				RepoPath:    repo,
 				UseTmux:     *useTmux,
 			}
 		}
+		payload["channels"] = cfg.Channels
+		payload["emojis"] = cfg.Emojis
 	case "emoji":
 		switch {
 		case len(args) == 3 && args[1] == "rm":
@@ -450,17 +585,16 @@ func cmdSlackerMap(args []string, cio *IO) error {
 		default:
 			return fmt.Errorf("usage: fleet slacker map emoji EMOJI claude|agy|codex | rm EMOJI")
 		}
+		payload["channels"] = cfg.Channels
+		payload["emojis"] = cfg.Emojis
 	default:
-		return fmt.Errorf("usage: fleet slacker map <ls|channel|emoji>")
+		return fmt.Errorf("usage: fleet slacker map <ls|workspace|default|channel|emoji>")
 	}
 
 	var updated struct {
 		Config slacker.ConfigView `json:"config"`
 	}
-	if err := client.Call(api, http.MethodPost, "/v1/slacker/config", map[string]any{
-		"channels": cfg.Channels,
-		"emojis":   cfg.Emojis,
-	}, 15*time.Second, nil, &updated); err != nil {
+	if err := client.Call(api, http.MethodPost, "/v1/slacker/config", payload, 15*time.Second, nil, &updated); err != nil {
 		return err
 	}
 	printSlackerConfig(cio, updated.Config)
@@ -539,12 +673,17 @@ func cmdSlackerWorker(args []string, cio *IO) error {
 	once := fs.Bool("once", false, "poll once and exit")
 	pollTimeout := fs.Float64("poll-timeout", 30.0, "long-poll seconds per request")
 	useTmux := fs.Bool("use-tmux", false, "force tmux for launched sessions")
+	policyFlag := fs.String("policy", "", "fallback permission policy when job policy is unset (bypass|auto|safe)")
 	pos, err := parseFlagsInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) > 0 {
-		return fmt.Errorf("usage: fleet slacker worker [--once] [--poll-timeout S] [--use-tmux]")
+		return fmt.Errorf("usage: fleet slacker worker [--once] [--poll-timeout S] [--use-tmux] [--policy bypass|auto|safe]")
+	}
+	pol, err := session.ParsePolicy(*policyFlag, session.PolicyBypass)
+	if err != nil {
+		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -552,6 +691,7 @@ func cmdSlackerWorker(args []string, cio *IO) error {
 		Once:        *once,
 		PollTimeout: *pollTimeout,
 		UseTmux:     *useTmux,
+		Policy:      pol,
 		Stdout:      cio.Stdout,
 		Stderr:      cio.Stderr,
 	})

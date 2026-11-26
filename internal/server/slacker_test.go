@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bdatdo0601/fleet/internal/agents"
 	"github.com/bdatdo0601/fleet/internal/client"
 	"github.com/bdatdo0601/fleet/internal/registry"
 	"github.com/bdatdo0601/fleet/internal/slacker"
@@ -316,5 +317,173 @@ func TestSlackerMultiAccountAndAgentReadSend(t *testing.T) {
 	}
 	if _, mappedStillThere := delRes.Config.Channels[slacker.ChannelKey("work", "CWORK")]; mappedStillThere {
 		t.Fatalf("expected work channel mappings cleaned up, got %+v", delRes.Config.Channels)
+	}
+}
+
+func TestSlackerWorkspacesDefaultsAndStatusCounts(t *testing.T) {
+	f, srv, tmp := setupTestServer(t)
+	approveTestDevice(t, f, tmp, "laptop", "mac", "managed")
+	approveTestDevice(t, f, tmp, "office", "mac", "managed")
+
+	// Reject relative repo_path when target devices lack workspace_dir.
+	err := client.Call(srv.URL, http.MethodPost, "/v1/slacker/config", map[string]any{
+		"default_devices": []string{"laptop", "office"},
+		"channels": map[string]any{
+			"C1": map[string]any{"channel_id": "C1", "repo_path": "fleet"},
+		},
+	}, 5*time.Second, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "HTTP 400") {
+		t.Fatalf("expected 400 when workspace_dir missing, got %v", err)
+	}
+
+	// Reject channel with neither explicit devices nor default_devices.
+	err = client.Call(srv.URL, http.MethodPost, "/v1/slacker/config", map[string]any{
+		"default_devices": []string{},
+		"channels": map[string]any{
+			"C1": map[string]any{"channel_id": "C1", "repo_path": "/tmp/r"},
+		},
+	}, 5*time.Second, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "HTTP 400") {
+		t.Fatalf("expected 400 when channel has no target devices, got %v", err)
+	}
+
+	// Save per-machine workspaces, default pool/strategy, and multi-device relative channel.
+	var cfgRes struct {
+		Config slacker.ConfigView `json:"config"`
+	}
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/slacker/config", map[string]any{
+		"devices": map[string]any{
+			"laptop": map[string]any{"workspace_dir": "~/workspace"},
+			"office": map[string]any{"workspace_dir": "/Users/dat/src"},
+		},
+		"default_devices":  []string{"laptop", "office"},
+		"default_strategy": "round_robin",
+		"channels": map[string]any{
+			"C1": map[string]any{"channel_id": "C1", "repo_path": "fleet"},
+		},
+	}, 5*time.Second, nil, &cfgRes); err != nil {
+		t.Fatalf("save workspaces & defaults failed: %v", err)
+	}
+	if cfgRes.Config.DefaultStrategy != slacker.StrategyRoundRobin || len(cfgRes.Config.DefaultDevices) != 2 ||
+		cfgRes.Config.Devices["laptop"].WorkspaceDir != "~/workspace" || cfgRes.Config.Devices["office"].WorkspaceDir != "/Users/dat/src" {
+		t.Fatalf("unexpected config view: %+v", cfgRes.Config)
+	}
+
+	// Populate live agent + pending job and verify GET /v1/slacker/status includes counts.
+	if _, err := f.Agents.Heartbeat(agents.HeartbeatParams{Device: "laptop", Harness: "claude", RawID: "lap1", State: "working"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := f.Slacker.EnqueueJob(slacker.Job{
+		EventID: "EvSt1", ChannelID: "C1", MessageTS: "1.1", Reaction: "claude", UserID: "U1",
+		TargetDevice: "office", RepoPath: "/Users/dat/src/fleet", Harness: "claude", SessionName: "s1", Prompt: "hi",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stRes struct {
+		Config        slacker.ConfigView `json:"config"`
+		AgentCounts   map[string]int     `json:"agent_counts"`
+		PendingCounts map[string]int     `json:"pending_counts"`
+	}
+	if err := client.Call(srv.URL, http.MethodGet, "/v1/slacker/status", nil, 5*time.Second, nil, &stRes); err != nil {
+		t.Fatalf("GET /v1/slacker/status failed: %v", err)
+	}
+	if stRes.AgentCounts["laptop"] != 1 || stRes.PendingCounts["office"] != 1 {
+		t.Fatalf("unexpected status counts: agents=%+v pending=%+v", stRes.AgentCounts, stRes.PendingCounts)
+	}
+}
+
+func TestAgentSpawnEndpoint(t *testing.T) {
+	f, srv, tmp := setupTestServer(t)
+	_, laptop := approveTestDevice(t, f, tmp, "laptop", "mac", "managed")
+	approveTestDevice(t, f, tmp, "office", "mac", "managed")
+	approveTestDevice(t, f, tmp, "bare", "mac", "managed")
+
+	// Configure workspaces, default pool, and default_policy=auto.
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/slacker/config", map[string]any{
+		"devices": map[string]any{
+			"laptop": map[string]any{"workspace_dir": "~/workspace"},
+			"office": map[string]any{"workspace_dir": "/Users/dat/src"},
+		},
+		"default_devices":  []string{"laptop", "office"},
+		"default_strategy": "least_agents",
+		"default_policy":   "auto",
+	}, 5*time.Second, nil, nil); err != nil {
+		t.Fatalf("config setup failed: %v", err)
+	}
+
+	// Mark both laptop and office workers online, and give laptop 1 live agent so least_agents picks office.
+	if err := f.Slacker.UpsertWorkerRuntime("laptop", 10, true, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Slacker.UpsertWorkerRuntime("office", 20, true, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Agents.Heartbeat(agents.HeartbeatParams{Device: "laptop", Harness: "claude", RawID: "lap1", State: "working"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var spawnRes struct {
+		Job          slacker.Job `json:"job"`
+		WorkerOnline bool        `json:"worker_online"`
+	}
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/agents/spawn", map[string]any{
+		"harness":   "claude",
+		"repo_path": "fleet",
+		"prompt":    "Investigate UI spawn",
+	}, 5*time.Second, nil, &spawnRes); err != nil {
+		t.Fatalf("POST /v1/agents/spawn (default pool) failed: %v", err)
+	}
+	if !spawnRes.WorkerOnline ||
+		spawnRes.Job.TargetDevice != "office" ||
+		spawnRes.Job.RepoPath != "/Users/dat/src/fleet" ||
+		spawnRes.Job.Policy != "auto" ||
+		spawnRes.Job.Harness != "claude" ||
+		!strings.HasPrefix(spawnRes.Job.SessionName, "ui-claude-") {
+		t.Fatalf("unexpected first spawn response: %+v", spawnRes)
+	}
+
+	// Second spawn targeting offline "bare" explicitly with custom name, policy=safe, empty prompt -> succeeds and reports worker_online=false.
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/agents/spawn", map[string]any{
+		"harness":   "agy",
+		"name":      "custom-ui-sess",
+		"device":    "bare",
+		"policy":    "safe",
+		"repo_path": "/tmp/bare-repo",
+		"use_tmux":  true,
+	}, 5*time.Second, nil, &spawnRes); err != nil {
+		t.Fatalf("POST /v1/agents/spawn (explicit bare) failed: %v", err)
+	}
+	if spawnRes.WorkerOnline ||
+		spawnRes.Job.TargetDevice != "bare" ||
+		spawnRes.Job.SessionName != "custom-ui-sess" ||
+		spawnRes.Job.Policy != "safe" ||
+		spawnRes.Job.RepoPath != "/tmp/bare-repo" ||
+		!spawnRes.Job.UseTmux {
+		t.Fatalf("unexpected second spawn response: %+v", spawnRes)
+	}
+
+	// Validation errors (400).
+	for _, tc := range []struct {
+		name string
+		body map[string]any
+	}{
+		{"invalid harness", map[string]any{"harness": "unknown", "repo_path": "/tmp"}},
+		{"invalid session name", map[string]any{"harness": "claude", "name": "bad name!", "repo_path": "/tmp"}},
+		{"relative repo without workspace_dir", map[string]any{"harness": "claude", "device": "bare", "repo_path": "fleet"}},
+	} {
+		err := client.Call(srv.URL, http.MethodPost, "/v1/agents/spawn", tc.body, 5*time.Second, nil, nil)
+		if err == nil || !strings.Contains(err.Error(), "HTTP 400") {
+			t.Fatalf("%s expected HTTP 400, got %v", tc.name, err)
+		}
+	}
+
+	// Managed (non-admin) device is forbidden (403).
+	f.IdentifyOverride = func(string) *registry.Device { return laptop }
+	err := client.Call(srv.URL, http.MethodPost, "/v1/agents/spawn", map[string]any{
+		"harness": "claude", "repo_path": "fleet",
+	}, 5*time.Second, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "HTTP 403") {
+		t.Fatalf("managed POST /v1/agents/spawn expected HTTP 403, got %v", err)
 	}
 }

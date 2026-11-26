@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -19,6 +21,12 @@ import (
 
 // DefaultAccountID is the implicit Slack account identifier used when none is specified.
 const DefaultAccountID = "default"
+
+// Routing strategy constants for multi-device Slacker channels.
+const (
+	StrategyLeastAgents = "least_agents"
+	StrategyRoundRobin  = "round_robin"
+)
 
 // SlackerError represents a caller-level error carrying an HTTP status code.
 type SlackerError struct {
@@ -92,20 +100,32 @@ type AccountUpdate struct {
 	AllowUnmappedSend *bool   `json:"allow_unmapped_send"`
 }
 
-// ChannelMapping maps a Slack (account, channel_id) pair to a Fleet device and local repo path.
+// DeviceConfig stores per-machine Slacker defaults such as its workspace root directory.
+type DeviceConfig struct {
+	WorkspaceDir string `json:"workspace_dir,omitempty"`
+}
+
+// ChannelMapping maps a Slack (account, channel_id) pair to Fleet device(s), strategy, policy, and local repo path.
 type ChannelMapping struct {
-	Account     string `json:"account,omitempty"`
-	ChannelID   string `json:"channel_id"`
-	ChannelName string `json:"channel_name,omitempty"`
-	Device      string `json:"device"`
-	RepoPath    string `json:"repo_path"`
-	UseTmux     bool   `json:"use_tmux,omitempty"`
+	Account     string   `json:"account,omitempty"`
+	ChannelID   string   `json:"channel_id"`
+	ChannelName string   `json:"channel_name,omitempty"`
+	Device      string   `json:"device,omitempty"`
+	Devices     []string `json:"devices,omitempty"`
+	Strategy    string   `json:"strategy,omitempty"`
+	Policy      string   `json:"policy,omitempty"`
+	RepoPath    string   `json:"repo_path,omitempty"`
+	UseTmux     bool     `json:"use_tmux,omitempty"`
 }
 
 // Config persists lighthouse Slacker settings in ~/.fleet/slacker.json.
 // Top-level token fields are kept only for backward-compatible unmarshaling of single-account configs.
 type Config struct {
 	Accounts         map[string]AccountConfig  `json:"accounts,omitempty"`
+	Devices          map[string]DeviceConfig   `json:"devices,omitempty"`
+	DefaultDevices   []string                  `json:"default_devices,omitempty"`
+	DefaultStrategy  string                    `json:"default_strategy,omitempty"`
+	DefaultPolicy    string                    `json:"default_policy,omitempty"`
 	Channels         map[string]ChannelMapping `json:"channels"`
 	Emojis           map[string]string         `json:"emojis"`
 	UpdatedAt        string                    `json:"updated_at,omitempty"`
@@ -125,6 +145,10 @@ type Config struct {
 // ConfigView is the redacted view of Config returned over HTTP APIs.
 type ConfigView struct {
 	Accounts          map[string]AccountView    `json:"accounts"`
+	Devices           map[string]DeviceConfig   `json:"devices"`
+	DefaultDevices    []string                  `json:"default_devices"`
+	DefaultStrategy   string                    `json:"default_strategy"`
+	DefaultPolicy     string                    `json:"default_policy"`
 	Enabled           bool                      `json:"enabled"`
 	Configured        bool                      `json:"configured"`
 	HasAppToken       bool                      `json:"has_app_token"`
@@ -151,6 +175,10 @@ type ConfigUpdate struct {
 	Account           string                    `json:"account"`
 	DeleteAccount     string                    `json:"delete_account"`
 	Accounts          map[string]AccountUpdate  `json:"accounts"`
+	Devices           map[string]DeviceConfig   `json:"devices"`
+	DefaultDevices    *[]string                 `json:"default_devices"`
+	DefaultStrategy   *string                   `json:"default_strategy"`
+	DefaultPolicy     *string                   `json:"default_policy"`
 	Enabled           *bool                     `json:"enabled"`
 	AppToken          *string                   `json:"app_token"`
 	UserToken         *string                   `json:"user_token"`
@@ -182,6 +210,7 @@ type Job struct {
 	TargetDevice   string `json:"target_device"`
 	RepoPath       string `json:"repo_path"`
 	UseTmux        bool   `json:"use_tmux"`
+	Policy         string `json:"policy,omitempty"`
 	Harness        string `json:"harness"`
 	SessionName    string `json:"session_name"`
 	Prompt         string `json:"prompt"`
@@ -240,6 +269,72 @@ func MaskSecret(s string) string {
 func NormalizeEmoji(raw string) string {
 	s := strings.TrimSpace(strings.ToLower(raw))
 	return strings.Trim(s, ":")
+}
+
+// NormalizeStrategy validates and normalizes a multi-device routing strategy.
+func NormalizeStrategy(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "":
+		return "", nil
+	case "least_agents", "least-agents", "least":
+		return StrategyLeastAgents, nil
+	case "round_robin", "round-robin", "rr":
+		return StrategyRoundRobin, nil
+	default:
+		return "", newSlackerErr(fmt.Sprintf("invalid routing strategy %q (expected least_agents or round_robin)", raw), 400)
+	}
+}
+
+// NormalizePolicy validates and normalizes a Slacker session permission policy.
+func NormalizePolicy(raw string) (string, error) {
+	p := strings.ToLower(strings.TrimSpace(raw))
+	if p == "" {
+		return "", nil
+	}
+	pol, err := session.ParsePolicy(p, "")
+	if err != nil {
+		return "", newSlackerErr(err.Error(), 400)
+	}
+	return string(pol), nil
+}
+
+func normalizeDeviceList(raw []string) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(raw))
+	out := make([]string, 0, len(raw))
+	for _, item := range raw {
+		d := strings.TrimSpace(item)
+		if d == "" || seen[d] {
+			continue
+		}
+		seen[d] = true
+		out = append(out, d)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func normalizeWorkspaceDir(raw string) (string, error) {
+	ws := strings.TrimSpace(raw)
+	if ws == "" {
+		return "", nil
+	}
+	if !strings.HasPrefix(ws, "/") && ws != "~" && !strings.HasPrefix(ws, "~/") {
+		return "", newSlackerErr(fmt.Sprintf("workspace_dir %q must be an absolute or ~/ path", ws), 400)
+	}
+	if len(ws) > 1 {
+		trimmed := strings.TrimRight(ws, "/")
+		if trimmed == "" {
+			ws = "/"
+		} else {
+			ws = trimmed
+		}
+	}
+	return ws, nil
 }
 
 // NormalizeAccountID validates and normalizes a Slack account identifier, defaulting empty to "default".
@@ -333,11 +428,21 @@ func normalizeLoadedConfig(cfg *Config) {
 	if cfg.Accounts == nil {
 		cfg.Accounts = map[string]AccountConfig{}
 	}
+	if cfg.Devices == nil {
+		cfg.Devices = map[string]DeviceConfig{}
+	}
 	if cfg.Channels == nil {
 		cfg.Channels = map[string]ChannelMapping{}
 	}
 	if cfg.Emojis == nil {
 		cfg.Emojis = map[string]string{}
+	}
+	cfg.DefaultDevices = normalizeDeviceList(cfg.DefaultDevices)
+	if strat, err := NormalizeStrategy(cfg.DefaultStrategy); err == nil {
+		cfg.DefaultStrategy = strat
+	}
+	if pol, err := NormalizePolicy(cfg.DefaultPolicy); err == nil {
+		cfg.DefaultPolicy = pol
 	}
 	// Migrate legacy top-level single-account config into Accounts["default"].
 	if len(cfg.Accounts) == 0 && (cfg.Enabled || cfg.AppToken != "" || cfg.UserToken != "" || cfg.AuthorizedUserID != "") {
@@ -360,11 +465,37 @@ func normalizeLoadedConfig(cfg *Config) {
 		acct.ID = id
 		cfg.Accounts[id] = acct
 	}
+	for dev, dc := range cfg.Devices {
+		if norm, err := normalizeWorkspaceDir(dc.WorkspaceDir); err == nil {
+			dc.WorkspaceDir = norm
+		}
+		if dc.WorkspaceDir == "" {
+			delete(cfg.Devices, dev)
+		} else {
+			cfg.Devices[dev] = dc
+		}
+	}
 	for k, ch := range cfg.Channels {
 		if ch.Account == "" {
 			ch.Account = DefaultAccountID
-			cfg.Channels[k] = ch
 		}
+		devs := normalizeDeviceList(ch.Devices)
+		if len(devs) == 0 && strings.TrimSpace(ch.Device) != "" {
+			devs = []string{strings.TrimSpace(ch.Device)}
+		}
+		ch.Devices = devs
+		if len(devs) == 1 {
+			ch.Device = devs[0]
+		} else {
+			ch.Device = ""
+		}
+		if strat, err := NormalizeStrategy(ch.Strategy); err == nil {
+			ch.Strategy = strat
+		}
+		if pol, err := NormalizePolicy(ch.Policy); err == nil {
+			ch.Policy = pol
+		}
+		cfg.Channels[k] = ch
 	}
 }
 
@@ -372,6 +503,7 @@ func normalizeLoadedConfig(cfg *Config) {
 func LoadConfig(path string) (Config, error) {
 	cfg := Config{
 		Accounts: map[string]AccountConfig{},
+		Devices:  map[string]DeviceConfig{},
 		Channels: map[string]ChannelMapping{},
 		Emojis:   map[string]string{},
 	}
@@ -444,10 +576,76 @@ func (c Config) primaryAccount() (AccountConfig, bool) {
 	return AccountConfig{}, false
 }
 
+// EffectiveDefaultStrategy returns the configured global default routing strategy, defaulting to least_agents.
+func (c Config) EffectiveDefaultStrategy() string {
+	return cmp.Or(c.DefaultStrategy, StrategyLeastAgents)
+}
+
+// EffectiveChannelDevices returns the ordered candidate device list for ch, falling back to DefaultDevices.
+func (c Config) EffectiveChannelDevices(ch ChannelMapping) []string {
+	if devs := normalizeDeviceList(ch.Devices); len(devs) > 0 {
+		return devs
+	}
+	if d := strings.TrimSpace(ch.Device); d != "" {
+		return []string{d}
+	}
+	return normalizeDeviceList(c.DefaultDevices)
+}
+
+// EffectiveChannelStrategy returns the routing strategy for ch, falling back to DefaultStrategy then least_agents.
+func (c Config) EffectiveChannelStrategy(ch ChannelMapping) string {
+	return cmp.Or(ch.Strategy, c.DefaultStrategy, StrategyLeastAgents)
+}
+
+// EffectiveDefaultPolicy returns the configured global default permission policy, defaulting to bypass.
+func (c Config) EffectiveDefaultPolicy() string {
+	return cmp.Or(c.DefaultPolicy, string(session.PolicyBypass))
+}
+
+// EffectiveChannelPolicy returns the permission policy for ch, falling back to DefaultPolicy then bypass.
+func (c Config) EffectiveChannelPolicy(ch ChannelMapping) string {
+	return cmp.Or(ch.Policy, c.DefaultPolicy, string(session.PolicyBypass))
+}
+
+// ResolveRepoPath resolves repoPath on device, joining relative subpaths (or blank) onto the device's workspace_dir.
+func (c Config) ResolveRepoPath(device, repoPath string) (string, error) {
+	repo := strings.TrimSpace(repoPath)
+	if strings.HasPrefix(repo, "/") || repo == "~" || strings.HasPrefix(repo, "~/") {
+		return repo, nil
+	}
+	if strings.HasPrefix(repo, "~") {
+		return "", newSlackerErr(fmt.Sprintf("repo_path %q must use ~/ or an absolute/relative path", repo), 400)
+	}
+	ws := strings.TrimSpace(c.Devices[device].WorkspaceDir)
+	if ws == "" {
+		return "", newSlackerErr(fmt.Sprintf("device %q has no workspace_dir configured for repo_path %q", device, repo), 400)
+	}
+	if repo == "" || repo == "." {
+		return ws, nil
+	}
+	clean := filepath.Clean(repo)
+	if clean == ".." || strings.HasPrefix(clean, "../") || strings.HasPrefix(clean, "/") {
+		return "", newSlackerErr(fmt.Sprintf("relative repo_path %q cannot escape workspace_dir", repo), 400)
+	}
+	if clean == "." {
+		return ws, nil
+	}
+	return filepath.Join(ws, clean), nil
+}
+
 // View returns a redacted ConfigView safe for HTTP/CLI display.
 func (c Config) View() ConfigView {
 	channels := make(map[string]ChannelMapping, len(c.Channels))
-	maps.Copy(channels, c.Channels)
+	for k, ch := range c.Channels {
+		ch.Devices = slices.Clone(ch.Devices)
+		channels[k] = ch
+	}
+	devices := make(map[string]DeviceConfig, len(c.Devices))
+	maps.Copy(devices, c.Devices)
+	defDevices := []string{}
+	if len(c.DefaultDevices) > 0 {
+		defDevices = slices.Clone(c.DefaultDevices)
+	}
 	emojis := make(map[string]string, len(c.Emojis))
 	maps.Copy(emojis, c.Emojis)
 	accts := make(map[string]AccountView, len(c.Accounts))
@@ -463,12 +661,16 @@ func (c Config) View() ConfigView {
 		}
 	}
 	view := ConfigView{
-		Accounts:   accts,
-		Enabled:    anyEnabled,
-		Configured: anyConfigured,
-		Channels:   channels,
-		Emojis:     emojis,
-		UpdatedAt:  c.UpdatedAt,
+		Accounts:        accts,
+		Devices:         devices,
+		DefaultDevices:  defDevices,
+		DefaultStrategy: c.EffectiveDefaultStrategy(),
+		DefaultPolicy:   c.EffectiveDefaultPolicy(),
+		Enabled:         anyEnabled,
+		Configured:      anyConfigured,
+		Channels:        channels,
+		Emojis:          emojis,
+		UpdatedAt:       c.UpdatedAt,
 	}
 	if p, ok := c.primaryAccount(); ok {
 		pv := p.View()
@@ -636,6 +838,43 @@ func hasInlineAccountFields(upd ConfigUpdate) bool {
 		upd.AllowUnmappedSend != nil
 }
 
+func applyDeviceUpdates(rawDevices map[string]DeviceConfig, activeDevices map[string]bool) (map[string]DeviceConfig, error) {
+	normalized := make(map[string]DeviceConfig, len(rawDevices))
+	for rawDev, dc := range rawDevices {
+		dev := strings.TrimSpace(rawDev)
+		if dev == "" {
+			return nil, newSlackerErr("device name cannot be empty in devices map", 400)
+		}
+		if len(activeDevices) > 0 && !activeDevices[dev] {
+			return nil, newSlackerErr(fmt.Sprintf("unknown or revoked device %q in devices", dev), 400)
+		}
+		ws, err := normalizeWorkspaceDir(dc.WorkspaceDir)
+		if err != nil {
+			return nil, err
+		}
+		if ws == "" {
+			continue
+		}
+		normalized[dev] = DeviceConfig{WorkspaceDir: ws}
+	}
+	return normalized, nil
+}
+
+func validateDeviceList(raw []string, activeDevices map[string]bool, ctxLabel string) ([]string, error) {
+	devs := normalizeDeviceList(raw)
+	if len(activeDevices) > 0 {
+		for _, dev := range devs {
+			if !activeDevices[dev] {
+				return nil, newSlackerErr(fmt.Sprintf("unknown or revoked device %q in %s", dev, ctxLabel), 400)
+			}
+		}
+	}
+	if devs == nil {
+		return []string{}, nil
+	}
+	return devs, nil
+}
+
 func applyChannelUpdates(rawChannels map[string]ChannelMapping, activeDevices map[string]bool) (map[string]ChannelMapping, error) {
 	normalized := make(map[string]ChannelMapping, len(rawChannels))
 	for rawKey, ch := range rawChannels {
@@ -651,21 +890,40 @@ func applyChannelUpdates(rawChannels map[string]ChannelMapping, activeDevices ma
 				cid = strings.TrimSpace(rawKey)
 			}
 		}
-		dev := strings.TrimSpace(ch.Device)
+		if cid == "" {
+			return nil, newSlackerErr("each channel mapping requires channel_id", 400)
+		}
+		devs := normalizeDeviceList(ch.Devices)
+		if len(devs) == 0 && strings.TrimSpace(ch.Device) != "" {
+			devs = []string{strings.TrimSpace(ch.Device)}
+		}
+		if len(activeDevices) > 0 {
+			for _, dev := range devs {
+				if !activeDevices[dev] {
+					return nil, newSlackerErr(fmt.Sprintf("unknown or revoked device %q in channel %s", dev, cid), 400)
+				}
+			}
+		}
+		strat, err := NormalizeStrategy(ch.Strategy)
+		if err != nil {
+			return nil, err
+		}
+		pol, err := NormalizePolicy(ch.Policy)
+		if err != nil {
+			return nil, err
+		}
 		repo := strings.TrimSpace(ch.RepoPath)
-		if cid == "" || dev == "" || repo == "" {
-			return nil, newSlackerErr("each channel mapping requires channel_id, device, and repo_path", 400)
-		}
-		if !strings.HasPrefix(repo, "/") && !strings.HasPrefix(repo, "~/") {
-			return nil, newSlackerErr(fmt.Sprintf("channel %s repo_path %q must be an absolute or ~/ path", cid, repo), 400)
-		}
-		if len(activeDevices) > 0 && !activeDevices[dev] {
-			return nil, newSlackerErr(fmt.Sprintf("unknown or revoked device %q in channel %s", dev, cid), 400)
-		}
 		ch.Account = acctID
 		ch.ChannelID = cid
 		ch.ChannelName = strings.TrimSpace(ch.ChannelName)
-		ch.Device = dev
+		ch.Devices = devs
+		if len(devs) == 1 {
+			ch.Device = devs[0]
+		} else {
+			ch.Device = ""
+		}
+		ch.Strategy = strat
+		ch.Policy = pol
 		ch.RepoPath = repo
 		normalized[ChannelKey(acctID, cid)] = ch
 	}
@@ -685,7 +943,7 @@ func applyEmojiUpdates(rawEmojis map[string]string) (map[string]string, error) {
 	return normalized, nil
 }
 
-// ApplyUpdate merges upd onto prev, validating accounts, token prefixes, devices, repo paths, and harness mappings.
+// ApplyUpdate merges upd onto prev, validating accounts, token prefixes, devices, workspace dirs, routing defaults, repo paths, and harness mappings.
 func ApplyUpdate(prev Config, upd ConfigUpdate, activeDevices map[string]bool) (Config, error) {
 	next := prev
 	normalizeLoadedConfig(&next)
@@ -744,12 +1002,53 @@ func ApplyUpdate(prev Config, upd ConfigUpdate, activeDevices map[string]bool) (
 		next.Accounts[id] = updated
 	}
 
+	if upd.Devices != nil {
+		devs, err := applyDeviceUpdates(upd.Devices, activeDevices)
+		if err != nil {
+			return next, err
+		}
+		next.Devices = devs
+	}
+	if upd.DefaultDevices != nil {
+		defDevs, err := validateDeviceList(*upd.DefaultDevices, activeDevices, "default_devices")
+		if err != nil {
+			return next, err
+		}
+		next.DefaultDevices = defDevs
+	}
+	if upd.DefaultStrategy != nil {
+		strat, err := NormalizeStrategy(*upd.DefaultStrategy)
+		if err != nil {
+			return next, err
+		}
+		next.DefaultStrategy = strat
+	}
+	if upd.DefaultPolicy != nil {
+		pol, err := NormalizePolicy(*upd.DefaultPolicy)
+		if err != nil {
+			return next, err
+		}
+		next.DefaultPolicy = pol
+	}
 	if upd.Channels != nil {
 		ch, err := applyChannelUpdates(upd.Channels, activeDevices)
 		if err != nil {
 			return next, err
 		}
 		next.Channels = ch
+	}
+	if upd.Devices != nil || upd.DefaultDevices != nil || upd.Channels != nil {
+		for _, ch := range next.Channels {
+			targets := next.EffectiveChannelDevices(ch)
+			if len(targets) == 0 {
+				return next, newSlackerErr(fmt.Sprintf("channel %s requires at least one device or default_devices", ch.ChannelID), 400)
+			}
+			for _, dev := range targets {
+				if _, err := next.ResolveRepoPath(dev, ch.RepoPath); err != nil {
+					return next, newSlackerErr(fmt.Sprintf("channel %s: %s", ch.ChannelID, err.Error()), 400)
+				}
+			}
+		}
 	}
 	if upd.Emojis != nil {
 		em, err := applyEmojiUpdates(upd.Emojis)

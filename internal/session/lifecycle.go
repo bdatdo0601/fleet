@@ -18,9 +18,11 @@ type StartOpts struct {
 	Harness   string
 	Name      string
 	Directory string
+	UseRex    bool
 	UseTmux   bool
 	Attach    bool
 	ResumeID  string
+	Model     string
 	Policy    Policy
 	Prompt    string
 	SelfBin   string
@@ -89,7 +91,7 @@ func resolveDirectory(raw string) (string, error) {
 	return abs, nil
 }
 
-// Start launches a new detached or attached session in Rex (when installed) or tmux.
+// Start launches a new detached or attached session in the Antigravity app (agy default), Rex, or tmux.
 func Start(opts StartOpts) (string, error) {
 	spec, err := GetSpec(opts.Harness)
 	if err != nil {
@@ -98,31 +100,47 @@ func Start(opts StartOpts) (string, error) {
 	if err := ValidateName(opts.Name); err != nil {
 		return "", err
 	}
-	pathEnv := AugmentedPath(os.Getenv("PATH"), os.Getenv("HOME"))
-	_ = os.Setenv("PATH", pathEnv)
-	if _, err := lookPathWithEnv("tmux", pathEnv); err != nil {
-		return "", errors.New("tmux is required (macOS: brew install tmux)")
-	}
-	if _, err := os.Stat(upgradeLockPath(spec.Name)); err == nil {
-		return "", errors.New("an upgrade is running; wait for it to finish before starting sessions")
+	if opts.UseRex && opts.UseTmux {
+		return "", errors.New("--rex and --tmux cannot be combined")
 	}
 	directory, err := resolveDirectory(opts.Directory)
 	if err != nil {
 		return "", err
-	}
-	harnessBin, err := lookPathWithEnv(spec.Binary, pathEnv)
-	if err != nil {
-		return "", fmt.Errorf("%s is required. Install %s and sign in first", spec.Binary, spec.DisplayName)
 	}
 	if opts.ResumeID != "" {
 		if err := ValidateUUID(opts.ResumeID); err != nil {
 			return "", err
 		}
 	}
-	session := spec.Prefix + opts.Name
-	target := "=" + session
 	if exists, _ := SessionExists(spec.Name, opts.Name); exists {
 		return "", fmt.Errorf("session '%s' already exists. Attach with: fleet session %s attach %s", opts.Name, spec.Name, opts.Name)
+	}
+
+	if spec.Name == HarnessAgy && !opts.UseRex && !opts.UseTmux {
+		if err := startAgyAppSession(opts, directory); err != nil {
+			return "", err
+		}
+		return "app", nil
+	}
+
+	pathEnv := AugmentedPath(os.Getenv("PATH"), os.Getenv("HOME"))
+	_ = os.Setenv("PATH", pathEnv)
+	if _, err := os.Stat(upgradeLockPath(spec.Name)); err == nil {
+		return "", errors.New("an upgrade is running; wait for it to finish before starting sessions")
+	}
+	harnessBin, err := lookPathWithEnv(spec.Binary, pathEnv)
+	if err != nil {
+		return "", fmt.Errorf("%s is required. Install %s and sign in first", spec.Binary, spec.DisplayName)
+	}
+
+	useRex := opts.UseRex || (!opts.UseTmux && spec.Name != HarnessAgy && rexInstalled(pathEnv))
+	if opts.UseRex && !rexInstalled(pathEnv) {
+		return "", errors.New("rex is required when --rex is specified")
+	}
+	if !useRex {
+		if _, err := lookPathWithEnv("tmux", pathEnv); err != nil {
+			return "", errors.New("tmux is required (macOS: brew install tmux)")
+		}
 	}
 
 	self := resolveSelfBin(opts.SelfBin)
@@ -144,12 +162,14 @@ func Start(opts StartOpts) (string, error) {
 		}
 	}
 
-	if !opts.UseTmux && rexInstalled(pathEnv) {
+	if useRex {
 		if err := startRexSession(spec, opts, directory, self, pathEnv, pol); err != nil {
 			return "", err
 		}
 		return "rex", nil
 	}
+	session := spec.Prefix + opts.Name
+	target := "=" + session
 	if err := startTmuxSession(spec, opts, directory, harnessBin, self, pathEnv, session, target, pol); err != nil {
 		return "", err
 	}
@@ -280,7 +300,7 @@ func startTmuxSession(spec Spec, opts StartOpts, directory, harnessBin, self, pa
 	return nil
 }
 
-// Attach connects to an existing tmux session or selects an existing Rex session in the Rex app.
+// Attach connects to an existing tmux session, selects a Rex session, or opens the Antigravity app for an app session.
 func Attach(harness, name string, stderr io.Writer) error {
 	spec, err := GetSpec(harness)
 	if err != nil {
@@ -291,24 +311,36 @@ func Attach(harness, name string, stderr io.Writer) error {
 	}
 	pathEnv := AugmentedPath(os.Getenv("PATH"), os.Getenv("HOME"))
 	_ = os.Setenv("PATH", pathEnv)
-	if _, err := lookPathWithEnv("tmux", pathEnv); err != nil {
+	_, tmuxErr := lookPathWithEnv("tmux", pathEnv)
+	hasTmux := tmuxErr == nil
+	if spec.Name != HarnessAgy && !hasTmux {
 		return errors.New("tmux is required (macOS: brew install tmux)")
 	}
 	session := spec.Prefix + name
 	target := "=" + session
-	if !tmuxHasSession(target) {
-		if rexID := rexSessionID(spec, session); rexID != "" {
-			if !rexShow(spec, rexID, stderr) {
-				return fmt.Errorf("could not show '%s' in Rex; open it from the Rex session picker (Shift-Cmd-K)", name)
-			}
-			return nil
-		}
-		return fmt.Errorf("no session named '%s'. Run fleet session %s list", name, spec.Name)
+	if hasTmux && tmuxHasSession(target) {
+		return tmuxAttachExec(spec, target, pathEnv)
 	}
-	return tmuxAttachExec(spec, target, pathEnv)
+	if rexID := rexSessionID(spec, session); rexID != "" {
+		if !rexShow(spec, rexID, stderr) {
+			return fmt.Errorf("could not show '%s' in Rex; open it from the Rex session picker (Shift-Cmd-K)", name)
+		}
+		return nil
+	}
+	if spec.Name == HarnessAgy {
+		if st, ok := agyAppSessionActive(name); ok {
+			if hub, hErr := discoverAgyHub(); hErr == nil {
+				if conv, gErr := agyGetConversation(hub, st.ConversationID); gErr == nil && conv.Annotations.Archived {
+					_ = agyUpdateConversationArchived(hub, st.ConversationID, false)
+				}
+			}
+			return openAgyAppFn()
+		}
+	}
+	return fmt.Errorf("no session named '%s'. Run fleet session %s list", name, spec.Name)
 }
 
-// List prints all active tmux and Rex sessions for harness.
+// List prints all active tmux, Rex, and (for agy) Antigravity app sessions for harness.
 func List(harness string, stdout io.Writer) error {
 	spec, err := GetSpec(harness)
 	if err != nil {
@@ -316,17 +348,21 @@ func List(harness string, stdout io.Writer) error {
 	}
 	pathEnv := AugmentedPath(os.Getenv("PATH"), os.Getenv("HOME"))
 	_ = os.Setenv("PATH", pathEnv)
-	if _, err := lookPathWithEnv("tmux", pathEnv); err != nil {
+	_, tmuxErr := lookPathWithEnv("tmux", pathEnv)
+	hasTmux := tmuxErr == nil
+	if spec.Name != HarnessAgy && !hasTmux {
 		return errors.New("tmux is required (macOS: brew install tmux)")
 	}
 	found := false
-	for _, s := range tmuxListSessions() {
-		if !strings.HasPrefix(s, spec.Prefix) {
-			continue
-		}
-		if tmuxRunsHarness(spec, s) {
-			_, _ = fmt.Fprintf(stdout, "%s\n", strings.TrimPrefix(s, spec.Prefix))
-			found = true
+	if hasTmux {
+		for _, s := range tmuxListSessions() {
+			if !strings.HasPrefix(s, spec.Prefix) {
+				continue
+			}
+			if tmuxRunsHarness(spec, s) {
+				_, _ = fmt.Fprintf(stdout, "%s\n", strings.TrimPrefix(s, spec.Prefix))
+				found = true
+			}
 		}
 	}
 	for _, rs := range rexSessionsFor(spec) {
@@ -336,13 +372,21 @@ func List(harness string, stdout io.Writer) error {
 			found = true
 		}
 	}
+	if spec.Name == HarnessAgy {
+		for _, st := range listAppSessionStates(HarnessAgy) {
+			if _, ok := agyAppSessionActive(st.Name); ok {
+				_, _ = fmt.Fprintf(stdout, "%s (app)\n", st.Name)
+				found = true
+			}
+		}
+	}
 	if !found {
 		_, _ = fmt.Fprintf(stdout, "No %s sessions. Start one: fleet session %s start NAME DIRECTORY\n", spec.DisplayName, spec.Name)
 	}
 	return nil
 }
 
-// Kill terminates one tmux or Rex session by exact name.
+// Kill terminates one tmux or Rex session, or archives an Antigravity app session by exact name.
 func Kill(harness, name string, stdout io.Writer) error {
 	spec, err := GetSpec(harness)
 	if err != nil {
@@ -353,29 +397,47 @@ func Kill(harness, name string, stdout io.Writer) error {
 	}
 	pathEnv := AugmentedPath(os.Getenv("PATH"), os.Getenv("HOME"))
 	_ = os.Setenv("PATH", pathEnv)
-	if _, err := lookPathWithEnv("tmux", pathEnv); err != nil {
+	_, tmuxErr := lookPathWithEnv("tmux", pathEnv)
+	hasTmux := tmuxErr == nil
+	if spec.Name != HarnessAgy && !hasTmux {
 		return errors.New("tmux is required (macOS: brew install tmux)")
 	}
 	session := spec.Prefix + name
 	target := "=" + session
-	if !tmuxHasSession(target) {
-		if rexID := rexSessionID(spec, session); rexID != "" {
-			if _, err := runCmdCapture("rex", "kill", rexID); err != nil {
-				return err
+	if hasTmux && tmuxHasSession(target) {
+		if _, err := tmuxCmd("kill-session", "-t", target); err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(stdout, "Killed %s\n", name)
+		return nil
+	}
+	if rexID := rexSessionID(spec, session); rexID != "" {
+		if _, err := runCmdCapture("rex", "kill", rexID); err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(stdout, "Killed %s\n", name)
+		return nil
+	}
+	if spec.Name == HarnessAgy {
+		if st, ok := agyAppSessionActive(name); ok {
+			hub, hErr := discoverAgyHub()
+			if hErr == nil {
+				if uErr := agyUpdateConversationArchived(hub, st.ConversationID, true); uErr != nil && !isConnectNotFound(uErr) {
+					return uErr
+				}
+				removeAppSessionState(HarnessAgy, name)
+				_, _ = fmt.Fprintf(stdout, "Killed %s (app) (archived in Antigravity)\n", name)
+				return nil
 			}
-			_, _ = fmt.Fprintf(stdout, "Killed %s\n", name)
+			removeAppSessionState(HarnessAgy, name)
+			_, _ = fmt.Fprintf(stdout, "Removed local session %s (app); Antigravity app is not running so it was not archived remotely\n", name)
 			return nil
 		}
-		return fmt.Errorf("no session named '%s'. Run fleet session %s list", name, spec.Name)
 	}
-	if _, err := tmuxCmd("kill-session", "-t", target); err != nil {
-		return err
-	}
-	_, _ = fmt.Fprintf(stdout, "Killed %s\n", name)
-	return nil
+	return fmt.Errorf("no session named '%s'. Run fleet session %s list", name, spec.Name)
 }
 
-// KillAll terminates all tmux and Rex sessions belonging to harness, deferring the caller's own session to last.
+// KillAll terminates all tmux and Rex sessions (and archives Antigravity app sessions) belonging to harness, deferring the caller's own session to last.
 func KillAll(harness string, stdout, stderr io.Writer) error {
 	spec, err := GetSpec(harness)
 	if err != nil {
@@ -383,26 +445,30 @@ func KillAll(harness string, stdout, stderr io.Writer) error {
 	}
 	pathEnv := AugmentedPath(os.Getenv("PATH"), os.Getenv("HOME"))
 	_ = os.Setenv("PATH", pathEnv)
-	if _, err := lookPathWithEnv("tmux", pathEnv); err != nil {
+	_, tmuxErr := lookPathWithEnv("tmux", pathEnv)
+	hasTmux := tmuxErr == nil
+	if spec.Name != HarnessAgy && !hasTmux {
 		return errors.New("tmux is required (macOS: brew install tmux)")
 	}
 	currentSession := ""
-	if pane := os.Getenv("TMUX_PANE"); pane != "" {
+	if pane := os.Getenv("TMUX_PANE"); pane != "" && hasTmux {
 		currentSession, _ = tmuxDisplay(pane, "#{session_name}")
 	}
 	found := false
 	deferredSession := ""
-	for _, s := range tmuxListSessions() {
-		if !strings.HasPrefix(s, spec.Prefix) {
-			continue
-		}
-		found = true
-		if s == currentSession {
-			deferredSession = s
-			continue
-		}
-		if _, err := tmuxCmd("kill-session", "-t", "="+s); err == nil {
-			_, _ = fmt.Fprintf(stdout, "Killed %s\n", strings.TrimPrefix(s, spec.Prefix))
+	if hasTmux {
+		for _, s := range tmuxListSessions() {
+			if !strings.HasPrefix(s, spec.Prefix) {
+				continue
+			}
+			found = true
+			if s == currentSession {
+				deferredSession = s
+				continue
+			}
+			if _, err := tmuxCmd("kill-session", "-t", "="+s); err == nil {
+				_, _ = fmt.Fprintf(stdout, "Killed %s\n", strings.TrimPrefix(s, spec.Prefix))
+			}
 		}
 	}
 
@@ -420,6 +486,25 @@ func KillAll(harness string, stdout, stderr io.Writer) error {
 			_, _ = fmt.Fprintf(stdout, "Killed %s (rex)\n", rexName)
 		} else {
 			_, _ = fmt.Fprintf(stderr, "fleet session %s: could not kill Rex session %s\n", spec.Name, rexName)
+		}
+	}
+
+	if spec.Name == HarnessAgy {
+		appStates := listAppSessionStates(HarnessAgy)
+		if len(appStates) > 0 {
+			hub, hubErr := discoverAgyHub()
+			for _, st := range appStates {
+				found = true
+				if hubErr == nil {
+					if uErr := agyUpdateConversationArchived(hub, st.ConversationID, true); uErr != nil && !isConnectNotFound(uErr) {
+						_, _ = fmt.Fprintf(stderr, "fleet session %s: could not archive Antigravity session %s: %v\n", spec.Name, st.Name, uErr)
+					}
+				} else {
+					_, _ = fmt.Fprintf(stderr, "fleet session %s: Antigravity app is not running; removed local session %s without archiving remotely\n", spec.Name, st.Name)
+				}
+				removeAppSessionState(HarnessAgy, st.Name)
+				_, _ = fmt.Fprintf(stdout, "Killed %s (app)\n", st.Name)
+			}
 		}
 	}
 

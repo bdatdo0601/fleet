@@ -1,3 +1,4 @@
+import { openSpawnSessionModal } from "./agents.js";
 import { api, badge, clear, confirmDialog, el, makeCopyBtn, relTime, state, toast } from "./lib.js";
 
 function renderStatusCard(statusRes) {
@@ -186,6 +187,143 @@ function renderAccountsCard(cfg, runtimes, ctx) {
   return card;
 }
 
+function isWorkerOnline(runtimes, dev) {
+  const rt = runtimes.find((r) => r.role === `worker:${dev}`);
+  if (!rt || !rt.connected) {
+    return false;
+  }
+  const ts = Date.parse(rt.last_poll_at || rt.updated_at || "");
+  if (!Number.isFinite(ts)) {
+    return false;
+  }
+  return Date.now() - ts <= 90 * 1000;
+}
+
+function renderMachinesCard(cfg, statusRes, knownDevices, ctx) {
+  const runtimes = statusRes.runtimes || [];
+  const agentCounts = statusRes.agent_counts || {};
+  const pendingCounts = statusRes.pending_counts || {};
+  const deviceCfg = cfg.devices || {};
+  const defaultDevices = Array.isArray(cfg.default_devices) ? cfg.default_devices : [];
+  const allDevs = Array.from(new Set([...knownDevices, ...Object.keys(deviceCfg), ...defaultDevices])).sort();
+
+  const rowState = allDevs.map((name) => ({
+    name,
+    inDefault: defaultDevices.includes(name),
+    workspaceDir: (deviceCfg[name] && deviceCfg[name].workspace_dir) || "",
+  }));
+
+  let defaultStrategy = cfg.default_strategy || "least_agents";
+  const stratSel = el(
+    "select",
+    { onchange: (e) => { defaultStrategy = e.target.value; } },
+    el("option", { value: "least_agents", text: "Least agents (round-robin tie-break)", selected: defaultStrategy === "least_agents" }),
+    el("option", { value: "round_robin", text: "Round-robin", selected: defaultStrategy === "round_robin" }),
+  );
+  let defaultPolicy = cfg.default_policy || "bypass";
+  const policySel = el(
+    "select",
+    { onchange: (e) => { defaultPolicy = e.target.value; } },
+    el("option", { value: "bypass", text: "Bypass (skip permissions)", selected: defaultPolicy === "bypass" }),
+    el("option", { value: "auto", text: "Auto", selected: defaultPolicy === "auto" }),
+    el("option", { value: "safe", text: "Safe (manual / plan)", selected: defaultPolicy === "safe" }),
+  );
+
+  const tbody = el("tbody");
+  for (const row of rowState) {
+    const online = isWorkerOnline(runtimes, row.name);
+    const liveN = agentCounts[row.name] || 0;
+    const pendN = pendingCounts[row.name] || 0;
+    const defChk = el("input", {
+      type: "checkbox",
+      checked: row.inDefault,
+      onchange: (e) => { row.inDefault = e.target.checked; },
+    });
+    const wsIn = el("input", {
+      type: "text",
+      value: row.workspaceDir,
+      placeholder: "~/workspace",
+      oninput: (e) => { row.workspaceDir = e.target.value; },
+    });
+    tbody.appendChild(
+      el(
+        "tr",
+        null,
+        el("td", null, el("label", { className: "checkbox-row" }, defChk, el("span", { className: "mono", text: row.name }))),
+        el(
+          "td",
+          null,
+          el(
+            "div",
+            { className: "actions-row" },
+            badge(online ? "worker online" : "worker offline", online ? "ok" : "neutral"),
+            badge(`${liveN} agent${liveN === 1 ? "" : "s"}${pendN > 0 ? ` + ${pendN} queued` : ""}`, liveN + pendN > 0 ? "info" : "neutral"),
+          ),
+        ),
+        el("td", null, wsIn),
+      ),
+    );
+  }
+
+  const saveBtn = el("button", { type: "submit", className: "btn btn-primary", text: "Save Machines & Defaults" });
+  return el(
+    "form",
+    {
+      className: "card mb-3 form-grid",
+      onsubmit: async (ev) => {
+        ev.preventDefault();
+        saveBtn.disabled = true;
+        try {
+          const devicesPayload = {};
+          const defaultList = [];
+          for (const row of rowState) {
+            const ws = row.workspaceDir.trim();
+            if (ws) {
+              devicesPayload[row.name] = { workspace_dir: ws };
+            }
+            if (row.inDefault) {
+              defaultList.push(row.name);
+            }
+          }
+          await api("POST", "/v1/slacker/config", {
+            devices: devicesPayload,
+            default_devices: defaultList,
+            default_strategy: defaultStrategy,
+            default_policy: defaultPolicy,
+          });
+          toast("Saved machine workspaces & defaults", "ok");
+          ctx.refresh();
+        } catch (err) {
+          toast(err.message, "error");
+        } finally {
+          saveBtn.disabled = false;
+        }
+      },
+    },
+    el("div", { className: "card-header" }, el("h3", { className: "card-title", text: "Machine Workspaces & Default Routing" }), badge(`${rowState.filter((r) => r.inDefault).length} in default pool`, "info")),
+    allDevs.length === 0
+      ? el("div", { className: "muted small", text: "No active Mac/desktop devices registered yet." })
+      : el(
+          "div",
+          { className: "table-wrap" },
+          el("table", null, el("thead", null, el("tr", null, el("th", { text: "Default Pool / Machine" }), el("th", { text: "Worker & Load" }), el("th", { text: "Default Workspace Dir" }))), tbody),
+        ),
+    el(
+      "div",
+      { className: "actions-row flex-between" },
+      el(
+        "div",
+        { className: "actions-row" },
+        el("label", { className: "small muted", text: "Default routing:" }),
+        stratSel,
+        el("label", { className: "small muted", text: "Default policy:" }),
+        policySel,
+      ),
+      saveBtn,
+    ),
+  );
+}
+
 export async function renderSlacker(root, ctx) {
   if (!state.isAdmin) {
     root.appendChild(el("div", { className: "empty-state", text: "Admin privileges required to configure Slacker." }));
@@ -216,8 +354,14 @@ export async function renderSlacker(root, ctx) {
     accountIDs.push("default");
   }
   const devices = (devicesRes.devices || []).filter((d) => !d.revoked_at && d.kind !== "mobile").map((d) => d.name);
+  const defaultDevices = Array.isArray(cfg.default_devices) ? cfg.default_devices : [];
+  const globalStrategyLabel = (cfg.default_strategy || "least_agents") === "round_robin" ? "round-robin" : "least agents";
+  const globalPolicyLabel = cfg.default_policy || "bypass";
 
-  const channels = Object.values(cfg.channels || {}).map((c) => ({ account: c.account || "default", ...c }));
+  const channels = Object.values(cfg.channels || {}).map((c) => {
+    const chDevs = Array.isArray(c.devices) && c.devices.length > 0 ? [...c.devices] : c.device ? [c.device] : [];
+    return { account: c.account || "default", ...c, devices: chDevs, strategy: c.strategy || "", policy: c.policy || "" };
+  });
   const emojis = Object.entries(cfg.emojis || {}).map(([emoji, harness]) => ({ emoji, harness }));
   if (emojis.length === 0) {
     emojis.push({ emoji: "claude", harness: "claude" }, { emoji: "agy", harness: "agy" }, { emoji: "codex", harness: "codex" });
@@ -234,11 +378,18 @@ export async function renderSlacker(root, ctx) {
         el("h1", { className: "page-title", text: "Slack Reaction Dispatcher" }),
         el("p", { className: "page-subtitle", text: "Multi-account Slack Socket Mode routing and agent read/send access over Nebula" }),
       ),
+      el("button", {
+        type: "button",
+        className: "btn btn-primary",
+        text: "+ Spawn Session",
+        onclick: () => openSpawnSessionModal(() => ctx.refresh()),
+      }),
     ),
   );
 
   root.appendChild(renderStatusCard(statusRes));
   root.appendChild(renderAccountsCard(cfg, runtimes, ctx));
+  root.appendChild(renderMachinesCard(cfg, statusRes, devices, ctx));
 
   const chanList = el("div", { className: "form-grid" });
   const renderChannels = () => {
@@ -251,15 +402,48 @@ export async function renderSlacker(root, ctx) {
         ...Array.from(new Set([...accountIDs, ch.account].filter(Boolean))).map((a) => el("option", { value: a, text: a, selected: a === ch.account })),
       );
       const idIn = el("input", { type: "text", value: ch.channel_id || "", placeholder: "C0123456789", oninput: (e) => { ch.channel_id = e.target.value; } });
-      const devSel = el(
+      const chipPool = Array.from(new Set([...devices, ...(ch.devices || [])].filter(Boolean)));
+      const poolHint = el("span", {
+        className: "small muted",
+        text: (ch.devices || []).length === 0 ? `default (${defaultDevices.length > 0 ? defaultDevices.join(", ") : "none"})` : "",
+      });
+      const chipButtons = chipPool.map((devName) => {
+        const isSelected = (ch.devices || []).includes(devName);
+        const btn = el("button", {
+          type: "button",
+          className: `chip${isSelected ? " active" : ""}`,
+          text: devName,
+          onclick: () => {
+            const cur = new Set(ch.devices || []);
+            if (cur.has(devName)) {
+              cur.delete(devName);
+            } else {
+              cur.add(devName);
+            }
+            ch.devices = chipPool.filter((d) => cur.has(d));
+            btn.classList.toggle("active", cur.has(devName));
+            poolHint.textContent = ch.devices.length === 0 ? `default (${defaultDevices.length > 0 ? defaultDevices.join(", ") : "none"})` : "";
+          },
+        });
+        return btn;
+      });
+      const devChipsBox = el("div", { className: "chips-row" }, ...chipButtons, poolHint);
+      const stratSel = el(
         "select",
-        { onchange: (e) => { ch.device = e.target.value; } },
-        ...Array.from(new Set([...devices, ch.device].filter(Boolean))).map((d) => el("option", { value: d, text: d, selected: d === ch.device })),
+        { onchange: (e) => { ch.strategy = e.target.value; } },
+        el("option", { value: "", text: `Default (${globalStrategyLabel})`, selected: !ch.strategy }),
+        el("option", { value: "least_agents", text: "Least agents", selected: ch.strategy === "least_agents" }),
+        el("option", { value: "round_robin", text: "Round-robin", selected: ch.strategy === "round_robin" }),
       );
-      if (!ch.device && devices.length > 0) {
-        ch.device = devices[0];
-      }
-      const repoIn = el("input", { type: "text", value: ch.repo_path || "", placeholder: "~/workspace/repo", oninput: (e) => { ch.repo_path = e.target.value; } });
+      const polSel = el(
+        "select",
+        { onchange: (e) => { ch.policy = e.target.value; } },
+        el("option", { value: "", text: `Policy: Default (${globalPolicyLabel})`, selected: !ch.policy }),
+        el("option", { value: "bypass", text: "Bypass", selected: ch.policy === "bypass" }),
+        el("option", { value: "auto", text: "Auto", selected: ch.policy === "auto" }),
+        el("option", { value: "safe", text: "Safe", selected: ch.policy === "safe" }),
+      );
+      const repoIn = el("input", { type: "text", value: ch.repo_path || "", placeholder: "subpath (e.g. fleet), blank=workspace, or ~/path", oninput: (e) => { ch.repo_path = e.target.value; } });
       const tmuxChk = el("input", { type: "checkbox", checked: Boolean(ch.use_tmux), onchange: (e) => { ch.use_tmux = e.target.checked; } });
       const rmBtn = el("button", {
         type: "button",
@@ -271,7 +455,7 @@ export async function renderSlacker(root, ctx) {
         },
       });
       chanList.appendChild(
-        el("div", { className: "toolbar m-0" }, acctSel, idIn, devSel, repoIn, el("label", { className: "checkbox-row" }, tmuxChk, "tmux"), rmBtn),
+        el("div", { className: "toolbar m-0" }, acctSel, idIn, devChipsBox, stratSel, polSel, repoIn, el("label", { className: "checkbox-row" }, tmuxChk, "tmux"), rmBtn),
       );
     }
   };
@@ -316,9 +500,20 @@ export async function renderSlacker(root, ctx) {
             for (const ch of channels) {
               const cid = (ch.channel_id || "").trim();
               const acct = (ch.account || "default").trim();
+              const devs = Array.isArray(ch.devices) ? ch.devices.map((d) => d.trim()).filter(Boolean) : [];
               if (cid) {
                 const key = acct === "default" ? cid : `${acct}:${cid}`;
-                chMap[key] = { account: acct, channel_id: cid, channel_name: (ch.channel_name || "").trim(), device: (ch.device || "").trim(), repo_path: (ch.repo_path || "").trim(), use_tmux: Boolean(ch.use_tmux) };
+                chMap[key] = {
+                  account: acct,
+                  channel_id: cid,
+                  channel_name: (ch.channel_name || "").trim(),
+                  device: devs.length === 1 ? devs[0] : "",
+                  devices: devs,
+                  strategy: (ch.strategy || "").trim(),
+                  policy: (ch.policy || "").trim(),
+                  repo_path: (ch.repo_path || "").trim(),
+                  use_tmux: Boolean(ch.use_tmux),
+                };
               }
             }
             const emMap = {};
@@ -338,7 +533,27 @@ export async function renderSlacker(root, ctx) {
           }
         },
       },
-      el("div", { className: "actions-row flex-between" }, el("strong", { text: "Channel → Account / Device / Repo" }), el("button", { type: "button", className: "btn btn-sm", text: "+ Add Channel", onclick: () => { channels.push({ account: accountIDs[0] || "default", channel_id: "", device: devices[0] || "", repo_path: "" }); renderChannels(); } })),
+      el(
+        "div",
+        { className: "actions-row flex-between" },
+        el("strong", { text: "Channel → Account / Machines / Repo" }),
+        el("button", {
+          type: "button",
+          className: "btn btn-sm",
+          text: "+ Add Channel",
+          onclick: () => {
+            channels.push({
+              account: accountIDs[0] || "default",
+              channel_id: "",
+              devices: defaultDevices.length > 0 ? [] : devices.length > 0 ? [devices[0]] : [],
+              strategy: "",
+              policy: "",
+              repo_path: "",
+            });
+            renderChannels();
+          },
+        }),
+      ),
       chanList,
       el("div", { className: "actions-row flex-between" }, el("strong", { text: "Emoji → Harness" }), el("button", { type: "button", className: "btn btn-sm", text: "+ Add Emoji", onclick: () => { emojis.push({ emoji: "", harness: "claude" }); renderEmojis(); } })),
       emojiList,
@@ -367,13 +582,14 @@ export async function renderSlacker(root, ctx) {
       acts.appendChild(el("button", { type: "button", className: "btn btn-sm btn-danger", text: "Cancel", onclick: async () => { await api("POST", `/v1/slacker/jobs/${encodeURIComponent(j.id)}/cancel`, {}); ctx.refresh(); } }));
     }
     const variant = j.status === "launched" ? "ok" : j.status === "failed" ? "danger" : j.status === "queued" || j.status === "claimed" ? "warn" : "neutral";
+    const triggerText = j.account === "ui" ? "web-ui" : `:${j.reaction}: #${j.channel_name || j.channel_id}`;
     tbody.appendChild(
       el(
         "tr",
         null,
         el("td", { className: "mono small", text: j.session_name }),
         el("td", { className: "mono small", text: `${j.account || "default"} · ${j.target_device}/${j.harness}` }),
-        el("td", { className: "mono small", text: `:${j.reaction}: #${j.channel_name || j.channel_id}` }),
+        el("td", { className: "mono small", text: triggerText }),
         el("td", null, badge(j.status, variant)),
         el("td", { className: "small", text: `${j.backend || "-"} · ${relTime(j.updated_at)}${j.error ? ` (${j.error})` : ""}` }),
         el("td", null, acts),

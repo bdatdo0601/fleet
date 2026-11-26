@@ -37,6 +37,7 @@ type WorkerOpts struct {
 	LocalStateDir string
 	PollTimeout   float64
 	UseTmux       bool
+	Policy        session.Policy
 	Once          bool
 	Stderr        io.Writer
 	Stdout        io.Writer
@@ -63,12 +64,16 @@ func defaultLaunchJob(job Job, useTmux bool, stdout, stderr io.Writer) (string, 
 	if err != nil {
 		return "", err
 	}
+	pol, err := session.ParsePolicy(job.Policy, session.PolicyBypass)
+	if err != nil {
+		pol = session.PolicyBypass
+	}
 	return session.Start(session.StartOpts{
 		Harness:   job.Harness,
 		Name:      job.SessionName,
 		Directory: dir,
 		UseTmux:   useTmux || job.UseTmux,
-		Policy:    session.PolicySafe,
+		Policy:    pol,
 		Prompt:    job.Prompt,
 		Stdout:    stdout,
 		Stderr:    stderr,
@@ -173,6 +178,9 @@ func processJob(ctx context.Context, api, localStateDir string, job Job, opts Wo
 		rec.Status = "launched"
 		rec.Backend = cmp.Or(backend, "existing")
 	} else {
+		if job.Policy == "" && opts.Policy != "" {
+			job.Policy = string(opts.Policy)
+		}
 		backend, err := launchFn(job, opts.UseTmux, opts.Stdout, opts.Stderr)
 		if err != nil {
 			rec.Status = "failed"

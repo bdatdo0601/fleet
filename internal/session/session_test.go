@@ -2,13 +2,19 @@ package session
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -73,6 +79,8 @@ func newSessionEnv(t *testing.T) *sessionEnv {
 	}
 	t.Setenv("HOME", base)
 	t.Setenv("XDG_STATE_HOME", filepath.Join(base, "state"))
+	t.Setenv("FLEET_AGY_APP_DATA_DIR", filepath.Join(base, ".gemini", "antigravity"))
+	t.Setenv("FLEET_SESSION_NO_OPEN", "1")
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+strings.Join(filteredPath, string(os.PathListSeparator)))
 	t.Setenv("FLEET_SESSION_SELF_BIN", testFleetBin)
 	t.Setenv("AGY_SESSION_RESUME_GRACE_TENTHS", "3")
@@ -415,8 +423,8 @@ func TestClaudeAndAgyAndCodexTmuxLifecycleAndUpgrade(t *testing.T) {
 		t.Fatalf("claude upgrade did not preserve ID with new PID: before=%+v after=%+v", rec, after)
 	}
 
-	// Agy start + Codex start
-	if _, err := Start(StartOpts{Harness: "agy", Name: "beta", Directory: specialDir, Stdout: &out, Stderr: &errBuf}); err != nil {
+	// Agy start (explicit --tmux) + Codex start
+	if _, err := Start(StartOpts{Harness: "agy", Name: "beta", Directory: specialDir, UseTmux: true, Stdout: &out, Stderr: &errBuf}); err != nil {
 		t.Fatal(err)
 	}
 	se.waitTmuxReady("agy", "beta")
@@ -505,9 +513,9 @@ func TestStartTaskSafePoliciesAndMultilinePromptsAcrossTmuxAndRex(t *testing.T) 
 		t.Fatalf("claude upgrade escalated policy from safe: %v", cAfter.Args)
 	}
 
-	// 2. Agy start-task in Rex -> --sandbox --mode plan --prompt-interactive <prompt>, lazygit split
+	// 2. Agy start-task in Rex (--rex) -> --sandbox --mode plan --prompt-interactive <prompt>, lazygit split
 	backend, err = Start(StartOpts{
-		Harness: "agy", Name: "slack-c1-2", Directory: repo,
+		Harness: "agy", Name: "slack-c1-2", Directory: repo, UseRex: true,
 		Policy: PolicySafe, Prompt: prompt, Stdout: &out, Stderr: &errBuf,
 	})
 	if err != nil || backend != "rex" {
@@ -635,5 +643,281 @@ func TestStartResolvesRelativeDotDirectoryForRex(t *testing.T) {
 	}
 	if len(sessions) != 1 || sessions[0].Label != "claude-ethan" || sessions[0].CWD != repo {
 		t.Fatalf("expected rex -c to receive absolute %q, got %+v", repo, sessions)
+	}
+}
+
+func TestAgyDefaultAppBackendLifecycle(t *testing.T) {
+	se := newSessionEnv(t)
+	_ = se.installFakeRex() // Ensure agy defaults to app even when rex is installed.
+
+	repo := filepath.Join(se.base, "repo-with-project")
+	unmapped := filepath.Join(se.base, "repo-unmapped")
+	for _, d := range []string{repo, unmapped} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	appDir := filepath.Join(se.base, ".gemini", "antigravity")
+	daemonDir := filepath.Join(appDir, "daemon")
+	if err := os.MkdirAll(daemonDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed conversation_summaries.db mapping repo -> proj-test-123.
+	dbPath := filepath.Join(appDir, "conversation_summaries.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE conversation_summaries (
+			conversation_id TEXT PRIMARY KEY,
+			last_modified_time TEXT NOT NULL,
+			workspace_uris TEXT NOT NULL,
+			project_id TEXT NOT NULL
+		);
+		INSERT INTO conversation_summaries (conversation_id, last_modified_time, workspace_uris, project_id)
+		VALUES ('conv-old', '2026-11-25T10:00:00Z', ?, 'proj-test-123');
+	`, fmt.Sprintf(`[%q]`, "file://"+repo)); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	var out, errBuf bytes.Buffer
+	// 8. Before any live hub exists, Start fails with clear error mentioning --rex / --tmux.
+	if _, err := Start(StartOpts{Harness: "agy", Name: "nohub", Directory: repo, Stdout: &out, Stderr: &errBuf}); err == nil || !strings.Contains(err.Error(), "--rex / --tmux") {
+		t.Fatalf("expected missing hub error mentioning --rex / --tmux, got %v", err)
+	}
+	// 9. --rex and --tmux together are rejected.
+	if _, err := Start(StartOpts{Harness: "agy", Name: "badflags", Directory: repo, UseRex: true, UseTmux: true, Stdout: &out, Stderr: &errBuf}); err == nil || !strings.Contains(err.Error(), "cannot be combined") {
+		t.Fatalf("expected --rex/--tmux conflict error, got %v", err)
+	}
+
+	// Start mock Antigravity hub.
+	const testCSRF = "csrf-secret-123"
+	var (
+		mu             sync.Mutex
+		createRequests []map[string]any
+		archivedCalls  []map[string]any
+		convs          = map[string]agyConversation{}
+		nextSeq        = 0
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("x-antigravity-csrf-token") != testCSRF || r.Header.Get("Connect-Protocol-Version") != "1" {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"code":"permission_denied","message":"bad headers"}`))
+			return
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+
+		switch r.URL.Path {
+		case "/product.v1.ConversationService/CreateConversation":
+			createRequests = append(createRequests, body)
+			nextSeq++
+			id := fmt.Sprintf("11111111-1111-4111-8111-%012d", nextSeq)
+			var c agyConversation
+			c.ID = id
+			if pid, ok := body["projectId"].(string); ok {
+				c.Metadata.ProjectID = pid
+			}
+			if title, ok := body["title"].(string); ok {
+				c.Annotations.Title = title
+			}
+			convs[id] = c
+			_ = json.NewEncoder(w).Encode(map[string]any{"conversation": c})
+		case "/product.v1.ConversationService/GetConversation":
+			id, _ := body["conversationId"].(string)
+			c, ok := convs[id]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(map[string]string{"code": "not_found", "message": "not found"})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(c)
+		case "/product.v1.ConversationService/UpdateConversation":
+			id, _ := body["conversationId"].(string)
+			c, ok := convs[id]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(map[string]string{"code": "not_found", "message": "not found"})
+				return
+			}
+			if ann, ok := body["annotations"].(map[string]any); ok {
+				if arch, ok := ann["archived"].(bool); ok {
+					c.Annotations.Archived = arch
+				}
+			}
+			convs[id] = c
+			archivedCalls = append(archivedCalls, body)
+			_ = json.NewEncoder(w).Encode(c)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatal(err)
+	}
+	hubBytes, _ := json.Marshal(agyHubInfo{
+		PID:       os.Getpid(),
+		HTTPPort:  port,
+		HTTPSPort: port,
+		LSVersion: "2.35.2",
+		CSRFToken: testCSRF,
+	})
+	if err := os.WriteFile(filepath.Join(daemonDir, fmt.Sprintf("hub_%d.json", port)), hubBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	origOpen := openAgyAppFn
+	openCount := 0
+	openAgyAppFn = func() error {
+		openCount++
+		return nil
+	}
+	t.Cleanup(func() { openAgyAppFn = origOpen })
+
+	// 1a. Start with mapped project (empty prompt).
+	out.Reset()
+	errBuf.Reset()
+	backend, err := Start(StartOpts{Harness: "agy", Name: "app-idle", Directory: repo, Model: "pro", Stdout: &out, Stderr: &errBuf})
+	if err != nil || backend != "app" {
+		t.Fatalf("agy Start default failed: backend=%s err=%v stderr=%s", backend, err, errBuf.String())
+	}
+
+	// 1b. Start-task with mapped project + multiline prompt.
+	out.Reset()
+	errBuf.Reset()
+	multiline := "Line 1\nLine 2: fix tests"
+	backend, err = Start(StartOpts{Harness: "agy", Name: "app-task", Directory: repo, Prompt: multiline, Stdout: &out, Stderr: &errBuf})
+	if err != nil || backend != "app" {
+		t.Fatalf("agy start-task default failed: backend=%s err=%v stderr=%s", backend, err, errBuf.String())
+	}
+
+	// 2. Start-task in unmapped directory -> omits projectId, prepends working dir, warns on stderr.
+	out.Reset()
+	errBuf.Reset()
+	backend, err = Start(StartOpts{Harness: "agy", Name: "app-unmapped", Directory: unmapped, Prompt: "Investigate", Stdout: &out, Stderr: &errBuf})
+	if err != nil || backend != "app" {
+		t.Fatalf("agy unmapped Start failed: backend=%s err=%v", backend, err)
+	}
+	if !strings.Contains(errBuf.String(), "no existing Antigravity project found") {
+		t.Fatalf("expected stderr warning for unmapped dir, got %q", errBuf.String())
+	}
+
+	mu.Lock()
+	if len(createRequests) != 3 {
+		mu.Unlock()
+		t.Fatalf("expected 3 CreateConversation requests, got %d", len(createRequests))
+	}
+	r0, r1, r2 := createRequests[0], createRequests[1], createRequests[2]
+	mu.Unlock()
+
+	if r0["projectId"] != "proj-test-123" || r0["title"] != "app-idle" || r0["model"] != "pro" || r0["prompt"] != nil {
+		t.Fatalf("unexpected r0 payload: %+v", r0)
+	}
+	if tags, ok := r0["tags"].([]any); !ok || len(tags) != 2 || tags[0] != "fleet" || tags[1] != "fleet-session:app-idle" {
+		t.Fatalf("unexpected r0 tags: %+v", r0["tags"])
+	}
+	if p1, ok := r1["prompt"].([]any); !ok || len(p1) != 1 || p1[0].(map[string]any)["text"] != multiline {
+		t.Fatalf("unexpected r1 prompt: %+v", r1["prompt"])
+	}
+	if _, hasProj := r2["projectId"]; hasProj {
+		t.Fatalf("expected unmapped request to omit projectId, got %+v", r2)
+	}
+	if p2, ok := r2["prompt"].([]any); !ok || !strings.HasPrefix(p2[0].(map[string]any)["text"].(string), "Working directory: "+unmapped+"\n\nInvestigate") {
+		t.Fatalf("expected working directory prepended in r2 prompt, got %+v", r2["prompt"])
+	}
+
+	// 3. Duplicate rejection.
+	if _, err := Start(StartOpts{Harness: "agy", Name: "app-task", Directory: repo, Stdout: &out, Stderr: &errBuf}); err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("expected duplicate rejection, got %v", err)
+	}
+
+	// 4. SessionExists -> true, "app".
+	if exists, gotBackend := SessionExists("agy", "app-task"); !exists || gotBackend != "app" {
+		t.Fatalf("SessionExists = (%v, %q), want (true, %q)", exists, gotBackend, "app")
+	}
+
+	// 5. List prints "<name> (app)".
+	out.Reset()
+	if err := List("agy", &out); err != nil {
+		t.Fatalf("List agy failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "app-task (app)") || !strings.Contains(out.String(), "app-idle (app)") {
+		t.Fatalf("expected app sessions in List output, got:\n%s", out.String())
+	}
+
+	// 6. Attach invokes openAgyAppFn.
+	errBuf.Reset()
+	if err := Attach("agy", "app-task", &errBuf); err != nil {
+		t.Fatalf("Attach agy app failed: %v", err)
+	}
+	if openCount != 1 {
+		t.Fatalf("expected openAgyAppFn called once, got %d", openCount)
+	}
+
+	// 7. Kill archives conversation and removes local state.
+	out.Reset()
+	if err := Kill("agy", "app-task", &out); err != nil {
+		t.Fatalf("Kill agy app failed: %v", err)
+	}
+	if exists, _ := SessionExists("agy", "app-task"); exists {
+		t.Fatal("expected app-task to be inactive after Kill")
+	}
+	mu.Lock()
+	if len(archivedCalls) != 1 || archivedCalls[0]["annotations"].(map[string]any)["archived"] != true {
+		mu.Unlock()
+		t.Fatalf("expected UpdateConversation archived=true, got %+v", archivedCalls)
+	}
+	mu.Unlock()
+}
+
+func TestAutoAndBypassPoliciesAcrossHarnesses(t *testing.T) {
+	if pol, err := ParsePolicy("auto", PolicyBypass); err != nil || pol != PolicyAuto {
+		t.Fatalf("ParsePolicy(auto) = (%q, %v)", pol, err)
+	}
+	if _, err := ParsePolicy("bogus", PolicyBypass); err == nil {
+		t.Fatal("expected ParsePolicy(bogus) to fail")
+	}
+
+	cSpec, _ := GetSpec(HarnessClaude)
+	cAuto, err := BuildHarnessArgs(cSpec, "s1", "/bin/fleet", "", "fix", PolicyAuto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(cAuto, "--permission-mode") || !slices.Contains(cAuto, "auto") || slices.Contains(cAuto, "--dangerously-skip-permissions") {
+		t.Fatalf("unexpected claude auto args: %v", cAuto)
+	}
+
+	aSpec, _ := GetSpec(HarnessAgy)
+	aAuto, err := BuildHarnessArgs(aSpec, "s2", "/bin/fleet", "", "fix", PolicyAuto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(aAuto, []string{"--mode", "auto", "--remote-control", "--prompt-interactive", "fix"}) {
+		t.Fatalf("unexpected agy auto args: %v", aAuto)
+	}
+
+	xSpec, _ := GetSpec(HarnessCodex)
+	xAuto, err := BuildHarnessArgs(xSpec, "s3", "/bin/fleet", "", "fix", PolicyAuto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(xAuto, []string{"--approve-for-me", "--", "fix"}) {
+		t.Fatalf("unexpected codex auto args: %v", xAuto)
 	}
 }

@@ -169,6 +169,177 @@ export function openQuickMessageModal(target, opts = {}, onSent = null) {
   });
 }
 
+function workerIsOnline(runtimes, dev) {
+  const rt = (runtimes || []).find((r) => r.role === `worker:${dev}`);
+  if (!rt || !rt.connected) {
+    return false;
+  }
+  const ts = Date.parse(rt.last_poll_at || rt.updated_at || "");
+  return Number.isFinite(ts) && Date.now() - ts <= 90 * 1000;
+}
+
+export async function openSpawnSessionModal(onSpawned = null) {
+  let statusRes;
+  let devicesRes;
+  try {
+    [statusRes, devicesRes] = await Promise.all([api("GET", "/v1/slacker/status"), api("GET", "/v1/devices")]);
+  } catch (err) {
+    toast(err.message, "error");
+    return;
+  }
+
+  const cfg = statusRes.config || {};
+  const runtimes = statusRes.runtimes || [];
+  const agentCounts = statusRes.agent_counts || {};
+  const pendingCounts = statusRes.pending_counts || {};
+  const devices = (devicesRes.devices || []).filter((d) => !d.revoked_at && d.kind !== "mobile").map((d) => d.name);
+  const defaultDevices = Array.isArray(cfg.default_devices) ? cfg.default_devices : [];
+  const globalStrategyLabel = (cfg.default_strategy || "least_agents") === "round_robin" ? "round-robin" : "least agents";
+  const globalPolicyLabel = cfg.default_policy || "bypass";
+  const wsHints = Object.entries(cfg.devices || {})
+    .filter(([, dc]) => dc && dc.workspace_dir)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([d, dc]) => `${d}:${dc.workspace_dir}`);
+
+  const harnessSel = el(
+    "select",
+    null,
+    el("option", { value: "claude", text: "claude" }),
+    el("option", { value: "agy", text: "agy" }),
+    el("option", { value: "codex", text: "codex" }),
+  );
+  const policySel = el(
+    "select",
+    null,
+    el("option", { value: "", text: `Default (${globalPolicyLabel})` }),
+    el("option", { value: "bypass", text: "Bypass (skip permissions)" }),
+    el("option", { value: "auto", text: "Auto" }),
+    el("option", { value: "safe", text: "Safe (manual / plan)" }),
+  );
+  const stratSel = el(
+    "select",
+    null,
+    el("option", { value: "", text: `Default (${globalStrategyLabel})` }),
+    el("option", { value: "least_agents", text: "Least agents" }),
+    el("option", { value: "round_robin", text: "Round-robin" }),
+  );
+  const repoIn = el("input", { type: "text", placeholder: "subpath (e.g. fleet), blank=workspace, or ~/path" });
+  const nameIn = el("input", { type: "text", placeholder: "auto-generated if blank" });
+  const promptIn = el("textarea", { rows: 4, placeholder: "Optional prompt (leave blank for an interactive session)" });
+  const tmuxChk = el("input", { type: "checkbox" });
+
+  let selectedDevices = defaultDevices.length > 0 ? [] : devices.length > 0 ? [devices[0]] : [];
+  const poolHint = el("span", {
+    className: "small muted",
+    text: selectedDevices.length === 0 ? `default (${defaultDevices.length > 0 ? defaultDevices.join(", ") : "none"})` : "",
+  });
+  const chipButtons = devices.map((devName) => {
+    const load = (agentCounts[devName] || 0) + (pendingCounts[devName] || 0);
+    const online = workerIsOnline(runtimes, devName);
+    const btn = el("button", {
+      type: "button",
+      className: `chip${selectedDevices.includes(devName) ? " active" : ""}`,
+      text: `${devName} (${load})${online ? " · online" : ""}`,
+      onclick: () => {
+        const cur = new Set(selectedDevices);
+        if (cur.has(devName)) {
+          cur.delete(devName);
+        } else {
+          cur.add(devName);
+        }
+        selectedDevices = devices.filter((d) => cur.has(d));
+        btn.classList.toggle("active", cur.has(devName));
+        poolHint.textContent = selectedDevices.length === 0 ? `default (${defaultDevices.length > 0 ? defaultDevices.join(", ") : "none"})` : "";
+      },
+    });
+    return btn;
+  });
+
+  const markEditing = () => {
+    state.editing = Boolean(promptIn.value.trim() || repoIn.value.trim() || nameIn.value.trim());
+  };
+  promptIn.addEventListener("input", markEditing);
+  repoIn.addEventListener("input", markEditing);
+  nameIn.addEventListener("input", markEditing);
+
+  const spawnBtn = el("button", { type: "submit", className: "btn btn-primary", text: "Spawn Session" });
+  const form = el(
+    "form",
+    {
+      className: "form-grid",
+      onsubmit: async (ev) => {
+        ev.preventDefault();
+        spawnBtn.disabled = true;
+        try {
+          const res = await api("POST", "/v1/agents/spawn", {
+            harness: harnessSel.value,
+            name: nameIn.value.trim(),
+            devices: selectedDevices,
+            strategy: stratSel.value,
+            policy: policySel.value,
+            repo_path: repoIn.value.trim(),
+            prompt: promptIn.value.trim(),
+            use_tmux: tmuxChk.checked,
+          });
+          const j = res.job || {};
+          const msg = res.worker_online
+            ? `Spawned ${j.harness} session ${j.session_name} on ${j.target_device} (${j.repo_path})`
+            : `Queued ${j.harness} session ${j.session_name} on ${j.target_device} (${j.repo_path}) — worker offline, will start when connected`;
+          toast(msg, res.worker_online ? "ok" : "warn");
+          state.editing = false;
+          closeModal();
+          if (onSpawned) {
+            onSpawned(res);
+          }
+        } catch (err) {
+          toast(err.message, "error");
+        } finally {
+          spawnBtn.disabled = false;
+        }
+      },
+    },
+    el(
+      "div",
+      { className: "form-row-2" },
+      el("div", { className: "field" }, el("label", { text: "Harness" }), harnessSel),
+      el("div", { className: "field" }, el("label", { text: "Permission Policy" }), policySel),
+    ),
+    el(
+      "div",
+      { className: "field" },
+      el("label", { text: "Target Machine(s)" }),
+      el("div", { className: "chips-row" }, ...chipButtons, poolHint),
+    ),
+    el(
+      "div",
+      { className: "form-row-2" },
+      el("div", { className: "field" }, el("label", { text: "Routing Strategy" }), stratSel),
+      el("div", { className: "field" }, el("label", { text: "Session Name (optional)" }), nameIn),
+    ),
+    el(
+      "div",
+      { className: "field" },
+      el("label", { text: "Directory / Repo" }),
+      repoIn,
+      wsHints.length > 0 ? el("div", { className: "field-hint mono", text: `Workspaces: ${wsHints.join(" · ")}` }) : null,
+    ),
+    el("div", { className: "field" }, el("label", { text: "Initial Prompt (optional)" }), promptIn),
+    el("label", { className: "checkbox-row" }, tmuxChk, "Use tmux"),
+    el(
+      "div",
+      { className: "actions-row flex-end" },
+      el("button", { type: "button", className: "btn", text: "Cancel", onclick: closeModal }),
+      spawnBtn,
+    ),
+  );
+
+  openModal("Spawn Agent Session", form, {
+    onClose: () => {
+      state.editing = false;
+    },
+  });
+}
+
 async function renameSessionPrompt(ag, onDone) {
   const input = el("input", { type: "text", value: ag.name || "", placeholder: "new-session-name" });
   const saveBtn = el("button", { type: "submit", className: "btn btn-primary", text: "Save Name" });
@@ -791,6 +962,26 @@ export async function renderAgents(root, ctx, subRoute = "") {
     const liveCount = sessions.filter((s) => s.live).length;
     const waitCount = sessions.filter((s) => s.live && (s.state === "waiting_permission" || s.state === "waiting_question")).length;
 
+    const headerActions = el("div", { className: "actions-row" });
+    if (state.isAdmin) {
+      headerActions.appendChild(
+        el("button", {
+          type: "button",
+          className: "btn btn-primary",
+          text: "+ Spawn Session",
+          onclick: () => openSpawnSessionModal(() => ctx.refresh()),
+        }),
+      );
+    }
+    headerActions.appendChild(
+      el("button", {
+        type: "button",
+        className: state.isAdmin ? "btn" : "btn btn-primary",
+        text: "Broadcast / Compose",
+        onclick: () => openQuickMessageModal("all", {}, () => ctx.refresh()),
+      }),
+    );
+
     root.appendChild(
       el(
         "div",
@@ -801,15 +992,7 @@ export async function renderAgents(root, ctx, subRoute = "") {
           el("h1", { className: "page-title", text: "AI Agent Sessions & Messages" }),
           el("p", { className: "page-subtitle", text: `${liveCount} live · ${waitCount} waiting · ${sessions.length} retained` }),
         ),
-        el(
-          "button",
-          {
-            type: "button",
-            className: "btn btn-primary",
-            text: "Broadcast / Compose",
-            onclick: () => openQuickMessageModal("all", {}, () => ctx.refresh()),
-          },
-        ),
+        headerActions,
       ),
     );
 

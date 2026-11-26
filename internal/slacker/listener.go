@@ -30,6 +30,8 @@ type ListenerOpts struct {
 	Slack       *SlackClient
 	TLSConfig   *tls.Config
 	NotifyURL   string
+	APIBaseURL  string
+	AgentLoadFn AgentLoadFunc
 	Stderr      io.Writer
 	BackoffBase time.Duration
 }
@@ -114,13 +116,15 @@ type accountRunner struct {
 }
 
 type listenerHub struct {
-	opts      ListenerOpts
-	cfgPath   string
-	store     *Store
-	slack     *SlackClient
-	notifyURL string
-	stderr    io.Writer
-	backoff   time.Duration
+	opts       ListenerOpts
+	cfgPath    string
+	store      *Store
+	slack      *SlackClient
+	notifyURL  string
+	loadFn     AgentLoadFunc
+	stderr     io.Writer
+	backoff    time.Duration
+	dispatchMu sync.Mutex
 
 	mu      sync.Mutex
 	runners map[string]*accountRunner
@@ -294,7 +298,7 @@ func (h *listenerHub) serveAccountSocket(ctx context.Context, conn *WSConn, acct
 			return "account disabled"
 		}
 
-		shouldACK, targetDev, procErr := HandleAccountEnvelope(ctx, acct, cfg, env, h.store, h.slack)
+		shouldACK, targetDev, procErr := handleAccountEnvelope(ctx, acct, cfg, env, h.store, h.slack, h.loadFn, &h.dispatchMu)
 		if procErr != nil {
 			h.setConnected(acctID, true, "", procErr.Error())
 			_, _ = fmt.Fprintf(h.stderr, "slacker[%s] envelope error: %v\n", acctID, procErr)
@@ -326,6 +330,14 @@ func RunListener(ctx context.Context, opts ListenerOpts) error {
 	if notifyURL == "" {
 		notifyURL = fmt.Sprintf("http://127.0.0.1:%d/v1/slacker/notify", paths.APIPort())
 	}
+	loadFn := opts.AgentLoadFn
+	if loadFn == nil {
+		apiBase := opts.APIBaseURL
+		if apiBase == "" && opts.NotifyURL == "" {
+			apiBase = fmt.Sprintf("http://127.0.0.1:%d", paths.APIPort())
+		}
+		loadFn = DefaultAgentLoad(stateDir, apiBase)
+	}
 
 	store := opts.Store
 	if store == nil {
@@ -349,6 +361,7 @@ func RunListener(ctx context.Context, opts ListenerOpts) error {
 		store:     store,
 		slack:     slack,
 		notifyURL: notifyURL,
+		loadFn:    loadFn,
 		stderr:    stderr,
 		backoff:   cmp.Or(opts.BackoffBase, 2*time.Second),
 		runners:   map[string]*accountRunner{},
@@ -382,6 +395,19 @@ func HandleAccountEnvelope(
 	store *Store,
 	slack *SlackClient,
 ) (shouldACK bool, notifyDevice string, err error) {
+	return handleAccountEnvelope(ctx, acct, cfg, env, store, slack, nil, nil)
+}
+
+func handleAccountEnvelope(
+	ctx context.Context,
+	acct AccountConfig,
+	cfg Config,
+	env socketEnvelope,
+	store *Store,
+	slack *SlackClient,
+	loadFn AgentLoadFunc,
+	dispatchMu *sync.Mutex,
+) (shouldACK bool, notifyDevice string, err error) {
 	if env.Type != "events_api" || len(env.Payload) == 0 {
 		return true, "", nil
 	}
@@ -404,10 +430,11 @@ func HandleAccountEnvelope(
 	if !ok {
 		return true, "", nil
 	}
+	acctID := cmp.Or(acct.ID, DefaultAccountID)
 	rawEventID := cmp.Or(p.EventID, fmt.Sprintf("%s:%s:%s:%s", p.Event.User, p.Event.Item.Channel, p.Event.Item.TS, emoji))
 	eventID := rawEventID
-	if acct.ID != "" && acct.ID != DefaultAccountID {
-		eventID = acct.ID + ":" + rawEventID
+	if acctID != DefaultAccountID {
+		eventID = acctID + ":" + rawEventID
 	}
 
 	exists, err := store.HasEvent(eventID)
@@ -415,6 +442,14 @@ func HandleAccountEnvelope(
 		return false, "", err
 	}
 	if exists {
+		return true, "", nil
+	}
+
+	msgExists, err := store.HasMessageJob(acctID, p.Event.Item.Channel, p.Event.Item.TS)
+	if err != nil {
+		return false, "", err
+	}
+	if msgExists {
 		return true, "", nil
 	}
 
@@ -430,7 +465,20 @@ func HandleAccountEnvelope(
 		ChannelID: p.Event.Item.Channel,
 		MessageTS: p.Event.Item.TS,
 	}
-	acctID := cmp.Or(acct.ID, DefaultAccountID)
+
+	if dispatchMu != nil {
+		dispatchMu.Lock()
+		defer dispatchMu.Unlock()
+	}
+	targetDevice, resolvedRepo, scope, selErr := SelectTarget(ctx, cfg, acctID, chMap, store, loadFn, time.Now())
+	if selErr != nil {
+		// Configuration error: ACK to prevent Slack retry storm, while surfacing the error in runtime status.
+		return true, "", selErr
+	}
+	resolvedCh := chMap
+	resolvedCh.Device = targetDevice
+	resolvedCh.RepoPath = resolvedRepo
+
 	job := Job{
 		Account:      acctID,
 		EventID:      eventID,
@@ -440,12 +488,13 @@ func HandleAccountEnvelope(
 		ThreadTS:     msg.Message.ThreadTS,
 		Reaction:     emoji,
 		UserID:       ev.User,
-		TargetDevice: chMap.Device,
-		RepoPath:     chMap.RepoPath,
+		TargetDevice: targetDevice,
+		RepoPath:     resolvedRepo,
 		UseTmux:      chMap.UseTmux,
+		Policy:       cfg.EffectiveChannelPolicy(chMap),
 		Harness:      harness,
 		SessionName:  DeterministicSessionNameForAccount(acctID, ev.ChannelID, ev.MessageTS),
-		Prompt:       FormatTaskPrompt(acctID, ev, msg, chMap),
+		Prompt:       FormatTaskPrompt(acctID, ev, msg, resolvedCh),
 		Permalink:    msg.Permalink,
 	}
 
@@ -455,6 +504,7 @@ func HandleAccountEnvelope(
 		return false, "", err
 	}
 	if inserted {
+		_ = store.SetLastDevice(scope, targetDevice)
 		return true, job.TargetDevice, nil
 	}
 	return true, "", nil

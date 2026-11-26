@@ -19,15 +19,18 @@ Setup:
   fleet session <claude|agy|codex> setup [--check] [--install] [--tmux-only] [--yes]
 
 Session commands (for <claude|agy|codex>, alias antigravity -> agy):
-  start [--tmux] [--policy bypass|safe] NAME DIRECTORY
-  start-attach [--tmux] [--policy bypass|safe] NAME DIRECTORY
-  start-task [--tmux] [--policy safe|bypass] NAME DIRECTORY   (reads multiline prompt from stdin)
-  resume [--tmux] [--policy bypass|safe] NAME DIRECTORY SESSION_ID
+  start [--rex|--tmux] [--model MODEL] [--policy bypass|auto|safe] NAME DIRECTORY
+  start-attach [--rex|--tmux] [--model MODEL] [--policy bypass|auto|safe] NAME DIRECTORY
+  start-task [--rex|--tmux] [--model MODEL] [--policy safe|auto|bypass] NAME DIRECTORY   (reads multiline prompt from stdin)
+  resume [--rex|--tmux] [--model MODEL] [--policy bypass|auto|safe] NAME DIRECTORY SESSION_ID
   attach NAME
   list
   kill NAME
   kill-all
   upgrade
+
+Defaults: agy submits to the Antigravity desktop app (use --rex or --tmux for CLI sessions);
+claude and codex default to Rex (with --tmux optional). --model applies to agy app sessions.
 `
 }
 
@@ -57,7 +60,9 @@ func runSessionSetup(harness string, args []string, cio *IO) error {
 }
 
 type parsedSessionArgs struct {
+	useRex     bool
 	useTmux    bool
+	model      string
 	policyRaw  string
 	promptFile string
 	positional []string
@@ -71,11 +76,21 @@ func parseSessionActionArgs(args []string) (parsedSessionArgs, error) {
 		case a == "--":
 			out.positional = append(out.positional, args[i+1:]...)
 			return out, nil
+		case a == "--rex":
+			out.useRex = true
 		case a == "--tmux":
 			out.useTmux = true
+		case a == "--model":
+			if i+1 >= len(args) {
+				return out, fmt.Errorf("--model requires an argument")
+			}
+			i++
+			out.model = args[i]
+		case strings.HasPrefix(a, "--model="):
+			out.model = strings.TrimPrefix(a, "--model=")
 		case a == "--policy":
 			if i+1 >= len(args) {
-				return out, fmt.Errorf("--policy requires an argument (safe|bypass)")
+				return out, fmt.Errorf("--policy requires an argument (bypass|auto|safe)")
 			}
 			i++
 			out.policyRaw = args[i]
@@ -94,6 +109,9 @@ func parseSessionActionArgs(args []string) (parsedSessionArgs, error) {
 		default:
 			out.positional = append(out.positional, a)
 		}
+	}
+	if out.useRex && out.useTmux {
+		return out, fmt.Errorf("--rex and --tmux cannot be combined")
 	}
 	return out, nil
 }
@@ -125,7 +143,7 @@ func runSessionStartAction(harness, action string, pos []string, parsed parsedSe
 	switch action {
 	case "start", "start-attach":
 		if len(pos) != 2 {
-			return fmt.Errorf("usage: fleet session %s %s [--tmux] [--policy bypass|safe] NAME DIRECTORY", harness, action)
+			return fmt.Errorf("usage: fleet session %s %s [--rex|--tmux] [--model MODEL] [--policy bypass|auto|safe] NAME DIRECTORY", harness, action)
 		}
 		pol, pErr := session.ParsePolicy(parsed.policyRaw, session.PolicyBypass)
 		if pErr != nil {
@@ -135,8 +153,10 @@ func runSessionStartAction(harness, action string, pos []string, parsed parsedSe
 			Harness:   harness,
 			Name:      pos[0],
 			Directory: pos[1],
+			UseRex:    parsed.useRex,
 			UseTmux:   parsed.useTmux,
 			Attach:    action == "start-attach",
+			Model:     parsed.model,
 			Policy:    pol,
 			Stdout:    cio.Stdout,
 			Stderr:    cio.Stderr,
@@ -144,7 +164,7 @@ func runSessionStartAction(harness, action string, pos []string, parsed parsedSe
 		return err
 	case "start-task":
 		if len(pos) != 2 {
-			return fmt.Errorf("usage: fleet session %s start-task [--tmux] [--policy safe|bypass] NAME DIRECTORY", harness)
+			return fmt.Errorf("usage: fleet session %s start-task [--rex|--tmux] [--model MODEL] [--policy safe|auto|bypass] NAME DIRECTORY", harness)
 		}
 		pol, pErr := session.ParsePolicy(parsed.policyRaw, session.PolicySafe)
 		if pErr != nil {
@@ -162,7 +182,9 @@ func runSessionStartAction(harness, action string, pos []string, parsed parsedSe
 			Harness:   harness,
 			Name:      pos[0],
 			Directory: pos[1],
+			UseRex:    parsed.useRex,
 			UseTmux:   parsed.useTmux,
+			Model:     parsed.model,
 			Policy:    pol,
 			Prompt:    prompt,
 			Stdout:    cio.Stdout,
@@ -171,7 +193,7 @@ func runSessionStartAction(harness, action string, pos []string, parsed parsedSe
 		return err
 	case "resume":
 		if len(pos) != 3 {
-			return fmt.Errorf("usage: fleet session %s resume [--tmux] [--policy bypass|safe] NAME DIRECTORY SESSION_ID", harness)
+			return fmt.Errorf("usage: fleet session %s resume [--rex|--tmux] [--model MODEL] [--policy bypass|auto|safe] NAME DIRECTORY SESSION_ID", harness)
 		}
 		pol, pErr := session.ParsePolicy(parsed.policyRaw, session.PolicyBypass)
 		if pErr != nil {
@@ -181,8 +203,10 @@ func runSessionStartAction(harness, action string, pos []string, parsed parsedSe
 			Harness:   harness,
 			Name:      pos[0],
 			Directory: pos[1],
+			UseRex:    parsed.useRex,
 			UseTmux:   parsed.useTmux,
 			ResumeID:  pos[2],
+			Model:     parsed.model,
 			Policy:    pol,
 			Stdout:    cio.Stdout,
 			Stderr:    cio.Stderr,
@@ -270,8 +294,8 @@ func cmdSession(args []string, cio *IO) error {
 		pos = pos[1:]
 	}
 
-	if parsed.useTmux && action != "start" && action != "start-attach" && action != "start-task" && action != "resume" {
-		return fmt.Errorf("--tmux is only valid with start, start-attach, start-task, or resume\n\n%s", sessionUsageText())
+	if (parsed.useRex || parsed.useTmux || parsed.model != "") && action != "start" && action != "start-attach" && action != "start-task" && action != "resume" {
+		return fmt.Errorf("--rex, --tmux, and --model are only valid with start, start-attach, start-task, or resume\n\n%s", sessionUsageText())
 	}
 	return dispatchSessionAction(harness, action, pos, parsed, cio)
 }

@@ -155,7 +155,7 @@ func parseTrackedState(raw string) (trackedState, bool) {
 	return st, true
 }
 
-// SessionExists reports whether a session for harness/name exists in tmux or Rex.
+// SessionExists reports whether a session for harness/name exists in tmux, Rex, or (for agy) the Antigravity app.
 func SessionExists(harness, name string) (bool, string) {
 	spec, err := GetSpec(harness)
 	if err != nil {
@@ -167,6 +167,11 @@ func SessionExists(harness, name string) (bool, string) {
 	}
 	if id := rexSessionID(spec, session); id != "" {
 		return true, "rex"
+	}
+	if spec.Name == HarnessAgy {
+		if _, ok := agyAppSessionActive(name); ok {
+			return true, "app"
+		}
 	}
 	return false, ""
 }

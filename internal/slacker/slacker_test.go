@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bdatdo0601/fleet/internal/agents"
 	"github.com/bdatdo0601/fleet/internal/client"
 	"github.com/bdatdo0601/fleet/internal/registry"
 	"github.com/bdatdo0601/fleet/internal/session"
@@ -631,7 +632,7 @@ while True:
 	})
 	_, _, _ = store.EnqueueJob(Job{
 		EventID: "EvA", ChannelID: "C1", MessageTS: "10.2", Reaction: "agy", UserID: "U1",
-		TargetDevice: "laptop", RepoPath: repoDir, Harness: "agy",
+		TargetDevice: "laptop", RepoPath: repoDir, Policy: "auto", Harness: "agy", UseTmux: true,
 		SessionName: DeterministicSessionName("C1", "10.2"), Prompt: "Agy multiline\n\"task\"",
 	})
 
@@ -656,11 +657,11 @@ while True:
 	b2, _ := os.ReadFile(filepath.Join(base, "slack-c1-10-2.json"))
 	_ = json.Unmarshal(b2, &agyRec)
 
-	if !slices.Contains(claudeRec.Args, "manual") || slices.Contains(claudeRec.Args, "--dangerously-skip-permissions") {
-		t.Fatalf("expected claude manual approval mode: %v", claudeRec.Args)
+	if !slices.Contains(claudeRec.Args, "--dangerously-skip-permissions") || slices.Contains(claudeRec.Args, "manual") {
+		t.Fatalf("expected claude default bypass mode (--dangerously-skip-permissions): %v", claudeRec.Args)
 	}
-	if !slices.Contains(agyRec.Args, "--sandbox") || !slices.Contains(agyRec.Args, "plan") || slices.Contains(agyRec.Args, "--dangerously-skip-permissions") {
-		t.Fatalf("expected agy sandboxed plan mode: %v", agyRec.Args)
+	if !slices.Contains(agyRec.Args, "--mode") || !slices.Contains(agyRec.Args, "auto") || slices.Contains(agyRec.Args, "--sandbox") || slices.Contains(agyRec.Args, "--dangerously-skip-permissions") {
+		t.Fatalf("expected agy auto mode: %v", agyRec.Args)
 	}
 	if exists, _ := session.SessionExists("claude", "slack-c1-10-1"); !exists {
 		t.Fatal("expected claude session alive")
@@ -673,6 +674,87 @@ while True:
 	}
 	var unusedClient *client.APIError
 	_ = unusedClient
+}
+
+func TestWorkerAgyDefaultAppBackend(t *testing.T) {
+	base := t.TempDir()
+	repoDir := filepath.Join(base, "myrepo")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	appDir := filepath.Join(base, "agy-app")
+	daemonDir := filepath.Join(appDir, "daemon")
+	if err := os.MkdirAll(daemonDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotCreate map[string]any
+	hubSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/product.v1.ConversationService/CreateConversation":
+			_ = json.NewDecoder(r.Body).Decode(&gotCreate)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"conversation": map[string]any{"id": "22222222-2222-4222-8222-000000000001"},
+			})
+		case "/product.v1.ConversationService/GetConversation":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "22222222-2222-4222-8222-000000000001"})
+		}
+	}))
+	t.Cleanup(hubSrv.Close)
+
+	port := strings.TrimPrefix(hubSrv.URL, "http://127.0.0.1:")
+	if idx := strings.LastIndex(hubSrv.URL, ":"); idx >= 0 {
+		port = hubSrv.URL[idx+1:]
+	}
+	_ = os.WriteFile(
+		filepath.Join(daemonDir, fmt.Sprintf("hub_%s.json", port)),
+		[]byte(fmt.Sprintf(`{"pid":%d,"httpPort":%s,"csrfToken":"slacker-csrf"}`, os.Getpid(), port)),
+		0o600,
+	)
+
+	t.Setenv("HOME", base)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(base, "state"))
+	t.Setenv("FLEET_AGY_APP_DATA_DIR", appDir)
+	t.Setenv("FLEET_SESSION_NO_OPEN", "1")
+
+	store, err := Open(filepath.Join(base, "slacker.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/slacker/worker/poll":
+			j, _ := store.ClaimNextJob("laptop", 90*time.Second)
+			_ = json.NewEncoder(w).Encode(map[string]any{"job": j, "device": "laptop"})
+		case "/v1/slacker/worker/receipt":
+			var rec Receipt
+			_ = json.NewDecoder(r.Body).Decode(&rec)
+			j, _ := store.RecordReceipt("laptop", rec)
+			_ = json.NewEncoder(w).Encode(map[string]any{"job": j})
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	_, _, _ = store.EnqueueJob(Job{
+		EventID: "EvApp", ChannelID: "C1", MessageTS: "12.3", Reaction: "agy", UserID: "U1",
+		TargetDevice: "laptop", RepoPath: repoDir, Harness: "agy",
+		SessionName: DeterministicSessionName("C1", "12.3"), Prompt: "Check mobile sync",
+	})
+
+	workerState := filepath.Join(base, "slacker-local")
+	if err := RunWorker(context.Background(), WorkerOpts{APIURL: srv.URL, LocalStateDir: workerState, Once: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	jobs, err := store.ListJobs("", "", 10)
+	if err != nil || len(jobs) != 1 || jobs[0].Status != "launched" || jobs[0].Backend != "app" {
+		t.Fatalf("expected launched job with backend=app, got %+v (err=%v)", jobs, err)
+	}
+	if gotCreate == nil || gotCreate["title"] != "slack-c1-12-3" {
+		t.Fatalf("unexpected CreateConversation payload: %+v", gotCreate)
+	}
 }
 
 func TestStoreMigratesLegacyJobsMissingAccountColumn(t *testing.T) {
@@ -987,4 +1069,563 @@ func cmpOr(a, b string) string {
 		return a
 	}
 	return b
+}
+
+func TestWorkspaceDirAndMultiDeviceConfigValidation(t *testing.T) {
+	active := map[string]bool{"mini": true, "laptop": true, "office": true}
+
+	// Legacy single-device JSON loads cleanly with normalized Devices slice.
+	tmp := t.TempDir()
+	cfgPath := filepath.Join(tmp, "slacker.json")
+	legacyJSON := `{
+  "accounts": {"default": {"id":"default","enabled":true,"app_token":"xapp-1","user_token":"xoxp-1","authorized_user_id":"U1"}},
+  "channels": {"C1": {"channel_id":"C1","device":"mini","repo_path":"/tmp/r"}},
+  "emojis": {"claude":"claude"}
+}`
+	if err := os.WriteFile(cfgPath, []byte(legacyJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.EffectiveChannelDevices(loaded.Channels["C1"]); !slices.Equal(got, []string{"mini"}) {
+		t.Fatalf("expected legacy channel normalized to [mini], got %v", got)
+	}
+	if loaded.EffectiveDefaultStrategy() != StrategyLeastAgents {
+		t.Fatalf("expected default strategy %q, got %q", StrategyLeastAgents, loaded.EffectiveDefaultStrategy())
+	}
+
+	// Relative subpath without workspace_dir must fail validation.
+	_, err = ApplyUpdate(Config{}, ConfigUpdate{
+		DefaultDevices: &[]string{"mini", "laptop"},
+		Channels: map[string]ChannelMapping{
+			"C2": {ChannelID: "C2", RepoPath: "fleet"},
+		},
+	}, active)
+	if err == nil {
+		t.Fatal("expected error when relative repo_path lacks workspace_dir")
+	}
+
+	// Configuring per-machine workspace_dir (stripping trailing slashes) allows relative & blank repo_path.
+	defStrat := StrategyRoundRobin
+	cfg, err := ApplyUpdate(Config{}, ConfigUpdate{
+		Devices: map[string]DeviceConfig{
+			"mini":   {WorkspaceDir: "~/workspace/"},
+			"laptop": {WorkspaceDir: "/Users/dat/src/"},
+			"office": {WorkspaceDir: ""}, // empty clears entry
+		},
+		DefaultDevices:  &[]string{"mini", "laptop"},
+		DefaultStrategy: &defStrat,
+		Channels: map[string]ChannelMapping{
+			"C2": {ChannelID: "C2", RepoPath: "fleet"},
+			"C3": {ChannelID: "C3", Devices: []string{"laptop"}, RepoPath: ""},
+			"C4": {ChannelID: "C4", Devices: []string{"mini", "laptop"}, RepoPath: "~/override"},
+		},
+	}, active)
+	if err != nil {
+		t.Fatalf("ApplyUpdate failed: %v", err)
+	}
+	if cfg.Devices["mini"].WorkspaceDir != "~/workspace" || cfg.Devices["laptop"].WorkspaceDir != "/Users/dat/src" {
+		t.Fatalf("unexpected normalized devices: %+v", cfg.Devices)
+	}
+	if _, ok := cfg.Devices["office"]; ok {
+		t.Fatalf("expected empty workspace_dir cleared, got %+v", cfg.Devices)
+	}
+	if got, err := cfg.ResolveRepoPath("mini", "fleet"); err != nil || got != "~/workspace/fleet" {
+		t.Fatalf("ResolveRepoPath mini/fleet = %q, %v", got, err)
+	}
+	if got, err := cfg.ResolveRepoPath("laptop", ""); err != nil || got != "/Users/dat/src" {
+		t.Fatalf("ResolveRepoPath laptop/blank = %q, %v", got, err)
+	}
+	if got, err := cfg.ResolveRepoPath("mini", "~/override"); err != nil || got != "~/override" {
+		t.Fatalf("ResolveRepoPath override = %q, %v", got, err)
+	}
+	if _, err := cfg.ResolveRepoPath("mini", "../escape"); err == nil {
+		t.Fatal("expected .. traversal to be rejected")
+	}
+	if _, err := cfg.ResolveRepoPath("office", "fleet"); err == nil {
+		t.Fatal("expected missing workspace_dir for office to fail")
+	}
+}
+
+func TestRouterLeastAgentsRoundRobinAndOnlineFallback(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "slacker.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	cfg := Config{
+		Devices: map[string]DeviceConfig{
+			"mini":   {WorkspaceDir: "~/ws"},
+			"laptop": {WorkspaceDir: "/src"},
+			"office": {WorkspaceDir: "/work"},
+		},
+		DefaultDevices:  []string{"mini", "laptop", "office"},
+		DefaultStrategy: StrategyRoundRobin,
+	}
+	chInherit := ChannelMapping{ChannelID: "C1", RepoPath: "fleet"}
+
+	// 1. Round-robin with no online workers falls back to all 3 and cycles across reopen.
+	var picked []string
+	for range 4 {
+		dev, repo, scope, err := SelectTarget(context.Background(), cfg, "default", chInherit, store, nil, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if scope != "default" {
+			t.Fatalf("expected default scope, got %q", scope)
+		}
+		wantRepo, _ := cfg.ResolveRepoPath(dev, "fleet")
+		if repo != wantRepo {
+			t.Fatalf("repo mismatch for %s: got %q want %q", dev, repo, wantRepo)
+		}
+		if err := store.SetLastDevice(scope, dev); err != nil {
+			t.Fatal(err)
+		}
+		picked = append(picked, dev)
+	}
+	if !slices.Equal(picked, []string{"mini", "laptop", "office", "mini"}) {
+		t.Fatalf("unexpected round-robin sequence: %v", picked)
+	}
+
+	// Reopen DB -> cursor persists (last was mini, so next is laptop).
+	_ = store.Close()
+	store, err = Open(filepath.Join(tmp, "slacker.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	devAfterReopen, _, scope, err := SelectTarget(context.Background(), cfg, "default", chInherit, store, nil, time.Now())
+	if err != nil || devAfterReopen != "laptop" {
+		t.Fatalf("expected laptop after reopen, got %q (err=%v)", devAfterReopen, err)
+	}
+	_ = store.SetLastDevice(scope, devAfterReopen)
+
+	// 2. Only mini and office online -> skips offline laptop.
+	if err := store.UpsertWorkerRuntime("mini", 1, true, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertWorkerRuntime("office", 2, true, ""); err != nil {
+		t.Fatal(err)
+	}
+	devOnline, _, _, err := SelectTarget(context.Background(), cfg, "default", chInherit, store, nil, time.Now())
+	if err != nil || devOnline != "office" {
+		t.Fatalf("expected office (skipping offline laptop after laptop), got %q (err=%v)", devOnline, err)
+	}
+
+	// 3. Least-agents using agents.db directly + pending slacker_jobs + tie-break cursor.
+	hub, err := agents.Open(filepath.Join(tmp, "agents.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = hub.Close() })
+	// Give mini 2 live agents and office 1 live agent.
+	for i := range 2 {
+		if _, err := hub.Heartbeat(agents.HeartbeatParams{Device: "mini", Harness: "claude", RawID: fmt.Sprintf("m%d", i), State: "working"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := hub.Heartbeat(agents.HeartbeatParams{Device: "office", Harness: "claude", RawID: "o1", State: "idle"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = hub.Close()
+
+	loadFn := DefaultAgentLoad(tmp, "")
+	chLeast := ChannelMapping{
+		ChannelID: "C2",
+		Devices:   []string{"mini", "laptop", "office"},
+		Strategy:  StrategyLeastAgents,
+		RepoPath:  "",
+	}
+	// Mark laptop online too so all 3 compete: mini=2, laptop=0, office=1 -> picks laptop.
+	if err := store.UpsertWorkerRuntime("laptop", 3, true, ""); err != nil {
+		t.Fatal(err)
+	}
+	d1, r1, sc2, err := SelectTarget(context.Background(), cfg, "default", chLeast, store, loadFn, time.Now())
+	if err != nil || d1 != "laptop" || r1 != "/src" {
+		t.Fatalf("expected laptop /src, got %q %q (err=%v)", d1, r1, err)
+	}
+	// Enqueue queued job on laptop -> now mini=2, laptop=0+1=1, office=1 -> tie between laptop and office!
+	// Cursor is empty (or set to laptop), so tie-break picks office next!
+	_, _, err = store.EnqueueJob(Job{
+		EventID: "EvLoad1", ChannelID: "C2", MessageTS: "1.1", Reaction: "claude", UserID: "U1",
+		TargetDevice: d1, RepoPath: r1, Harness: "claude", SessionName: "s1", Prompt: "p1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = store.SetLastDevice(sc2, d1)
+
+	d2, _, _, err := SelectTarget(context.Background(), cfg, "default", chLeast, store, loadFn, time.Now())
+	if err != nil || d2 != "office" {
+		t.Fatalf("expected tie-break to pick office over laptop, got %q (err=%v)", d2, err)
+	}
+}
+
+func TestListenerEndToEndMultiMachineWorkspaceRouting(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "slacker.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	ms := newMockSlackServer(t)
+	ms.messages["C1:1.1"] = SlackMessage{Type: "message", User: "U1", Text: "Task one", TS: "1.1"}
+	ms.messages["C1:1.2"] = SlackMessage{Type: "message", User: "U1", Text: "Task two", TS: "1.2"}
+
+	cfg := Config{
+		Accounts: map[string]AccountConfig{
+			"default": {ID: "default", Enabled: true, AppToken: "xapp-test", UserToken: "xoxp-test", AuthorizedUserID: "UADMIN"},
+		},
+		Devices: map[string]DeviceConfig{
+			"mini":   {WorkspaceDir: "~/workspace"},
+			"laptop": {WorkspaceDir: "/Users/dat/src"},
+		},
+		DefaultDevices:  []string{"mini", "laptop"},
+		DefaultStrategy: StrategyLeastAgents,
+		Channels: map[string]ChannelMapping{
+			"C1": {ChannelID: "C1", ChannelName: "fleet", RepoPath: "fleet"},
+		},
+		Emojis: DefaultEmojis(),
+	}
+	cfgPath := filepath.Join(tmp, "slacker.json")
+	if err := SaveConfig(cfgPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	// Both workers online; mini starts with 1 live agent, laptop has 0 -> 1st goes to laptop, 2nd (with pending job on laptop -> 1 vs 1) tie-breaks to mini.
+	_ = store.UpsertWorkerRuntime("mini", 10, true, "")
+	_ = store.UpsertWorkerRuntime("laptop", 20, true, "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	doneCh := make(chan error, 1)
+	go func() {
+		doneCh <- RunListener(ctx, ListenerOpts{
+			StateDir:   tmp,
+			ConfigPath: cfgPath,
+			Store:      store,
+			Slack:      &SlackClient{BaseURL: ms.srv.URL},
+			NotifyURL:  "http://127.0.0.1:1/unused",
+			AgentLoadFn: func(context.Context) (map[string]int, error) {
+				return map[string]int{"mini": 1, "laptop": 0}, nil
+			},
+			Stderr:      io.Discard,
+			BackoffBase: 50 * time.Millisecond,
+		})
+	}()
+	defer func() {
+		cancel()
+		<-doneCh
+	}()
+
+	ms.sendEnvelope(t, reactionEnvelope("e1", "EvM1", "UADMIN", "claude", "C1", "1.1"))
+	select {
+	case <-ms.ackCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for e1 ack")
+	}
+	ms.sendEnvelope(t, reactionEnvelope("e2", "EvM2", "UADMIN", "claude", "C1", "1.2"))
+	select {
+	case <-ms.ackCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for e2 ack")
+	}
+
+	jobs, err := store.ListJobs("", "", 10)
+	if err != nil || len(jobs) != 2 {
+		t.Fatalf("expected 2 jobs, got %+v (err=%v)", jobs, err)
+	}
+	byEvt := map[string]Job{}
+	for _, j := range jobs {
+		byEvt[j.EventID] = j
+	}
+	j1 := byEvt["EvM1"]
+	j2 := byEvt["EvM2"]
+	if j1.TargetDevice != "laptop" || j1.RepoPath != "/Users/dat/src/fleet" || !strings.HasPrefix(j1.Prompt, "Task one\n") || j1.Policy != string(session.PolicyBypass) {
+		t.Fatalf("unexpected j1: %+v", j1)
+	}
+	if j2.TargetDevice != "mini" || j2.RepoPath != "~/workspace/fleet" || !strings.HasPrefix(j2.Prompt, "Task two\n") || j2.Policy != string(session.PolicyBypass) {
+		t.Fatalf("unexpected j2: %+v", j2)
+	}
+}
+
+func TestSlackerPolicyConfigAndListenerPropagation(t *testing.T) {
+	active := map[string]bool{"mini": true}
+	if _, err := ApplyUpdate(Config{}, ConfigUpdate{DefaultPolicy: new("invalid")}, active); err == nil {
+		t.Fatal("expected invalid default_policy to fail")
+	}
+	defPol := "auto"
+	cfg, err := ApplyUpdate(Config{}, ConfigUpdate{
+		DefaultPolicy: &defPol,
+		Channels: map[string]ChannelMapping{
+			"C1": {ChannelID: "C1", Device: "mini", RepoPath: "/tmp/r1"},
+			"C2": {ChannelID: "C2", Device: "mini", RepoPath: "/tmp/r2", Policy: "safe"},
+		},
+	}, active)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.EffectiveDefaultPolicy() != "auto" || cfg.EffectiveChannelPolicy(cfg.Channels["C1"]) != "auto" || cfg.EffectiveChannelPolicy(cfg.Channels["C2"]) != "safe" {
+		t.Fatalf("unexpected policy resolution: default=%q c1=%q c2=%q", cfg.EffectiveDefaultPolicy(), cfg.EffectiveChannelPolicy(cfg.Channels["C1"]), cfg.EffectiveChannelPolicy(cfg.Channels["C2"]))
+	}
+
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "slacker.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	ms := newMockSlackServer(t)
+	ms.messages["C1:1.1"] = SlackMessage{Type: "message", User: "U1", Text: "Use default auto", TS: "1.1"}
+	ms.messages["C2:2.1"] = SlackMessage{Type: "message", User: "U1", Text: "Use safe override", TS: "2.1"}
+
+	cfg.Accounts = map[string]AccountConfig{
+		"default": {ID: "default", Enabled: true, AppToken: "xapp-t", UserToken: "xoxp-t", AuthorizedUserID: "UADMIN"},
+	}
+	cfg.Emojis = DefaultEmojis()
+	cfgPath := filepath.Join(tmp, "slacker.json")
+	if err := SaveConfig(cfgPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	doneCh := make(chan error, 1)
+	go func() {
+		doneCh <- RunListener(ctx, ListenerOpts{
+			StateDir: tmp, ConfigPath: cfgPath, Store: store,
+			Slack: &SlackClient{BaseURL: ms.srv.URL}, NotifyURL: "http://127.0.0.1:1/unused",
+			Stderr: io.Discard, BackoffBase: 50 * time.Millisecond,
+		})
+	}()
+	defer func() {
+		cancel()
+		<-doneCh
+	}()
+
+	ms.sendEnvelope(t, reactionEnvelope("p1", "EvPol1", "UADMIN", "claude", "C1", "1.1"))
+	ms.sendEnvelope(t, reactionEnvelope("p2", "EvPol2", "UADMIN", "claude", "C2", "2.1"))
+	for range 2 {
+		select {
+		case <-ms.ackCh:
+		case <-time.After(3 * time.Second):
+			t.Fatal("timeout waiting for policy test ack")
+		}
+	}
+	jobs, err := store.ListJobs("", "", 10)
+	if err != nil || len(jobs) != 2 {
+		t.Fatalf("expected 2 jobs, got %+v (err=%v)", jobs, err)
+	}
+	byEvt := map[string]Job{}
+	for _, j := range jobs {
+		byEvt[j.EventID] = j
+	}
+	if byEvt["EvPol1"].Policy != "auto" || byEvt["EvPol2"].Policy != "safe" {
+		t.Fatalf("unexpected job policies: EvPol1=%q EvPol2=%q", byEvt["EvPol1"].Policy, byEvt["EvPol2"].Policy)
+	}
+}
+
+func TestFormatTaskPrompt(t *testing.T) {
+	// Top-level message: leads directly with the ask, omits reaction emoji, Repository:, and default account.
+	top := FormatTaskPrompt(
+		DefaultAccountID,
+		ReactionEvent{Reaction: "claude", ChannelID: "C1", MessageTS: "1700.1"},
+		FetchedMessage{
+			ChannelName: "eng",
+			AuthorName:  "Alice",
+			Permalink:   "https://slack.test/archives/C1/p17001",
+			Message:     SlackMessage{Text: "  Please check why the build is failing  ", TS: "1700.1"},
+		},
+		ChannelMapping{ChannelID: "C1", RepoPath: "~/workspace/fleet"},
+	)
+	if !strings.HasPrefix(top, "Please check why the build is failing\n\n---\n") {
+		t.Fatalf("expected top-level prompt to lead directly with trimmed ask, got:\n%s", top)
+	}
+	for _, unwanted := range []string{":claude:", "Repository:", "account `default`", "thread `"} {
+		if strings.Contains(top, unwanted) {
+			t.Fatalf("unexpected boilerplate %q in prompt:\n%s", unwanted, top)
+		}
+	}
+	for _, want := range []string{
+		"Slack request from Alice in #eng (`C1`, ts `1700.1`).",
+		"Link: https://slack.test/archives/C1/p17001",
+		"Use `fleet_slack_read`",
+		"`fleet_slack_send`",
+	} {
+		if !strings.Contains(top, want) {
+			t.Fatalf("missing %q in prompt:\n%s", want, top)
+		}
+	}
+
+	// Thread reply on non-default account without channel name: includes parent, thread ts, account, and no #C2 (C2) duplication.
+	reply := FormatTaskPrompt(
+		"work",
+		ReactionEvent{Reaction: "agy", ChannelID: "C2", MessageTS: "1700.2"},
+		FetchedMessage{
+			AuthorName: "Bob",
+			Message:    SlackMessage{Text: "Look at this regression", TS: "1700.2", ThreadTS: "1700.0"},
+			Parent:     &SlackMessage{Text: "Deploy failed on staging", TS: "1700.0"},
+		},
+		ChannelMapping{ChannelID: "C2"},
+	)
+	if !strings.HasPrefix(reply, "Look at this regression\n\nThread parent:\nDeploy failed on staging\n\n---\n") {
+		t.Fatalf("unexpected thread prompt layout:\n%s", reply)
+	}
+	if !strings.Contains(reply, "Slack request from Bob in channel `C2` (ts `1700.2`, thread `1700.0`, account `work`).") {
+		t.Fatalf("unexpected thread footer:\n%s", reply)
+	}
+
+	// Empty message text falls back to a clear instruction.
+	empty := FormatTaskPrompt(
+		DefaultAccountID,
+		ReactionEvent{Reaction: "codex", ChannelID: "C3", MessageTS: "1700.3"},
+		FetchedMessage{},
+		ChannelMapping{ChannelID: "C3"},
+	)
+	if !strings.HasPrefix(empty, "Inspect this Slack message and handle the request.\n") {
+		t.Fatalf("unexpected empty message fallback:\n%s", empty)
+	}
+}
+
+func TestMessageLevelDeduplicationBlocksButterFingerReacts(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "slacker.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	ms := newMockSlackServer(t)
+	ms.messages["C1:1700.1"] = SlackMessage{Type: "message", User: "U1", Text: "Fix flaky test", TS: "1700.1"}
+
+	cfg := Config{
+		Accounts: map[string]AccountConfig{
+			"default": {ID: "default", Enabled: true, AppToken: "xapp-test", UserToken: "xoxp-test", AuthorizedUserID: "UADMIN"},
+		},
+		Devices: map[string]DeviceConfig{
+			"mini":   {WorkspaceDir: "~/ws"},
+			"laptop": {WorkspaceDir: "/src"},
+		},
+		DefaultDevices:  []string{"mini", "laptop"},
+		DefaultStrategy: StrategyRoundRobin,
+		Channels: map[string]ChannelMapping{
+			"C1": {ChannelID: "C1", RepoPath: "fleet"},
+		},
+		Emojis: DefaultEmojis(),
+	}
+	cfgPath := filepath.Join(tmp, "slacker.json")
+	if err := SaveConfig(cfgPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	doneCh := make(chan error, 1)
+	go func() {
+		doneCh <- RunListener(ctx, ListenerOpts{
+			StateDir:    tmp,
+			ConfigPath:  cfgPath,
+			Store:       store,
+			Slack:       &SlackClient{BaseURL: ms.srv.URL},
+			NotifyURL:   "http://127.0.0.1:1/unused",
+			Stderr:      io.Discard,
+			BackoffBase: 50 * time.Millisecond,
+		})
+	}()
+	defer func() {
+		cancel()
+		<-doneCh
+	}()
+
+	// 1. Initial :claude: reaction enqueues job on mini and sets cursor to mini.
+	ms.sendEnvelope(t, reactionEnvelope("e1", "EvBF1", "UADMIN", "claude", "C1", "1700.1"))
+	select {
+	case <-ms.ackCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for e1 ack")
+	}
+
+	// 2. Butter-finger :agy: and re-react :claude: (new event_ids) on the same message must be ACKed without new jobs or advancing round-robin.
+	ms.sendEnvelope(t, reactionEnvelope("e2", "EvBF2", "UADMIN", "agy", "C1", "1700.1"))
+	ms.sendEnvelope(t, reactionEnvelope("e3", "EvBF3", "UADMIN", "claude", "C1", "1700.1"))
+	for range 2 {
+		select {
+		case <-ms.ackCh:
+		case <-time.After(3 * time.Second):
+			t.Fatal("timeout waiting for duplicate reaction ack")
+		}
+	}
+
+	jobs, err := store.ListJobs("", "", 10)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("expected only 1 job for butter-finger reactions, got %+v (err=%v)", jobs, err)
+	}
+	if last, err := store.GetLastDevice("default"); err != nil || last != "mini" {
+		t.Fatalf("expected round-robin cursor to stay on mini, got %q (err=%v)", last, err)
+	}
+
+	// 3. Direct EnqueueJob deduplicates across queued -> claimed -> launched, while another account stays independent.
+	orig := jobs[0]
+	if inserted, got, err := store.EnqueueJob(Job{
+		EventID: "EvDirectDup1", ChannelID: "C1", MessageTS: "1700.1", Reaction: "codex", UserID: "UADMIN",
+		TargetDevice: "laptop", RepoPath: "/src/fleet", Harness: "codex", SessionName: "s-dup", Prompt: "dup",
+	}); err != nil || inserted || got.ID != orig.ID {
+		t.Fatalf("expected queued message dedupe returning %s, got inserted=%v job=%+v err=%v", orig.ID, inserted, got, err)
+	}
+
+	if claimed, err := store.ClaimNextJob("mini", 90*time.Second); err != nil || claimed == nil || claimed.ID != orig.ID {
+		t.Fatalf("expected claim of %s, got %+v err=%v", orig.ID, claimed, err)
+	}
+	if inserted, _, err := store.EnqueueJob(Job{
+		EventID: "EvDirectDup2", ChannelID: "C1", MessageTS: "1700.1", Reaction: "agy", UserID: "UADMIN",
+		TargetDevice: "laptop", RepoPath: "/src/fleet", Harness: "agy", SessionName: "s-dup2", Prompt: "dup2",
+	}); err != nil || inserted {
+		t.Fatalf("expected claimed message dedupe, got inserted=%v err=%v", inserted, err)
+	}
+
+	if _, err := store.RecordReceipt("mini", Receipt{
+		JobID: orig.ID, ReceiptID: "rcpt-bf", SessionName: orig.SessionName, Backend: "tmux", Status: "launched",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if inserted, _, err := store.EnqueueJob(Job{
+		EventID: "EvDirectDup3", ChannelID: "C1", MessageTS: "1700.1", Reaction: "agy", UserID: "UADMIN",
+		TargetDevice: "laptop", RepoPath: "/src/fleet", Harness: "agy", SessionName: "s-dup3", Prompt: "dup3",
+	}); err != nil || inserted {
+		t.Fatalf("expected launched message dedupe, got inserted=%v err=%v", inserted, err)
+	}
+
+	if inserted, _, err := store.EnqueueJob(Job{
+		Account: "work", EventID: "EvWorkSameMsg", ChannelID: "C1", MessageTS: "1700.1", Reaction: "claude", UserID: "UWORK",
+		TargetDevice: "laptop", RepoPath: "/src/fleet", Harness: "claude", SessionName: "s-work", Prompt: "work",
+	}); err != nil || !inserted {
+		t.Fatalf("expected work account message to stay independent, got inserted=%v err=%v", inserted, err)
+	}
+
+	// 4. Cancelled/failed job allows a fresh trigger on the same message, and retrying the superseded job is blocked with 409.
+	inserted, failJob, err := store.EnqueueJob(Job{
+		EventID: "EvFailFirst", ChannelID: "C2", MessageTS: "2000.1", Reaction: "claude", UserID: "UADMIN",
+		TargetDevice: "mini", RepoPath: "~/ws/fleet", Harness: "claude", SessionName: "s-fail", Prompt: "first",
+	})
+	if err != nil || !inserted {
+		t.Fatalf("enqueue failJob: inserted=%v err=%v", inserted, err)
+	}
+	if _, err := store.CancelJob(failJob.ID); err != nil {
+		t.Fatal(err)
+	}
+	inserted, replacement, err := store.EnqueueJob(Job{
+		EventID: "EvAfterCancel", ChannelID: "C2", MessageTS: "2000.1", Reaction: "agy", UserID: "UADMIN",
+		TargetDevice: "laptop", RepoPath: "/src/fleet", Harness: "agy", SessionName: "s-rep", Prompt: "second",
+	})
+	if err != nil || !inserted || replacement.ID == failJob.ID {
+		t.Fatalf("expected replacement job after cancel, got inserted=%v job=%+v err=%v", inserted, replacement, err)
+	}
+	if _, err := store.RetryJob(failJob.ID); err == nil || !strings.Contains(err.Error(), "already has an active or launched job") {
+		t.Fatalf("expected RetryJob conflict when replacement is active, got %v", err)
+	} else if se, ok := errors.AsType[*SlackerError](err); !ok || se.HTTPStatus() != 409 {
+		t.Fatalf("expected 409 SlackerError, got %T (%v)", err, err)
+	}
 }

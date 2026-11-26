@@ -136,3 +136,25 @@ func TestCLIReportsErrorsWithoutStacktrace(t *testing.T) {
 		t.Fatalf("unexpected error output: rc=%d err=%q", rc, errBuf.String())
 	}
 }
+
+func TestParseSessionActionArgs(t *testing.T) {
+	parsed, err := parseSessionActionArgs([]string{"start", "--rex", "--model", "pro", "my-task", "/tmp"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !parsed.useRex || parsed.useTmux || parsed.model != "pro" || len(parsed.positional) != 3 {
+		t.Fatalf("unexpected parsed args: %+v", parsed)
+	}
+
+	parsedEq, err := parseSessionActionArgs([]string{"start", "--tmux", "--model=flash", "my-task", "/tmp"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsedEq.useRex || !parsedEq.useTmux || parsedEq.model != "flash" {
+		t.Fatalf("unexpected parsed = args: %+v", parsedEq)
+	}
+
+	if _, err := parseSessionActionArgs([]string{"start", "--rex", "--tmux", "my-task", "/tmp"}); err == nil || !strings.Contains(err.Error(), "cannot be combined") {
+		t.Fatalf("expected --rex/--tmux conflict error, got %v", err)
+	}
+}

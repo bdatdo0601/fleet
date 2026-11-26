@@ -29,6 +29,7 @@ type Policy string
 
 const (
 	PolicyBypass Policy = "bypass"
+	PolicyAuto   Policy = "auto"
 	PolicySafe   Policy = "safe"
 )
 
@@ -116,10 +117,10 @@ func ParsePolicy(raw string, def Policy) (Policy, error) {
 		return def, nil
 	}
 	switch Policy(p) {
-	case PolicyBypass, PolicySafe:
+	case PolicyBypass, PolicyAuto, PolicySafe:
 		return Policy(p), nil
 	default:
-		return "", fmt.Errorf("invalid policy %q (expected safe or bypass)", raw)
+		return "", fmt.Errorf("invalid policy %q (expected bypass, auto, or safe)", raw)
 	}
 }
 
@@ -290,9 +291,12 @@ func BuildHarnessArgs(spec Spec, name, selfBin, resumeID, prompt string, policy 
 			return nil, err
 		}
 		var args []string
-		if pol == PolicySafe {
+		switch pol {
+		case PolicySafe:
 			args = append(args, "--permission-mode", "manual")
-		} else {
+		case PolicyAuto:
+			args = append(args, "--permission-mode", "auto")
+		default:
 			args = append(args, "--dangerously-skip-permissions")
 		}
 		args = append(args, "--remote-control", name, "--settings", settingsJSON)
@@ -306,9 +310,12 @@ func BuildHarnessArgs(spec Spec, name, selfBin, resumeID, prompt string, policy 
 
 	case HarnessAgy:
 		var args []string
-		if pol == PolicySafe {
+		switch pol {
+		case PolicySafe:
 			args = append(args, "--sandbox", "--mode", "plan")
-		} else {
+		case PolicyAuto:
+			args = append(args, "--mode", "auto")
+		default:
 			args = append(args, "--dangerously-skip-permissions")
 		}
 		args = append(args, "--remote-control")
@@ -325,9 +332,12 @@ func BuildHarnessArgs(spec Spec, name, selfBin, resumeID, prompt string, policy 
 		if resumeID != "" {
 			args = append(args, "resume")
 		}
-		if pol == PolicySafe {
+		switch pol {
+		case PolicySafe:
 			args = append(args, "-s", "workspace-write", "-a", "on-request")
-		} else {
+		case PolicyAuto:
+			args = append(args, "--approve-for-me")
+		default:
 			args = append(args, "--dangerously-bypass-approvals-and-sandbox")
 		}
 		if resumeID != "" {

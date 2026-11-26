@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bdatdo0601/fleet/internal/core"
+	"github.com/bdatdo0601/fleet/internal/pki"
 	"github.com/bdatdo0601/fleet/internal/slacker"
 )
 
@@ -169,5 +171,64 @@ func TestCLISlackerMultiAccountReadSend(t *testing.T) {
 	errBuf.Reset()
 	if rc := Run([]string{"slacker", "account", "rm", "work"}, &IO{Stdout: &out, Stderr: &errBuf}); rc != 0 || strings.Contains(out.String(), "[work]") {
 		t.Fatalf("slacker account rm failed: rc=%d out=%q err=%q", rc, out.String(), errBuf.String())
+	}
+}
+
+func TestCLISlackerMapWorkspaceDefaultAndMultiDeviceChannel(t *testing.T) {
+	f, _, tmp := setupCLIServer(t)
+	lapPubFile := filepath.Join(tmp, "lap.pub")
+	if err := pki.Keygen(filepath.Join(tmp, "lap.key"), lapPubFile); err != nil {
+		t.Fatal(err)
+	}
+	lapPub, _ := os.ReadFile(lapPubFile)
+	if _, err := f.Approve(core.ApproveOpts{
+		Name: "laptop", Pubkey: string(lapPub), Kind: "mac", Group: "managed", Passphrase: testPass,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	runCLI := func(args ...string) (int, string, string) {
+		var out, errBuf bytes.Buffer
+		rc := Run(args, &IO{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errBuf})
+		return rc, out.String(), errBuf.String()
+	}
+
+	if rc, out, errStr := runCLI("slacker", "map", "workspace", "mini", "~/workspace"); rc != 0 || !strings.Contains(out, "mini -> ~/workspace") {
+		t.Fatalf("map workspace mini failed: rc=%d out=%q err=%q", rc, out, errStr)
+	}
+	if rc, out, errStr := runCLI("slacker", "map", "workspace", "laptop", "/Users/dat/src"); rc != 0 || !strings.Contains(out, "laptop -> /Users/dat/src") {
+		t.Fatalf("map workspace laptop failed: rc=%d out=%q err=%q", rc, out, errStr)
+	}
+	if rc, out, errStr := runCLI("slacker", "map", "default", "--devices", "mini,laptop", "--strategy", "round_robin", "--policy", "auto"); rc != 0 ||
+		!strings.Contains(out, "strategy=round_robin policy=auto devices=mini,laptop") {
+		t.Fatalf("map default failed: rc=%d out=%q err=%q", rc, out, errStr)
+	}
+	if rc, out, errStr := runCLI("slacker", "map", "channel", "CPOOL", "--repo", "fleet", "--strategy", "least_agents", "--policy", "safe"); rc != 0 ||
+		!strings.Contains(out, "CPOOL -> default:fleet") || !strings.Contains(out, "strategy=least_agents") || !strings.Contains(out, "policy=safe") {
+		t.Fatalf("map channel inheriting defaults failed: rc=%d out=%q err=%q", rc, out, errStr)
+	}
+	if rc, out, errStr := runCLI("slacker", "map", "channel", "CEXPLICIT", "mini,laptop", "api", "--tmux"); rc != 0 ||
+		!strings.Contains(out, "CEXPLICIT -> mini,laptop:api (tmux=true)") {
+		t.Fatalf("map channel explicit multi-device failed: rc=%d out=%q err=%q", rc, out, errStr)
+	}
+
+	if rc, out, errStr := runCLI("slacker", "map", "ls"); rc != 0 || !strings.Contains(out, "workspaces:      2") {
+		t.Fatalf("map ls failed: rc=%d out=%q err=%q", rc, out, errStr)
+	}
+
+	// Removing laptop workspace while channels still use laptop with relative repo_path must fail.
+	if rc, _, _ := runCLI("slacker", "map", "workspace", "rm", "laptop"); rc == 0 {
+		t.Fatal("expected workspace rm laptop to fail while channels require laptop workspace_dir")
+	}
+
+	// Clear CEXPLICIT, remove laptop from defaults, then remove laptop workspace cleanly.
+	if rc, _, errStr := runCLI("slacker", "map", "channel", "rm", "CEXPLICIT"); rc != 0 {
+		t.Fatalf("channel rm CEXPLICIT failed: %s", errStr)
+	}
+	if rc, _, errStr := runCLI("slacker", "map", "default", "--devices", "mini"); rc != 0 {
+		t.Fatalf("map default update failed: %s", errStr)
+	}
+	if rc, out, errStr := runCLI("slacker", "map", "workspace", "rm", "laptop"); rc != 0 || strings.Contains(out, "laptop ->") {
+		t.Fatalf("workspace rm laptop failed: rc=%d out=%q err=%q", rc, out, errStr)
 	}
 }

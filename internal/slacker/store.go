@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS slacker_jobs (
   target_device    TEXT NOT NULL,
   repo_path        TEXT NOT NULL,
   use_tmux         INTEGER NOT NULL DEFAULT 0,
+  policy           TEXT NOT NULL DEFAULT '',
   harness          TEXT NOT NULL,
   session_name     TEXT NOT NULL,
   prompt           TEXT NOT NULL,
@@ -56,10 +57,17 @@ CREATE TABLE IF NOT EXISTS slacker_runtime (
   last_error    TEXT NOT NULL DEFAULT '',
   updated_at    TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS slacker_dispatch_state (
+  scope       TEXT PRIMARY KEY,
+  last_device TEXT NOT NULL DEFAULT '',
+  updated_at  TEXT NOT NULL
+);
 `
 
 var jobMigrations = []registry.ColumnMigration{
 	{Col: "account", Def: "TEXT NOT NULL DEFAULT 'default'"},
+	{Col: "policy", Def: "TEXT NOT NULL DEFAULT ''"},
 }
 
 // Store manages persisted Slacker jobs and runtime status in ~/.fleet/slacker.db.
@@ -75,6 +83,10 @@ type Store struct {
 func Open(path string) (*Store, error) {
 	db, err := registry.OpenSQLite(path, slackerSchema, "slacker_jobs", jobMigrations)
 	if err != nil {
+		return nil, err
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_slacker_jobs_message ON slacker_jobs(account, channel_id, message_ts, status)`); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
 	return &Store{
@@ -165,8 +177,26 @@ func (s *Store) HasEvent(eventID string) (bool, error) {
 	return n > 0, err
 }
 
+// HasMessageJob reports whether an active or launched job already exists for (account, channelID, messageTS).
+func (s *Store) HasMessageJob(account, channelID, messageTS string) (bool, error) {
+	if channelID == "" || messageTS == "" {
+		return false, nil
+	}
+	acct := cmp.Or(account, DefaultAccountID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM slacker_jobs
+		 WHERE account = ? AND channel_id = ? AND message_ts = ?
+		   AND status IN ('queued', 'claimed', 'launched')`,
+		acct, channelID, messageTS,
+	).Scan(&n)
+	return n > 0, err
+}
+
 const jobSelectCols = `id, account, event_id, channel_id, channel_name, message_ts, thread_ts, reaction, user_id,
-  target_device, repo_path, use_tmux, harness, session_name, prompt, permalink, status,
+  target_device, repo_path, use_tmux, policy, harness, session_name, prompt, permalink, status,
   attempt_count, claimed_by, claimed_at, lease_expires_at, receipt_id, backend, error, created_at, updated_at`
 
 func scanJobRow(sc interface{ Scan(...any) error }) (Job, error) {
@@ -174,7 +204,7 @@ func scanJobRow(sc interface{ Scan(...any) error }) (Job, error) {
 	var useTmux int
 	err := sc.Scan(
 		&j.ID, &j.Account, &j.EventID, &j.ChannelID, &j.ChannelName, &j.MessageTS, &j.ThreadTS, &j.Reaction, &j.UserID,
-		&j.TargetDevice, &j.RepoPath, &useTmux, &j.Harness, &j.SessionName, &j.Prompt, &j.Permalink, &j.Status,
+		&j.TargetDevice, &j.RepoPath, &useTmux, &j.Policy, &j.Harness, &j.SessionName, &j.Prompt, &j.Permalink, &j.Status,
 		&j.AttemptCount, &j.ClaimedBy, &j.ClaimedAt, &j.LeaseExpiresAt, &j.ReceiptID, &j.Backend, &j.Error,
 		&j.CreatedAt, &j.UpdatedAt,
 	)
@@ -182,8 +212,8 @@ func scanJobRow(sc interface{ Scan(...any) error }) (Job, error) {
 	return j, err
 }
 
-// EnqueueJob inserts a job deduplicated by event_id. Returns (true, insertedJob, nil) on insert,
-// or (false, existingJob, nil) when event_id already exists.
+// EnqueueJob inserts a job deduplicated by event_id and active/launched message key (account, channel_id, message_ts).
+// Returns (true, insertedJob, nil) on insert, or (false, existingJob, nil) when a matching job already exists.
 func (s *Store) EnqueueJob(job Job) (bool, Job, error) {
 	if job.EventID == "" {
 		return false, Job{}, newSlackerErr("event_id is required", 400)
@@ -199,32 +229,64 @@ func (s *Store) EnqueueJob(job Job) (bool, Job, error) {
 		useTmuxInt = 1
 	}
 
+	inserted, resJob, err := s.enqueueJobTx(job, useTmuxInt)
+	if err != nil || !inserted {
+		return false, resJob, err
+	}
+	s.NotifyDevice(resJob.TargetDevice)
+	return true, resJob, nil
+}
+
+func (s *Store) enqueueJobTx(job Job, useTmuxInt int) (bool, Job, error) {
 	s.mu.Lock()
-	res, err := s.db.Exec(
-		`INSERT OR IGNORE INTO slacker_jobs(
-			id, account, event_id, channel_id, channel_name, message_ts, thread_ts, reaction, user_id,
-			target_device, repo_path, use_tmux, harness, session_name, prompt, permalink, status,
-			attempt_count, claimed_by, claimed_at, lease_expires_at, receipt_id, backend, error, created_at, updated_at
-		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', '', '', '', '', '', ?, ?)`,
-		job.ID, job.Account, job.EventID, job.ChannelID, job.ChannelName, job.MessageTS, job.ThreadTS, job.Reaction, job.UserID,
-		job.TargetDevice, job.RepoPath, useTmuxInt, job.Harness, job.SessionName, job.Prompt, job.Permalink, job.Status,
-		job.CreatedAt, job.UpdatedAt,
-	)
+	defer s.mu.Unlock()
+
+	tx, err := s.db.Begin()
 	if err != nil {
-		s.mu.Unlock()
 		return false, Job{}, err
 	}
-	affected, _ := res.RowsAffected()
-	existing, gErr := scanJobRow(s.db.QueryRow(`SELECT `+jobSelectCols+` FROM slacker_jobs WHERE event_id = ?`, job.EventID))
-	s.mu.Unlock()
-	if gErr != nil {
-		return false, Job{}, gErr
+	defer func() { _ = tx.Rollback() }()
+
+	existing, err := scanJobRow(tx.QueryRow(`SELECT `+jobSelectCols+` FROM slacker_jobs WHERE event_id = ?`, job.EventID))
+	if err == nil {
+		return false, existing, nil
 	}
-	if affected > 0 {
-		s.NotifyDevice(existing.TargetDevice)
-		return true, existing, nil
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, Job{}, err
 	}
-	return false, existing, nil
+
+	if job.ChannelID != "" && job.MessageTS != "" {
+		existingMsg, mErr := scanJobRow(tx.QueryRow(
+			`SELECT `+jobSelectCols+` FROM slacker_jobs
+			 WHERE account = ? AND channel_id = ? AND message_ts = ?
+			   AND status IN ('queued', 'claimed', 'launched')
+			 ORDER BY created_at ASC, rowid ASC LIMIT 1`,
+			job.Account, job.ChannelID, job.MessageTS,
+		))
+		if mErr == nil {
+			return false, existingMsg, nil
+		}
+		if !errors.Is(mErr, sql.ErrNoRows) {
+			return false, Job{}, mErr
+		}
+	}
+
+	if _, err := tx.Exec(
+		`INSERT INTO slacker_jobs(
+			id, account, event_id, channel_id, channel_name, message_ts, thread_ts, reaction, user_id,
+			target_device, repo_path, use_tmux, policy, harness, session_name, prompt, permalink, status,
+			attempt_count, claimed_by, claimed_at, lease_expires_at, receipt_id, backend, error, created_at, updated_at
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', '', '', '', '', '', ?, ?)`,
+		job.ID, job.Account, job.EventID, job.ChannelID, job.ChannelName, job.MessageTS, job.ThreadTS, job.Reaction, job.UserID,
+		job.TargetDevice, job.RepoPath, useTmuxInt, job.Policy, job.Harness, job.SessionName, job.Prompt, job.Permalink, job.Status,
+		job.CreatedAt, job.UpdatedAt,
+	); err != nil {
+		return false, Job{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, Job{}, err
+	}
+	return true, job, nil
 }
 
 // ClaimNextJob atomically claims the oldest queued or lease-expired job targeted at device.
@@ -426,34 +488,67 @@ func (s *Store) ListJobs(device, status string, limit int) ([]Job, error) {
 	return out, rows.Err()
 }
 
-// RetryJob resets a failed or cancelled job back to queued and wakes target device waiters.
+// RetryJob resets a failed, cancelled, or claimed job back to queued and wakes target device waiters.
 func (s *Store) RetryJob(id string) (Job, error) {
 	now := registry.NowISO()
-	s.mu.Lock()
-	res, err := s.db.Exec(
-		`UPDATE slacker_jobs
-		 SET status = 'queued', claimed_by = '', claimed_at = '', lease_expires_at = '', error = '', updated_at = ?
-		 WHERE id = ? AND status IN ('failed', 'cancelled', 'claimed')`,
-		now, id,
-	)
+	var retried Job
+
+	err := func() error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		cur, err := scanJobRow(s.db.QueryRow(`SELECT `+jobSelectCols+` FROM slacker_jobs WHERE id = ?`, id))
+		if errors.Is(err, sql.ErrNoRows) {
+			return newSlackerErr("job not found", 404)
+		}
+		if err != nil {
+			return err
+		}
+		if cur.Status != "failed" && cur.Status != "cancelled" && cur.Status != "claimed" {
+			return newSlackerErr(fmt.Sprintf("job %s is %s and cannot be retried", id, cur.Status), 409)
+		}
+		if cur.ChannelID != "" && cur.MessageTS != "" {
+			var otherID string
+			oErr := s.db.QueryRow(
+				`SELECT id FROM slacker_jobs
+				 WHERE id != ? AND account = ? AND channel_id = ? AND message_ts = ?
+				   AND status IN ('queued', 'claimed', 'launched')
+				 LIMIT 1`,
+				cur.ID, cmp.Or(cur.Account, DefaultAccountID), cur.ChannelID, cur.MessageTS,
+			).Scan(&otherID)
+			if oErr == nil {
+				return newSlackerErr(fmt.Sprintf("message already has an active or launched job %s", otherID), 409)
+			}
+			if !errors.Is(oErr, sql.ErrNoRows) {
+				return oErr
+			}
+		}
+
+		res, err := s.db.Exec(
+			`UPDATE slacker_jobs
+			 SET status = 'queued', claimed_by = '', claimed_at = '', lease_expires_at = '', error = '', updated_at = ?
+			 WHERE id = ? AND status IN ('failed', 'cancelled', 'claimed')`,
+			now, id,
+		)
+		if err != nil {
+			return err
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			return newSlackerErr(fmt.Sprintf("job %s is %s and cannot be retried", id, cur.Status), 409)
+		}
+		j, gErr := scanJobRow(s.db.QueryRow(`SELECT `+jobSelectCols+` FROM slacker_jobs WHERE id = ?`, id))
+		if gErr != nil {
+			return gErr
+		}
+		retried = j
+		return nil
+	}()
 	if err != nil {
-		s.mu.Unlock()
 		return Job{}, err
 	}
-	n, _ := res.RowsAffected()
-	j, gErr := scanJobRow(s.db.QueryRow(`SELECT `+jobSelectCols+` FROM slacker_jobs WHERE id = ?`, id))
-	s.mu.Unlock()
-	if errors.Is(gErr, sql.ErrNoRows) {
-		return Job{}, newSlackerErr("job not found", 404)
-	}
-	if gErr != nil {
-		return Job{}, gErr
-	}
-	if n == 0 {
-		return Job{}, newSlackerErr(fmt.Sprintf("job %s is %s and cannot be retried", id, j.Status), 409)
-	}
-	s.NotifyDevice(j.TargetDevice)
-	return j, nil
+	s.NotifyDevice(retried.TargetDevice)
+	return retried, nil
 }
 
 // CancelJob marks a queued or claimed job as cancelled.
@@ -623,4 +718,87 @@ func (s *Store) Cleanup(olderThan time.Duration, allTerminal bool) (int64, int64
 		prunedWorkers, _ = wRes.RowsAffected()
 	}
 	return prunedJobs, prunedWorkers, nil
+}
+
+// PendingJobCounts returns the count of queued or claimed jobs per target device.
+func (s *Store) PendingJobCounts() (map[string]int, error) {
+	counts := map[string]int{}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(
+		`SELECT target_device, COUNT(*) FROM slacker_jobs WHERE status IN ('queued', 'claimed') GROUP BY target_device`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var dev string
+		var n int
+		if err := rows.Scan(&dev, &n); err != nil {
+			return nil, err
+		}
+		counts[dev] = n
+	}
+	return counts, rows.Err()
+}
+
+// OnlineWorkers returns devices whose Slacker worker reported connected within window of now.
+func (s *Store) OnlineWorkers(now time.Time, window time.Duration) (map[string]bool, error) {
+	online := map[string]bool{}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(
+		`SELECT role, last_poll_at, updated_at FROM slacker_runtime WHERE role LIKE 'worker:%' AND connected = 1`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var role, lastPoll, updatedAt string
+		if err := rows.Scan(&role, &lastPoll, &updatedAt); err != nil {
+			return nil, err
+		}
+		rawTS := cmp.Or(lastPoll, updatedAt)
+		if rawTS == "" {
+			continue
+		}
+		ts, err := time.Parse(time.RFC3339, rawTS)
+		if err != nil {
+			continue
+		}
+		if now.UTC().Sub(ts.UTC()) <= window {
+			online[strings.TrimPrefix(role, "worker:")] = true
+		}
+	}
+	return online, rows.Err()
+}
+
+// GetLastDevice returns the last dispatched target device for scope, or empty if unset.
+func (s *Store) GetLastDevice(scope string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var dev string
+	err := s.db.QueryRow(`SELECT last_device FROM slacker_dispatch_state WHERE scope = ?`, scope).Scan(&dev)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return dev, err
+}
+
+// SetLastDevice persists the last dispatched target device for scope.
+func (s *Store) SetLastDevice(scope, device string) error {
+	now := registry.NowISO()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(
+		`INSERT INTO slacker_dispatch_state(scope, last_device, updated_at)
+		 VALUES(?, ?, ?)
+		 ON CONFLICT(scope) DO UPDATE SET
+		   last_device = excluded.last_device,
+		   updated_at = excluded.updated_at`,
+		scope, device, now,
+	)
+	return err
 }

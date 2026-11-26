@@ -3,14 +3,18 @@ package server
 import (
 	"cmp"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bdatdo0601/fleet/internal/core"
 	"github.com/bdatdo0601/fleet/internal/registry"
+	"github.com/bdatdo0601/fleet/internal/session"
 	"github.com/bdatdo0601/fleet/internal/slacker"
 )
 
@@ -111,6 +115,7 @@ func registerSlackerRoutes(
 	registerSlackerJobRoutes(mux, fleet, route)
 	registerSlackerWorkerRoutes(mux, fleet, route)
 	registerSlackerAgentRoutes(mux, fleet, route)
+	registerAgentSpawnRoute(mux, fleet, route)
 }
 
 func registerSlackerAdminRoutes(
@@ -131,7 +136,27 @@ func registerSlackerAdminRoutes(
 		if err != nil {
 			return err
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"config": cfg.View(), "runtimes": runtimes, "counts": counts})
+		pendingCounts, err := fleet.Slacker.PendingJobCounts()
+		if err != nil {
+			pendingCounts = map[string]int{}
+		}
+		agentCounts := map[string]int{}
+		if fleet.Agents != nil {
+			if sessions, lErr := fleet.Agents.ListSessions("", "", "", "", false); lErr == nil {
+				for _, s := range sessions {
+					if s.Device != "" {
+						agentCounts[s.Device]++
+					}
+				}
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"config":         cfg.View(),
+			"runtimes":       runtimes,
+			"counts":         counts,
+			"agent_counts":   agentCounts,
+			"pending_counts": pendingCounts,
+		})
 		return nil
 	}))
 
@@ -434,4 +459,160 @@ func handleSlackerSend(fleet *core.Fleet) func(http.ResponseWriter, *http.Reques
 		writeJSON(w, http.StatusOK, posted)
 		return nil
 	}
+}
+
+type spawnRequest struct {
+	Harness  string   `json:"harness"`
+	Name     string   `json:"name"`
+	Device   string   `json:"device"`
+	Devices  []string `json:"devices"`
+	Strategy string   `json:"strategy"`
+	Policy   string   `json:"policy"`
+	RepoPath string   `json:"repo_path"`
+	Prompt   string   `json:"prompt"`
+	UseTmux  bool     `json:"use_tmux"`
+}
+
+func randomHex(nBytes int) string {
+	b := make([]byte, nBytes)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func registerAgentSpawnRoute(
+	mux *http.ServeMux,
+	fleet *core.Fleet,
+	route func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc,
+) {
+	var spawnMu sync.Mutex
+
+	mux.HandleFunc("POST /v1/agents/spawn", route(true, func(w http.ResponseWriter, r *http.Request, caller *registry.Device) error {
+		var req spawnRequest
+		if err := readJSONBody(r, &req); err != nil {
+			return err
+		}
+		harness, ok := session.NormalizeHarness(req.Harness)
+		if !ok {
+			return &core.FleetError{Msg: fmt.Sprintf("unknown harness %q (expected claude, agy, or codex)", req.Harness), Status: http.StatusBadRequest}
+		}
+		sessName := strings.TrimSpace(req.Name)
+		if sessName != "" {
+			if err := session.ValidateName(sessName); err != nil {
+				return &core.FleetError{Msg: err.Error(), Status: http.StatusBadRequest}
+			}
+		} else {
+			sessName = "ui-" + harness + "-" + randomHex(4)
+		}
+		strat, err := slacker.NormalizeStrategy(req.Strategy)
+		if err != nil {
+			return err
+		}
+		pol, err := slacker.NormalizePolicy(req.Policy)
+		if err != nil {
+			return err
+		}
+
+		var rawDevs []string
+		if len(req.Devices) > 0 {
+			rawDevs = req.Devices
+		} else if strings.TrimSpace(req.Device) != "" {
+			rawDevs = []string{req.Device}
+		}
+		seen := make(map[string]bool, len(rawDevs))
+		var devs []string
+		for _, d := range rawDevs {
+			d = strings.TrimSpace(d)
+			if d == "" || seen[d] {
+				continue
+			}
+			seen[d] = true
+			devs = append(devs, d)
+		}
+		if len(devs) > 0 {
+			activeDevs, aErr := fleet.ActiveDeviceNames()
+			if aErr != nil {
+				return aErr
+			}
+			for _, d := range devs {
+				if !activeDevs[d] {
+					return &core.FleetError{Msg: fmt.Sprintf("unknown or revoked device %q", d), Status: http.StatusBadRequest}
+				}
+			}
+		}
+
+		cfg, err := slacker.LoadConfig(fleet.SlackerConfigPath)
+		if err != nil {
+			return err
+		}
+		singleDev := ""
+		if len(devs) == 1 {
+			singleDev = devs[0]
+		}
+		ch := slacker.ChannelMapping{
+			ChannelID: strings.Join(devs, ","),
+			Device:    singleDev,
+			Devices:   devs,
+			Strategy:  strat,
+			Policy:    pol,
+			RepoPath:  strings.TrimSpace(req.RepoPath),
+			UseTmux:   req.UseTmux,
+		}
+
+		loadFn := func(context.Context) (map[string]int, error) {
+			counts := map[string]int{}
+			if fleet.Agents != nil {
+				if sessions, lErr := fleet.Agents.ListSessions("", "", "", "", false); lErr == nil {
+					for _, s := range sessions {
+						if s.Device != "" {
+							counts[s.Device]++
+						}
+					}
+				}
+			}
+			return counts, nil
+		}
+
+		spawnMu.Lock()
+		defer spawnMu.Unlock()
+
+		now := time.Now()
+		targetDevice, resolvedRepo, scope, err := slacker.SelectTarget(r.Context(), cfg, "ui", ch, fleet.Slacker, loadFn, now)
+		if err != nil {
+			return err
+		}
+		onlineWorkers, _ := fleet.Slacker.OnlineWorkers(now, slacker.WorkerOnlineWindow)
+		workerOnline := onlineWorkers[targetDevice]
+
+		callerName := "admin"
+		if caller != nil && caller.Name != "" {
+			callerName = caller.Name
+		}
+		inserted, job, err := fleet.Slacker.EnqueueJob(slacker.Job{
+			Account:      "ui",
+			EventID:      "ui-" + randomHex(8),
+			ChannelID:    "",
+			ChannelName:  "web-ui",
+			MessageTS:    "",
+			Reaction:     "spawn",
+			UserID:       callerName,
+			TargetDevice: targetDevice,
+			RepoPath:     resolvedRepo,
+			UseTmux:      req.UseTmux,
+			Policy:       cfg.EffectiveChannelPolicy(ch),
+			Harness:      harness,
+			SessionName:  sessName,
+			Prompt:       strings.TrimSpace(req.Prompt),
+		})
+		if err != nil {
+			return err
+		}
+		if inserted {
+			_ = fleet.Slacker.SetLastDevice(scope, targetDevice)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"job":           job,
+			"worker_online": workerOnline,
+		})
+		return nil
+	}))
 }

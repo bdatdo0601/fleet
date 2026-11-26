@@ -245,10 +245,11 @@ on the lighthouse across all active Macs (`admin` and `managed` alike).
   fleet session setup --check    # inspect tmux, rex, lazygit, CLIs, tmux extended-keys, and hooks
   fleet session setup            # install missing tmux/lazygit via brew and configure hooks
   ```
-- **Manual interactive sessions (Rex default with `lazygit` pane in git repos, or `--tmux`):**
+- **Interactive sessions (`agy` defaults to the Antigravity desktop app so sessions sync to desktop & phone, with `--rex` / `--tmux` optional; `claude` and `codex` default to Rex with `lazygit` pane in git repos, or `--tmux`):**
   ```bash
+  fleet session agy start my-task ~/workspace/repo       # Antigravity app (syncs to desktop & phone)
+  fleet session agy start --rex my-task ~/workspace/repo # Rex CLI session (optional)
   fleet session claude start my-task ~/workspace/repo
-  fleet session agy start-attach my-task ~/workspace/repo
   fleet session codex start --tmux my-task ~/workspace/repo
   fleet session claude attach my-task
   fleet session claude list
@@ -259,7 +260,7 @@ on the lighthouse across all active Macs (`admin` and `managed` alike).
   ```
 - **Task-seeded sessions (`start-task`):** Reads a multiline prompt from stdin and launches safely:
   - `claude`: `--permission-mode manual --remote-control <NAME>` (manual tool approvals)
-  - `agy`: `--sandbox --mode plan --remote-control --prompt-interactive <PROMPT>` (sandboxed plan mode)
+  - `agy`: submits a native conversation to the Antigravity app by default (or `--sandbox --mode plan --remote-control --prompt-interactive <PROMPT>` with `--rex` / `--tmux`)
   - `codex`: `-s workspace-write -a on-request` (workspace-write sandbox, on-request approvals) after best-effort `codex remote-control start`
 
 ### Cutover from shell launchers (`claude-session` / `agy-session`)

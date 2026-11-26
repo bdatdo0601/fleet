@@ -524,32 +524,54 @@ func (c *SlackClient) fetchUserName(ctx context.Context, userToken, userID strin
 	return cmp.Or(res.User.Profile.DisplayName, res.User.Profile.RealName, res.User.Name)
 }
 
-// FormatTaskPrompt builds the multiline task prompt delivered to `fleet session ... start-task`.
+// FormatTaskPrompt builds the task prompt delivered to `fleet session ... start-task`.
 func FormatTaskPrompt(account string, ev ReactionEvent, msg FetchedMessage, ch ChannelMapping) string {
 	var b strings.Builder
-	acct := cmp.Or(account, DefaultAccountID)
-	chanLabel := cmp.Or(msg.ChannelName, ch.ChannelName, ev.ChannelID)
-	fmt.Fprintf(&b, "Slack task triggered by :%s: in #%s (%s)\n", ev.Reaction, chanLabel, ev.ChannelID)
-	fmt.Fprintf(&b, "Account: %s\n", acct)
-	fmt.Fprintf(&b, "Message TS: %s\n", ev.MessageTS)
-	if msg.Message.ThreadTS != "" {
-		fmt.Fprintf(&b, "Thread TS: %s\n", msg.Message.ThreadTS)
+
+	body := strings.TrimSpace(msg.Message.Text)
+	if body == "" {
+		body = "Inspect this Slack message and handle the request."
 	}
-	if msg.AuthorName != "" || msg.Message.User != "" {
-		fmt.Fprintf(&b, "Author: %s\n", cmp.Or(msg.AuthorName, msg.Message.User))
-	}
-	if msg.Permalink != "" {
-		fmt.Fprintf(&b, "Permalink: %s\n", msg.Permalink)
-	}
-	fmt.Fprintf(&b, "Repository: %s\n", ch.RepoPath)
-	b.WriteString("Tools: use `fleet_slack_read` to inspect surrounding channel/thread context and `fleet_slack_send` to reply.\n")
+	b.WriteString(body)
+	b.WriteString("\n")
+
 	if msg.Parent != nil && strings.TrimSpace(msg.Parent.Text) != "" {
 		b.WriteString("\nThread parent:\n")
 		b.WriteString(strings.TrimSpace(msg.Parent.Text))
 		b.WriteString("\n")
 	}
-	b.WriteString("\nMessage:\n")
-	b.WriteString(strings.TrimSpace(msg.Message.Text))
-	b.WriteString("\n")
+
+	b.WriteString("\n---\n")
+	b.WriteString("Slack request")
+	if author := cmp.Or(msg.AuthorName, msg.Message.User); author != "" {
+		fmt.Fprintf(&b, " from %s", author)
+	}
+	chanName := cmp.Or(msg.ChannelName, ch.ChannelName)
+	var meta []string
+	if chanName != "" && chanName != ev.ChannelID {
+		fmt.Fprintf(&b, " in #%s", chanName)
+		meta = append(meta, "`"+ev.ChannelID+"`")
+	} else {
+		fmt.Fprintf(&b, " in channel `%s`", ev.ChannelID)
+	}
+	if ev.MessageTS != "" {
+		meta = append(meta, "ts `"+ev.MessageTS+"`")
+	}
+	if msg.Message.ThreadTS != "" && msg.Message.ThreadTS != ev.MessageTS {
+		meta = append(meta, "thread `"+msg.Message.ThreadTS+"`")
+	}
+	acct := cmp.Or(account, DefaultAccountID)
+	if acct != "" && acct != DefaultAccountID {
+		meta = append(meta, "account `"+acct+"`")
+	}
+	if len(meta) > 0 {
+		fmt.Fprintf(&b, " (%s)", strings.Join(meta, ", "))
+	}
+	b.WriteString(".\n")
+
+	if msg.Permalink != "" {
+		fmt.Fprintf(&b, "Link: %s\n", msg.Permalink)
+	}
+	b.WriteString("Use `fleet_slack_read` for more channel/thread context or `fleet_slack_send` to reply.\n")
 	return b.String()
 }
