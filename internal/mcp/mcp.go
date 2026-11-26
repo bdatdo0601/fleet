@@ -197,6 +197,48 @@ var Tools = []ToolDef{
 			Required: []string{"key"},
 		},
 	},
+	{
+		Name:        "fleet_slack_channels",
+		Description: "List configured Slack accounts and mapped channels, or also query Slack conversations via users.conversations when include_all is true.",
+		InputSchema: toolInputSchema{
+			Type: "object",
+			Properties: map[string]toolSchemaProp{
+				"account":     {Type: "string", Description: "Optional Slack account ID (defaults to configured account, e.g. 'default')."},
+				"include_all": {Type: "boolean", Description: "If true, also query Slack users.conversations for the selected account."},
+				"limit":       {Type: "integer", Description: "Maximum number of Slack channels to fetch when include_all is true (default 100, max 200)."},
+			},
+		},
+	},
+	{
+		Name:        "fleet_slack_read",
+		Description: "Read Slack messages during investigation: fetch channel history, a full thread via thread_ts, or search messages via query.",
+		InputSchema: toolInputSchema{
+			Type: "object",
+			Properties: map[string]toolSchemaProp{
+				"account":   {Type: "string", Description: "Optional Slack account ID (inferred from mapped channel if omitted)."},
+				"channel":   {Type: "string", Description: "Slack channel ID (e.g. C01234567) for history/thread reads."},
+				"thread_ts": {Type: "string", Description: "Parent message timestamp (ts) to fetch a full thread."},
+				"query":     {Type: "string", Description: "Slack search query (search.messages); can be used alone or alongside channel."},
+				"oldest":    {Type: "string", Description: "Optional oldest Slack timestamp bound for history/thread reads."},
+				"latest":    {Type: "string", Description: "Optional latest Slack timestamp bound for history/thread reads."},
+				"limit":     {Type: "integer", Description: "Maximum number of messages to return (default 25, max 100)."},
+			},
+		},
+	},
+	{
+		Name:        "fleet_slack_send",
+		Description: "Send a message or thread reply to a Slack channel using the configured Slacker account.",
+		InputSchema: toolInputSchema{
+			Type: "object",
+			Properties: map[string]toolSchemaProp{
+				"account":   {Type: "string", Description: "Optional Slack account ID (inferred from mapped channel if omitted)."},
+				"channel":   {Type: "string", Description: "Target Slack channel ID (e.g. C01234567). Must be mapped unless allow_unmapped_send is enabled on the account."},
+				"text":      {Type: "string", Description: "Message text to post."},
+				"thread_ts": {Type: "string", Description: "Optional parent message timestamp (ts) to post a thread reply."},
+			},
+			Required: []string{"channel", "text"},
+		},
+	},
 }
 
 // ServeOpts configures ServeStdio.
@@ -553,6 +595,9 @@ func callTool(name string, rawArgs json.RawMessage, apiURL, harness string, ppid
 
 	case "fleet_memory_search", "fleet_memory_get", "fleet_memory_set", "fleet_memory_delete":
 		return callMemoryTool(name, rawArgs, api, harness, cwd)
+
+	case "fleet_slack_channels", "fleet_slack_read", "fleet_slack_send":
+		return callSlackTool(name, rawArgs, api)
 
 	default:
 		return nil, fmt.Errorf("unknown tool %q", name)

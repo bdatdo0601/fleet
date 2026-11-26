@@ -226,7 +226,7 @@ async function renderLogsCard(container) {
     return;
   }
 
-  const tabs = ["serve", "ddns", "sync", "nebula"].map((name) =>
+  const tabs = ["serve", "ddns", "slacker", "sync", "nebula"].map((name) =>
     el("button", {
       type: "button",
       className: `chip${sysState.logName === name ? " active" : ""}`,

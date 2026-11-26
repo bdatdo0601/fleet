@@ -3,6 +3,7 @@ import { renderOverview } from "./overview.js";
 import { renderDevices } from "./devices.js";
 import { renderAgents } from "./agents.js";
 import { renderMemory } from "./memory.js";
+import { renderSlacker } from "./slacker.js";
 import { renderSystem } from "./system.js";
 
 function parseHash() {
@@ -51,6 +52,7 @@ function renderTopbar(ov, activeSection) {
       ["devices", "Devices", "#devices", true],
       ["agents", "Agents", "#agents", false],
       ["memory", "Memory", "#memory", false],
+      ["slacker", "Slacker", "#slacker", true],
       ["system", "System", "#system", true],
     ];
     for (const [id, label, href, adminOnly] of links) {
@@ -137,7 +139,7 @@ async function renderRoute() {
 
 async function renderCurrentRoute(seq) {
   let { section, sub } = parseHash();
-  if ((section === "devices" || section === "system") && !state.isAdmin) {
+  if ((section === "devices" || section === "system" || section === "slacker") && !state.isAdmin) {
     toast("Admin device required for that view", "warn");
     section = "overview";
     sub = "";
@@ -163,6 +165,9 @@ async function renderCurrentRoute(seq) {
     case "memory":
       await renderMemory(main, ctx, sub);
       break;
+    case "slacker":
+      await renderSlacker(main, ctx);
+      break;
     case "system":
       await renderSystem(main, ctx);
       break;
@@ -183,7 +188,7 @@ function setAutoRefresh(ms) {
   if (ms > 0) {
     refreshTimer = setInterval(() => {
       const { section, sub } = parseHash();
-      const skipSection = section === "system" || (section === "memory" && sub === "curator") || (section === "agents" && sub === "messages");
+      const skipSection = section === "system" || section === "slacker" || (section === "memory" && sub === "curator") || (section === "agents" && sub === "messages");
       const ae = document.activeElement;
       const typing = Boolean(ae && ae.closest("#app-main") && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName));
       if (document.hidden || state.modalOpen || state.editing || typing || skipSection) {

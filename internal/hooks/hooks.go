@@ -27,6 +27,7 @@ import (
 	"github.com/bdatdo0601/fleet/internal/client"
 	"github.com/bdatdo0601/fleet/internal/memory"
 	"github.com/bdatdo0601/fleet/internal/paths"
+	"github.com/bdatdo0601/fleet/internal/session"
 )
 
 const MaxTranscriptBytes = 256 * 1024
@@ -684,6 +685,11 @@ type hookInput struct {
 	Message             string `json:"message"`
 	Title               string `json:"title"`
 	CWD                 string `json:"cwd"`
+	AgentID             string `json:"agent_id"`
+	AgentIDCamel        string `json:"agentId"`
+	ParentConvID        string `json:"parentConversationId"`
+	ParentConvSnake     string `json:"parent_conversation_id"`
+	IsSubagent          bool   `json:"isSubagent"`
 }
 
 func classifyAntigravityEvent(event string, in *hookInput) (string, map[string]string, bool) {
@@ -860,6 +866,19 @@ func syncClaudeMessagingSocket(event, sessionID string, claudePID int) {
 	}
 }
 
+func maybeRecordSessionHook(harness string, in *hookInput, rawID, cwd, transcriptPath string) {
+	if os.Getenv("FLEET_SESSION_TARGET") == "" {
+		return
+	}
+	if in.AgentID != "" || in.AgentIDCamel != "" || in.ParentConvID != "" || in.ParentConvSnake != "" || in.IsSubagent {
+		return
+	}
+	if rawID == "" || rawID == "agy" || strings.HasPrefix(rawID, "pid-") {
+		return
+	}
+	session.RecordHookState(harness, rawID, cwd, transcriptPath)
+}
+
 // RunHook processes a single lifecycle hook payload from stdin and writes harness JSON to stdout.
 func RunHook(harness string, stdin io.Reader, stdout io.Writer, apiURL string) (int, error) {
 	if !paths.ValidHarness(harness) {
@@ -872,6 +891,7 @@ func RunHook(harness string, stdin io.Reader, stdout io.Writer, apiURL string) (
 		stdout = os.Stdout
 	}
 	in, event, rawID, cwd, transcriptPath, prompt := parseHookInput(harness, stdin)
+	maybeRecordSessionHook(harness, &in, rawID, cwd, transcriptPath)
 	state, pendingAction, canInject := classifyHookEvent(harness, event, &in)
 	if state == "" {
 		_, _ = io.WriteString(stdout, "{}\n")

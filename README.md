@@ -49,6 +49,8 @@ into it from anywhere. No third-party servers are involved.
 | Admin device | `fleet revoke NAME` | Cuts a device off everywhere within about 5 minutes |
 | Admin device | `fleet set NAME --group G` | Moves a device to another group (re-signs its cert, also used to renew one) |
 | Any Mac | `fleet agents [--all] [--waiting]` | Lists live AI agent sessions (`claude`, `codex`, `antigravity`), including sessions blocked on permission or question prompts |
+| Any Mac | `fleet session <setup\|claude\|agy\|codex> ...` | Manages persistent Rex/tmux agent sessions (`start`, `start-attach`, `start-task`, `resume`, `attach`, `list`, `kill`, `kill-all`, `upgrade`) |
+| Lighthouse / Any Mac | `fleet slacker <manifest\|setup\|listen\|worker\|...>` | Lighthouse-hosted Slack Socket Mode reaction dispatcher and per-Mac pull workers |
 | Any Mac / Admin | `fleet memory ...` | Manages shared agent memory (`ls`, `search`, `set`, `import`, `promote`, `review`, `curator setup`) |
 | Any Mac | `fleet mcp status\|install\|uninstall` | Checks or manages MCP + lifecycle hook configs for installed agent harnesses |
 | Any Mac | `fleet status` | Shows the services, whether the lighthouse is reachable, and this device's IP |
@@ -189,7 +191,7 @@ Each certificate carries one group. The CA signs it into the certificate, so a d
 `fleet serve` embeds and serves a mesh-only management console at `http://10.213.0.1:7443/` (also reachable at `http://127.0.0.1:7443/` on the lighthouse and from Mobile Nebula browsers on phones/tablets).
 
 - **Same Nebula identity model:** Access is verified by mesh source IP (`fleet.Identify`) with anti-CSRF/anti-DNS-rebinding `Host` and `Origin` checks. Strangers and revoked devices receive `403`.
-- **Role-scoped UI:** `admin` devices (`laptop`, `phone`, `ipadpro`, `mini`) see the full console — **Overview**, **Devices & PKI** (approve Mac/mobile blocks, change groups/renew certs, revoke, inspect configs & blocklist), **Agents & Messages**, **Shared Memory & Curator**, and **Lighthouse System** (PKI, published binaries, Route 53 DDNS check/sync/IAM policy, and service logs). `managed` devices see **Overview**, **Agents & Messages**, and **Shared Memory**.
+- **Role-scoped UI:** `admin` devices (`laptop`, `phone`, `ipadpro`, `mini`) see the full console — **Overview**, **Devices & PKI** (approve Mac/mobile blocks, change groups/renew certs, revoke, inspect configs & blocklist), **Agents & Messages**, **Shared Memory & Curator**, **Slacker** (Slack reaction dispatcher config & job queue), and **Lighthouse System** (PKI, published binaries, Route 53 DDNS check/sync/IAM policy, and service logs). `managed` devices see **Overview**, **Agents & Messages**, and **Shared Memory**.
 - **Single binary:** All HTML/CSS/JS assets are embedded directly via `go:embed` with zero external CDN or Node runtime dependencies, so `fleet sync` updates the UI automatically with `fleet serve`.
 
 ## Agent sessions (MCP)
@@ -233,6 +235,79 @@ on the lighthouse across all active Macs (`admin` and `managed` alike).
 - **One-way local backup:** `fleet memory import` (and automatic `fleet sync`) harvests local `~/.claude/projects/*/memory/*.md` (and `~/.codex/memories/*.md`) up to the lighthouse without overwriting `human`-edited or `locked` entries.
 - **Async LLM curator (optional):** Configure an OpenRouter or OpenAI-compatible curator on the lighthouse from an admin Mac using 1Password (`fleet memory curator setup --provider openrouter --model openai/gpt-6-luna --op-ref "op://Vault/OpenRouter/credential"`). It runs automatically in the background to filter noise, merge duplicates, and auto-apply `global` promotions by default (opt out of any rule with `fleet memory rm`, or pass `--review-global` during setup to stage `global` promotions into `fleet memory review` / `approve` / `reject`).
 - **Human CLI curation:** `fleet memory ls|search|get|set|edit|rm|promote|history|revert|context`.
+
+## Session management (`fleet session`)
+
+`fleet session` replaces the chezmoi `claude-session` and `agy-session` shell scripts with native Go session management for **Claude Code** (`claude`), **Antigravity** (`agy` / `antigravity`), and **Codex CLI** (`codex`).
+
+- **Prerequisite check & setup:**
+  ```bash
+  fleet session setup --check    # inspect tmux, rex, lazygit, CLIs, tmux extended-keys, and hooks
+  fleet session setup            # install missing tmux/lazygit via brew and configure hooks
+  ```
+- **Manual interactive sessions (Rex default with `lazygit` pane in git repos, or `--tmux`):**
+  ```bash
+  fleet session claude start my-task ~/workspace/repo
+  fleet session agy start-attach my-task ~/workspace/repo
+  fleet session codex start --tmux my-task ~/workspace/repo
+  fleet session claude attach my-task
+  fleet session claude list
+  fleet session claude resume my-task ~/workspace/repo <SESSION_UUID>
+  fleet session claude kill my-task
+  fleet session claude kill-all
+  fleet session claude upgrade   # stops sessions, upgrades CLI, resumes exact conversations in place
+  ```
+- **Task-seeded sessions (`start-task`):** Reads a multiline prompt from stdin and launches safely:
+  - `claude`: `--permission-mode manual --remote-control <NAME>` (manual tool approvals)
+  - `agy`: `--sandbox --mode plan --remote-control --prompt-interactive <PROMPT>` (sandboxed plan mode)
+  - `codex`: `-s workspace-write -a on-request` (workspace-write sandbox, on-request approvals) after best-effort `codex remote-control start`
+
+### Cutover from shell launchers (`claude-session` / `agy-session`)
+
+`fleet session` preserves the exact tmux session prefixes (`claude-`, `agy-`), Rex labels, and pane metadata options (`@claude_session`, `@agy_session`, `@claude_exit_option`, `@agy_exit_option`, `@agy_managed`) used by the chezmoi scripts.
+
+1. Upgrade `fleet` everywhere (`fleet sync` on the lighthouse and target Macs).
+2. Run `fleet session setup` on each Mac to update `~/.gemini/config/hooks.json` (`agy-session` entry) to call `fleet session agy __hook`.
+3. Replace `~/.customscripts/claude-session` and `~/.customscripts/agy-session` (or add shell aliases/shims):
+   ```sh
+   alias claude-session='fleet session claude'
+   alias agy-session='fleet session agy'
+   ```
+   Once `fleet session` is verified, remove the old bash scripts from `~/.local/share/chezmoi/dot_customscripts/` and apply chezmoi.
+
+## Slack reaction dispatcher (`fleet slacker`)
+
+`fleet slacker` runs one supervised Socket Mode listener per configured Slack account on the lighthouse (`fleet slacker listen` via `io.github.bdatdo0601.fleet.slacker`) and pull-based workers on target Macs (`fleet slacker worker` via a per-user `Aqua` LaunchAgent `io.github.bdatdo0601.fleet.slacker-worker`) so launched sessions run as the logged-in user.
+
+1. **Create the Slack app & verify credentials (multi-account supported):**
+   The generated manifest (`fleet slacker manifest`) includes User OAuth scopes for reading, searching, and replying (`reactions:read`, `channels:history`, `groups:history`, `im:history`, `mpim:history`, `channels:read`, `groups:read`, `search:read`, `chat:write`).
+   ```bash
+   fleet slacker manifest > /tmp/slack-manifest.yml
+   fleet slacker setup --account work --op-item "Local/Fleet Slacker Work" \
+     --channel C0123456789=laptop:~/workspace/fleet \
+     --emoji claude=claude --emoji agy=agy --emoji codex=codex
+   fleet slacker accounts
+   ```
+   Or configure accounts, channels, emojis, tokens, and inspect jobs in the Fleet Web UI under **Slacker** (`#slacker`).
+2. **Agent & CLI Slack reading and messaging (all Nebula devices):**
+   - **MCP tools:** `fleet_slack_channels` (list configured accounts/mapped channels or Slack `users.conversations`), `fleet_slack_read` (read channel history, a thread via `thread_ts`, or `search.messages` during investigation), and `fleet_slack_send` (send messages or thread replies, restricted to mapped channels unless `allow_unmapped_send` is enabled on the account). Uses `bot_token` (`xoxb-`) if configured on that account, otherwise `user_token` (`xoxp-`).
+   - **CLI / HTTP API:** `fleet slacker read [--account ID] [--channel ID] [--thread TS] [--query Q]` (`GET /v1/slacker/messages`), `GET /v1/slacker/channels`, and `fleet slacker send --channel ID --text "..."` (`POST /v1/slacker/send`).
+3. **Install & manage services:**
+   ```bash
+   fleet slacker install          # installs listener LaunchDaemon on lighthouse, or worker LaunchAgent on a Mac
+   fleet slacker status           # checks launchd state, listener connection, worker heartbeats, and queue counts
+   fleet slacker start|stop|logs  # controls and tails logs
+   ```
+4. **Reliability & security:**
+   - Only `reaction_added` events from each account's configured `authorized_user_id` on mapped `(account, channel)` pairs and configured emojis are accepted.
+   - Jobs are persisted in `~/.fleet/slacker.db` (deduplicated by `event_id`, scoped by `account`) **before** acknowledging the Socket Mode envelope.
+   - Exact messages (including thread replies via `conversations.replies`) are fetched and passed via `fleet session <harness> start-task` in safe mode (`manual` / `--sandbox --mode plan` / `workspace-write`).
+   - Sleeping Macs pull their own jobs over Nebula when awake; deterministic session names (`slack-<channel>-<ts>` for `default`, `slack-<account>-<channel>-<ts>` for named accounts) and local worker receipts prevent duplicate launches across restarts.
+5. **Cleanup:**
+   ```bash
+   fleet slacker cleanup --uninstall --prune-jobs
+   ```
+   Cleanup removes slacker services, local receipts/locks, and terminal DB job records while preserving all active tmux/Rex sessions and user repositories.
 
 ## Security model
 

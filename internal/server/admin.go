@@ -186,11 +186,13 @@ func buildOverviewPayload(fleet *core.Fleet, c *registry.Device, startedAt time.
 	if err != nil {
 		return nil, err
 	}
+	slkSummary := buildSlackerSummary(fleet)
 	payload["devices"] = devSummary
 	payload["ca"] = caInfo
 	payload["settings"] = settings
 	payload["manifest"] = manifest
 	payload["ddns"] = buildDDNSSummary(ddnsCfg)
+	payload["slacker"] = slkSummary
 	return payload, nil
 }
 
@@ -201,12 +203,14 @@ func resolveLogPath(fleet *core.Fleet, name string) (string, string, error) {
 		return n, filepath.Join(fleet.Root, "serve.log"), nil
 	case "ddns":
 		return n, filepath.Join(fleet.Root, "ddns.log"), nil
+	case "slacker":
+		return n, filepath.Join(fleet.Root, "slacker.log"), nil
 	case "sync":
 		return n, "/var/log/fleet-sync.log", nil
 	case "nebula":
 		return n, "/opt/homebrew/var/log/nebula.log", nil
 	default:
-		return "", "", &core.FleetError{Msg: "unknown log name (expected serve, ddns, sync, or nebula)", Status: http.StatusBadRequest}
+		return "", "", &core.FleetError{Msg: "unknown log name (expected serve, ddns, slacker, sync, or nebula)", Status: http.StatusBadRequest}
 	}
 }
 

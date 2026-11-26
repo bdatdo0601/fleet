@@ -49,6 +49,27 @@ func TestNebulaLabelAndPlistValidation(t *testing.T) {
 			t.Fatalf("plutil -lint failed: %v\n%s\n%s", err, string(out), plist)
 		}
 	}
+
+	agentPlist, err := BuildAgentPlist(AgentOpts{
+		Label:     paths.SlackerWorkerLabel,
+		Args:      []string{"/opt/homebrew/bin/fleet", "slacker", "worker"},
+		LogPath:   "/tmp/slacker-worker.log",
+		WorkDir:   "/tmp",
+		KeepAlive: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(agentPlist, "<key>LimitLoadToSessionType</key>") || !strings.Contains(agentPlist, "<string>Aqua</string>") {
+		t.Fatalf("expected Aqua session type in agent plist:\n%s", agentPlist)
+	}
+	if _, err := exec.LookPath("plutil"); err == nil {
+		aFile := filepath.Join(t.TempDir(), "agent.plist")
+		_ = os.WriteFile(aFile, []byte(agentPlist), 0o644)
+		if out, err := exec.Command("plutil", "-lint", aFile).CombinedOutput(); err != nil {
+			t.Fatalf("plutil -lint failed on agent plist: %v\n%s\n%s", err, string(out), agentPlist)
+		}
+	}
 }
 
 func TestInstallBinaryAtomicAndRollbackAndClientUpdate(t *testing.T) {

@@ -21,10 +21,12 @@ const (
 	AgentWaitingActiveSeconds = 3600
 	AgentRetentionSeconds     = 172800
 
-	LabelPrefix = "io.github.bdatdo0601.fleet"
-	ServeLabel  = LabelPrefix + ".serve"
-	SyncLabel   = LabelPrefix + ".sync"
-	DDNSLabel   = LabelPrefix + ".ddns"
+	LabelPrefix        = "io.github.bdatdo0601.fleet"
+	ServeLabel         = LabelPrefix + ".serve"
+	SyncLabel          = LabelPrefix + ".sync"
+	DDNSLabel          = LabelPrefix + ".ddns"
+	SlackerLabel       = LabelPrefix + ".slacker"
+	SlackerWorkerLabel = LabelPrefix + ".slacker-worker"
 
 	SyncIntervalSeconds = 300
 
@@ -178,4 +180,22 @@ func ValidHarness(name string) bool {
 // ValidGroup reports whether group is a supported device group.
 func ValidGroup(group string) bool {
 	return slices.Contains(Groups, group)
+}
+
+// LocalStateRoot returns XDG_STATE_HOME if set, otherwise ~/.local/state.
+func LocalStateRoot() string {
+	if v := os.Getenv("XDG_STATE_HOME"); v != "" {
+		return v
+	}
+	return filepath.Join(homeDir(), ".local", "state")
+}
+
+// SessionStateDir returns the per-harness session state directory under LocalStateRoot.
+func SessionStateDir(harness string) string {
+	return filepath.Join(LocalStateRoot(), "fleet-session", harness)
+}
+
+// SlackerLocalStateDir returns the local worker state directory under LocalStateRoot.
+func SlackerLocalStateDir() string {
+	return filepath.Join(LocalStateRoot(), "fleet-slacker")
 }

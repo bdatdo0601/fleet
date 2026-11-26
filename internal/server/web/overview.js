@@ -268,6 +268,19 @@ export async function renderOverview(root, ctx) {
       badge(curLabel, ov.curator.enabled ? "ok" : "neutral"),
     ),
   );
+  if (state.isAdmin && ov.slacker) {
+    const slk = ov.slacker;
+    const slkLabel = slk.enabled ? (slk.listener_connected ? "Online" : "Enabled") : slk.configured ? "Disabled" : "Not set";
+    cards.appendChild(
+      summaryCard(
+        "Slacker",
+        slkLabel,
+        `${slk.channels || 0} channel(s) · ${slk.queued_jobs || 0} queued · ${slk.failed_jobs || 0} failed`,
+        () => ctx.navigate("#slacker"),
+        badge(slkLabel, slk.listener_connected ? "ok" : slk.enabled ? "warn" : "neutral"),
+      ),
+    );
+  }
   if (state.isAdmin && ov.ca) {
     cards.appendChild(
       summaryCard(

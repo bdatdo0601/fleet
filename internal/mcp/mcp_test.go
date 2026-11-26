@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -17,6 +18,7 @@ import (
 	"github.com/bdatdo0601/fleet/internal/memory"
 	"github.com/bdatdo0601/fleet/internal/pki"
 	"github.com/bdatdo0601/fleet/internal/server"
+	"github.com/bdatdo0601/fleet/internal/slacker"
 )
 
 func setupMCPServer(t *testing.T) (*core.Fleet, *httptest.Server) {
@@ -414,5 +416,86 @@ func TestMCPClaudeAutoListenAndAntigravitySidecarStatus(t *testing.T) {
 	_ = json.Unmarshal([]byte(agyTxt), &agyData)
 	if agyData["mode"] != "antigravity_sidecar" || agyData["listening"] != false {
 		t.Fatalf("unexpected antigravity fleet_listen response: %+v", agyData)
+	}
+}
+
+func TestMCPSlackTools(t *testing.T) {
+	f, srv := setupMCPServer(t)
+
+	var postedText string
+	slackMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/conversations.replies":
+			_, _ = w.Write([]byte(`{"ok":true,"messages":[{"ts":"100.0","user":"U1","text":"Investigate latency spike"}]}`))
+		case "/search.messages":
+			_, _ = w.Write([]byte(`{"ok":true,"messages":{"matches":[{"ts":"200.0","user":"U2","text":"latency trace","channel":{"id":"CWORK","name":"eng"}}]}}`))
+		case "/chat.postMessage":
+			var b map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&b)
+			postedText, _ = b["text"].(string)
+			_, _ = w.Write([]byte(`{"ok":true,"channel":"CWORK","ts":"100.5"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(slackMock.Close)
+	f.SlackClient = &slacker.SlackClient{BaseURL: slackMock.URL}
+
+	if err := slacker.SaveConfig(f.SlackerConfigPath, slacker.Config{
+		Accounts: map[string]slacker.AccountConfig{
+			"work": {ID: "work", Enabled: true, AppToken: "xapp-w", UserToken: "xoxp-w", BotToken: "xoxb-w", AuthorizedUserID: "UW"},
+		},
+		Channels: map[string]slacker.ChannelMapping{
+			slacker.ChannelKey("work", "CWORK"): {Account: "work", ChannelID: "CWORK", Device: "mini", RepoPath: "/tmp/work"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	reqs := []string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fleet_slack_channels","arguments":{"account":"work"}}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fleet_slack_read","arguments":{"channel":"CWORK","thread_ts":"100.0"}}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"fleet_slack_read","arguments":{"account":"work","query":"latency"}}}`,
+		`{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"fleet_slack_send","arguments":{"channel":"CWORK","thread_ts":"100.0","text":"Fixed in commit abc"}}}`,
+	}
+	var out bytes.Buffer
+	rc, err := ServeStdio(ServeOpts{
+		Harness:           "claude",
+		Stdin:             strings.NewReader(strings.Join(reqs, "\n") + "\n"),
+		Stdout:            &out,
+		APIURL:            srv.URL,
+		HeartbeatInterval: 60.0,
+	})
+	if err != nil || rc != 0 {
+		t.Fatalf("ServeStdio failed: rc=%d err=%v", rc, err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 5 {
+		t.Fatalf("expected 5 responses, got %d: %s", len(lines), out.String())
+	}
+	parseTool := func(idx int) map[string]any {
+		var r map[string]any
+		_ = json.Unmarshal([]byte(lines[idx]), &r)
+		txt := r["result"].(map[string]any)["content"].([]any)[0].(map[string]any)["text"].(string)
+		var d map[string]any
+		_ = json.Unmarshal([]byte(txt), &d)
+		return d
+	}
+	chData := parseTool(1)
+	if len(chData["mapped_channels"].([]any)) != 1 {
+		t.Fatalf("unexpected fleet_slack_channels output: %+v", chData)
+	}
+	threadData := parseTool(2)
+	if threadData["mode"] != "thread" || threadData["account"] != "work" {
+		t.Fatalf("unexpected thread read output: %+v", threadData)
+	}
+	searchData := parseTool(3)
+	if searchData["mode"] != "search" {
+		t.Fatalf("unexpected search read output: %+v", searchData)
+	}
+	sendData := parseTool(4)
+	if sendData["ts"] != "100.5" || postedText != "Fixed in commit abc" {
+		t.Fatalf("unexpected send output: %+v posted=%q", sendData, postedText)
 	}
 }

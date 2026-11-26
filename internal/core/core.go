@@ -21,6 +21,7 @@ import (
 	"github.com/bdatdo0601/fleet/internal/pki"
 	"github.com/bdatdo0601/fleet/internal/registry"
 	"github.com/bdatdo0601/fleet/internal/render"
+	"github.com/bdatdo0601/fleet/internal/slacker"
 )
 
 // WrongPassphraseMsg matches the Python error message inspected by `fleet` passphrase retry logic.
@@ -144,17 +145,20 @@ type ApproveOpts struct {
 	Replace    bool   `json:"replace"`
 }
 
-// Fleet coordinates CA keys, the device registry, the agent session hub, and shared memory.
+// Fleet coordinates CA keys, the device registry, the agent session hub, shared memory, and Slacker.
 type Fleet struct {
-	Root             string
-	CAKey            string
-	CACrt            string
-	Registry         *registry.Registry
-	Agents           *agents.Hub
-	Memory           *memory.Store
-	Curator          *memory.Curator
-	approveMu        sync.Mutex
-	IdentifyOverride func(peerIP string) *registry.Device // optional hook for tests
+	Root              string
+	CAKey             string
+	CACrt             string
+	SlackerConfigPath string
+	Registry          *registry.Registry
+	Agents            *agents.Hub
+	Memory            *memory.Store
+	Curator           *memory.Curator
+	Slacker           *slacker.Store
+	SlackClient       *slacker.SlackClient
+	approveMu         sync.Mutex
+	IdentifyOverride  func(peerIP string) *registry.Device // optional hook for tests
 }
 
 // Open opens an existing fleet state directory (or creates the DBs if missing).
@@ -177,15 +181,24 @@ func Open(root string) (*Fleet, error) {
 		_ = reg.Close()
 		return nil, err
 	}
+	slk, err := slacker.Open(filepath.Join(root, "slacker.db"))
+	if err != nil {
+		_ = mem.Close()
+		_ = hub.Close()
+		_ = reg.Close()
+		return nil, err
+	}
 	curator := memory.NewCurator(mem, filepath.Join(root, "curator.json"))
 	return &Fleet{
-		Root:     root,
-		CAKey:    filepath.Join(root, "ca.key"),
-		CACrt:    filepath.Join(root, "ca.crt"),
-		Registry: reg,
-		Agents:   hub,
-		Memory:   mem,
-		Curator:  curator,
+		Root:              root,
+		CAKey:             filepath.Join(root, "ca.key"),
+		CACrt:             filepath.Join(root, "ca.crt"),
+		SlackerConfigPath: filepath.Join(root, "slacker.json"),
+		Registry:          reg,
+		Agents:            hub,
+		Memory:            mem,
+		Curator:           curator,
+		Slacker:           slk,
 	}, nil
 }
 
@@ -277,6 +290,11 @@ func (f *Fleet) Close() error {
 	}
 	if f.Memory != nil {
 		if err := f.Memory.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if f.Slacker != nil {
+		if err := f.Slacker.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}

@@ -228,20 +228,87 @@ type DaemonOpts struct {
 	ReloadDetached bool
 }
 
+// AgentOpts configures a per-user launchd LaunchAgent plist.
+type AgentOpts struct {
+	Label     string
+	Args      []string
+	LogPath   string
+	WorkDir   string
+	KeepAlive bool
+	ExtraPath string
+}
+
+type plistSpec struct {
+	Label         string
+	Args          []string
+	Env           map[string]string
+	Interval      int
+	KeepAlive     bool
+	LogPath       string
+	User          string
+	WorkDir       string
+	LimitLoadType string
+}
+
 func xmlEscape(s string) string {
 	var b bytes.Buffer
 	_ = xml.EscapeText(&b, []byte(s))
 	return b.String()
 }
 
-// BuildDaemonPlist renders a valid Apple XML plist for a LaunchDaemon.
-func BuildDaemonPlist(opts DaemonOpts) (string, error) {
+func buildPlistXML(spec plistSpec) string {
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>` + "\n")
 	b.WriteString(`<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">` + "\n")
 	b.WriteString(`<plist version="1.0">` + "\n")
 	b.WriteString("<dict>\n")
 
+	if len(spec.Env) > 0 {
+		envKeys := make([]string, 0, len(spec.Env))
+		for k := range spec.Env {
+			envKeys = append(envKeys, k)
+		}
+		sort.Strings(envKeys)
+		b.WriteString("\t<key>EnvironmentVariables</key>\n\t<dict>\n")
+		for _, k := range envKeys {
+			b.WriteString("\t\t<key>" + xmlEscape(k) + "</key>\n")
+			b.WriteString("\t\t<string>" + xmlEscape(spec.Env[k]) + "</string>\n")
+		}
+		b.WriteString("\t</dict>\n")
+	}
+
+	if spec.KeepAlive {
+		b.WriteString("\t<key>KeepAlive</key>\n\t<true/>\n")
+	}
+	b.WriteString("\t<key>Label</key>\n\t<string>" + xmlEscape(spec.Label) + "</string>\n")
+	if spec.LimitLoadType != "" {
+		b.WriteString("\t<key>LimitLoadToSessionType</key>\n\t<string>" + xmlEscape(spec.LimitLoadType) + "</string>\n")
+	}
+	b.WriteString("\t<key>ProgramArguments</key>\n\t<array>\n")
+	for _, a := range spec.Args {
+		b.WriteString("\t\t<string>" + xmlEscape(a) + "</string>\n")
+	}
+	b.WriteString("\t</array>\n")
+	b.WriteString("\t<key>RunAtLoad</key>\n\t<true/>\n")
+	if spec.LogPath != "" {
+		b.WriteString("\t<key>StandardErrorPath</key>\n\t<string>" + xmlEscape(spec.LogPath) + "</string>\n")
+		b.WriteString("\t<key>StandardOutPath</key>\n\t<string>" + xmlEscape(spec.LogPath) + "</string>\n")
+	}
+	if spec.Interval > 0 {
+		fmt.Fprintf(&b, "\t<key>StartInterval</key>\n\t<integer>%d</integer>\n", spec.Interval)
+	}
+	if spec.User != "" {
+		b.WriteString("\t<key>UserName</key>\n\t<string>" + xmlEscape(spec.User) + "</string>\n")
+	}
+	if spec.WorkDir != "" {
+		b.WriteString("\t<key>WorkingDirectory</key>\n\t<string>" + xmlEscape(spec.WorkDir) + "</string>\n")
+	}
+	b.WriteString("</dict>\n</plist>\n")
+	return b.String()
+}
+
+// BuildDaemonPlist renders a valid Apple XML plist for a LaunchDaemon.
+func BuildDaemonPlist(opts DaemonOpts) (string, error) {
 	env := map[string]string{
 		"PATH": StandardPathEnv,
 	}
@@ -252,41 +319,43 @@ func BuildDaemonPlist(opts DaemonOpts) (string, error) {
 			return "", fmt.Errorf("lookup home for user %q failed", opts.User)
 		}
 	}
-	envKeys := make([]string, 0, len(env))
-	for k := range env {
-		envKeys = append(envKeys, k)
-	}
-	sort.Strings(envKeys)
-	b.WriteString("\t<key>EnvironmentVariables</key>\n\t<dict>\n")
-	for _, k := range envKeys {
-		b.WriteString("\t\t<key>" + xmlEscape(k) + "</key>\n")
-		b.WriteString("\t\t<string>" + xmlEscape(env[k]) + "</string>\n")
-	}
-	b.WriteString("\t</dict>\n")
+	return buildPlistXML(plistSpec{
+		Label:     opts.Label,
+		Args:      opts.Args,
+		Env:       env,
+		Interval:  opts.Interval,
+		KeepAlive: opts.KeepAlive,
+		LogPath:   opts.LogPath,
+		User:      opts.User,
+		WorkDir:   opts.WorkDir,
+	}), nil
+}
 
-	if opts.KeepAlive {
-		b.WriteString("\t<key>KeepAlive</key>\n\t<true/>\n")
+// BuildAgentPlist renders a valid Apple XML plist for a per-user LaunchAgent.
+func BuildAgentPlist(opts AgentOpts) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		home = os.Getenv("HOME")
 	}
-	b.WriteString("\t<key>Label</key>\n\t<string>" + xmlEscape(opts.Label) + "</string>\n")
-	b.WriteString("\t<key>ProgramArguments</key>\n\t<array>\n")
-	for _, a := range opts.Args {
-		b.WriteString("\t\t<string>" + xmlEscape(a) + "</string>\n")
+	if home == "" {
+		return "", fmt.Errorf("cannot determine user home directory")
 	}
-	b.WriteString("\t</array>\n")
-	b.WriteString("\t<key>RunAtLoad</key>\n\t<true/>\n")
-	b.WriteString("\t<key>StandardErrorPath</key>\n\t<string>" + xmlEscape(opts.LogPath) + "</string>\n")
-	b.WriteString("\t<key>StandardOutPath</key>\n\t<string>" + xmlEscape(opts.LogPath) + "</string>\n")
-	if opts.Interval > 0 {
-		fmt.Fprintf(&b, "\t<key>StartInterval</key>\n\t<integer>%d</integer>\n", opts.Interval)
+	pathEnv := filepath.Join(home, ".local", "bin") + ":" + StandardPathEnv
+	if opts.ExtraPath != "" {
+		pathEnv = opts.ExtraPath + ":" + pathEnv
 	}
-	if opts.User != "" {
-		b.WriteString("\t<key>UserName</key>\n\t<string>" + xmlEscape(opts.User) + "</string>\n")
-	}
-	if opts.WorkDir != "" {
-		b.WriteString("\t<key>WorkingDirectory</key>\n\t<string>" + xmlEscape(opts.WorkDir) + "</string>\n")
-	}
-	b.WriteString("</dict>\n</plist>\n")
-	return b.String(), nil
+	return buildPlistXML(plistSpec{
+		Label: opts.Label,
+		Args:  opts.Args,
+		Env: map[string]string{
+			"HOME": home,
+			"PATH": pathEnv,
+		},
+		KeepAlive:     opts.KeepAlive,
+		LogPath:       opts.LogPath,
+		WorkDir:       opts.WorkDir,
+		LimitLoadType: "Aqua",
+	}), nil
 }
 
 func reloadDaemon(label, plistPath string) error {
@@ -423,6 +492,182 @@ func InstallDDNSDaemon(binPath, username, stateDir, workDir string) error {
 		LogPath:  filepath.Join(stateDir, "ddns.log"),
 		WorkDir:  workDir,
 	})
+}
+
+// InstallSlackerDaemon installs/updates the lighthouse `fleet slacker listen` LaunchDaemon.
+func InstallSlackerDaemon(binPath, username, stateDir, workDir string) error {
+	if binPath == "" {
+		binPath = paths.InstalledBinaryPath()
+	}
+	if stateDir == "" {
+		stateDir = paths.StateDirForOwner(username)
+	}
+	if workDir == "" {
+		workDir = stateDir
+	}
+	return InstallDaemon(DaemonOpts{
+		Label:     paths.SlackerLabel,
+		Args:      []string{binPath, "slacker", "listen"},
+		User:      username,
+		KeepAlive: true,
+		LogPath:   filepath.Join(stateDir, "slacker.log"),
+		WorkDir:   workDir,
+	})
+}
+
+// StartDaemon kickstarts or bootstraps a system LaunchDaemon.
+func StartDaemon(label string) error {
+	plistPath := filepath.Join(LaunchDaemonsDir, label+".plist")
+	if LaunchdLoaded(label) {
+		_, stderrStr, rc, err := Sudo(false, "launchctl", "kickstart", "-k", "system/"+label)
+		if err != nil || rc != 0 {
+			return fmt.Errorf("launchctl kickstart system/%s failed: %w (%s)", label, err, strings.TrimSpace(stderrStr))
+		}
+		return nil
+	}
+	if _, err := os.Stat(plistPath); err != nil {
+		return fmt.Errorf("LaunchDaemon %s is not installed (%s)", label, plistPath)
+	}
+	return reloadDaemon(label, plistPath)
+}
+
+// StopDaemon boots out a system LaunchDaemon without removing its plist.
+func StopDaemon(label string) error {
+	if !LaunchdLoaded(label) {
+		return nil
+	}
+	_, stderrStr, rc, err := Sudo(false, "launchctl", "bootout", "system/"+label)
+	if err != nil || rc != 0 {
+		if !LaunchdLoaded(label) {
+			return nil
+		}
+		return fmt.Errorf("launchctl bootout system/%s failed: %w (%s)", label, err, strings.TrimSpace(stderrStr))
+	}
+	return nil
+}
+
+// UninstallDaemon stops and removes a system LaunchDaemon plist.
+func UninstallDaemon(label string) error {
+	if err := StopDaemon(label); err != nil {
+		return err
+	}
+	plistPath := filepath.Join(LaunchDaemonsDir, label+".plist")
+	if _, err := os.Stat(plistPath); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if IsRoot() {
+		return os.Remove(plistPath)
+	}
+	_, stderrStr, rc, err := Sudo(false, "rm", "-f", plistPath)
+	if err != nil || rc != 0 {
+		return fmt.Errorf("remove %s failed: %w (%s)", plistPath, err, strings.TrimSpace(stderrStr))
+	}
+	return nil
+}
+
+func launchAgentDomain() string {
+	return fmt.Sprintf("gui/%d", os.Getuid())
+}
+
+// LaunchAgentPath returns the per-user LaunchAgent plist path for label.
+func LaunchAgentPath(label string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		home = os.Getenv("HOME")
+	}
+	return filepath.Join(home, "Library", "LaunchAgents", label+".plist")
+}
+
+// UserAgentLoaded reports whether gui/<uid>/<label> is currently loaded in launchd.
+func UserAgentLoaded(label string) bool {
+	err := exec.Command("launchctl", "print", launchAgentDomain()+"/"+label).Run()
+	return err == nil
+}
+
+// InstallUserAgent writes the per-user LaunchAgent plist and bootstraps it in gui/<uid>.
+func InstallUserAgent(opts AgentOpts) error {
+	plist, err := BuildAgentPlist(opts)
+	if err != nil {
+		return err
+	}
+	plistPath := LaunchAgentPath(opts.Label)
+	changed, err := paths.WriteFileAtomic(plistPath, []byte(plist), 0o644, nil, nil)
+	if err != nil {
+		return err
+	}
+	if opts.LogPath != "" {
+		if err := os.MkdirAll(filepath.Dir(opts.LogPath), 0o755); err != nil {
+			return err
+		}
+	}
+	if !changed && UserAgentLoaded(opts.Label) {
+		return StartUserAgent(opts.Label)
+	}
+	return reloadUserAgent(opts.Label, plistPath)
+}
+
+func reloadUserAgent(label, plistPath string) error {
+	domain := launchAgentDomain()
+	_ = exec.Command("launchctl", "bootout", domain+"/"+label).Run()
+	for range 20 {
+		if !UserAgentLoaded(label) {
+			break
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	var lastOut string
+	var lastErr error
+	for range 5 {
+		out, err := exec.Command("launchctl", "bootstrap", domain, plistPath).CombinedOutput()
+		if err == nil {
+			return nil
+		}
+		lastOut = string(out)
+		lastErr = err
+		time.Sleep(300 * time.Millisecond)
+	}
+	return fmt.Errorf("launchctl bootstrap %s failed: %w (%s)", plistPath, lastErr, strings.TrimSpace(lastOut))
+}
+
+// StartUserAgent kickstarts or bootstraps a per-user LaunchAgent.
+func StartUserAgent(label string) error {
+	domain := launchAgentDomain()
+	if UserAgentLoaded(label) {
+		if out, err := exec.Command("launchctl", "kickstart", "-k", domain+"/"+label).CombinedOutput(); err != nil {
+			return fmt.Errorf("launchctl kickstart %s/%s failed: %w (%s)", domain, label, err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+	plistPath := LaunchAgentPath(label)
+	if _, err := os.Stat(plistPath); err != nil {
+		return fmt.Errorf("LaunchAgent %s is not installed (%s)", label, plistPath)
+	}
+	return reloadUserAgent(label, plistPath)
+}
+
+// StopUserAgent boots out a per-user LaunchAgent without removing its plist.
+func StopUserAgent(label string) error {
+	if !UserAgentLoaded(label) {
+		return nil
+	}
+	domain := launchAgentDomain()
+	out, err := exec.Command("launchctl", "bootout", domain+"/"+label).CombinedOutput()
+	if err != nil && UserAgentLoaded(label) {
+		return fmt.Errorf("launchctl bootout %s/%s failed: %w (%s)", domain, label, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// UninstallUserAgent stops and removes a per-user LaunchAgent plist.
+func UninstallUserAgent(label string) error {
+	if err := StopUserAgent(label); err != nil {
+		return err
+	}
+	plistPath := LaunchAgentPath(label)
+	if err := os.Remove(plistPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // PathOwner returns the username that owns path on disk.
@@ -755,6 +1000,9 @@ func restartAndVerifyLighthouse(opts LighthouseUpdateOpts, targetBin, prevBin, o
 	}
 	if LaunchdLoaded(paths.DDNSLabel) {
 		_ = InstallDDNSDaemon(targetBin, owner, stateDir, stateDir)
+	}
+	if LaunchdLoaded(paths.SlackerLabel) {
+		_ = InstallSlackerDaemon(targetBin, owner, stateDir, stateDir)
 	}
 	localAPI := cmp.Or(opts.LocalAPI, fmt.Sprintf("http://127.0.0.1:%d", paths.APIPort()))
 	if !waitHealthy(localAPI, opts.HealthcheckTimeout, opts.HealthcheckFn) {

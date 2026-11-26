@@ -320,6 +320,7 @@ func NewHandler(fleet *core.Fleet, quiet bool) http.Handler {
 
 	registerAgentRoutes(mux, fleet, route)
 	registerMemoryRoutes(mux, fleet, route)
+	registerSlackerRoutes(mux, fleet, route)
 	registerAdminRoutes(mux, fleet, startedAt, route)
 	registerWebRoutes(mux, route)
 	registerDeviceRoutes(mux, fleet, route)

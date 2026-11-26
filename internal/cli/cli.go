@@ -1082,6 +1082,22 @@ func cmdStatus(args []string, cio *IO) error {
 		}
 		cio.printf("%-44s %s\n", label+":", st)
 	}
+	if isLighthouse {
+		if _, err := os.Stat(filepath.Join(system.LaunchDaemonsDir, paths.SlackerLabel+".plist")); err == nil {
+			st := "NOT loaded"
+			if system.LaunchdLoaded(paths.SlackerLabel) {
+				st = "loaded"
+			}
+			cio.printf("%-44s %s\n", paths.SlackerLabel+":", st)
+		}
+	}
+	if _, err := os.Stat(system.LaunchAgentPath(paths.SlackerWorkerLabel)); err == nil {
+		st := "NOT loaded"
+		if system.UserAgentLoaded(paths.SlackerWorkerLabel) {
+			st = "loaded"
+		}
+		cio.printf("%-44s %s\n", paths.SlackerWorkerLabel+":", st)
+	}
 	var syncRes core.SyncResult
 	if err := client.Call(node.API, "GET", "/v1/sync", nil, 10*time.Second, nil, &syncRes); err != nil {
 		cio.printf("lighthouse:  %v\n", err)
@@ -1632,6 +1648,8 @@ Commands:
   ddns            (lighthouse) keep the public DNS name pointed at home
   status          show this machine's fleet status
   agents          list active AI agent sessions across the fleet
+  session         manage detached Claude, Antigravity (agy), and Codex sessions
+  slacker         lighthouse Slack Socket Mode dispatcher & Mac task workers
   memory          manage shared fleet agent memory and LLM curation
   mcp             manage MCP and lifecycle hooks for claude, codex, and antigravity
   agent-hook      (internal) handle a harness lifecycle hook
@@ -1668,6 +1686,10 @@ func dispatchCommand(cmd string, rest []string, cio *IO) (bool, error) {
 		return true, cmdDDNS(rest, cio)
 	case "agents":
 		return true, cmdAgents(rest, cio)
+	case "session":
+		return true, cmdSession(rest, cio)
+	case "slacker":
+		return true, cmdSlacker(rest, cio)
 	case "memory":
 		return true, cmdMemory(rest, cio)
 	case "mcp":
