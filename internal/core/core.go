@@ -189,7 +189,7 @@ func Open(root string) (*Fleet, error) {
 		return nil, err
 	}
 	curator := memory.NewCurator(mem, filepath.Join(root, "curator.json"))
-	return &Fleet{
+	f := &Fleet{
 		Root:              root,
 		CAKey:             filepath.Join(root, "ca.key"),
 		CACrt:             filepath.Join(root, "ca.crt"),
@@ -199,7 +199,43 @@ func Open(root string) (*Fleet, error) {
 		Memory:            mem,
 		Curator:           curator,
 		Slacker:           slk,
-	}, nil
+	}
+	f.backfillPathsOnce()
+	return f, nil
+}
+
+func (f *Fleet) backfillPathsOnce() {
+	if f.Registry == nil || f.Agents == nil {
+		return
+	}
+	if v, ok, err := f.Registry.Setting("paths_backfilled"); err != nil || (ok && v == "1") {
+		return
+	}
+	if cfg, err := slacker.LoadConfig(f.SlackerConfigPath); err == nil {
+		for dev, dc := range cfg.Devices {
+			if dc.WorkspaceDir != "" {
+				_ = f.Agents.RecordPath(dev, dc.WorkspaceDir, "", "slacker_config", false)
+			}
+		}
+		for _, ch := range cfg.Channels {
+			for _, dev := range cfg.EffectiveChannelDevices(ch) {
+				if resolved, rErr := cfg.ResolveRepoPath(dev, ch.RepoPath); rErr == nil && resolved != "" {
+					_ = f.Agents.RecordPath(dev, resolved, agents.RepoNameFromPath(resolved), "slacker_config", false)
+				}
+			}
+		}
+	}
+	if f.Slacker != nil {
+		if jobs, err := f.Slacker.ListJobs("", "", 500); err == nil {
+			for _, j := range jobs {
+				if j.RepoPath == "" || j.Reaction == "kill" || j.Reaction == "kill-all" {
+					continue
+				}
+				_ = f.Agents.RecordPath(j.TargetDevice, j.RepoPath, agents.RepoNameFromPath(j.RepoPath), "slacker_job", true)
+			}
+		}
+	}
+	_ = f.Registry.SetSetting("paths_backfilled", "1")
 }
 
 // Initialize creates the CA, registry, and lighthouse entry in opts.Root.

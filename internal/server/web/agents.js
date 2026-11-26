@@ -1,14 +1,18 @@
 import {
   api,
   badge,
+  buildRepoSuggestions,
   clear,
   closeModal,
   confirmDialog,
   el,
+  fetchPathsCatalog,
   formatDuration,
   makeCopyBtn,
   openModal,
+  populateDatalist,
   relTime,
+  renderTrackedPathsBox,
   state,
   toast,
 } from "./lib.js";
@@ -73,7 +77,16 @@ function formatMessageTarget(m) {
 }
 
 function buildSendMessageForm(initialTo = "", opts = {}, onSent = null) {
-  const toInput = el("input", { type: "text", value: initialTo, placeholder: "session name/id, device:<name>, repo:<name>, or all" });
+  const datalistID = Array.isArray(opts.targets) && opts.targets.length > 0 ? "send-msg-targets" : "";
+  const toInput = el("input", {
+    type: "text",
+    value: initialTo,
+    list: datalistID || null,
+    placeholder: "session name/id, device:<name>, repo:<name>, or all",
+  });
+  const targetList = datalistID
+    ? el("datalist", { id: datalistID }, ...opts.targets.map((t) => el("option", { value: t.value, label: t.label || "" })))
+    : null;
   const threadInput = el("input", { type: "text", value: opts.thread_id || "", placeholder: "Optional thread_id" });
   const replyToInput = el("input", { type: "number", value: opts.reply_to ? String(opts.reply_to) : "", placeholder: "Optional reply_to message ID" });
   const bodyInput = el("textarea", { rows: 3, placeholder: "Message to deliver to agent inbox / live listener…" });
@@ -140,7 +153,7 @@ function buildSendMessageForm(initialTo = "", opts = {}, onSent = null) {
     },
     opts.hideTo
       ? null
-      : el("div", { className: "field" }, el("label", { text: "To" }), toInput),
+      : el("div", { className: "field" }, el("label", { text: "To" }), toInput, targetList),
     opts.compact
       ? null
       : el(
@@ -179,11 +192,16 @@ function workerIsOnline(runtimes, dev) {
   return Number.isFinite(ts) && Date.now() - ts <= 90 * 1000;
 }
 
-export async function openSpawnSessionModal(onSpawned = null) {
+export async function openSpawnSessionModal(onSpawned = null, initial = {}) {
   let statusRes;
   let devicesRes;
+  let pathsCatalog;
   try {
-    [statusRes, devicesRes] = await Promise.all([api("GET", "/v1/slacker/status"), api("GET", "/v1/devices")]);
+    [statusRes, devicesRes, pathsCatalog] = await Promise.all([
+      api("GET", "/v1/slacker/status"),
+      api("GET", "/v1/devices"),
+      fetchPathsCatalog(),
+    ]);
   } catch (err) {
     toast(err.message, "error");
     return;
@@ -224,16 +242,58 @@ export async function openSpawnSessionModal(onSpawned = null) {
     el("option", { value: "least_agents", text: "Least agents" }),
     el("option", { value: "round_robin", text: "Round-robin" }),
   );
-  const repoIn = el("input", { type: "text", placeholder: "subpath (e.g. fleet), blank=workspace, or ~/path" });
+  const repoDatalist = el("datalist", { id: "spawn-repo-list" });
+  const repoIn = el("input", {
+    type: "text",
+    list: "spawn-repo-list",
+    value: initial.repo_path || "",
+    placeholder: "subpath (e.g. fleet), blank=workspace, or ~/path",
+  });
+  const repoChipsRow = el("div", { className: "chips-row mt-1" });
   const nameIn = el("input", { type: "text", placeholder: "auto-generated if blank" });
   const promptIn = el("textarea", { rows: 4, placeholder: "Optional prompt (leave blank for an interactive session)" });
   const tmuxChk = el("input", { type: "checkbox" });
 
-  let selectedDevices = defaultDevices.length > 0 ? [] : devices.length > 0 ? [devices[0]] : [];
+  let selectedDevices = initial.device && devices.includes(initial.device)
+    ? [initial.device]
+    : defaultDevices.length > 0
+      ? []
+      : devices.length > 0
+        ? [devices[0]]
+        : [];
   const poolHint = el("span", {
     className: "small muted",
     text: selectedDevices.length === 0 ? `default (${defaultDevices.length > 0 ? defaultDevices.join(", ") : "none"})` : "",
   });
+
+  const markEditing = () => {
+    state.editing = Boolean(promptIn.value.trim() || repoIn.value.trim() || nameIn.value.trim());
+  };
+
+  const syncRepoSuggestions = () => {
+    const effDevs = selectedDevices.length > 0 ? selectedDevices : defaultDevices;
+    const suggestions = buildRepoSuggestions(pathsCatalog, effDevs, cfg.devices || {});
+    populateDatalist(repoDatalist, suggestions);
+    clear(repoChipsRow);
+    const curVal = repoIn.value.trim();
+    for (const s of suggestions.slice(0, 12)) {
+      repoChipsRow.appendChild(
+        el("button", {
+          type: "button",
+          className: `chip${curVal === s.value ? " active" : ""}`,
+          text: s.label,
+          title: s.detail,
+          onclick: () => {
+            repoIn.value = s.value;
+            markEditing();
+            syncRepoSuggestions();
+          },
+        }),
+      );
+    }
+    repoChipsRow.classList.toggle("hidden", suggestions.length === 0);
+  };
+
   const chipButtons = devices.map((devName) => {
     const load = (agentCounts[devName] || 0) + (pendingCounts[devName] || 0);
     const online = workerIsOnline(runtimes, devName);
@@ -251,17 +311,22 @@ export async function openSpawnSessionModal(onSpawned = null) {
         selectedDevices = devices.filter((d) => cur.has(d));
         btn.classList.toggle("active", cur.has(devName));
         poolHint.textContent = selectedDevices.length === 0 ? `default (${defaultDevices.length > 0 ? defaultDevices.join(", ") : "none"})` : "";
+        syncRepoSuggestions();
       },
     });
     return btn;
   });
 
-  const markEditing = () => {
-    state.editing = Boolean(promptIn.value.trim() || repoIn.value.trim() || nameIn.value.trim());
-  };
   promptIn.addEventListener("input", markEditing);
-  repoIn.addEventListener("input", markEditing);
+  repoIn.addEventListener("input", () => {
+    markEditing();
+    for (const chip of repoChipsRow.children) {
+      chip.classList.toggle("active", chip.textContent === repoIn.value.trim() || chip.textContent.startsWith(`${repoIn.value.trim()} (`));
+    }
+  });
   nameIn.addEventListener("input", markEditing);
+  syncRepoSuggestions();
+  markEditing();
 
   const spawnBtn = el("button", { type: "submit", className: "btn btn-primary", text: "Spawn Session" });
   const form = el(
@@ -322,6 +387,8 @@ export async function openSpawnSessionModal(onSpawned = null) {
       { className: "field" },
       el("label", { text: "Directory / Repo" }),
       repoIn,
+      repoDatalist,
+      repoChipsRow,
       wsHints.length > 0 ? el("div", { className: "field-hint mono", text: `Workspaces: ${wsHints.join(" · ")}` }) : null,
     ),
     el("div", { className: "field" }, el("label", { text: "Initial Prompt (optional)" }), promptIn),
@@ -604,9 +671,10 @@ export async function openAgentInspectModal(sessionID, onDone) {
   });
 }
 
-function renderSessionsView(root, sessions, ctx) {
+function renderSessionsView(root, sessions, ctx, pathsCatalog) {
   const devices = [...new Set(sessions.map((s) => s.device).filter(Boolean))].sort();
   const harnesses = [...new Set(sessions.map((s) => s.harness).filter(Boolean))].sort();
+  const repos = [...new Set([...sessions.map((s) => s.repo), ...(pathsCatalog.repos || [])].filter(Boolean))].sort();
 
   const tableContainer = el("div");
   const chips = [
@@ -653,6 +721,18 @@ function renderSessionsView(root, sessions, ctx) {
     },
     el("option", { value: "", text: "All harnesses", selected: agentsFilter.harness === "" }),
     ...harnesses.map((h) => el("option", { value: h, text: h, selected: agentsFilter.harness === h })),
+  );
+
+  const repoSel = el(
+    "select",
+    {
+      onchange: (ev) => {
+        agentsFilter.repo = ev.target.value;
+        drawTable();
+      },
+    },
+    el("option", { value: "", text: "All repos", selected: agentsFilter.repo === "" }),
+    ...repos.map((r) => el("option", { value: r, text: r, selected: agentsFilter.repo === r })),
   );
 
   const queryInput = el("input", {
@@ -707,8 +787,21 @@ function renderSessionsView(root, sessions, ctx) {
 
   root.appendChild(renderUsageCard((state.overview && state.overview.usage) || []));
   root.appendChild(killControls);
-  root.appendChild(el("div", { className: "toolbar" }, el("div", { className: "chips-row" }, chips), devSel, harSel, el("div", { className: "toolbar-spacer" }), queryInput));
+  root.appendChild(el("div", { className: "toolbar" }, el("div", { className: "chips-row" }, chips), devSel, harSel, repoSel, el("div", { className: "toolbar-spacer" }), queryInput));
   root.appendChild(tableContainer);
+  root.appendChild(
+    renderTrackedPathsBox(
+      pathsCatalog,
+      {
+        devices,
+        onUse: state.isAdmin
+          ? (p) => openSpawnSessionModal(() => ctx.refresh(), { device: p.device, repo_path: p.subpath || p.tilde_path || p.path })
+          : null,
+        useLabel: "Spawn",
+      },
+      () => ctx.refresh(),
+    ),
+  );
 
   const drawTable = () => {
     clear(tableContainer);
@@ -730,6 +823,9 @@ function renderSessionsView(root, sessions, ctx) {
         return false;
       }
       if (agentsFilter.harness && s.harness !== agentsFilter.harness) {
+        return false;
+      }
+      if (agentsFilter.repo && s.repo !== agentsFilter.repo) {
         return false;
       }
       if (!q) {
@@ -860,10 +956,10 @@ function renderSessionsView(root, sessions, ctx) {
   drawTable();
 }
 
-async function renderMessagesView(root, sessions, ctx) {
+async function renderMessagesView(root, sessions, ctx, pathsCatalog) {
   const liveSessions = sessions.filter((s) => s.live);
   const devices = [...new Set(sessions.map((s) => s.device).filter(Boolean))].sort();
-  const repos = [...new Set(sessions.map((s) => s.repo).filter(Boolean))].sort();
+  const repos = [...new Set([...sessions.map((s) => s.repo), ...(pathsCatalog.repos || [])].filter(Boolean))].sort();
 
   const feedBox = el("div");
   const loadFeed = async () => {
@@ -950,12 +1046,18 @@ async function renderMessagesView(root, sessions, ctx) {
     ...liveSessions.map((s) => el("option", { value: s.session_id, text: `${s.name || s.session_id} (${s.device}/${s.harness})` })),
   );
 
+  const targetSuggestions = [
+    { value: "all", label: "broadcast to fleet" },
+    ...devices.map((d) => ({ value: `device:${d}`, label: "device" })),
+    ...repos.map((r) => ({ value: `repo:${r}`, label: "repo" })),
+    ...liveSessions.map((s) => ({ value: s.session_id, label: `${s.name || s.session_id} (${s.device}/${s.harness})` })),
+  ];
   const composeCard = el(
     "div",
     { className: "card mb-3" },
     el("div", { className: "card-header" }, el("h3", { className: "card-title", text: "Send Message" }), presetSel),
   );
-  const composeForm = buildSendMessageForm("", {}, () => loadFeed());
+  const composeForm = buildSendMessageForm("", { targets: targetSuggestions }, () => loadFeed());
   const toField = composeForm.querySelector('input[type="text"]');
   presetSel.addEventListener("change", () => {
     if (presetSel.value && toField) {
@@ -1023,9 +1125,11 @@ export async function renderAgents(root, ctx, subRoute = "") {
   }
 
   let sessions = [];
+  let pathsCatalog = { paths: [], repos: [], workspaces: {} };
   try {
-    const res = await api("GET", "/v1/agents?include_stale=true");
+    const [res, cat] = await Promise.all([api("GET", "/v1/agents?include_stale=true"), fetchPathsCatalog()]);
     sessions = res.agents || [];
+    pathsCatalog = cat;
   } catch (err) {
     clear(root);
     root.appendChild(el("div", { className: "alert-banner alert-danger", text: err.message }));
@@ -1096,9 +1200,9 @@ export async function renderAgents(root, ctx, subRoute = "") {
     root.appendChild(tabs);
 
     if (agentsFilter.tab === "messages") {
-      await renderMessagesView(root, sessions, ctx);
+      await renderMessagesView(root, sessions, ctx, pathsCatalog);
     } else {
-      renderSessionsView(root, sessions, ctx);
+      renderSessionsView(root, sessions, ctx, pathsCatalog);
     }
   };
 

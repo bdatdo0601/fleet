@@ -363,3 +363,247 @@ export function makeCopyBtn(text, label = "Copy") {
 export function badge(text, variant = "neutral") {
   return el("span", { className: `badge badge-${variant}`, text });
 }
+
+export async function fetchPathsCatalog(device = "") {
+  const qs = device ? `?device=${encodeURIComponent(device)}` : "";
+  try {
+    const res = await api("GET", `/v1/agents/paths${qs}`);
+    return {
+      paths: Array.isArray(res.paths) ? res.paths : [],
+      repos: Array.isArray(res.repos) ? res.repos : [],
+      workspaces: res.workspaces && typeof res.workspaces === "object" ? res.workspaces : {},
+    };
+  } catch {
+    return { paths: [], repos: [], workspaces: {} };
+  }
+}
+
+export function populateDatalist(listEl, items) {
+  if (!listEl) {
+    return;
+  }
+  clear(listEl);
+  for (const item of items) {
+    const val = typeof item === "string" ? item : item.value;
+    const label = typeof item === "string" ? "" : item.label || item.detail || "";
+    if (!val) {
+      continue;
+    }
+    listEl.appendChild(el("option", label ? { value: val, label } : { value: val }));
+  }
+}
+
+export function buildRepoSuggestions(catalog, targetDevices = [], deviceConfigs = {}) {
+  const entries = (catalog && Array.isArray(catalog.paths) ? catalog.paths : []).filter((p) => p && p.path);
+  const targets = Array.isArray(targetDevices) ? targetDevices.filter(Boolean) : [];
+  const hasTargets = targets.length > 0;
+  const allHaveWS = hasTargets && targets.every((d) => Boolean(deviceConfigs[d] && deviceConfigs[d].workspace_dir));
+
+  const byValue = new Map();
+  for (const p of entries) {
+    const matchesTarget = !hasTargets || targets.includes(p.device);
+    if (!matchesTarget && !(allHaveWS && p.subpath)) {
+      continue;
+    }
+    let val = "";
+    if (hasTargets) {
+      val = allHaveWS && p.subpath ? p.subpath : p.tilde_path || p.path;
+    } else {
+      const devHasWS = Boolean(deviceConfigs[p.device] && deviceConfigs[p.device].workspace_dir);
+      val = (devHasWS && p.subpath) || p.tilde_path || p.path;
+    }
+    if (!val) {
+      continue;
+    }
+    const existing = byValue.get(val);
+    if (!existing) {
+      byValue.set(val, {
+        value: val,
+        repo: p.repo || "",
+        subpath: p.subpath || "",
+        path: p.path,
+        devices: new Set([p.device]),
+        matchesTarget,
+        last_seen: p.last_seen || "",
+        use_count: p.use_count || 1,
+        sampleDetail: `${p.device}: ${p.path}`,
+      });
+    } else {
+      existing.devices.add(p.device);
+      existing.matchesTarget = existing.matchesTarget || matchesTarget;
+      existing.use_count += p.use_count || 1;
+      if ((p.last_seen || "") > existing.last_seen) {
+        existing.last_seen = p.last_seen || "";
+      }
+      if (!existing.repo && p.repo) {
+        existing.repo = p.repo;
+      }
+    }
+  }
+
+  return Array.from(byValue.values())
+    .sort((a, b) => {
+      if (a.matchesTarget !== b.matchesTarget) {
+        return a.matchesTarget ? -1 : 1;
+      }
+      if (a.last_seen !== b.last_seen) {
+        return a.last_seen > b.last_seen ? -1 : 1;
+      }
+      if (a.use_count !== b.use_count) {
+        return b.use_count - a.use_count;
+      }
+      return a.value.localeCompare(b.value);
+    })
+    .map((item) => {
+      const devList = Array.from(item.devices).sort();
+      const repoTag = item.repo && item.repo !== item.value ? ` (${item.repo})` : "";
+      const devTag = devList.length > 0 ? ` · ${devList.join(", ")}` : "";
+      return {
+        ...item,
+        devices: devList,
+        label: `${item.value}${repoTag}`,
+        detail: `${item.repo ? `repo:${item.repo} · ` : ""}${item.sampleDetail}${devTag}`,
+      };
+    });
+}
+
+export function renderTrackedPathsBox(catalog, opts = {}, onChanged = null) {
+  const paths = (catalog && Array.isArray(catalog.paths) ? catalog.paths : []).slice();
+  const knownDevices = Array.isArray(opts.devices) && opts.devices.length > 0
+    ? opts.devices
+    : Array.from(new Set([state.caller ? state.caller.name : "", ...paths.map((p) => p.device)].filter(Boolean))).sort();
+
+  const details = el("details", { className: "details-box mt-3 mb-3" }, el("summary", { text: `Known Directories & Repos (${paths.length})` }));
+  const content = el("div", { className: "form-grid mt-2" });
+
+  if (paths.length === 0) {
+    content.appendChild(el("div", { className: "muted small", text: "No directories or repos recorded yet — they are captured automatically from agent heartbeats, spawns, and Slacker configs." }));
+  } else {
+    const tbody = el("tbody");
+    for (const p of paths) {
+      const canEdit = state.isAdmin || (state.caller && p.device === state.caller.name);
+      const acts = el("div", { className: "actions-row" });
+      if (opts.onUse) {
+        acts.appendChild(
+          el("button", {
+            type: "button",
+            className: "btn btn-sm",
+            text: opts.useLabel || "Use",
+            onclick: () => opts.onUse(p),
+          }),
+        );
+      }
+      acts.appendChild(makeCopyBtn(p.subpath || p.tilde_path || p.path, "Copy"));
+      if (canEdit) {
+        acts.appendChild(
+          el("button", {
+            type: "button",
+            className: "btn btn-sm btn-danger",
+            text: "Remove",
+            onclick: async () => {
+              try {
+                await api("DELETE", `/v1/agents/paths?device=${encodeURIComponent(p.device)}&path=${encodeURIComponent(p.path)}`);
+                toast(`Removed ${p.path}`, "ok");
+                if (onChanged) {
+                  onChanged();
+                }
+              } catch (err) {
+                toast(err.message, "error");
+              }
+            },
+          }),
+        );
+      }
+      const dirCell = el("td", { className: "mono small" }, p.path);
+      if (p.subpath) {
+        dirCell.appendChild(el("div", { className: "mt-1" }, badge(`subpath: ${p.subpath}`, "info")));
+      }
+      tbody.appendChild(
+        el(
+          "tr",
+          null,
+          el("td", { className: "mono small", text: p.device }),
+          el("td", { className: "mono small", text: p.repo || "-" }),
+          dirCell,
+          el("td", { className: "small muted", text: `${p.source || "-"} (${p.use_count || 1})` }),
+          el("td", { className: "small", text: relTime(p.last_seen) }),
+          el("td", null, acts),
+        ),
+      );
+    }
+    content.appendChild(
+      el(
+        "div",
+        { className: "table-wrap" },
+        el(
+          "table",
+          null,
+          el(
+            "thead",
+            null,
+            el(
+              "tr",
+              null,
+              el("th", { text: "Device" }),
+              el("th", { text: "Repo" }),
+              el("th", { text: "Directory" }),
+              el("th", { text: "Source" }),
+              el("th", { text: "Last Seen" }),
+              el("th", { text: "Actions" }),
+            ),
+          ),
+          tbody,
+        ),
+      ),
+    );
+  }
+
+  const devInput = state.isAdmin && knownDevices.length > 0
+    ? el("select", null, ...knownDevices.map((d) => el("option", { value: d, text: d, selected: state.caller && d === state.caller.name })))
+    : el("input", { type: "text", value: state.caller ? state.caller.name : "", disabled: true });
+  const pathInput = el("input", { type: "text", className: "grow", placeholder: "Add directory (/abs/path, ~/path, or workspace subpath)" });
+  const repoInput = el("input", { type: "text", className: "max-w-sm", placeholder: "Repo name (optional)" });
+  const addBtn = el("button", { type: "submit", className: "btn btn-sm btn-primary", text: "+ Track Path" });
+
+  content.appendChild(
+    el(
+      "form",
+      {
+        className: "toolbar m-0",
+        onsubmit: async (ev) => {
+          ev.preventDefault();
+          const pVal = pathInput.value.trim();
+          if (!pVal) {
+            toast("Directory path is required", "warn");
+            return;
+          }
+          addBtn.disabled = true;
+          try {
+            await api("POST", "/v1/agents/paths", {
+              device: devInput.value.trim(),
+              path: pVal,
+              repo: repoInput.value.trim(),
+            });
+            pathInput.value = "";
+            repoInput.value = "";
+            toast("Tracked directory saved", "ok");
+            if (onChanged) {
+              onChanged();
+            }
+          } catch (err) {
+            toast(err.message, "error");
+          } finally {
+            addBtn.disabled = false;
+          }
+        },
+      },
+      devInput,
+      pathInput,
+      repoInput,
+      addBtn,
+    ),
+  );
+
+  details.appendChild(content);
+  return details;
+}

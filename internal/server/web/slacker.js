@@ -1,5 +1,19 @@
 import { openSpawnSessionModal } from "./agents.js";
-import { api, badge, clear, confirmDialog, el, makeCopyBtn, relTime, state, toast } from "./lib.js";
+import {
+  api,
+  badge,
+  buildRepoSuggestions,
+  clear,
+  confirmDialog,
+  el,
+  fetchPathsCatalog,
+  makeCopyBtn,
+  populateDatalist,
+  relTime,
+  renderTrackedPathsBox,
+  state,
+  toast,
+} from "./lib.js";
 
 function renderStatusCard(statusRes) {
   const cfg = statusRes.config || {};
@@ -199,13 +213,14 @@ function isWorkerOnline(runtimes, dev) {
   return Date.now() - ts <= 90 * 1000;
 }
 
-function renderMachinesCard(cfg, statusRes, knownDevices, ctx) {
+function renderMachinesCard(cfg, statusRes, knownDevices, pathsCatalog, ctx) {
   const runtimes = statusRes.runtimes || [];
   const agentCounts = statusRes.agent_counts || {};
   const pendingCounts = statusRes.pending_counts || {};
   const deviceCfg = cfg.devices || {};
   const defaultDevices = Array.isArray(cfg.default_devices) ? cfg.default_devices : [];
   const allDevs = Array.from(new Set([...knownDevices, ...Object.keys(deviceCfg), ...defaultDevices])).sort();
+  const wsCatalog = (pathsCatalog && pathsCatalog.workspaces) || {};
 
   const rowState = allDevs.map((name) => ({
     name,
@@ -239,8 +254,12 @@ function renderMachinesCard(cfg, statusRes, knownDevices, ctx) {
       checked: row.inDefault,
       onchange: (e) => { row.inDefault = e.target.checked; },
     });
+    const wsListID = `slacker-ws-${row.name}`;
+    const wsChoices = Array.from(new Set([...(wsCatalog[row.name] || []), row.workspaceDir].filter(Boolean)));
+    const wsDatalist = el("datalist", { id: wsListID }, ...wsChoices.map((w) => el("option", { value: w })));
     const wsIn = el("input", {
       type: "text",
+      list: wsListID,
       value: row.workspaceDir,
       placeholder: "~/workspace",
       oninput: (e) => { row.workspaceDir = e.target.value; },
@@ -260,7 +279,7 @@ function renderMachinesCard(cfg, statusRes, knownDevices, ctx) {
             badge(`${liveN} agent${liveN === 1 ? "" : "s"}${pendN > 0 ? ` + ${pendN} queued` : ""}`, liveN + pendN > 0 ? "info" : "neutral"),
           ),
         ),
-        el("td", null, wsIn),
+        el("td", null, wsIn, wsDatalist),
       ),
     );
   }
@@ -334,12 +353,14 @@ export async function renderSlacker(root, ctx) {
   let cfgRes;
   let jobsRes;
   let devicesRes;
+  let pathsCatalog;
   try {
-    [statusRes, cfgRes, jobsRes, devicesRes] = await Promise.all([
+    [statusRes, cfgRes, jobsRes, devicesRes, pathsCatalog] = await Promise.all([
       api("GET", "/v1/slacker/status"),
       api("GET", "/v1/slacker/config"),
       api("GET", "/v1/slacker/jobs?limit=50"),
       api("GET", "/v1/devices"),
+      fetchPathsCatalog(),
     ]);
   } catch (err) {
     clear(root);
@@ -389,7 +410,7 @@ export async function renderSlacker(root, ctx) {
 
   root.appendChild(renderStatusCard(statusRes));
   root.appendChild(renderAccountsCard(cfg, runtimes, ctx));
-  root.appendChild(renderMachinesCard(cfg, statusRes, devices, ctx));
+  root.appendChild(renderMachinesCard(cfg, statusRes, devices, pathsCatalog, ctx));
 
   const chanList = el("div", { className: "form-grid" });
   const renderChannels = () => {
@@ -407,6 +428,38 @@ export async function renderSlacker(root, ctx) {
         className: "small muted",
         text: (ch.devices || []).length === 0 ? `default (${defaultDevices.length > 0 ? defaultDevices.join(", ") : "none"})` : "",
       });
+      const repoListID = `slacker-ch-repo-${i}`;
+      const repoDatalist = el("datalist", { id: repoListID });
+      const repoIn = el("input", {
+        type: "text",
+        list: repoListID,
+        value: ch.repo_path || "",
+        placeholder: "subpath (e.g. fleet), blank=workspace, or ~/path",
+        oninput: (e) => { ch.repo_path = e.target.value; },
+      });
+      const repoPickSel = el("select", {
+        className: "max-w-sm",
+        onchange: (e) => {
+          if (e.target.value) {
+            repoIn.value = e.target.value;
+            ch.repo_path = e.target.value;
+            e.target.value = "";
+          }
+        },
+      });
+      const syncRowRepoChoices = () => {
+        const effDevs = (ch.devices || []).length > 0 ? ch.devices : defaultDevices;
+        const suggestions = buildRepoSuggestions(pathsCatalog, effDevs, cfg.devices || {});
+        populateDatalist(repoDatalist, suggestions);
+        clear(repoPickSel);
+        repoPickSel.appendChild(el("option", { value: "", text: suggestions.length > 0 ? "Pick dir/repo…" : "No tracked dirs" }));
+        for (const s of suggestions) {
+          repoPickSel.appendChild(el("option", { value: s.value, text: s.label, title: s.detail }));
+        }
+        repoPickSel.disabled = suggestions.length === 0;
+      };
+      syncRowRepoChoices();
+
       const chipButtons = chipPool.map((devName) => {
         const isSelected = (ch.devices || []).includes(devName);
         const btn = el("button", {
@@ -423,6 +476,7 @@ export async function renderSlacker(root, ctx) {
             ch.devices = chipPool.filter((d) => cur.has(d));
             btn.classList.toggle("active", cur.has(devName));
             poolHint.textContent = ch.devices.length === 0 ? `default (${defaultDevices.length > 0 ? defaultDevices.join(", ") : "none"})` : "";
+            syncRowRepoChoices();
           },
         });
         return btn;
@@ -443,7 +497,6 @@ export async function renderSlacker(root, ctx) {
         el("option", { value: "bypass", text: "Bypass", selected: ch.policy === "bypass" }),
         el("option", { value: "safe", text: "Safe", selected: ch.policy === "safe" }),
       );
-      const repoIn = el("input", { type: "text", value: ch.repo_path || "", placeholder: "subpath (e.g. fleet), blank=workspace, or ~/path", oninput: (e) => { ch.repo_path = e.target.value; } });
       const tmuxChk = el("input", { type: "checkbox", checked: Boolean(ch.use_tmux), onchange: (e) => { ch.use_tmux = e.target.checked; } });
       const rmBtn = el("button", {
         type: "button",
@@ -455,7 +508,20 @@ export async function renderSlacker(root, ctx) {
         },
       });
       chanList.appendChild(
-        el("div", { className: "toolbar m-0" }, acctSel, idIn, devChipsBox, stratSel, polSel, repoIn, el("label", { className: "checkbox-row" }, tmuxChk, "tmux"), rmBtn),
+        el(
+          "div",
+          { className: "toolbar m-0" },
+          acctSel,
+          idIn,
+          devChipsBox,
+          stratSel,
+          polSel,
+          repoIn,
+          repoDatalist,
+          repoPickSel,
+          el("label", { className: "checkbox-row" }, tmuxChk, "tmux"),
+          rmBtn,
+        ),
       );
     }
   };
@@ -568,6 +634,18 @@ export async function renderSlacker(root, ctx) {
       el("summary", { text: "Slack App Manifest (YAML)" }),
       el("div", { className: "actions-row flex-end mt-2 mb-2" }, makeCopyBtn(cfgRes.manifest_yaml || "", "Copy Manifest")),
       el("pre", { className: "code-block", text: cfgRes.manifest_yaml || "" }),
+    ),
+  );
+
+  root.appendChild(
+    renderTrackedPathsBox(
+      pathsCatalog,
+      {
+        devices,
+        onUse: (p) => openSpawnSessionModal(() => ctx.refresh(), { device: p.device, repo_path: p.subpath || p.tilde_path || p.path }),
+        useLabel: "Spawn",
+      },
+      () => ctx.refresh(),
     ),
   );
 

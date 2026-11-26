@@ -402,6 +402,7 @@ func registerAgentRoutes(
 		return nil
 	}))
 	registerAgentMessageRoutes(mux, fleet, route)
+	registerAgentPathRoutes(mux, fleet, route)
 }
 
 func registerAgentMessageRoutes(

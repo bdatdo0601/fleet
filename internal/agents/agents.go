@@ -81,6 +81,19 @@ CREATE TABLE IF NOT EXISTS harness_usage (
   metrics_json TEXT NOT NULL DEFAULT '{}',
   updated_at   TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS agent_paths (
+  device     TEXT NOT NULL,
+  path       TEXT NOT NULL,
+  repo       TEXT NOT NULL DEFAULT '',
+  source     TEXT NOT NULL DEFAULT '',
+  use_count  INTEGER NOT NULL DEFAULT 1,
+  first_seen TEXT NOT NULL,
+  last_seen  TEXT NOT NULL,
+  PRIMARY KEY (device, path)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_paths_last_seen
+  ON agent_paths(last_seen DESC);
 `
 
 var sessionMigrations = []registry.ColumnMigration{
@@ -627,6 +640,10 @@ type Hub struct {
 func Open(path string) (*Hub, error) {
 	db, err := registry.OpenSQLite(path, schema, "agent_sessions", sessionMigrations)
 	if err != nil {
+		return nil, err
+	}
+	if err := backfillPathsFromSessions(db); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
 	_ = os.Chmod(path, 0o600)
@@ -1243,14 +1260,19 @@ func (h *Hub) heartbeatPromotedLocked(p HeartbeatParams, sessionID string, promo
 	if newPID == nil {
 		newPID = p.PID
 	}
+	effCWD := cmp.Or(p.CWD, promoted.cwd)
 	if _, err := tx.Exec(
 		"UPDATE agent_sessions SET pid = ?, cwd = ?, repo = ?, branch = ?, "+
 			"title = ?, name = ?, custom_name = ?, summary = ?, git_status = ?, "+
 			"tail_json = ?, updated_at = ? WHERE session_id = ?",
-		newPID, cmp.Or(p.CWD, promoted.cwd), effRepo, cmp.Or(p.Branch, promoted.branch),
+		newPID, effCWD, effRepo, cmp.Or(p.Branch, promoted.branch),
 		effTitle, effName, effCustom, optionalTruncated(p.Summary, promoted.summary, 160),
 		optionalTruncated(p.GitStatus, promoted.gitStatus, 1500), effTailJSON, nowISO, targetID,
 	); err != nil {
+		return HeartbeatResult{}, err
+	}
+	bumpPath := p.CWD != "" && NormalizeTrackedPath(p.CWD) != NormalizeTrackedPath(promoted.cwd)
+	if err := recordPathExecLocked(tx, p.Device, effCWD, effRepo, "heartbeat", nowISO, bumpPath); err != nil {
 		return HeartbeatResult{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -1379,10 +1401,22 @@ func (h *Hub) Heartbeat(p HeartbeatParams) (HeartbeatResult, error) {
 	if err := upsertSessionTxLocked(tx, p, existing, sessionID, shortID, fullRaw, effRepo, effTitle, effName, effCustom, newPendingJSON, newStateChangedAt, oldStarted, nowISO, oldPID); err != nil {
 		return HeartbeatResult{}, err
 	}
+	if err := recordHeartbeatSessionPathLocked(tx, p, existing, effRepo, nowISO); err != nil {
+		return HeartbeatResult{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return HeartbeatResult{}, err
 	}
 	return h.finishHeartbeatLocked(p.Device, sessionID, fullRaw, effName, effTitle, p.DrainInbox)
+}
+
+func recordHeartbeatSessionPathLocked(tx *sql.Tx, p HeartbeatParams, existing *sessionRow, effRepo, nowISO string) error {
+	effCWD := p.CWD
+	if effCWD == "" && existing != nil {
+		effCWD = existing.cwd
+	}
+	bumpPath := existing == nil || (p.CWD != "" && NormalizeTrackedPath(p.CWD) != NormalizeTrackedPath(existing.cwd))
+	return recordPathExecLocked(tx, p.Device, effCWD, effRepo, "heartbeat", nowISO, bumpPath)
 }
 
 func validateSessionName(newName string) (string, error) {

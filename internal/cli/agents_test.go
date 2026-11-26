@@ -178,3 +178,27 @@ func TestCLIAgentsSpawnKillAndLocalFallback(t *testing.T) {
 		t.Fatalf("kill-all failed: rc=%d out=%q err=%q calls=%v", rc, out, errStr, killAllCalls)
 	}
 }
+
+func TestCLIAgentsPaths(t *testing.T) {
+	f, _, _ := setupCLIServer(t)
+	if _, err := f.Agents.Heartbeat(agents.HeartbeatParams{
+		Device: "mini", Harness: "claude", RawID: "p1", CWD: "/Users/dat/workspace/fleet", Repo: "fleet",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rc, out, errStr := runAgentCLI("agents", "paths", "--json")
+	if rc != 0 || !strings.Contains(out, "/Users/dat/workspace/fleet") || !strings.Contains(out, `"fleet"`) {
+		t.Fatalf("agents paths --json failed: rc=%d out=%q err=%q", rc, out, errStr)
+	}
+
+	rc, out, errStr = runAgentCLI("agents", "paths", "add", "~/workspace/other", "--device", "mini", "--repo", "other", "--json")
+	if rc != 0 || !strings.Contains(out, "~/workspace/other") {
+		t.Fatalf("agents paths add failed: rc=%d out=%q err=%q", rc, out, errStr)
+	}
+
+	rc, out, errStr = runAgentCLI("agents", "paths", "rm", "~/workspace/other", "--device", "mini", "--json")
+	if rc != 0 || !strings.Contains(out, `"deleted": true`) {
+		t.Fatalf("agents paths rm failed: rc=%d out=%q err=%q", rc, out, errStr)
+	}
+}

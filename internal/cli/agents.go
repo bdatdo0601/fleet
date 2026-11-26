@@ -41,6 +41,7 @@ func agentsUsageText() string {
 Discovery & Inspection:
   ls       [--device D] [--repo R] [--harness H] [--state S] [--waiting] [--all] [--json]
   inspect  TARGET [--tail N] [--json]
+  paths    [add|rm PATH] [--device D] [--repo R] [--q TEXT] [--json]
 
 Peer Messaging:
   send     TO [MESSAGE...] [--message TEXT] [--stdin] [--session SID] [--thread ID] [--reply-to ID] [--json]
@@ -1116,6 +1117,8 @@ func cmdAgents(args []string, cio *IO) error {
 			return cmdAgentsList(args[1:], cio)
 		case "inspect":
 			return cmdAgentsInspect(args[1:], cio)
+		case "paths":
+			return cmdAgentsPaths(args[1:], cio)
 		case "send":
 			return cmdAgentsSend(args[1:], cio)
 		case "inbox":
@@ -1139,4 +1142,136 @@ func cmdAgents(args []string, cio *IO) error {
 		}
 	}
 	return cmdAgentsList(args, cio)
+}
+
+func cmdAgentsPathsList(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("agents paths", flag.ContinueOnError)
+	device := fs.String("device", "", "filter by fleet device name")
+	query := fs.String("q", "", "filter by path, repo, or device substring")
+	jsonOut := fs.Bool("json", false, "output JSON")
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf("usage: fleet agents paths [--device D] [--q TEXT] [--json]")
+	}
+	api, err := client.ResolveAPI("")
+	if err != nil {
+		return err
+	}
+	q := url.Values{}
+	if *device != "" {
+		q.Set("device", *device)
+	}
+	if *query != "" {
+		q.Set("q", *query)
+	}
+	qs := ""
+	if enc := q.Encode(); enc != "" {
+		qs = "?" + enc
+	}
+	var resp struct {
+		Paths      []agents.TrackedPath `json:"paths"`
+		Repos      []string             `json:"repos"`
+		Workspaces map[string][]string  `json:"workspaces"`
+	}
+	if err := client.Call(api, http.MethodGet, "/v1/agents/paths"+qs, nil, 15*time.Second, nil, &resp); err != nil {
+		return err
+	}
+	if *jsonOut {
+		return writeJSONOut(cio.Stdout, resp)
+	}
+	if len(resp.Paths) == 0 {
+		cio.printf("no tracked directories or repos yet\n")
+		return nil
+	}
+	rows := [][]string{{"DEVICE", "REPO", "SUBPATH", "PATH", "USES", "SOURCE", "LAST SEEN"}}
+	for _, p := range resp.Paths {
+		ls := p.LastSeen
+		rows = append(rows, []string{
+			p.Device, cmp.Or(p.Repo, "-"), cmp.Or(p.Subpath, "-"), p.Path,
+			fmt.Sprintf("%d", p.UseCount), cmp.Or(p.Source, "-"), ago(&ls),
+		})
+	}
+	printTable(cio.Stdout, rows)
+	return nil
+}
+
+func cmdAgentsPathsAdd(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("agents paths add", flag.ContinueOnError)
+	device := fs.String("device", "", "target fleet device (defaults to local device)")
+	repo := fs.String("repo", "", "optional repository name")
+	jsonOut := fs.Bool("json", false, "output JSON")
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return fmt.Errorf("usage: fleet agents paths add PATH [--device D] [--repo R] [--json]")
+	}
+	api, err := client.ResolveAPI("")
+	if err != nil {
+		return err
+	}
+	var res map[string]any
+	if err := client.Call(api, http.MethodPost, "/v1/agents/paths", map[string]string{
+		"device": strings.TrimSpace(*device),
+		"path":   pos[0],
+		"repo":   strings.TrimSpace(*repo),
+	}, 15*time.Second, nil, &res); err != nil {
+		return err
+	}
+	if *jsonOut {
+		return writeJSONOut(cio.Stdout, res)
+	}
+	cio.printf("tracked %s:%s (repo=%s)\n", res["device"], res["path"], cmp.Or(fmt.Sprint(res["repo"]), "-"))
+	return nil
+}
+
+func cmdAgentsPathsRemove(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("agents paths rm", flag.ContinueOnError)
+	device := fs.String("device", "", "target fleet device (defaults to local device)")
+	jsonOut := fs.Bool("json", false, "output JSON")
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return fmt.Errorf("usage: fleet agents paths rm PATH [--device D] [--json]")
+	}
+	api, err := client.ResolveAPI("")
+	if err != nil {
+		return err
+	}
+	q := url.Values{"path": {pos[0]}}
+	if *device != "" {
+		q.Set("device", strings.TrimSpace(*device))
+	}
+	var res struct {
+		OK      bool `json:"ok"`
+		Deleted bool `json:"deleted"`
+	}
+	if err := client.Call(api, http.MethodDelete, "/v1/agents/paths?"+q.Encode(), nil, 15*time.Second, nil, &res); err != nil {
+		return err
+	}
+	if *jsonOut {
+		return writeJSONOut(cio.Stdout, res)
+	}
+	cio.printf("removed=%v\n", res.Deleted)
+	return nil
+}
+
+func cmdAgentsPaths(args []string, cio *IO) error {
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		switch args[0] {
+		case "add":
+			return cmdAgentsPathsAdd(args[1:], cio)
+		case "rm", "remove", "delete":
+			return cmdAgentsPathsRemove(args[1:], cio)
+		case "ls":
+			return cmdAgentsPathsList(args[1:], cio)
+		}
+	}
+	return cmdAgentsPathsList(args, cio)
 }

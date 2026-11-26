@@ -19,6 +19,8 @@ Use your session ID (`--session <id>`) from the `SessionStart` hook when calling
 - **Inspect a session (cwd, branch, pending prompt, recent tail):**
   `fleet agents inspect TARGET [--tail N] [--json]`
   (`TARGET` accepts friendly name, `device/name`, title, short ID, or full `session_id`.)
+- **List known directories and repos across devices (captured from heartbeats, spawns, and Slacker):**
+  `fleet agents paths [--device D] [--q TEXT] [--json]`
 
 ## Peer Messaging
 

@@ -5,6 +5,7 @@ import {
   closeModal,
   confirmDialog,
   el,
+  fetchPathsCatalog,
   makeCopyBtn,
   openModal,
   relTime,
@@ -1077,9 +1078,10 @@ export async function renderMemory(root, ctx, subRoute = "") {
 
   let scopes = ["global"];
   try {
-    const res = await api("GET", "/v1/memory/scopes");
-    if (res.scopes && res.scopes.length > 0) {
-      scopes = res.scopes;
+    const [res, cat] = await Promise.all([api("GET", "/v1/memory/scopes"), fetchPathsCatalog()]);
+    const set = new Set([...(res.scopes || []), ...(cat.repos || []).map((r) => `repo:${r}`)]);
+    if (set.size > 0) {
+      scopes = Array.from(set).sort();
     }
   } catch {
     // fallback to global

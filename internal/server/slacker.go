@@ -14,11 +14,37 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bdatdo0601/fleet/internal/agents"
 	"github.com/bdatdo0601/fleet/internal/core"
 	"github.com/bdatdo0601/fleet/internal/registry"
 	"github.com/bdatdo0601/fleet/internal/session"
 	"github.com/bdatdo0601/fleet/internal/slacker"
 )
+
+func recordSlackerConfigPaths(fleet *core.Fleet, cfg slacker.Config) {
+	if fleet.Agents == nil {
+		return
+	}
+	for dev, dc := range cfg.Devices {
+		if dc.WorkspaceDir != "" {
+			_ = fleet.Agents.RecordPath(dev, dc.WorkspaceDir, "", "slacker_config", false)
+		}
+	}
+	for _, ch := range cfg.Channels {
+		for _, dev := range cfg.EffectiveChannelDevices(ch) {
+			if resolved, err := cfg.ResolveRepoPath(dev, ch.RepoPath); err == nil && resolved != "" {
+				_ = fleet.Agents.RecordPath(dev, resolved, agents.RepoNameFromPath(resolved), "slacker_config", false)
+			}
+		}
+	}
+}
+
+func recordSlackerJobPath(fleet *core.Fleet, job slacker.Job, bump bool) {
+	if fleet.Agents == nil || job.RepoPath == "" || job.Reaction == "kill" || job.Reaction == "kill-all" {
+		return
+	}
+	_ = fleet.Agents.RecordPath(job.TargetDevice, job.RepoPath, agents.RepoNameFromPath(job.RepoPath), "slacker_job", bump)
+}
 
 func buildSlackerSummary(fleet *core.Fleet) map[string]any {
 	cfg, err := slacker.LoadConfig(fleet.SlackerConfigPath)
@@ -196,6 +222,7 @@ func registerSlackerAdminRoutes(
 		if err := slacker.SaveConfig(fleet.SlackerConfigPath, next); err != nil {
 			return err
 		}
+		recordSlackerConfigPaths(fleet, next)
 		writeJSON(w, http.StatusOK, map[string]any{"config": next.View()})
 		return nil
 	}))
@@ -313,6 +340,9 @@ func registerSlackerWorkerRoutes(
 			}
 			return err
 		}
+		if job != nil {
+			recordSlackerJobPath(fleet, *job, false)
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"job": job, "device": c.Name})
 		return nil
 	}))
@@ -325,6 +355,9 @@ func registerSlackerWorkerRoutes(
 		job, err := fleet.Slacker.RecordReceipt(c.Name, rec)
 		if err != nil {
 			return err
+		}
+		if rec.Status == "launched" {
+			recordSlackerJobPath(fleet, job, true)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"job": job})
 		return nil
@@ -616,6 +649,9 @@ func handleAgentSpawn(fleet *core.Fleet, spawnMu *sync.Mutex) func(http.Response
 		}
 		if inserted {
 			_ = fleet.Slacker.SetLastDevice(scope, targetDevice)
+			if fleet.Agents != nil && resolvedRepo != "" {
+				_ = fleet.Agents.RecordPath(targetDevice, resolvedRepo, agents.RepoNameFromPath(resolvedRepo), "spawn", true)
+			}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"job":           job,
