@@ -39,6 +39,7 @@ import (
 	"github.com/bdatdo0601/fleet/internal/pki"
 	"github.com/bdatdo0601/fleet/internal/server"
 	"github.com/bdatdo0601/fleet/internal/system"
+	"github.com/bdatdo0601/fleet/internal/usage"
 	"github.com/bdatdo0601/fleet/internal/version"
 	"github.com/bdatdo0601/fleet/internal/waiter"
 )
@@ -1052,6 +1053,21 @@ func cmdSync(args []string, cio *IO) error {
 		return err
 	}
 	harvestSyncedOwnerMemories(cio, stamp, node)
+	if node.Owner != "" {
+		if restarted, rErr := system.RestartStaleUserAgent(node.Owner, paths.SlackerWorkerLabel, paths.InstalledBinaryPath()); rErr != nil {
+			cio.printf("%s slacker-worker restart warning: %v\n", stamp, rErr)
+		} else if restarted {
+			cio.printf("%s restarted %s (binary updated)\n", stamp, paths.SlackerWorkerLabel)
+		}
+		if ownerHome := paths.HomeForUser(node.Owner); ownerHome != "" {
+			syncItems := usage.CollectAll(context.Background(), usage.CollectOpts{
+				Home:      ownerHome,
+				Device:    node.Name,
+				SkipCodex: true,
+			})
+			_ = usage.ReportToLighthouse(node.API, syncItems)
+		}
+	}
 	warnStaleMCPServers(cio, stamp+" warning", paths.InstalledBinaryPath())
 	return nil
 }
@@ -1306,21 +1322,29 @@ func cmdAgentsList(args []string, cio *IO) error {
 	}
 	if len(resp.Agents) == 0 {
 		cio.printf("no active agent sessions\n")
-		return nil
-	}
-	rows := [][]string{{"NAME", "DEVICE", "HARNESS", "REPO", "STATE", "LAST SEEN", "TITLE", "SESSION"}}
-	for _, ag := range resp.Agents {
-		repoLabel := ag.Repo
-		if ag.Repo != "" && ag.Branch != "" {
-			repoLabel = ag.Repo + "@" + ag.Branch
+	} else {
+		rows := [][]string{{"NAME", "DEVICE", "HARNESS", "REPO", "STATE", "LAST SEEN", "TITLE", "SESSION"}}
+		for _, ag := range resp.Agents {
+			repoLabel := ag.Repo
+			if ag.Repo != "" && ag.Branch != "" {
+				repoLabel = ag.Repo + "@" + ag.Branch
+			}
+			ls := ag.UpdatedAt
+			rows = append(rows, []string{
+				cmp.Or(ag.Name, "-"), ag.Device, ag.Harness, cmp.Or(repoLabel, "-"),
+				formatAgentState(ag), ago(&ls), formatAgentTitle(ag), ag.SessionID,
+			})
 		}
-		ls := ag.UpdatedAt
-		rows = append(rows, []string{
-			cmp.Or(ag.Name, "-"), ag.Device, ag.Harness, cmp.Or(repoLabel, "-"),
-			formatAgentState(ag), ago(&ls), formatAgentTitle(ag), ag.SessionID,
-		})
+		printTable(cio.Stdout, rows)
 	}
-	printTable(cio.Stdout, rows)
+	var uResp struct {
+		Usage []agents.HarnessUsage `json:"usage"`
+	}
+	if uErr := client.Call(api, "GET", "/v1/usage", nil, 3*time.Second, nil, &uResp); uErr == nil {
+		if footer := formatCompactUsageFooter(uResp.Usage); footer != "" {
+			cio.printf("\n%s\n", footer)
+		}
+	}
 	return nil
 }
 
@@ -1648,6 +1672,7 @@ Commands:
   ddns            (lighthouse) keep the public DNS name pointed at home
   status          show this machine's fleet status
   agents          list active AI agent sessions across the fleet
+  usage           show quota and usage status across claude, codex, and antigravity
   session         manage detached Claude, Antigravity (agy), and Codex sessions
   slacker         lighthouse Slack Socket Mode dispatcher & Mac task workers
   memory          manage shared fleet agent memory and LLM curation
@@ -1686,6 +1711,10 @@ func dispatchCommand(cmd string, rest []string, cio *IO) (bool, error) {
 		return true, cmdDDNS(rest, cio)
 	case "agents":
 		return true, cmdAgents(rest, cio)
+	case "usage":
+		return true, cmdUsage(rest, cio)
+	case "statusline":
+		return true, cmdStatusLine(rest, cio)
 	case "session":
 		return true, cmdSession(rest, cio)
 	case "slacker":

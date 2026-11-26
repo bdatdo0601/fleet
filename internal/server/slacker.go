@@ -5,9 +5,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -612,6 +614,186 @@ func registerAgentSpawnRoute(
 		writeJSON(w, http.StatusOK, map[string]any{
 			"job":           job,
 			"worker_online": workerOnline,
+		})
+		return nil
+	}))
+
+	mux.HandleFunc("POST /v1/agents/kill", route(false, func(w http.ResponseWriter, r *http.Request, caller *registry.Device) error {
+		var req struct {
+			SessionID string `json:"session_id"`
+		}
+		if err := readJSONBody(r, &req); err != nil {
+			return err
+		}
+		if strings.TrimSpace(req.SessionID) == "" {
+			return &core.FleetError{Msg: "session_id is required", Status: http.StatusBadRequest}
+		}
+		detail, err := fleet.Agents.GetSession(req.SessionID)
+		if err != nil {
+			return err
+		}
+		if !core.IsAdmin(caller) && detail.Device != caller.Name {
+			return &core.FleetError{Msg: fmt.Sprintf("%s cannot kill session on %s", caller.Name, detail.Device), Status: http.StatusForbidden}
+		}
+		sessHarness, ok := session.NormalizeHarness(detail.Harness)
+		if !ok {
+			sessHarness = detail.Harness
+		}
+		targetPayload, _ := json.Marshal(session.KillTarget{
+			SessionID: detail.SessionID,
+			Harness:   sessHarness,
+			Name:      detail.Name,
+			FullRawID: detail.FullRawID,
+			PID:       detail.PID,
+		})
+		onlineWorkers, _ := fleet.Slacker.OnlineWorkers(time.Now(), slacker.WorkerOnlineWindow)
+		callerName := "admin"
+		if caller != nil && caller.Name != "" {
+			callerName = caller.Name
+		}
+		_, job, err := fleet.Slacker.EnqueueJob(slacker.Job{
+			Account:      "ui",
+			EventID:      "ui-kill-" + randomHex(8),
+			ChannelName:  "web-ui",
+			Reaction:     "kill",
+			UserID:       callerName,
+			TargetDevice: detail.Device,
+			Harness:      sessHarness,
+			SessionName:  cmp.Or(detail.Name, detail.FullRawID, detail.SessionID),
+			Prompt:       string(targetPayload),
+		})
+		if err != nil {
+			return err
+		}
+		_ = fleet.Agents.DeregisterAny(detail.SessionID)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":            true,
+			"session_id":    detail.SessionID,
+			"device":        detail.Device,
+			"job":           job,
+			"worker_online": onlineWorkers[detail.Device],
+		})
+		return nil
+	}))
+
+	mux.HandleFunc("POST /v1/agents/kill-all", route(false, func(w http.ResponseWriter, r *http.Request, caller *registry.Device) error {
+		var req struct {
+			Harness string `json:"harness"`
+			Device  string `json:"device"`
+		}
+		if err := readJSONBody(r, &req); err != nil {
+			return err
+		}
+		rawHarness := strings.ToLower(strings.TrimSpace(req.Harness))
+		agentHarness := ""
+		sessHarness := "all"
+		if rawHarness != "" && rawHarness != "all" {
+			norm, ok := session.NormalizeHarness(rawHarness)
+			if !ok {
+				return &core.FleetError{Msg: fmt.Sprintf("unknown harness %q (expected claude, agy, codex, or all)", req.Harness), Status: http.StatusBadRequest}
+			}
+			sessHarness = norm
+			switch norm {
+			case session.HarnessAgy:
+				agentHarness = "antigravity"
+			default:
+				agentHarness = norm
+			}
+		}
+
+		targetDevice := strings.TrimSpace(req.Device)
+		if !core.IsAdmin(caller) {
+			if targetDevice != "" && targetDevice != caller.Name {
+				return &core.FleetError{Msg: fmt.Sprintf("%s cannot kill agents on %s", caller.Name, targetDevice), Status: http.StatusForbidden}
+			}
+			targetDevice = caller.Name
+		} else if targetDevice != "" {
+			activeDevs, aErr := fleet.ActiveDeviceNames()
+			if aErr != nil {
+				return aErr
+			}
+			if !activeDevs[targetDevice] {
+				return &core.FleetError{Msg: fmt.Sprintf("unknown or revoked device %q", targetDevice), Status: http.StatusBadRequest}
+			}
+		}
+
+		liveSessions, err := fleet.Agents.ListSessions(targetDevice, "", agentHarness, "", false)
+		if err != nil {
+			return err
+		}
+		targetsByDevice := map[string][]session.KillTarget{}
+		for _, s := range liveSessions {
+			h, ok := session.NormalizeHarness(s.Harness)
+			if !ok {
+				h = s.Harness
+			}
+			targetsByDevice[s.Device] = append(targetsByDevice[s.Device], session.KillTarget{
+				SessionID: s.SessionID,
+				Harness:   h,
+				Name:      s.Name,
+				FullRawID: s.FullRawID,
+				PID:       s.PID,
+			})
+		}
+
+		onlineWorkers, _ := fleet.Slacker.OnlineWorkers(time.Now(), slacker.WorkerOnlineWindow)
+		var targetDevices []string
+		if targetDevice != "" {
+			targetDevices = []string{targetDevice}
+		} else {
+			devSet := map[string]bool{}
+			for d := range targetsByDevice {
+				devSet[d] = true
+			}
+			for d, online := range onlineWorkers {
+				if online {
+					devSet[d] = true
+				}
+			}
+			for d := range devSet {
+				targetDevices = append(targetDevices, d)
+			}
+			slices.Sort(targetDevices)
+		}
+
+		callerName := "admin"
+		if caller != nil && caller.Name != "" {
+			callerName = caller.Name
+		}
+		var jobs []slacker.Job
+		var offlineDevices []string
+		for _, dev := range targetDevices {
+			targetsJSON, _ := json.Marshal(targetsByDevice[dev])
+			_, job, jErr := fleet.Slacker.EnqueueJob(slacker.Job{
+				Account:      "ui",
+				EventID:      "ui-killall-" + dev + "-" + randomHex(6),
+				ChannelName:  "web-ui",
+				Reaction:     "kill-all",
+				UserID:       callerName,
+				TargetDevice: dev,
+				Harness:      sessHarness,
+				SessionName:  "kill-all-" + sessHarness,
+				Prompt:       string(targetsJSON),
+			})
+			if jErr != nil {
+				return jErr
+			}
+			jobs = append(jobs, job)
+			if !onlineWorkers[dev] {
+				offlineDevices = append(offlineDevices, dev)
+			}
+		}
+		for _, s := range liveSessions {
+			_ = fleet.Agents.DeregisterAny(s.SessionID)
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":              true,
+			"harness":         cmp.Or(agentHarness, "all"),
+			"deregistered":    len(liveSessions),
+			"devices":         targetDevices,
+			"offline_devices": offlineDevices,
+			"jobs":            jobs,
 		})
 		return nil
 	}))

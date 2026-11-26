@@ -13,6 +13,7 @@ import (
 
 	"github.com/bdatdo0601/fleet/internal/agents"
 	"github.com/bdatdo0601/fleet/internal/client"
+	"github.com/bdatdo0601/fleet/internal/usage"
 )
 
 // RelayOpts configures RunAntigravityRelay.
@@ -118,6 +119,10 @@ func RunAntigravityRelay(ctx context.Context, opts RelayOpts) (int, error) {
 		return 1, err
 	}
 	defer releasePIDLock(lockPath)
+
+	if opts.RunSendFn == nil && os.Getenv("FLEET_DISABLE_USAGE_REPORTER") != "1" {
+		usage.StartPeriodicReporter(ctx, 10*time.Minute, api)
+	}
 
 	backedOff := map[string]time.Time{}
 	backoff := 2.0

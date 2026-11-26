@@ -489,6 +489,55 @@ func registerAgentMessageRoutes(
 	mux.HandleFunc("POST /v1/agents/rename", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
 		return handleAgentRename(w, r, fleet, c)
 	}))
+	mux.HandleFunc("GET /v1/usage", route(false, func(w http.ResponseWriter, _ *http.Request, _ *registry.Device) error {
+		list, err := fleet.Agents.ListUsage()
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"usage": list})
+		return nil
+	}))
+	mux.HandleFunc("POST /v1/usage", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
+		return handleUsagePost(w, r, fleet, c.Name)
+	}))
+}
+
+func handleUsagePost(w http.ResponseWriter, r *http.Request, fleet *core.Fleet, dev string) error {
+	var raw json.RawMessage
+	if err := readJSONBody(r, &raw); err != nil {
+		return err
+	}
+	var batch struct {
+		Usage []agents.HarnessUsage `json:"usage"`
+	}
+	if err := json.Unmarshal(raw, &batch); err != nil {
+		return &core.FleetError{Msg: "invalid usage JSON", Status: http.StatusBadRequest}
+	}
+	items := batch.Usage
+	if items == nil {
+		var single agents.HarnessUsage
+		if err := json.Unmarshal(raw, &single); err != nil {
+			return &core.FleetError{Msg: "invalid usage JSON", Status: http.StatusBadRequest}
+		}
+		if single.Harness == "" {
+			return &core.FleetError{Msg: "harness or usage list is required", Status: http.StatusBadRequest}
+		}
+		items = []agents.HarnessUsage{single}
+	}
+	for _, u := range items {
+		if u.Device == "" {
+			u.Device = dev
+		}
+		if _, err := fleet.Agents.UpsertUsage(u); err != nil {
+			return err
+		}
+	}
+	list, err := fleet.Agents.ListUsage()
+	if err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"usage": list})
+	return nil
 }
 
 func handleAgentMessagesPost(w http.ResponseWriter, r *http.Request, fleet *core.Fleet, dev string) error {

@@ -46,7 +46,7 @@ Agent Read & Send:
 
 Runtime:
   listen                                run the lighthouse Slack Socket Mode listener(s)
-  worker    [--once] [--poll-timeout S] [--use-tmux] [--policy bypass|auto|safe]
+  worker    [--once] [--poll-timeout S] [--use-tmux] [--policy auto|bypass|safe]
                                         pull and run jobs for this Mac as logged-in user
 
 Jobs & Services:
@@ -395,7 +395,7 @@ func printSlackerConfig(cio *IO, cfg slacker.ConfigView) {
 	}
 	cio.printf("default_routing: strategy=%s policy=%s devices=%s\n",
 		cmp.Or(cfg.DefaultStrategy, slacker.StrategyLeastAgents),
-		cmp.Or(cfg.DefaultPolicy, string(session.PolicyBypass)),
+		cmp.Or(cfg.DefaultPolicy, string(session.PolicyAuto)),
 		defDevs)
 	cio.printf("workspaces:      %d\n", len(cfg.Devices))
 	for _, dev := range slices.Sorted(maps.Keys(cfg.Devices)) {
@@ -479,13 +479,13 @@ func cmdSlackerMap(args []string, cio *IO) error {
 		devicesFlag := fs.String("devices", "", "comma-separated default devices")
 		clearDevices := fs.Bool("clear-devices", false, "clear default devices")
 		strategyFlag := fs.String("strategy", "", "default routing strategy (least_agents|round_robin)")
-		policyFlag := fs.String("policy", "", "default permission policy (bypass|auto|safe)")
+		policyFlag := fs.String("policy", "", "default permission policy (auto|bypass|safe)")
 		pos, pErr := parseFlagsInterspersed(fs, args[1:])
 		if pErr != nil {
 			return pErr
 		}
 		if len(pos) > 0 || (*devicesFlag == "" && !*clearDevices && *strategyFlag == "" && *policyFlag == "") {
-			return fmt.Errorf("usage: fleet slacker map default [--devices D1,D2] [--clear-devices] [--strategy least_agents|round_robin] [--policy bypass|auto|safe]")
+			return fmt.Errorf("usage: fleet slacker map default [--devices D1,D2] [--clear-devices] [--strategy least_agents|round_robin] [--policy auto|bypass|safe]")
 		}
 		if *clearDevices {
 			payload["default_devices"] = []string{}
@@ -515,7 +515,7 @@ func cmdSlackerMap(args []string, cio *IO) error {
 		accountFlag := fs.String("account", slacker.DefaultAccountID, "Slack account ID")
 		devicesFlag := fs.String("devices", "", "comma-separated target devices (defaults to global default_devices when omitted)")
 		strategyFlag := fs.String("strategy", "", "routing strategy override (least_agents|round_robin)")
-		policyFlag := fs.String("policy", "", "permission policy override (bypass|auto|safe)")
+		policyFlag := fs.String("policy", "", "permission policy override (auto|bypass|safe)")
 		repoFlag := fs.String("repo", "", "repo path or subpath relative to machine workspace_dir")
 		chName := fs.String("name", "", "optional Slack channel name label")
 		useTmux := fs.Bool("tmux", false, "force tmux for this channel")
@@ -532,7 +532,7 @@ func cmdSlackerMap(args []string, cio *IO) error {
 			delete(cfg.Channels, slacker.ChannelKey(acctID, pos[1]))
 		} else {
 			if len(pos) < 1 || len(pos) > 3 {
-				return fmt.Errorf("usage: fleet slacker map channel [--account ID] CHANNEL_ID [DEVICE[,DEVICE2...]] [REPO_PATH] [--devices D1,D2] [--strategy least_agents|round_robin] [--policy bypass|auto|safe] [--repo PATH] [--name NAME] [--tmux] | rm [--account ID] CHANNEL_ID")
+				return fmt.Errorf("usage: fleet slacker map channel [--account ID] CHANNEL_ID [DEVICE[,DEVICE2...]] [REPO_PATH] [--devices D1,D2] [--strategy least_agents|round_robin] [--policy auto|bypass|safe] [--repo PATH] [--name NAME] [--tmux] | rm [--account ID] CHANNEL_ID")
 			}
 			var devs []string
 			if len(pos) >= 2 {
@@ -673,15 +673,15 @@ func cmdSlackerWorker(args []string, cio *IO) error {
 	once := fs.Bool("once", false, "poll once and exit")
 	pollTimeout := fs.Float64("poll-timeout", 30.0, "long-poll seconds per request")
 	useTmux := fs.Bool("use-tmux", false, "force tmux for launched sessions")
-	policyFlag := fs.String("policy", "", "fallback permission policy when job policy is unset (bypass|auto|safe)")
+	policyFlag := fs.String("policy", "", "fallback permission policy when job policy is unset (auto|bypass|safe)")
 	pos, err := parseFlagsInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) > 0 {
-		return fmt.Errorf("usage: fleet slacker worker [--once] [--poll-timeout S] [--use-tmux] [--policy bypass|auto|safe]")
+		return fmt.Errorf("usage: fleet slacker worker [--once] [--poll-timeout S] [--use-tmux] [--policy auto|bypass|safe]")
 	}
-	pol, err := session.ParsePolicy(*policyFlag, session.PolicyBypass)
+	pol, err := session.ParsePolicy(*policyFlag, session.PolicyAuto)
 	if err != nil {
 		return err
 	}

@@ -401,7 +401,7 @@ func TestClaudeAndAgyAndCodexTmuxLifecycleAndUpgrade(t *testing.T) {
 	if rec.CWD != specialDir || !rec.TTY {
 		t.Fatalf("unexpected claude record: %+v", rec)
 	}
-	if !slices.Contains(rec.Args, "--dangerously-skip-permissions") || !slices.Contains(rec.Args, "--remote-control") {
+	if !slices.Contains(rec.Args, "--permission-mode") || !slices.Contains(rec.Args, "auto") || slices.Contains(rec.Args, "--dangerously-skip-permissions") || !slices.Contains(rec.Args, "--remote-control") {
 		t.Fatalf("unexpected claude args: %v", rec.Args)
 	}
 	if _, err := Start(StartOpts{Harness: "claude", Name: "alpha", Directory: specialDir, Stdout: &out, Stderr: &errBuf}); err == nil || !strings.Contains(err.Error(), "already exists") {
@@ -429,7 +429,7 @@ func TestClaudeAndAgyAndCodexTmuxLifecycleAndUpgrade(t *testing.T) {
 	}
 	se.waitTmuxReady("agy", "beta")
 	agyRec := se.readRecord("agy", "beta")
-	if !slices.Equal(agyRec.Args, []string{"--dangerously-skip-permissions", "--remote-control"}) {
+	if !slices.Equal(agyRec.Args, []string{"--mode", "auto", "--remote-control"}) {
 		t.Fatalf("unexpected agy args: %v", agyRec.Args)
 	}
 
@@ -438,7 +438,7 @@ func TestClaudeAndAgyAndCodexTmuxLifecycleAndUpgrade(t *testing.T) {
 	}
 	se.waitTmuxReady("codex", "gamma")
 	cdxRec := se.readRecord("codex", "gamma")
-	if !slices.Equal(cdxRec.Args, []string{"--dangerously-bypass-approvals-and-sandbox"}) {
+	if !slices.Equal(cdxRec.Args, []string{"--approve-for-me"}) {
 		t.Fatalf("unexpected codex args: %v", cdxRec.Args)
 	}
 	if _, err := os.Stat(filepath.Join(se.base, "codex-rc.json")); err != nil {
@@ -908,37 +908,97 @@ exit 1
 }
 
 func TestAutoAndBypassPoliciesAcrossHarnesses(t *testing.T) {
-	if pol, err := ParsePolicy("auto", PolicyBypass); err != nil || pol != PolicyAuto {
-		t.Fatalf("ParsePolicy(auto) = (%q, %v)", pol, err)
+	if pol, err := ParsePolicy("", PolicyAuto); err != nil || pol != PolicyAuto {
+		t.Fatalf("ParsePolicy('') = (%q, %v)", pol, err)
 	}
-	if _, err := ParsePolicy("bogus", PolicyBypass); err == nil {
+	if pol, err := ParsePolicy("bypass", PolicyAuto); err != nil || pol != PolicyBypass {
+		t.Fatalf("ParsePolicy(bypass) = (%q, %v)", pol, err)
+	}
+	if _, err := ParsePolicy("bogus", PolicyAuto); err == nil {
 		t.Fatal("expected ParsePolicy(bogus) to fail")
 	}
 
 	cSpec, _ := GetSpec(HarnessClaude)
-	cAuto, err := BuildHarnessArgs(cSpec, "s1", "/bin/fleet", "", "fix", PolicyAuto)
+	cAuto, err := BuildHarnessArgs(cSpec, "s1", "/bin/fleet", "", "fix", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Contains(cAuto, "--permission-mode") || !slices.Contains(cAuto, "auto") || slices.Contains(cAuto, "--dangerously-skip-permissions") {
-		t.Fatalf("unexpected claude auto args: %v", cAuto)
+		t.Fatalf("unexpected claude default auto args: %v", cAuto)
+	}
+	cBypass, err := BuildHarnessArgs(cSpec, "s1", "/bin/fleet", "", "fix", PolicyBypass)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(cBypass, "--dangerously-skip-permissions") || slices.Contains(cBypass, "--permission-mode") {
+		t.Fatalf("unexpected claude bypass args: %v", cBypass)
 	}
 
 	aSpec, _ := GetSpec(HarnessAgy)
-	aAuto, err := BuildHarnessArgs(aSpec, "s2", "/bin/fleet", "", "fix", PolicyAuto)
+	aAuto, err := BuildHarnessArgs(aSpec, "s2", "/bin/fleet", "", "fix", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Equal(aAuto, []string{"--mode", "auto", "--remote-control", "--prompt-interactive", "fix"}) {
-		t.Fatalf("unexpected agy auto args: %v", aAuto)
+		t.Fatalf("unexpected agy default auto args: %v", aAuto)
+	}
+	aBypass, err := BuildHarnessArgs(aSpec, "s2", "/bin/fleet", "", "fix", PolicyBypass)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(aBypass, []string{"--dangerously-skip-permissions", "--remote-control", "--prompt-interactive", "fix"}) {
+		t.Fatalf("unexpected agy bypass args: %v", aBypass)
 	}
 
 	xSpec, _ := GetSpec(HarnessCodex)
-	xAuto, err := BuildHarnessArgs(xSpec, "s3", "/bin/fleet", "", "fix", PolicyAuto)
+	xAuto, err := BuildHarnessArgs(xSpec, "s3", "/bin/fleet", "", "fix", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Equal(xAuto, []string{"--approve-for-me", "--", "fix"}) {
-		t.Fatalf("unexpected codex auto args: %v", xAuto)
+		t.Fatalf("unexpected codex default auto args: %v", xAuto)
+	}
+	xBypass, err := BuildHarnessArgs(xSpec, "s3", "/bin/fleet", "", "fix", PolicyBypass)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(xBypass, []string{"--dangerously-bypass-approvals-and-sandbox", "--", "fix"}) {
+		t.Fatalf("unexpected codex bypass args: %v", xBypass)
+	}
+}
+
+func TestKillAgentArchivesAgyAppByRawID(t *testing.T) {
+	se := newSessionEnv(t)
+	daemonDir := filepath.Join(se.base, ".gemini", "antigravity", "daemon")
+	if err := os.MkdirAll(daemonDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const convID = "33333333-3333-4333-8333-000000000001"
+	archived := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/product.v1.ConversationService/UpdateConversation" {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["conversationId"] == convID && body["annotations"].(map[string]any)["archived"] == true {
+				archived = true
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": convID})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+
+	u, _ := url.Parse(srv.URL)
+	port, _ := strconv.Atoi(u.Port())
+	hubBytes, _ := json.Marshal(agyHubInfo{PID: os.Getpid(), HTTPPort: port, CSRFToken: "kill-csrf"})
+	_ = os.WriteFile(filepath.Join(daemonDir, fmt.Sprintf("hub_%d.json", port)), hubBytes, 0o600)
+
+	var out, errBuf bytes.Buffer
+	if err := KillAgent(KillTarget{Harness: "antigravity", FullRawID: convID}, &out, &errBuf); err != nil {
+		t.Fatal(err)
+	}
+	if !archived || !strings.Contains(out.String(), convID) {
+		t.Fatalf("expected KillAgent to archive %s, archived=%v out=%q", convID, archived, out.String())
 	}
 }

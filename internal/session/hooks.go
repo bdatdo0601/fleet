@@ -151,7 +151,7 @@ func RecordHookState(harness, rawID, cwd, transcript string) {
 			return
 		}
 	}
-	policy := cmp.Or(os.Getenv("FLEET_SESSION_POLICY"), string(PolicyBypass))
+	policy := cmp.Or(os.Getenv("FLEET_SESSION_POLICY"), string(PolicyAuto))
 
 	switch target {
 	case "tmux":

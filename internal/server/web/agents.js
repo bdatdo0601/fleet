@@ -12,6 +12,7 @@ import {
   state,
   toast,
 } from "./lib.js";
+import { renderUsageCard } from "./usage.js";
 
 const agentsFilter = {
   tab: "sessions", // sessions | messages
@@ -195,7 +196,7 @@ export async function openSpawnSessionModal(onSpawned = null) {
   const devices = (devicesRes.devices || []).filter((d) => !d.revoked_at && d.kind !== "mobile").map((d) => d.name);
   const defaultDevices = Array.isArray(cfg.default_devices) ? cfg.default_devices : [];
   const globalStrategyLabel = (cfg.default_strategy || "least_agents") === "round_robin" ? "round-robin" : "least agents";
-  const globalPolicyLabel = cfg.default_policy || "bypass";
+  const globalPolicyLabel = cfg.default_policy || "auto";
   const wsHints = Object.entries(cfg.devices || {})
     .filter(([, dc]) => dc && dc.workspace_dir)
     .sort(([a], [b]) => a.localeCompare(b))
@@ -212,8 +213,8 @@ export async function openSpawnSessionModal(onSpawned = null) {
     "select",
     null,
     el("option", { value: "", text: `Default (${globalPolicyLabel})` }),
-    el("option", { value: "bypass", text: "Bypass (skip permissions)" }),
     el("option", { value: "auto", text: "Auto" }),
+    el("option", { value: "bypass", text: "Bypass (skip permissions)" }),
     el("option", { value: "safe", text: "Safe (manual / plan)" }),
   );
   const stratSel = el(
@@ -378,19 +379,51 @@ async function renameSessionPrompt(ag, onDone) {
   openModal(`Rename ${ag.session_id}`, form);
 }
 
-async function deregisterSession(ag, onDone) {
+async function killSession(ag, onDone) {
   const ok = await confirmDialog(
-    "Mark Session Exited?",
-    `Mark ${ag.name || ag.session_id} as exited and wake any active listeners?`,
-    "Mark Exited",
+    "Kill Agent Session?",
+    `Terminate ${ag.name || ag.session_id} (${ag.harness}) on ${ag.device} and mark it exited?`,
+    "Kill Session",
     true,
   );
   if (!ok) {
     return;
   }
   try {
-    await api("POST", "/v1/agents/deregister", { session_id: ag.session_id });
-    toast(`Marked ${ag.name || ag.session_id} exited`, "ok");
+    const res = await api("POST", "/v1/agents/kill", { session_id: ag.session_id });
+    toast(
+      res.worker_online
+        ? `Kill queued for ${ag.name || ag.session_id} on ${ag.device}`
+        : `Kill queued for ${ag.name || ag.session_id} on ${ag.device} (worker offline, will run when connected)`,
+      res.worker_online ? "ok" : "warn",
+    );
+    onDone();
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+async function killAllAgents(harness, label, deviceFilter, liveCount, onDone) {
+  const scopeDev = deviceFilter ? `on ${deviceFilter}` : state.isAdmin ? "across all devices" : `on ${state.caller ? state.caller.name : "this device"}`;
+  const countTxt = liveCount > 0 ? ` (${liveCount} live)` : "";
+  const ok = await confirmDialog(
+    `Kill ${label}?`,
+    `Terminate ${label.toLowerCase()} ${scopeDev}${countTxt}?`,
+    `Kill ${label}`,
+    true,
+  );
+  if (!ok) {
+    return;
+  }
+  try {
+    const res = await api("POST", "/v1/agents/kill-all", { harness, device: deviceFilter || "" });
+    const devs = (res.devices || []).join(", ") || "none";
+    const off = res.offline_devices || [];
+    const msg =
+      off.length > 0
+        ? `Killed ${res.deregistered || 0} ${label.toLowerCase()} (queued for ${devs}; offline: ${off.join(", ")})`
+        : `Killed ${res.deregistered || 0} ${label.toLowerCase()} (dispatched to ${devs})`;
+    toast(msg, off.length > 0 ? "warn" : "ok");
     onDone();
   } catch (err) {
     toast(err.message, "error");
@@ -493,8 +526,8 @@ export async function openAgentInspectModal(sessionID, onDone) {
         ? el("button", {
             type: "button",
             className: "btn btn-sm btn-danger",
-            text: "Mark Exited",
-            onclick: () => deregisterSession(detail, () => {
+            text: "Kill Session",
+            onclick: () => killSession(detail, () => {
               closeModal();
               if (onDone) {
                 onDone();
@@ -632,6 +665,48 @@ function renderSessionsView(root, sessions, ctx) {
     },
   });
 
+  const liveByHarness = { claude: 0, codex: 0, antigravity: 0 };
+  let totalLiveForScope = 0;
+  const scopeDevice = state.isAdmin ? agentsFilter.device : state.caller ? state.caller.name : "";
+  for (const s of sessions) {
+    if (!s.live) {
+      continue;
+    }
+    if (scopeDevice && s.device !== scopeDevice) {
+      continue;
+    }
+    totalLiveForScope++;
+    if (s.harness in liveByHarness) {
+      liveByHarness[s.harness]++;
+    }
+  }
+
+  const killControls = el(
+    "div",
+    { className: "actions-row mb-3" },
+    el("span", { className: "small muted", text: scopeDevice ? `Actions (${scopeDevice}):` : "Actions (all devices):" }),
+    ...[
+      ["claude", "Claude", liveByHarness.claude],
+      ["codex", "Codex", liveByHarness.codex],
+      ["antigravity", "Antigravity", liveByHarness.antigravity],
+    ].map(([h, label, cnt]) =>
+      el("button", {
+        type: "button",
+        className: "btn btn-sm",
+        text: cnt > 0 ? `Kill ${label} (${cnt})` : `Kill ${label}`,
+        onclick: () => killAllAgents(h, `${label} Agents`, scopeDevice, cnt, () => ctx.refresh()),
+      }),
+    ),
+    el("button", {
+      type: "button",
+      className: "btn btn-sm btn-danger",
+      text: totalLiveForScope > 0 ? `Kill All Agents (${totalLiveForScope})` : "Kill All Agents",
+      onclick: () => killAllAgents("all", "All Agents", scopeDevice, totalLiveForScope, () => ctx.refresh()),
+    }),
+  );
+
+  root.appendChild(renderUsageCard((state.overview && state.overview.usage) || []));
+  root.appendChild(killControls);
   root.appendChild(el("div", { className: "toolbar" }, el("div", { className: "chips-row" }, chips), devSel, harSel, el("div", { className: "toolbar-spacer" }), queryInput));
   root.appendChild(tableContainer);
 
@@ -714,10 +789,10 @@ function renderSessionsView(root, sessions, ctx) {
             el("button", {
               type: "button",
               className: "btn btn-sm btn-danger",
-              text: "Exit",
+              text: "Kill",
               onclick: (ev) => {
                 ev.stopPropagation();
-                deregisterSession(ag, () => ctx.refresh());
+                killSession(ag, () => ctx.refresh());
               },
             }),
           );

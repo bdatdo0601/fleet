@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bdatdo0601/fleet/internal/core"
 	"github.com/bdatdo0601/fleet/internal/paths"
@@ -177,5 +178,42 @@ func TestSelfUpdateLighthouseRollbackAndManifestPublish(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(binDir, "manifest.json")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestParseLaunchctlPIDAndProcessStartTime(t *testing.T) {
+	sample := `
+gui/501/io.github.bdatdo0601.fleet.slacker-worker = {
+	active count = 1
+	state = running
+	pid = 7015
+}
+`
+	if got := parseLaunchctlPID(sample); got != 7015 {
+		t.Fatalf("parseLaunchctlPID = %d, want 7015", got)
+	}
+	if got := parseLaunchctlPID("state = waiting\n"); got != 0 {
+		t.Fatalf("parseLaunchctlPID(no pid) = %d, want 0", got)
+	}
+
+	tsSingleDigit, err := parseProcessStartTime("Wed Nov  5 09:04:05 2026\n")
+	if err != nil {
+		t.Fatalf("parseProcessStartTime single digit failed: %v", err)
+	}
+	wantSingle := time.Date(2026, time.November, 5, 9, 4, 5, 0, time.Local)
+	if !tsSingleDigit.Equal(wantSingle) {
+		t.Fatalf("got %v, want %v", tsSingleDigit, wantSingle)
+	}
+
+	tsDoubleDigit, err := parseProcessStartTime("Wed Nov 25 21:40:54 2026")
+	if err != nil {
+		t.Fatalf("parseProcessStartTime double digit failed: %v", err)
+	}
+	wantDouble := time.Date(2026, time.November, 25, 21, 40, 54, 0, time.Local)
+	if !tsDoubleDigit.Equal(wantDouble) {
+		t.Fatalf("got %v, want %v", tsDoubleDigit, wantDouble)
+	}
+	if _, err := parseProcessStartTime("   "); err == nil {
+		t.Fatal("expected parseProcessStartTime(empty) to fail")
 	}
 }

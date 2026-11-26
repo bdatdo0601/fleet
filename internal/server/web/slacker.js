@@ -220,12 +220,12 @@ function renderMachinesCard(cfg, statusRes, knownDevices, ctx) {
     el("option", { value: "least_agents", text: "Least agents (round-robin tie-break)", selected: defaultStrategy === "least_agents" }),
     el("option", { value: "round_robin", text: "Round-robin", selected: defaultStrategy === "round_robin" }),
   );
-  let defaultPolicy = cfg.default_policy || "bypass";
+  let defaultPolicy = cfg.default_policy || "auto";
   const policySel = el(
     "select",
     { onchange: (e) => { defaultPolicy = e.target.value; } },
-    el("option", { value: "bypass", text: "Bypass (skip permissions)", selected: defaultPolicy === "bypass" }),
     el("option", { value: "auto", text: "Auto", selected: defaultPolicy === "auto" }),
+    el("option", { value: "bypass", text: "Bypass (skip permissions)", selected: defaultPolicy === "bypass" }),
     el("option", { value: "safe", text: "Safe (manual / plan)", selected: defaultPolicy === "safe" }),
   );
 
@@ -356,7 +356,7 @@ export async function renderSlacker(root, ctx) {
   const devices = (devicesRes.devices || []).filter((d) => !d.revoked_at && d.kind !== "mobile").map((d) => d.name);
   const defaultDevices = Array.isArray(cfg.default_devices) ? cfg.default_devices : [];
   const globalStrategyLabel = (cfg.default_strategy || "least_agents") === "round_robin" ? "round-robin" : "least agents";
-  const globalPolicyLabel = cfg.default_policy || "bypass";
+  const globalPolicyLabel = cfg.default_policy || "auto";
 
   const channels = Object.values(cfg.channels || {}).map((c) => {
     const chDevs = Array.isArray(c.devices) && c.devices.length > 0 ? [...c.devices] : c.device ? [c.device] : [];
@@ -439,8 +439,8 @@ export async function renderSlacker(root, ctx) {
         "select",
         { onchange: (e) => { ch.policy = e.target.value; } },
         el("option", { value: "", text: `Policy: Default (${globalPolicyLabel})`, selected: !ch.policy }),
-        el("option", { value: "bypass", text: "Bypass", selected: ch.policy === "bypass" }),
         el("option", { value: "auto", text: "Auto", selected: ch.policy === "auto" }),
+        el("option", { value: "bypass", text: "Bypass", selected: ch.policy === "bypass" }),
         el("option", { value: "safe", text: "Safe", selected: ch.policy === "safe" }),
       );
       const repoIn = el("input", { type: "text", value: ch.repo_path || "", placeholder: "subpath (e.g. fleet), blank=workspace, or ~/path", oninput: (e) => { ch.repo_path = e.target.value; } });

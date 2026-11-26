@@ -15,7 +15,10 @@ import (
 	"github.com/bdatdo0601/fleet/internal/paths"
 )
 
-const hookMarker = "agent-hook --harness "
+const (
+	hookMarker       = "agent-hook --harness "
+	statusLineMarker = " statusline claude"
+)
 
 var (
 	tomlHeaderRE = regexp.MustCompile(`^\s*\[[^\]]+\]\s*$`)
@@ -361,6 +364,7 @@ func Install(opts InstallOpts) ([]string, error) {
 					return false
 				}
 				upsertClaudeStyleHooks(h, "claude", cmdBin)
+				wrapClaudeStatusLine(d, cmdBin)
 				if _, exists := d["crossSessionInbound"]; !exists {
 					d["crossSessionInbound"] = "accept"
 				}
@@ -444,6 +448,75 @@ func Install(opts InstallOpts) ([]string, error) {
 	return append(changed, edited...), nil
 }
 
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+func shellUnquote(s string) string {
+	t := strings.TrimSpace(s)
+	if len(t) >= 2 && t[0] == '\'' && t[len(t)-1] == '\'' {
+		return strings.ReplaceAll(t[1:len(t)-1], `'\''`, "'")
+	}
+	if len(t) >= 2 && t[0] == '"' && t[len(t)-1] == '"' {
+		var out string
+		if json.Unmarshal([]byte(t), &out) == nil {
+			return out
+		}
+	}
+	return t
+}
+
+func wrapClaudeStatusLine(d map[string]any, cmdBin string) {
+	sl, hasSL := d["statusLine"].(map[string]any)
+	if !hasSL {
+		if _, exists := d["statusLine"]; exists {
+			return
+		}
+		d["statusLine"] = map[string]any{
+			"type":    "command",
+			"command": cmdBin + statusLineMarker,
+		}
+		return
+	}
+	if _, hasType := sl["type"]; !hasType {
+		sl["type"] = "command"
+	}
+	origCmd, _ := sl["command"].(string)
+	if strings.Contains(origCmd, statusLineMarker) {
+		if _, tail, ok := strings.Cut(origCmd, statusLineMarker); ok {
+			sl["command"] = cmdBin + statusLineMarker + tail
+		}
+		return
+	}
+	if strings.TrimSpace(origCmd) != "" {
+		sl["command"] = cmdBin + statusLineMarker + " --wrap " + shellQuote(origCmd)
+	} else {
+		sl["command"] = cmdBin + statusLineMarker
+	}
+}
+
+func unwrapClaudeStatusLine(d map[string]any) bool {
+	sl, ok := d["statusLine"].(map[string]any)
+	if !ok {
+		return false
+	}
+	cmd, _ := sl["command"].(string)
+	if !strings.Contains(cmd, statusLineMarker) {
+		return false
+	}
+	_, tail, _ := strings.Cut(cmd, statusLineMarker)
+	tail = strings.TrimSpace(tail)
+	if rest, hasWrap := strings.CutPrefix(tail, "--wrap "); hasWrap {
+		sl["command"] = shellUnquote(rest)
+		return true
+	}
+	delete(d, "statusLine")
+	return true
+}
+
 func deleteFleetKey(root map[string]any, sub string) bool {
 	m := root
 	if sub != "" {
@@ -477,8 +550,14 @@ func Uninstall(home string) ([]string, error) {
 	edited, err := applyEdits(targetHome, nil, nil, false, []jsonEditSpec{
 		{".claude.json", func(d map[string]any) bool { return deleteFleetKey(d, "mcpServers") }},
 		{filepath.Join(".claude", "settings.json"), func(d map[string]any) bool {
-			h := subMap(d, "hooks", false)
-			return h != nil && removeClaudeStyleHooks(h, "claude")
+			changed := false
+			if h := subMap(d, "hooks", false); h != nil && removeClaudeStyleHooks(h, "claude") {
+				changed = true
+			}
+			if unwrapClaudeStatusLine(d) {
+				changed = true
+			}
+			return changed
 		}},
 		{filepath.Join(".codex", "hooks.json"), func(d map[string]any) bool {
 			h := subMap(d, "hooks", false)

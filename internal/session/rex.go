@@ -237,7 +237,7 @@ func RunRexWrapper(harness, name, resumeID string, policy Policy, promptFile, se
 	signal.Notify(sigCh, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGINT)
 	defer signal.Stop(sigCh)
 
-	pol := cmp.Or(policy, PolicyBypass)
+	pol := cmp.Or(policy, PolicyAuto)
 	prompt, err := readPromptFileIfSet(promptFile)
 	if err != nil {
 		return err

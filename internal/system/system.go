@@ -670,6 +670,69 @@ func UninstallUserAgent(label string) error {
 	return nil
 }
 
+func parseLaunchctlPID(out string) int {
+	for line := range strings.SplitSeq(out, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "pid = ") {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(trimmed, "pid = ")))
+		if err == nil && pid > 0 {
+			return pid
+		}
+	}
+	return 0
+}
+
+func parseProcessStartTime(raw string) (time.Time, error) {
+	s := strings.Join(strings.Fields(strings.TrimSpace(raw)), " ")
+	if s == "" {
+		return time.Time{}, fmt.Errorf("empty process start time")
+	}
+	return time.ParseInLocation("Mon Jan 2 15:04:05 2006", s, time.Local)
+}
+
+// RestartStaleUserAgent kickstarts gui/<uid>/<label> if it is running a process started before binPath's modtime.
+func RestartStaleUserAgent(owner, label, binPath string) (bool, error) {
+	if owner == "" || owner == "root" || label == "" || binPath == "" {
+		return false, nil
+	}
+	uid, _, err := paths.LookupUIDGID(owner)
+	if err != nil {
+		return false, nil
+	}
+	fi, err := os.Stat(binPath)
+	if err != nil {
+		return false, nil
+	}
+	target := fmt.Sprintf("gui/%d/%s", uid, label)
+	out, err := exec.Command("launchctl", "print", target).CombinedOutput()
+	if err != nil {
+		return false, nil
+	}
+	pid := parseLaunchctlPID(string(out))
+	if pid <= 0 {
+		return false, nil
+	}
+	psCmd := exec.Command("ps", "-o", "lstart=", "-p", strconv.Itoa(pid))
+	psCmd.Env = append(os.Environ(), "LC_ALL=C")
+	psOut, err := psCmd.CombinedOutput()
+	if err != nil {
+		return false, nil
+	}
+	procStart, err := parseProcessStartTime(string(psOut))
+	if err != nil {
+		return false, nil
+	}
+	if !procStart.Before(fi.ModTime()) {
+		return false, nil
+	}
+	if kOut, kErr := exec.Command("launchctl", "kickstart", "-k", target).CombinedOutput(); kErr != nil {
+		return false, fmt.Errorf("launchctl kickstart %s failed: %w (%s)", target, kErr, strings.TrimSpace(string(kOut)))
+	}
+	return true, nil
+}
+
 // PathOwner returns the username that owns path on disk.
 func PathOwner(p string) (string, error) {
 	fi, err := os.Stat(p)

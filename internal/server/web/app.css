@@ -847,6 +847,85 @@ tr.row-clickable:hover td {
   opacity: 0;
 }
 
+.usage-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 10px;
+}
+
+.usage-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 11px 12px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--surface-alt);
+}
+
+.usage-tile-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.usage-tile-body {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.usage-window {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.usage-window-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.usage-bar {
+  width: 100%;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.usage-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.2s ease;
+}
+
+.usage-bar-fill.fill-ok {
+  background: var(--ok-text);
+}
+
+.usage-bar-fill.fill-warn {
+  background: var(--warn-text);
+}
+
+.usage-bar-fill.fill-danger {
+  background: var(--danger);
+}
+
+.usage-metrics {
+  line-height: 1.35;
+}
+
+.usage-meta {
+  margin-top: auto;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+}
+
 @media (max-width: 768px) {
   .topbar {
     padding: 10px 12px;

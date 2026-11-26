@@ -12,11 +12,11 @@ import (
 func TestInstallPreservesExistingHandlesEmptyJSONAndUninstalls(t *testing.T) {
 	home := t.TempDir()
 
-	// Existing Claude configs
+	// Existing Claude configs (including custom statusLine)
 	_ = os.WriteFile(filepath.Join(home, ".claude.json"), []byte(`{"mcpServers":{"other":{"command":"x"}}}`), 0o644)
 	_ = os.MkdirAll(filepath.Join(home, ".claude"), 0o755)
 	_ = os.WriteFile(filepath.Join(home, ".claude", "settings.json"), []byte(
-		`{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"existing.sh"}]}]}}`,
+		`{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"existing.sh"}]}]},"statusLine":{"type":"command","command":"node \"/Users/x/.claude/hooks/gsd-statusline.js\""}}`,
 	), 0o644)
 
 	// Existing Codex configs
@@ -75,6 +75,10 @@ func TestInstallPreservesExistingHandlesEmptyJSONAndUninstalls(t *testing.T) {
 	if clSet["crossSessionInbound"] != "accept" {
 		t.Fatalf("expected crossSessionInbound=accept default, got %v", clSet["crossSessionInbound"])
 	}
+	clSL, _ := clSet["statusLine"].(map[string]any)
+	if cmd, _ := clSL["command"].(string); !strings.Contains(cmd, "/opt/homebrew/bin/fleet statusline claude --wrap ") || !strings.Contains(cmd, "gsd-statusline.js") {
+		t.Fatalf("expected wrapped statusLine command, got %+v", clSL)
+	}
 
 	cxTOMLBytes, _ := os.ReadFile(filepath.Join(home, ".codex", "config.toml"))
 	cxTOML := string(cxTOMLBytes)
@@ -90,6 +94,11 @@ func TestInstallPreservesExistingHandlesEmptyJSONAndUninstalls(t *testing.T) {
 	stAfter := Status(home)
 	if stAfter["claude"] || stAfter["codex"] || stAfter["antigravity"] {
 		t.Fatalf("expected all uninstalled, got %+v", stAfter)
+	}
+	clAfterSet, _ := loadJSON(filepath.Join(home, ".claude", "settings.json"))
+	clAfterSL, _ := clAfterSet["statusLine"].(map[string]any)
+	if clAfterSL["command"] != `node "/Users/x/.claude/hooks/gsd-statusline.js"` {
+		t.Fatalf("expected original statusLine command restored on uninstall, got %+v", clAfterSL)
 	}
 	clData, _ := os.ReadFile(filepath.Join(home, ".claude.json"))
 	var clParsed map[string]any

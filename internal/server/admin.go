@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bdatdo0601/fleet/internal/agents"
 	"github.com/bdatdo0601/fleet/internal/core"
 	"github.com/bdatdo0601/fleet/internal/ddns"
 	"github.com/bdatdo0601/fleet/internal/paths"
@@ -135,6 +136,10 @@ func buildOverviewPayload(fleet *core.Fleet, c *registry.Device, startedAt time.
 	if err != nil {
 		return nil, err
 	}
+	usageList, uErr := fleet.Agents.ListUsage()
+	if uErr != nil {
+		usageList = []agents.HarnessUsage{}
+	}
 	isAdmin := core.IsAdmin(c)
 	payload := map[string]any{
 		"caller": map[string]any{
@@ -157,6 +162,7 @@ func buildOverviewPayload(fleet *core.Fleet, c *registry.Device, startedAt time.
 			"mesh_cidr":      paths.MeshCIDR,
 		},
 		"agents":  agentSummary,
+		"usage":   usageList,
 		"memory":  memStats,
 		"curator": fleet.Curator.Status(),
 	}

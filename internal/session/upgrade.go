@@ -177,7 +177,7 @@ func collectTmuxUpgradeTargets(spec Spec) ([]*tmuxUpgradeTarget, error) {
 				return nil, fmt.Errorf("conversation tracking is not ready in %s. Attach to complete %s's startup prompts first", sess, spec.DisplayName)
 			}
 			pidInt, _ := strconv.Atoi(p.PID)
-			pol, _ := ParsePolicy(st.Policy, PolicyBypass)
+			pol, _ := ParsePolicy(st.Policy, PolicyAuto)
 			exitOpt := tmuxShowPaneOption(p.ID, spec.ExitOption)
 			if exitOpt == "" {
 				exitOpt, _ = tmuxDisplay(p.ID, "#{remain-on-exit}")

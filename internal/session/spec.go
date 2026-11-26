@@ -120,7 +120,7 @@ func ParsePolicy(raw string, def Policy) (Policy, error) {
 	case PolicyBypass, PolicyAuto, PolicySafe:
 		return Policy(p), nil
 	default:
-		return "", fmt.Errorf("invalid policy %q (expected bypass, auto, or safe)", raw)
+		return "", fmt.Errorf("invalid policy %q (expected auto, bypass, or safe)", raw)
 	}
 }
 
@@ -283,7 +283,7 @@ func buildClaudeSettingsJSON(selfBin string) (string, error) {
 
 // BuildHarnessArgs constructs exact CLI arguments for launching or resuming a harness process.
 func BuildHarnessArgs(spec Spec, name, selfBin, resumeID, prompt string, policy Policy) ([]string, error) {
-	pol := cmp.Or(policy, PolicyBypass)
+	pol := cmp.Or(policy, PolicyAuto)
 	switch spec.Name {
 	case HarnessClaude:
 		settingsJSON, err := buildClaudeSettingsJSON(selfBin)
@@ -294,10 +294,10 @@ func BuildHarnessArgs(spec Spec, name, selfBin, resumeID, prompt string, policy 
 		switch pol {
 		case PolicySafe:
 			args = append(args, "--permission-mode", "manual")
-		case PolicyAuto:
-			args = append(args, "--permission-mode", "auto")
-		default:
+		case PolicyBypass:
 			args = append(args, "--dangerously-skip-permissions")
+		default:
+			args = append(args, "--permission-mode", "auto")
 		}
 		args = append(args, "--remote-control", name, "--settings", settingsJSON)
 		if resumeID != "" {
@@ -313,10 +313,10 @@ func BuildHarnessArgs(spec Spec, name, selfBin, resumeID, prompt string, policy 
 		switch pol {
 		case PolicySafe:
 			args = append(args, "--sandbox", "--mode", "plan")
-		case PolicyAuto:
-			args = append(args, "--mode", "auto")
-		default:
+		case PolicyBypass:
 			args = append(args, "--dangerously-skip-permissions")
+		default:
+			args = append(args, "--mode", "auto")
 		}
 		args = append(args, "--remote-control")
 		if resumeID != "" {
@@ -335,10 +335,10 @@ func BuildHarnessArgs(spec Spec, name, selfBin, resumeID, prompt string, policy 
 		switch pol {
 		case PolicySafe:
 			args = append(args, "-s", "workspace-write", "-a", "on-request")
-		case PolicyAuto:
-			args = append(args, "--approve-for-me")
-		default:
+		case PolicyBypass:
 			args = append(args, "--dangerously-bypass-approvals-and-sandbox")
+		default:
+			args = append(args, "--approve-for-me")
 		}
 		if resumeID != "" {
 			args = append(args, resumeID)

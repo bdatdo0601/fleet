@@ -19,10 +19,10 @@ Setup:
   fleet session <claude|agy|codex> setup [--check] [--install] [--tmux-only] [--yes]
 
 Session commands (for <claude|agy|codex>, alias antigravity -> agy):
-  start [--rex|--tmux] [--model MODEL] [--policy bypass|auto|safe] NAME DIRECTORY
-  start-attach [--rex|--tmux] [--model MODEL] [--policy bypass|auto|safe] NAME DIRECTORY
+  start [--rex|--tmux] [--model MODEL] [--policy auto|bypass|safe] NAME DIRECTORY
+  start-attach [--rex|--tmux] [--model MODEL] [--policy auto|bypass|safe] NAME DIRECTORY
   start-task [--rex|--tmux] [--model MODEL] [--policy safe|auto|bypass] NAME DIRECTORY   (reads multiline prompt from stdin)
-  resume [--rex|--tmux] [--model MODEL] [--policy bypass|auto|safe] NAME DIRECTORY SESSION_ID
+  resume [--rex|--tmux] [--model MODEL] [--policy auto|bypass|safe] NAME DIRECTORY SESSION_ID
   attach NAME
   list
   kill NAME
@@ -90,7 +90,7 @@ func parseSessionActionArgs(args []string) (parsedSessionArgs, error) {
 			out.model = strings.TrimPrefix(a, "--model=")
 		case a == "--policy":
 			if i+1 >= len(args) {
-				return out, fmt.Errorf("--policy requires an argument (bypass|auto|safe)")
+				return out, fmt.Errorf("--policy requires an argument (auto|bypass|safe)")
 			}
 			i++
 			out.policyRaw = args[i]
@@ -120,7 +120,7 @@ func runSessionRexRun(harness string, pos []string, policyRaw, promptFile string
 	if len(pos) != 1 && len(pos) != 2 {
 		return fmt.Errorf("usage: fleet session %s __rex-run NAME [RESUME_ID]", harness)
 	}
-	pol, err := session.ParsePolicy(policyRaw, session.PolicyBypass)
+	pol, err := session.ParsePolicy(policyRaw, session.PolicyAuto)
 	if err != nil {
 		return err
 	}
@@ -143,9 +143,9 @@ func runSessionStartAction(harness, action string, pos []string, parsed parsedSe
 	switch action {
 	case "start", "start-attach":
 		if len(pos) != 2 {
-			return fmt.Errorf("usage: fleet session %s %s [--rex|--tmux] [--model MODEL] [--policy bypass|auto|safe] NAME DIRECTORY", harness, action)
+			return fmt.Errorf("usage: fleet session %s %s [--rex|--tmux] [--model MODEL] [--policy auto|bypass|safe] NAME DIRECTORY", harness, action)
 		}
-		pol, pErr := session.ParsePolicy(parsed.policyRaw, session.PolicyBypass)
+		pol, pErr := session.ParsePolicy(parsed.policyRaw, session.PolicyAuto)
 		if pErr != nil {
 			return pErr
 		}
@@ -193,9 +193,9 @@ func runSessionStartAction(harness, action string, pos []string, parsed parsedSe
 		return err
 	case "resume":
 		if len(pos) != 3 {
-			return fmt.Errorf("usage: fleet session %s resume [--rex|--tmux] [--model MODEL] [--policy bypass|auto|safe] NAME DIRECTORY SESSION_ID", harness)
+			return fmt.Errorf("usage: fleet session %s resume [--rex|--tmux] [--model MODEL] [--policy auto|bypass|safe] NAME DIRECTORY SESSION_ID", harness)
 		}
-		pol, pErr := session.ParsePolicy(parsed.policyRaw, session.PolicyBypass)
+		pol, pErr := session.ParsePolicy(parsed.policyRaw, session.PolicyAuto)
 		if pErr != nil {
 			return pErr
 		}

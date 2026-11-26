@@ -1,5 +1,6 @@
 import { api, badge, clear, el, formatDuration, relTime, shortDate, state, toast } from "./lib.js";
 import { openAgentInspectModal, openQuickMessageModal } from "./agents.js";
+import { renderUsageCard } from "./usage.js";
 
 function summaryCard(title, value, subtitle, onClick, badgeNode = null) {
   return el(
@@ -293,6 +294,7 @@ export async function renderOverview(root, ctx) {
     );
   }
   root.appendChild(cards);
+  root.appendChild(renderUsageCard(ov.usage || []));
 
   root.appendChild(
     el("div", { className: "split-grid" }, renderWaitingCard(waiting, ctx), renderMessagesCard(messages)),

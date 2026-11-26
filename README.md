@@ -49,6 +49,7 @@ into it from anywhere. No third-party servers are involved.
 | Admin device | `fleet revoke NAME` | Cuts a device off everywhere within about 5 minutes |
 | Admin device | `fleet set NAME --group G` | Moves a device to another group (re-signs its cert, also used to renew one) |
 | Any Mac | `fleet agents [--all] [--waiting]` | Lists live AI agent sessions (`claude`, `codex`, `antigravity`), including sessions blocked on permission or question prompts |
+| Any Mac | `fleet usage [--cached\|--local] [--json] [--harness H]` | Shows quota windows and usage status across `claude`, `codex`, and `antigravity` |
 | Any Mac | `fleet session <setup\|claude\|agy\|codex> ...` | Manages persistent Rex/tmux agent sessions (`start`, `start-attach`, `start-task`, `resume`, `attach`, `list`, `kill`, `kill-all`, `upgrade`) |
 | Lighthouse / Any Mac | `fleet slacker <manifest\|setup\|listen\|worker\|...>` | Lighthouse-hosted Slack Socket Mode reaction dispatcher and per-Mac pull workers |
 | Any Mac / Admin | `fleet memory ...` | Manages shared agent memory (`ls`, `search`, `set`, `import`, `promote`, `review`, `curator setup`) |
@@ -191,7 +192,7 @@ Each certificate carries one group. The CA signs it into the certificate, so a d
 `fleet serve` embeds and serves a mesh-only management console at `http://10.213.0.1:7443/` (also reachable at `http://127.0.0.1:7443/` on the lighthouse and from Mobile Nebula browsers on phones/tablets).
 
 - **Same Nebula identity model:** Access is verified by mesh source IP (`fleet.Identify`) with anti-CSRF/anti-DNS-rebinding `Host` and `Origin` checks. Strangers and revoked devices receive `403`.
-- **Role-scoped UI:** `admin` devices (`laptop`, `phone`, `ipadpro`, `mini`) see the full console — **Overview**, **Devices & PKI** (approve Mac/mobile blocks, change groups/renew certs, revoke, inspect configs & blocklist), **Agents & Messages**, **Shared Memory & Curator**, **Slacker** (Slack reaction dispatcher config & job queue), and **Lighthouse System** (PKI, published binaries, Route 53 DDNS check/sync/IAM policy, and service logs). `managed` devices see **Overview**, **Agents & Messages**, and **Shared Memory**.
+- **Role-scoped UI:** `admin` devices (`laptop`, `phone`, `ipadpro`, `mini`) see the full console — **Overview**, **Devices & PKI** (approve Mac/mobile blocks, change groups/renew certs, revoke, inspect configs & blocklist), **Agents & Messages** (including live **Harness Usage & Quotas** across Claude, Codex, and Antigravity, plus spawn/kill/kill-by-type/kill-all agent controls), **Shared Memory & Curator**, **Slacker** (Slack reaction dispatcher config & job queue), and **Lighthouse System** (PKI, published binaries, Route 53 DDNS check/sync/IAM policy, and service logs). `managed` devices see **Overview**, **Agents & Messages**, and **Shared Memory**.
 - **Single binary:** All HTML/CSS/JS assets are embedded directly via `go:embed` with zero external CDN or Node runtime dependencies, so `fleet sync` updates the UI automatically with `fleet serve`.
 
 ## Agent sessions (MCP)

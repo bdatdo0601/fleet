@@ -597,14 +597,14 @@ func (c Config) EffectiveChannelStrategy(ch ChannelMapping) string {
 	return cmp.Or(ch.Strategy, c.DefaultStrategy, StrategyLeastAgents)
 }
 
-// EffectiveDefaultPolicy returns the configured global default permission policy, defaulting to bypass.
+// EffectiveDefaultPolicy returns the configured global default permission policy, defaulting to auto.
 func (c Config) EffectiveDefaultPolicy() string {
-	return cmp.Or(c.DefaultPolicy, string(session.PolicyBypass))
+	return cmp.Or(c.DefaultPolicy, string(session.PolicyAuto))
 }
 
-// EffectiveChannelPolicy returns the permission policy for ch, falling back to DefaultPolicy then bypass.
+// EffectiveChannelPolicy returns the permission policy for ch, falling back to DefaultPolicy then auto.
 func (c Config) EffectiveChannelPolicy(ch ChannelMapping) string {
-	return cmp.Or(ch.Policy, c.DefaultPolicy, string(session.PolicyBypass))
+	return cmp.Or(ch.Policy, c.DefaultPolicy, string(session.PolicyAuto))
 }
 
 // ResolveRepoPath resolves repoPath on device, joining relative subpaths (or blank) onto the device's workspace_dir.

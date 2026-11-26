@@ -375,3 +375,55 @@ func TestWaitForHarnessMessagesRelayAndCleanup(t *testing.T) {
 		t.Fatalf("harness relay leak: relays=%d subs=%d", relaysLeft, subsLeft)
 	}
 }
+
+func TestUsageUpsertPreservesGoodSnapshotAgainstDegradedReport(t *testing.T) {
+	hub, err := Open(filepath.Join(t.TempDir(), "agents.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = hub.Close() })
+
+	good, err := hub.UpsertUsage(HarnessUsage{
+		Harness: "claude",
+		Device:  "laptop",
+		Source:  "claude-statusline",
+		Status:  "ok",
+		Windows: []UsageWindow{{Label: "5h", UsedPercent: 25, WindowMins: 300}},
+		Metrics: map[string]any{"model": "Claude Opus"},
+	})
+	if err != nil || good.Status != "ok" || len(good.Windows) != 1 {
+		t.Fatalf("expected good upsert, got %+v err=%v", good, err)
+	}
+
+	// Degraded report from another device must not clobber good snapshot.
+	afterBad, err := hub.UpsertUsage(HarnessUsage{
+		Harness: "claude",
+		Device:  "mini",
+		Source:  "claude-statusline",
+		Status:  "unavailable",
+		Detail:  "waiting for next turn",
+	})
+	if err != nil || afterBad.Status != "ok" || afterBad.Device != "laptop" || len(afterBad.Windows) != 1 {
+		t.Fatalf("expected good snapshot preserved, got %+v err=%v", afterBad, err)
+	}
+
+	// Empty-windows ok report must not overwrite fresh windows within 24h.
+	afterEmpty, err := hub.UpsertUsage(HarnessUsage{
+		Harness: "claude",
+		Device:  "mini",
+		Source:  "claude-statusline",
+		Status:  "ok",
+		Windows: []UsageWindow{},
+	})
+	if err != nil || len(afterEmpty.Windows) != 1 || afterEmpty.Device != "laptop" {
+		t.Fatalf("expected fresh windows preserved, got %+v err=%v", afterEmpty, err)
+	}
+
+	if _, err := hub.UpsertUsage(HarnessUsage{Harness: "codex", Device: "laptop", Source: "codex-app-server", Status: "ok", Plan: "pro"}); err != nil {
+		t.Fatal(err)
+	}
+	list, err := hub.ListUsage()
+	if err != nil || len(list) != 2 || list[0].Harness != "claude" || list[1].Harness != "codex" {
+		t.Fatalf("unexpected ListUsage order/result: %+v err=%v", list, err)
+	}
+}

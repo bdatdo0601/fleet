@@ -657,8 +657,8 @@ while True:
 	b2, _ := os.ReadFile(filepath.Join(base, "slack-c1-10-2.json"))
 	_ = json.Unmarshal(b2, &agyRec)
 
-	if !slices.Contains(claudeRec.Args, "--dangerously-skip-permissions") || slices.Contains(claudeRec.Args, "manual") {
-		t.Fatalf("expected claude default bypass mode (--dangerously-skip-permissions): %v", claudeRec.Args)
+	if !slices.Contains(claudeRec.Args, "--permission-mode") || !slices.Contains(claudeRec.Args, "auto") || slices.Contains(claudeRec.Args, "--dangerously-skip-permissions") || slices.Contains(claudeRec.Args, "manual") {
+		t.Fatalf("expected claude default auto mode (--permission-mode auto): %v", claudeRec.Args)
 	}
 	if !slices.Contains(agyRec.Args, "--mode") || !slices.Contains(agyRec.Args, "auto") || slices.Contains(agyRec.Args, "--sandbox") || slices.Contains(agyRec.Args, "--dangerously-skip-permissions") {
 		t.Fatalf("expected agy auto mode: %v", agyRec.Args)
@@ -1345,10 +1345,10 @@ func TestListenerEndToEndMultiMachineWorkspaceRouting(t *testing.T) {
 	}
 	j1 := byEvt["EvM1"]
 	j2 := byEvt["EvM2"]
-	if j1.TargetDevice != "laptop" || j1.RepoPath != "/Users/dat/src/fleet" || !strings.HasPrefix(j1.Prompt, "Task one\n") || j1.Policy != string(session.PolicyBypass) {
+	if j1.TargetDevice != "laptop" || j1.RepoPath != "/Users/dat/src/fleet" || !strings.HasPrefix(j1.Prompt, "Task one\n") || j1.Policy != string(session.PolicyAuto) {
 		t.Fatalf("unexpected j1: %+v", j1)
 	}
-	if j2.TargetDevice != "mini" || j2.RepoPath != "~/workspace/fleet" || !strings.HasPrefix(j2.Prompt, "Task two\n") || j2.Policy != string(session.PolicyBypass) {
+	if j2.TargetDevice != "mini" || j2.RepoPath != "~/workspace/fleet" || !strings.HasPrefix(j2.Prompt, "Task two\n") || j2.Policy != string(session.PolicyAuto) {
 		t.Fatalf("unexpected j2: %+v", j2)
 	}
 }
@@ -1627,5 +1627,68 @@ func TestMessageLevelDeduplicationBlocksButterFingerReacts(t *testing.T) {
 		t.Fatalf("expected RetryJob conflict when replacement is active, got %v", err)
 	} else if se, ok := errors.AsType[*SlackerError](err); !ok || se.HTTPStatus() != 409 {
 		t.Fatalf("expected 409 SlackerError, got %T (%v)", err, err)
+	}
+}
+
+func TestWorkerProcessesKillAndKillAllJobs(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "slacker.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/slacker/worker/poll":
+			j, _ := store.ClaimNextJob("laptop", 90*time.Second)
+			_ = json.NewEncoder(w).Encode(map[string]any{"job": j, "device": "laptop"})
+		case "/v1/slacker/worker/receipt":
+			var rec Receipt
+			_ = json.NewDecoder(r.Body).Decode(&rec)
+			j, _ := store.RecordReceipt("laptop", rec)
+			_ = json.NewEncoder(w).Encode(map[string]any{"job": j})
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	_, jKill, err := store.EnqueueJob(Job{
+		Account: "ui", EventID: "ui-kill-1", ChannelName: "web-ui", Reaction: "kill", UserID: "admin",
+		TargetDevice: "laptop", Harness: "codex", SessionName: "s1", Prompt: `{"harness":"codex","name":"s1"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, jAll, err := store.EnqueueJob(Job{
+		Account: "ui", EventID: "ui-killall-1", ChannelName: "web-ui", Reaction: "kill-all", UserID: "admin",
+		TargetDevice: "laptop", Harness: "all", SessionName: "kill-all-all", Prompt: `[]`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var calls []string
+	workerDir := filepath.Join(tmp, "worker-state")
+	for range 2 {
+		if err := RunWorker(context.Background(), WorkerOpts{
+			APIURL:        srv.URL,
+			LocalStateDir: workerDir,
+			Once:          true,
+			SessionExists: func(string, string) (bool, string) { return true, "tmux" }, // must not short-circuit kill jobs
+			KillFn: func(job Job, _, _ io.Writer) (string, error) {
+				calls = append(calls, job.Reaction+":"+job.Harness+":"+job.SessionName)
+				return job.Reaction, nil
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !slices.Equal(calls, []string{"kill:codex:s1", "kill-all:all:kill-all-all"}) {
+		t.Fatalf("unexpected KillFn calls: %v", calls)
+	}
+	gotKill, _ := store.GetJob(jKill.ID)
+	gotAll, _ := store.GetJob(jAll.ID)
+	if gotKill.Status != "launched" || gotKill.Backend != "kill" || gotAll.Status != "launched" || gotAll.Backend != "kill-all" {
+		t.Fatalf("unexpected kill job receipts: kill=%+v killAll=%+v", gotKill, gotAll)
 	}
 }

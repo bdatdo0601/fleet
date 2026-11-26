@@ -16,6 +16,7 @@ import (
 	"github.com/bdatdo0601/fleet/internal/paths"
 	"github.com/bdatdo0601/fleet/internal/registry"
 	"github.com/bdatdo0601/fleet/internal/session"
+	"github.com/bdatdo0601/fleet/internal/usage"
 )
 
 // LocalReceipt persists worker-side launch state for crash/restart reconciliation.
@@ -43,6 +44,7 @@ type WorkerOpts struct {
 	Stdout        io.Writer
 	SessionExists func(harness, name string) (bool, string)
 	LaunchFn      func(job Job, useTmux bool, stdout, stderr io.Writer) (string, error)
+	KillFn        func(job Job, stdout, stderr io.Writer) (string, error)
 }
 
 func expandHomePath(p string) (string, error) {
@@ -64,9 +66,9 @@ func defaultLaunchJob(job Job, useTmux bool, stdout, stderr io.Writer) (string, 
 	if err != nil {
 		return "", err
 	}
-	pol, err := session.ParsePolicy(job.Policy, session.PolicyBypass)
+	pol, err := session.ParsePolicy(job.Policy, session.PolicyAuto)
 	if err != nil {
-		pol = session.PolicyBypass
+		pol = session.PolicyAuto
 	}
 	return session.Start(session.StartOpts{
 		Harness:   job.Harness,
@@ -78,6 +80,28 @@ func defaultLaunchJob(job Job, useTmux bool, stdout, stderr io.Writer) (string, 
 		Stdout:    stdout,
 		Stderr:    stderr,
 	})
+}
+
+func defaultKillJob(job Job, stdout, stderr io.Writer) (string, error) {
+	switch job.Reaction {
+	case "kill":
+		var target session.KillTarget
+		if strings.TrimSpace(job.Prompt) == "" || json.Unmarshal([]byte(job.Prompt), &target) != nil {
+			target = session.KillTarget{Harness: job.Harness, Name: job.SessionName}
+		}
+		if target.Harness == "" {
+			target.Harness = job.Harness
+		}
+		return "kill", session.KillAgent(target, stdout, stderr)
+	case "kill-all":
+		var targets []session.KillTarget
+		if strings.TrimSpace(job.Prompt) != "" {
+			_ = json.Unmarshal([]byte(job.Prompt), &targets)
+		}
+		return "kill-all", session.KillAllAgents(job.Harness, targets, stdout, stderr)
+	default:
+		return "", fmt.Errorf("unsupported kill reaction %q", job.Reaction)
+	}
 }
 
 func receiptsDir(localStateDir string) string {
@@ -174,6 +198,29 @@ func processJob(ctx context.Context, api, localStateDir string, job Job, opts Wo
 		CreatedAt:   registry.NowISO(),
 	}
 
+	if job.Reaction == "kill" || job.Reaction == "kill-all" {
+		killFn := opts.KillFn
+		if killFn == nil {
+			killFn = defaultKillJob
+		}
+		backend, err := killFn(job, opts.Stdout, opts.Stderr)
+		if err != nil {
+			rec.Status = "failed"
+			rec.Error = err.Error()
+		} else {
+			rec.Status = "launched"
+			rec.Backend = cmp.Or(backend, job.Reaction)
+		}
+		if err := saveLocalReceipt(rPath, rec); err != nil {
+			return err
+		}
+		if err := postReceipt(ctx, api, rec); err != nil {
+			return err
+		}
+		rec.Acked = true
+		return saveLocalReceipt(rPath, rec)
+	}
+
 	if exists, backend := existsFn(job.Harness, job.SessionName); exists {
 		rec.Status = "launched"
 		rec.Backend = cmp.Or(backend, "existing")
@@ -228,6 +275,10 @@ func RunWorker(ctx context.Context, opts WorkerOpts) error {
 	}
 	if opts.Once && opts.PollTimeout == 0 {
 		pollTimeout = 0.2
+	}
+
+	if !opts.Once && opts.LaunchFn == nil && os.Getenv("FLEET_DISABLE_USAGE_REPORTER") != "1" {
+		usage.StartPeriodicReporter(ctx, 10*time.Minute, api)
 	}
 
 	backoff := 2 * time.Second

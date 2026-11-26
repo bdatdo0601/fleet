@@ -170,7 +170,7 @@ func Start(opts StartOpts) (string, error) {
 		if opts.Prompt != "" {
 			pol = PolicySafe
 		} else {
-			pol = PolicyBypass
+			pol = PolicyAuto
 		}
 	}
 

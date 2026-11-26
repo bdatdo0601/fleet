@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bdatdo0601/fleet/internal/agents"
 	"github.com/bdatdo0601/fleet/internal/client"
@@ -156,5 +157,45 @@ func TestParseSessionActionArgs(t *testing.T) {
 
 	if _, err := parseSessionActionArgs([]string{"start", "--rex", "--tmux", "my-task", "/tmp"}); err == nil || !strings.Contains(err.Error(), "cannot be combined") {
 		t.Fatalf("expected --rex/--tmux conflict error, got %v", err)
+	}
+}
+
+func TestCLIUsageAndStatusLine(t *testing.T) {
+	_, srv, _ := setupCLIServer(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	wrapScript := filepath.Join(home, "wrap.sh")
+	if err := os.WriteFile(wrapScript, []byte("#!/bin/sh\ncat >/dev/null\necho 'ok-status'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	payload := `{"model":{"display_name":"Claude Opus"},"rate_limits":{"five_hour":{"used_percentage":18.0,"resets_at":1796000000}}}`
+	var out, errBuf bytes.Buffer
+	rc := Run([]string{"statusline", "claude", "--wrap", wrapScript}, &IO{
+		Stdin: strings.NewReader(payload), Stdout: &out, Stderr: &errBuf,
+	})
+	if rc != 0 || strings.TrimSpace(out.String()) != "ok-status" {
+		t.Fatalf("statusline claude failed: rc=%d out=%q err=%q", rc, out.String(), errBuf.String())
+	}
+
+	out.Reset()
+	errBuf.Reset()
+	rc = Run([]string{"usage", "--cached", "--json"}, &IO{
+		Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errBuf,
+	})
+	if rc != 0 || !strings.Contains(out.String(), `"harness": "claude"`) || !strings.Contains(out.String(), `"used_percent": 18`) {
+		t.Fatalf("usage --cached --json failed: rc=%d out=%q err=%q", rc, out.String(), errBuf.String())
+	}
+
+	// Verify compact usage footer appears in `fleet agents` output too.
+	out.Reset()
+	if err := client.Call(srv.URL, "POST", "/v1/agents/heartbeat", map[string]any{
+		"harness": "claude", "raw_id": "s1", "cwd": home, "state": "working",
+	}, 5*time.Second, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	rc = Run([]string{"agents"}, &IO{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errBuf})
+	if rc != 0 || !strings.Contains(out.String(), "Usage: claude 5h 18%") {
+		t.Fatalf("expected compact usage footer in fleet agents, got rc=%d out=%q", rc, out.String())
 	}
 }

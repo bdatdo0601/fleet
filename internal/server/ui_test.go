@@ -108,6 +108,7 @@ func TestWebUIAssetsSecurityAndStrangers(t *testing.T) {
 		wantPrefix string
 	}{
 		{"/assets/app.js", "text/javascript"},
+		{"/assets/usage.js", "text/javascript"},
 		{"/assets/app.css", "text/css"},
 		{"/assets/favicon.svg", "image/svg+xml"},
 		{"/favicon.ico", "image/svg+xml"},
@@ -541,5 +542,129 @@ func TestMemoryScopesAndProposalBatch(t *testing.T) {
 	}
 	if _, err := f.Memory.Get("global", "prop-two", false); err != nil {
 		t.Fatalf("expected prop-two memory to be created: %v", err)
+	}
+}
+
+func TestUsageEndpointsAndOverviewIntegration(t *testing.T) {
+	_, srv, _ := setupTestServer(t)
+
+	var postRes struct {
+		Usage []agents.HarnessUsage `json:"usage"`
+	}
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/usage", map[string]any{
+		"usage": []agents.HarnessUsage{
+			{
+				Harness: "codex",
+				Source:  "codex-app-server",
+				Plan:    "pro",
+				Status:  "ok",
+				Windows: []agents.UsageWindow{{Label: "7d", UsedPercent: 6, WindowMins: 10080}},
+			},
+		},
+	}, 5*time.Second, nil, &postRes); err != nil {
+		t.Fatal(err)
+	}
+	if len(postRes.Usage) != 1 || postRes.Usage[0].Device != "mini" || postRes.Usage[0].Plan != "pro" {
+		t.Fatalf("unexpected POST /v1/usage response: %+v", postRes.Usage)
+	}
+
+	var getRes struct {
+		Usage []agents.HarnessUsage `json:"usage"`
+	}
+	if err := client.Call(srv.URL, http.MethodGet, "/v1/usage", nil, 5*time.Second, nil, &getRes); err != nil {
+		t.Fatal(err)
+	}
+	if len(getRes.Usage) != 1 || getRes.Usage[0].Windows[0].UsedPercent != 6 {
+		t.Fatalf("unexpected GET /v1/usage response: %+v", getRes.Usage)
+	}
+
+	var ovRes struct {
+		Usage []agents.HarnessUsage `json:"usage"`
+	}
+	if err := client.Call(srv.URL, http.MethodGet, "/v1/overview", nil, 5*time.Second, nil, &ovRes); err != nil {
+		t.Fatal(err)
+	}
+	if len(ovRes.Usage) != 1 || ovRes.Usage[0].Harness != "codex" {
+		t.Fatalf("expected usage in GET /v1/overview, got %+v", ovRes.Usage)
+	}
+}
+
+func TestAgentKillAndKillAllEndpoints(t *testing.T) {
+	f, srv, tmp := setupTestServer(t)
+	_, office := approveTestDevice(t, f, tmp, "office", "mac", "managed")
+	_ = f.Slacker.UpsertWorkerRuntime("office", 200, true, "")
+
+	for _, hb := range []agents.HeartbeatParams{
+		agentsHeartbeat("office", "claude", "c1", "working"),
+		agentsHeartbeat("office", "codex", "x1", "working"),
+		agentsHeartbeat("mini", "codex", "x2", "idle"),
+		agentsHeartbeat("mini", "antigravity", "a1", "working"),
+	} {
+		if _, err := f.Agents.Heartbeat(hb); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Managed device cannot kill mini's session.
+	f.IdentifyOverride = func(string) *registry.Device { return office }
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/agents/kill", map[string]string{"session_id": "mini:codex:x2"}, 5*time.Second, nil, nil); err == nil || !strings.Contains(err.Error(), "HTTP 403") {
+		t.Fatalf("expected 403 for managed kill on other device, got %v", err)
+	}
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/agents/kill-all", map[string]string{"harness": "codex", "device": "mini"}, 5*time.Second, nil, nil); err == nil || !strings.Contains(err.Error(), "HTTP 403") {
+		t.Fatalf("expected 403 for managed kill-all on other device, got %v", err)
+	}
+
+	// Admin kills single session (office:claude:c1).
+	f.IdentifyOverride = nil
+	var killRes struct {
+		OK           bool           `json:"ok"`
+		Device       string         `json:"device"`
+		WorkerOnline bool           `json:"worker_online"`
+		Job          map[string]any `json:"job"`
+	}
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/agents/kill", map[string]string{"session_id": "office:claude:c1"}, 5*time.Second, nil, &killRes); err != nil {
+		t.Fatal(err)
+	}
+	if !killRes.OK || killRes.Device != "office" || !killRes.WorkerOnline || killRes.Job["reaction"] != "kill" {
+		t.Fatalf("unexpected kill response: %+v", killRes)
+	}
+	if det, err := f.Agents.GetSession("office:claude:c1"); err != nil || det.State != "exited" {
+		t.Fatalf("expected office:claude:c1 exited after kill, got %+v err=%v", det, err)
+	}
+
+	// Admin kills all codex sessions -> deregisters x1 & x2, leaves a1 live.
+	var kaCodex struct {
+		OK           bool     `json:"ok"`
+		Harness      string   `json:"harness"`
+		Deregistered int      `json:"deregistered"`
+		Devices      []string `json:"devices"`
+	}
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/agents/kill-all", map[string]string{"harness": "codex"}, 5*time.Second, nil, &kaCodex); err != nil {
+		t.Fatal(err)
+	}
+	if !kaCodex.OK || kaCodex.Harness != "codex" || kaCodex.Deregistered != 2 {
+		t.Fatalf("unexpected kill-all codex response: %+v", kaCodex)
+	}
+	live, err := f.Agents.ListSessions("", "", "", "", false)
+	if err != nil || len(live) != 1 || live[0].SessionID != "mini:antigravity:a1" {
+		t.Fatalf("expected only mini:antigravity:a1 left live, got %+v err=%v", live, err)
+	}
+
+	// Admin kills all remaining sessions across all harnesses.
+	var kaAll struct {
+		OK           bool     `json:"ok"`
+		Harness      string   `json:"harness"`
+		Deregistered int      `json:"deregistered"`
+		Devices      []string `json:"devices"`
+	}
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/agents/kill-all", map[string]string{}, 5*time.Second, nil, &kaAll); err != nil {
+		t.Fatal(err)
+	}
+	if !kaAll.OK || kaAll.Harness != "all" || kaAll.Deregistered != 1 {
+		t.Fatalf("unexpected kill-all all response: %+v", kaAll)
+	}
+	liveAfter, err := f.Agents.ListSessions("", "", "", "", false)
+	if err != nil || len(liveAfter) != 0 {
+		t.Fatalf("expected 0 live agents after kill-all, got %+v err=%v", liveAfter, err)
 	}
 }

@@ -69,6 +69,18 @@ CREATE TABLE IF NOT EXISTS agent_reads (
   read_at     TEXT NOT NULL,
   PRIMARY KEY (session_id, message_id)
 );
+
+CREATE TABLE IF NOT EXISTS harness_usage (
+  harness      TEXT PRIMARY KEY,
+  device       TEXT NOT NULL DEFAULT '',
+  source       TEXT NOT NULL DEFAULT '',
+  plan         TEXT NOT NULL DEFAULT '',
+  status       TEXT NOT NULL DEFAULT 'ok',
+  detail       TEXT NOT NULL DEFAULT '',
+  windows_json TEXT NOT NULL DEFAULT '[]',
+  metrics_json TEXT NOT NULL DEFAULT '{}',
+  updated_at   TEXT NOT NULL
+);
 `
 
 var sessionMigrations = []registry.ColumnMigration{
