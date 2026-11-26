@@ -64,6 +64,31 @@ func writePromptTempFile(harness, name, prompt string) (string, error) {
 	return p, nil
 }
 
+func resolveDirectory(raw string) (string, error) {
+	dir := strings.TrimSpace(raw)
+	if dir == "~" || strings.HasPrefix(dir, "~/") {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			if dir == "~" {
+				dir = home
+			} else {
+				dir = filepath.Join(home, dir[2:])
+			}
+		}
+	}
+	fi, err := os.Stat(dir)
+	if err != nil || !fi.IsDir() {
+		return "", fmt.Errorf("directory does not exist: %s", raw)
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return resolved, nil
+	}
+	return abs, nil
+}
+
 // Start launches a new detached or attached session in Rex (when installed) or tmux.
 func Start(opts StartOpts) (string, error) {
 	spec, err := GetSpec(opts.Harness)
@@ -81,16 +106,9 @@ func Start(opts StartOpts) (string, error) {
 	if _, err := os.Stat(upgradeLockPath(spec.Name)); err == nil {
 		return "", errors.New("an upgrade is running; wait for it to finish before starting sessions")
 	}
-	fi, err := os.Stat(opts.Directory)
-	if err != nil || !fi.IsDir() {
-		return "", fmt.Errorf("directory does not exist: %s", opts.Directory)
-	}
-	directory, err := filepath.EvalSymlinks(opts.Directory)
+	directory, err := resolveDirectory(opts.Directory)
 	if err != nil {
-		directory, err = filepath.Abs(opts.Directory)
-		if err != nil {
-			return "", err
-		}
+		return "", err
 	}
 	harnessBin, err := lookPathWithEnv(spec.Binary, pathEnv)
 	if err != nil {

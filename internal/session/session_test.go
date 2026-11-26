@@ -586,3 +586,54 @@ func TestSessionSetupCheckAndHookPreservation(t *testing.T) {
 		t.Fatalf("expected fleet and agy-session hooks preserved: %s", string(raw))
 	}
 }
+
+func TestStartResolvesRelativeDotDirectoryForRex(t *testing.T) {
+	se := newSessionEnv(t)
+	rexDir := se.installFakeRex()
+	repo := filepath.Join(se.base, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(repo)
+
+	gotDir, err := resolveDirectory(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(gotDir) || gotDir != repo {
+		t.Fatalf("resolveDirectory(.) = %q, want canonical %q", gotDir, repo)
+	}
+
+	var out, errBuf bytes.Buffer
+	backend, err := Start(StartOpts{
+		Harness: "claude", Name: "ethan", Directory: ".",
+		Stdout: &out, Stderr: &errBuf,
+	})
+	if err != nil || backend != "rex" {
+		t.Fatalf("Start in '.' failed: backend=%s err=%v stderr=%s", backend, err, errBuf.String())
+	}
+	if !strings.Contains(out.String(), "Started Rex session ethan in "+repo) {
+		t.Fatalf("expected absolute repo dir in output, got: %q", out.String())
+	}
+
+	_ = se.waitRexReady("claude", "ethan", 0)
+	rec := se.readRecord("claude", "ethan")
+	if !filepath.IsAbs(rec.CWD) || rec.CWD != repo {
+		t.Fatalf("launched claude CWD = %q, want %q", rec.CWD, repo)
+	}
+
+	sessRaw, err := os.ReadFile(filepath.Join(rexDir, "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sessions []struct {
+		Label string `json:"label"`
+		CWD   string `json:"cwd"`
+	}
+	if err := json.Unmarshal(sessRaw, &sessions); err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 || sessions[0].Label != "claude-ethan" || sessions[0].CWD != repo {
+		t.Fatalf("expected rex -c to receive absolute %q, got %+v", repo, sessions)
+	}
+}
