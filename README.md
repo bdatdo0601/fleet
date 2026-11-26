@@ -279,35 +279,72 @@ on the lighthouse across all active Macs (`admin` and `managed` alike).
 
 `fleet slacker` runs one supervised Socket Mode listener per configured Slack account on the lighthouse (`fleet slacker listen` via `io.github.bdatdo0601.fleet.slacker`) and pull-based workers on target Macs (`fleet slacker worker` via a per-user `Aqua` LaunchAgent `io.github.bdatdo0601.fleet.slacker-worker`) so launched sessions run as the logged-in user.
 
-1. **Create the Slack app & verify credentials (multi-account supported):**
-   The generated manifest (`fleet slacker manifest`) includes User OAuth scopes for reading, searching, and replying (`reactions:read`, `channels:history`, `groups:history`, `im:history`, `mpim:history`, `channels:read`, `groups:read`, `search:read`, `chat:write`).
+### Setup (where to run each step)
+
+1. **Update `fleet` everywhere (lighthouse first, then each target Mac):**
+   Run `fleet sync` on the **lighthouse**, then run `fleet sync` on **every other Mac** (`laptop`, `office`, etc.). This builds/installs the updated binary and refreshes each harness's MCP config with `fleet_slack_channels`, `fleet_slack_read`, and `fleet_slack_send`.
+2. **Install session prerequisites (each Mac that runs sessions):**
    ```bash
-   fleet slacker manifest > /tmp/slack-manifest.yml
-   fleet slacker setup --account work --op-item "Local/Fleet Slacker Work" \
+   fleet session setup --check    # inspect tmux, rex, lazygit, claude/agy/codex CLIs, and hooks
+   fleet session setup            # installs missing tmux/lazygit via Homebrew & updates hooks
+   ```
+3. **Create Slack app(s) and save tokens in 1Password (browser + 1Password):**
+   Print the Slack App Manifest YAML from **any Mac**:
+   ```bash
+   fleet slacker manifest
+   ```
+   The manifest configures Socket Mode, `reaction_added`, and User OAuth scopes (`reactions:read`, `channels:history`, `groups:history`, `im:history`, `mpim:history`, `channels:read`, `groups:read`, `users:read`, `search:read`, `chat:write`). For each workspace/account you want to connect (e.g. `personal` and `work`):
+   - Open `https://api.slack.com/apps` -> **Create New App** -> **From a manifest** -> pick the workspace -> paste the manifest -> create.
+   - Under **Basic Information -> App-Level Tokens**, generate a token with `connections:write` (`xapp-...`).
+   - Under **OAuth & Permissions**, install the app to the workspace and copy the **User OAuth Token** (`xoxp-...`) — and optionally a **Bot User OAuth Token** (`xoxb-...`) if you want agent-sent messages to post as the bot instead of your user.
+   - Store `app_token`, `user_token` (and optional `bot_token`) in a 1Password item (for example `Local/Fleet Slacker` or `Work/Fleet Slacker`).
+4. **Configure accounts, channels, and emojis (any admin Mac, lighthouse, or Web UI `#slacker`):**
+   ```bash
+   # First / personal account
+   fleet slacker setup --account personal --op-item "Local/Fleet Slacker" \
      --channel C0123456789=laptop:~/workspace/fleet \
      --emoji claude=claude --emoji agy=agy --emoji codex=codex
+
+   # Optional additional account(s)
+   fleet slacker setup --account work --op-item "Work/Fleet Slacker" \
+     --bot-token-op-ref "op://Work/Fleet Slacker/bot_token" \
+     --channel C9876543210=office:~/workspace/work-repo
+
+   # Add/update mappings or inspect accounts anytime
+   fleet slacker map channel --account work C9876543210 office ~/workspace/work-repo
+   fleet slacker map emoji codex codex
    fleet slacker accounts
    ```
-   Or configure accounts, channels, emojis, tokens, and inspect jobs in the Fleet Web UI under **Slacker** (`#slacker`).
-2. **Agent & CLI Slack reading and messaging (all Nebula devices):**
-   - **MCP tools:** `fleet_slack_channels` (list configured accounts/mapped channels or Slack `users.conversations`), `fleet_slack_read` (read channel history, a thread via `thread_ts`, or `search.messages` during investigation), and `fleet_slack_send` (send messages or thread replies, restricted to mapped channels unless `allow_unmapped_send` is enabled on the account). Uses `bot_token` (`xoxb-`) if configured on that account, otherwise `user_token` (`xoxp-`).
-   - **CLI / HTTP API:** `fleet slacker read [--account ID] [--channel ID] [--thread TS] [--query Q]` (`GET /v1/slacker/messages`), `GET /v1/slacker/channels`, and `fleet slacker send --channel ID --text "..."` (`POST /v1/slacker/send`).
-3. **Install & manage services:**
+   Pass `--allow-unmapped-send` during `setup` (or toggle it in the Web UI at `http://10.213.0.1:7443/#slacker`) on any account where agents should be allowed to post to unmapped channels.
+5. **Install & start background services (run as your logged-in user, without `sudo`):**
+   - **On the lighthouse:** `fleet slacker install` installs and starts `io.github.bdatdo0601.fleet.slacker` for all enabled accounts. Use `fleet slacker install --role both` if the lighthouse itself is also a target device in a channel mapping.
+   - **On each target Mac:** `fleet slacker install` installs and starts the per-user `Aqua` LaunchAgent `io.github.bdatdo0601.fleet.slacker-worker` so sessions launch as your logged-in macOS user.
+6. **Verify (from any admin Mac):**
    ```bash
-   fleet slacker install          # installs listener LaunchDaemon on lighthouse, or worker LaunchAgent on a Mac
-   fleet slacker status           # checks launchd state, listener connection, worker heartbeats, and queue counts
-   fleet slacker start|stop|logs  # controls and tails logs
+   fleet slacker status
+   fleet slacker logs
+   fleet slacker read --account personal --channel C0123456789 --limit 5
    ```
-4. **Reliability & security:**
-   - Only `reaction_added` events from each account's configured `authorized_user_id` on mapped `(account, channel)` pairs and configured emojis are accepted.
-   - Jobs are persisted in `~/.fleet/slacker.db` (deduplicated by `event_id`, scoped by `account`) **before** acknowledging the Socket Mode envelope.
-   - Exact messages (including thread replies via `conversations.replies`) are fetched and passed via `fleet session <harness> start-task` in safe mode (`manual` / `--sandbox --mode plan` / `workspace-write`).
-   - Sleeping Macs pull their own jobs over Nebula when awake; deterministic session names (`slack-<channel>-<ts>` for `default`, `slack-<account>-<channel>-<ts>` for named accounts) and local worker receipts prevent duplicate launches across restarts.
-5. **Cleanup:**
-   ```bash
-   fleet slacker cleanup --uninstall --prune-jobs
-   ```
-   Cleanup removes slacker services, local receipts/locks, and terminal DB job records while preserving all active tmux/Rex sessions and user repositories.
+   React to a message in a mapped channel with `:claude:`, `:agy:`, or `:codex:`, then inspect `fleet slacker jobs` (or `#slacker` in the Web UI) and `fleet session <claude|agy|codex> list` on that Mac.
+
+### Agent & CLI Slack reading and messaging
+
+- **MCP tools (all Nebula devices):** `fleet_slack_channels` (lists configured accounts/mapped channels or Slack `users.conversations` when `include_all=true`), `fleet_slack_read` (reads channel history, a full thread via `thread_ts`, or `search.messages` queries during investigation), and `fleet_slack_send` (posts messages or thread replies using `bot_token` if configured, else `user_token`; restricted to mapped channels unless `allow_unmapped_send` is enabled on the account).
+- **CLI / HTTP API:** `fleet slacker read [--account ID] [--channel ID] [--thread TS] [--query Q]` (`GET /v1/slacker/messages`), `GET /v1/slacker/channels`, and `fleet slacker send --channel ID [--account ID] [--thread TS] --text "..."` (`POST /v1/slacker/send`).
+
+### Reliability & security
+
+- Only `reaction_added` events from each account's configured `authorized_user_id` on mapped `(account, channel)` pairs and configured emojis are accepted.
+- Jobs are persisted in `~/.fleet/slacker.db` (deduplicated by `event_id`, scoped by `account`) **before** acknowledging the Socket Mode envelope.
+- Exact messages (including thread replies via `conversations.replies`) are fetched and passed via `fleet session <harness> start-task` in safe mode (`manual` / `--sandbox --mode plan` / `workspace-write`).
+- Sleeping Macs pull their own jobs over Nebula when awake; deterministic session names (`slack-<channel>-<ts>` for `default`, `slack-<account>-<channel>-<ts>` for named accounts) and local worker receipts prevent duplicate launches across restarts.
+
+### Cleanup
+
+```bash
+fleet slacker cleanup --uninstall --prune-jobs
+```
+Cleanup removes slacker services, local receipts/locks, and terminal DB job records while preserving all active tmux/Rex sessions and user repositories.
 
 ## Security model
 
