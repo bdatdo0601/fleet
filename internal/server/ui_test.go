@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"os"
@@ -123,6 +124,41 @@ func TestWebUIAssetsSecurityAndStrangers(t *testing.T) {
 		st, h, b := doRawReq(t, srv.URL+tc.path, http.MethodGet, "", nil, "")
 		if st != http.StatusOK || len(b) == 0 || !strings.HasPrefix(h.Get("Content-Type"), tc.wantPrefix) {
 			t.Fatalf("GET %s: status=%d ct=%q len=%d", tc.path, st, h.Get("Content-Type"), len(b))
+		}
+		if tc.path == "/manifest.webmanifest" {
+			var manifest struct {
+				ID       string `json:"id"`
+				StartURL string `json:"start_url"`
+				Scope    string `json:"scope"`
+				Display  string `json:"display"`
+				Icons    []struct {
+					Src     string `json:"src"`
+					Sizes   string `json:"sizes"`
+					Type    string `json:"type"`
+					Purpose string `json:"purpose"`
+				} `json:"icons"`
+			}
+			if err := json.Unmarshal(b, &manifest); err != nil {
+				t.Fatalf("unmarshal manifest: %v", err)
+			}
+			if manifest.ID != "/" || manifest.StartURL != "/#overview" || manifest.Scope != "/" || manifest.Display != "standalone" {
+				t.Fatalf("unexpected manifest metadata: %+v", manifest)
+			}
+			seen := make(map[string]bool)
+			for _, ic := range manifest.Icons {
+				if ic.Type != "image/png" || ic.Sizes == "any" {
+					t.Fatalf("invalid manifest icon entry: %+v", ic)
+				}
+				if ic.Purpose != "any" && ic.Purpose != "maskable" {
+					t.Fatalf("manifest icon purpose must be 'any' or 'maskable', got %+v", ic)
+				}
+				seen[ic.Sizes+"|"+ic.Purpose] = true
+			}
+			for _, req := range []string{"192x192|any", "192x192|maskable", "512x512|any", "512x512|maskable"} {
+				if !seen[req] {
+					t.Fatalf("manifest missing required icon %q in %+v", req, manifest.Icons)
+				}
+			}
 		}
 	}
 
