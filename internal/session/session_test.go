@@ -886,6 +886,27 @@ func TestAgyDefaultAppBackendLifecycle(t *testing.T) {
 	mu.Unlock()
 }
 
+func TestEnsureCodexRemoteControlWarnsOnConflict(t *testing.T) {
+	se := newSessionEnv(t)
+	codexBin := se.writeExec("codex", `#!/bin/sh
+echo "Error: Remote control is enabled on host but the connection is errored." >&2
+exit 1
+`)
+	var errBuf bytes.Buffer
+	ensureCodexRemoteControl(codexBin, &errBuf)
+	got := errBuf.String()
+	if !strings.Contains(got, "remote-control start failed") || !strings.Contains(got, "Codex Desktop") {
+		t.Fatalf("expected conflict warning mentioning Codex Desktop, got %q", got)
+	}
+
+	t.Setenv("FLEET_CODEX_SKIP_REMOTE_CONTROL", "1")
+	errBuf.Reset()
+	ensureCodexRemoteControl(codexBin, &errBuf)
+	if errBuf.Len() != 0 {
+		t.Fatalf("expected skip env var to suppress invocation, got %q", errBuf.String())
+	}
+}
+
 func TestAutoAndBypassPoliciesAcrossHarnesses(t *testing.T) {
 	if pol, err := ParsePolicy("auto", PolicyBypass); err != nil || pol != PolicyAuto {
 		t.Fatalf("ParsePolicy(auto) = (%q, %v)", pol, err)

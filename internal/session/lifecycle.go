@@ -30,13 +30,25 @@ type StartOpts struct {
 	Stderr    io.Writer
 }
 
-func ensureCodexRemoteControl(codexBin string) {
+func ensureCodexRemoteControl(codexBin string, stderr io.Writer) {
 	if os.Getenv("FLEET_CODEX_SKIP_REMOTE_CONTROL") == "1" {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = exec.CommandContext(ctx, codexBin, "remote-control", "start").Run()
+	out, err := exec.CommandContext(ctx, codexBin, "remote-control", "start").CombinedOutput()
+	if err == nil || stderr == nil {
+		return
+	}
+	detail := strings.TrimSpace(string(out))
+	if detail == "" {
+		detail = err.Error()
+	}
+	_, _ = fmt.Fprintf(stderr, "fleet session codex: remote-control start failed: %s\n", detail)
+	lower := strings.ToLower(detail)
+	if strings.Contains(lower, "errored") || strings.Contains(lower, "409") || strings.Contains(lower, "already online") {
+		_, _ = fmt.Fprintln(stderr, "Disable Remote Control in Codex Desktop (Settings -> Connections / Remote Control) so the shared CLI daemon can connect.")
+	}
 }
 
 func isGitRepo(dir string) bool {
@@ -150,7 +162,7 @@ func Start(opts StartOpts) (string, error) {
 			return "", err
 		}
 	case HarnessCodex:
-		ensureCodexRemoteControl(harnessBin)
+		ensureCodexRemoteControl(harnessBin, opts.Stderr)
 	}
 
 	pol := opts.Policy

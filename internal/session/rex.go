@@ -157,7 +157,7 @@ func readPromptFileIfSet(path string) (string, error) {
 	return string(b), nil
 }
 
-func prepareRexEnvAndHook(spec Spec, self string) (string, error) {
+func prepareRexEnvAndHook(spec Spec, self string, stderr io.Writer) (string, error) {
 	pathEnv := AugmentedPath(os.Getenv("PATH"), os.Getenv("HOME"))
 	_ = os.Setenv("PATH", pathEnv)
 	bin, err := lookPathWithEnv(spec.Binary, pathEnv)
@@ -170,7 +170,7 @@ func prepareRexEnvAndHook(spec Spec, self string) (string, error) {
 			return "", err
 		}
 	case HarnessCodex:
-		ensureCodexRemoteControl(bin)
+		ensureCodexRemoteControl(bin, stderr)
 	}
 	return bin, nil
 }
@@ -257,7 +257,7 @@ func RunRexWrapper(harness, name, resumeID string, policy Policy, promptFile, se
 	lockDir := upgradeLockPath(spec.Name)
 
 	for {
-		bin, err := prepareRexEnvAndHook(spec, self)
+		bin, err := prepareRexEnvAndHook(spec, self, stderr)
 		if err != nil {
 			return err
 		}

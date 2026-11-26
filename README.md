@@ -261,7 +261,7 @@ on the lighthouse across all active Macs (`admin` and `managed` alike).
 - **Task-seeded sessions (`start-task`):** Reads a multiline prompt from stdin and launches safely:
   - `claude`: `--permission-mode manual --remote-control <NAME>` (manual tool approvals)
   - `agy`: submits a native conversation to the Antigravity app by default (or `--sandbox --mode plan --remote-control --prompt-interactive <PROMPT>` with `--rex` / `--tmux`)
-  - `codex`: `-s workspace-write -a on-request` (workspace-write sandbox, on-request approvals) after best-effort `codex remote-control start`
+  - `codex`: `-s workspace-write -a on-request` (workspace-write sandbox, on-request approvals) and automatically starts `codex remote-control` (sharing `codex app-server daemon` with the mobile app; disable Remote Control in Codex Desktop Settings if Desktop holds the host's slot)
 
 ### Cutover from shell launchers (`claude-session` / `agy-session`)
 
