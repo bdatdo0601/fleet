@@ -87,7 +87,7 @@ function statusVariant(st) {
 function renderUsageTile(id, label, item) {
   if (!item) {
     return el(
-      "div",
+      "article",
       { className: "usage-tile" },
       el("div", { className: "usage-tile-head" }, el("strong", { text: label }), badge("no data", "neutral")),
       el("div", { className: "small muted mt-2", text: "No data reported yet." }),
@@ -118,7 +118,14 @@ function renderUsageTile(id, label, item) {
           ),
           el(
             "div",
-            { className: "usage-bar" },
+            {
+              className: "usage-bar",
+              role: "progressbar",
+              "aria-label": `${label} ${w.label}`,
+              "aria-valuenow": String(Math.round(pct)),
+              "aria-valuemin": "0",
+              "aria-valuemax": "100",
+            },
             el("div", {
               className: `usage-bar-fill ${fillClass(pct)}`,
               style: `width: ${pct}%`,
@@ -147,7 +154,7 @@ function renderUsageTile(id, label, item) {
   const metaParts = [item.device, item.source, item.updated_at ? relTime(item.updated_at) : ""].filter(Boolean);
 
   return el(
-    "div",
+    "article",
     { className: "usage-tile", dataset: { harness: id } },
     el("div", { className: "usage-tile-head" }, el("strong", { text: label }), headBadges),
     body,
@@ -155,7 +162,7 @@ function renderUsageTile(id, label, item) {
   );
 }
 
-export function renderUsageCard(usageList) {
+export function renderUsageCard(usageList, opts = {}) {
   const byHarness = new Map();
   for (const item of usageList || []) {
     if (item && item.harness) {
@@ -166,6 +173,10 @@ export function renderUsageCard(usageList) {
   const grid = el("div", { className: "usage-grid" });
   for (const [id, label] of HARNESS_META) {
     grid.appendChild(renderUsageTile(id, label, byHarness.get(id) || null));
+  }
+
+  if (opts.omitHeader) {
+    return el("div", { className: "card" }, grid);
   }
 
   return el(

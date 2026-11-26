@@ -1,14 +1,17 @@
 import {
   api,
   badge,
+  cell,
   clear,
   closeModal,
   confirmDialog,
   el,
   fetchPathsCatalog,
+  field,
   makeCopyBtn,
   openModal,
   relTime,
+  section,
   state,
   toast,
 } from "./lib.js";
@@ -89,17 +92,17 @@ function openNewMemoryModal(scopes, onDone) {
     el(
       "div",
       { className: "form-row-2" },
-      el("div", { className: "field" }, el("label", { text: "Scope" }), scopeInput),
-      el("div", { className: "field" }, el("label", { text: "Key" }), keyInput),
+      field("Scope", scopeInput),
+      field("Key", keyInput),
     ),
     el(
       "div",
       { className: "form-row-2" },
-      el("div", { className: "field" }, el("label", { text: "Kind" }), kindSel),
-      el("div", { className: "field" }, el("label", { text: "Tier" }), tierSel),
+      field("Kind", kindSel),
+      field("Tier", tierSel),
     ),
-    el("div", { className: "field" }, el("label", { text: "Summary" }), summaryInput),
-    el("div", { className: "field" }, el("label", { text: "Body" }), bodyInput),
+    field("Summary", summaryInput),
+    field("Body", bodyInput),
     el("label", { className: "checkbox-row" }, lockCheck, "Lock against automated edits"),
     el("label", { className: "checkbox-row" }, curateCheck, "Enqueue for LLM curator"),
     el(
@@ -159,14 +162,14 @@ async function openMemoryDetailModal(scope, key, onDone) {
     el(
       "div",
       { className: "form-grid" },
-      el("h4", { className: "card-title m-0", text: "Promote / Copy Entry" }),
+      el("h3", { className: "card-title m-0", text: "Promote / Copy Entry" }),
       el(
         "div",
         { className: "form-row-2" },
-        el("div", { className: "field" }, el("label", { text: "To Scope" }), toScopeIn),
-        el("div", { className: "field" }, el("label", { text: "To Key" }), toKeyIn),
+        field("To Scope", toScopeIn),
+        field("To Key", toKeyIn),
       ),
-      el("div", { className: "field" }, el("label", { text: "Destination Tier" }), toTierSel),
+      field("Destination Tier", toTierSel),
       el("label", { className: "checkbox-row" }, toLockCheck, "Lock destination"),
       el(
         "div",
@@ -239,17 +242,17 @@ async function openMemoryDetailModal(scope, key, onDone) {
     el(
       "div",
       { className: "form-row-2" },
-      el("div", { className: "field" }, el("label", { text: "Kind" }), kindSel),
-      el("div", { className: "field" }, el("label", { text: "Tier" }), tierSel),
+      field("Kind", kindSel),
+      field("Tier", tierSel),
     ),
     el(
       "div",
       { className: "form-row-2" },
-      el("div", { className: "field" }, el("label", { text: "Status" }), statusSel),
-      el("div", { className: "field" }, el("label", { text: "Edit Reason" }), reasonInput),
+      field("Status", statusSel),
+      field("Edit Reason", reasonInput),
     ),
-    el("div", { className: "field" }, el("label", { text: "Summary" }), summaryInput),
-    el("div", { className: "field" }, el("label", { text: "Body" }), bodyInput),
+    field("Summary", summaryInput),
+    field("Body", bodyInput),
     el(
       "div",
       { className: "actions-row" },
@@ -308,7 +311,7 @@ async function openMemoryDetailModal(scope, key, onDone) {
     ),
   );
 
-  const histBox = el("div", { className: "card mt-3" }, el("h4", { className: "card-title mb-2", text: `Revision History (${history.length})` }));
+  const histBox = el("div", { className: "card mt-3" }, el("h3", { className: "card-title mb-2", text: `Revision History (${history.length})` }));
   for (const r of history) {
     histBox.appendChild(
       el(
@@ -407,11 +410,11 @@ async function renderEntriesView(root, scopes, ctx) {
       }),
     ),
   ];
-  root.appendChild(el("div", { className: "chips-row mb-2" }, scopeChips));
 
   const searchIn = el("input", {
     type: "search",
     className: "grow",
+    "aria-label": "Search memories",
     placeholder: "FTS5 search memories…",
     value: memState.q,
     onkeydown: (ev) => {
@@ -424,6 +427,7 @@ async function renderEntriesView(root, scopes, ctx) {
   const kindSel = el(
     "select",
     {
+      "aria-label": "Filter by kind",
       onchange: (ev) => {
         memState.kind = ev.target.value;
         ctx.refresh();
@@ -435,6 +439,7 @@ async function renderEntriesView(root, scopes, ctx) {
   const tierSel = el(
     "select",
     {
+      "aria-label": "Filter by tier",
       onchange: (ev) => {
         memState.tier = ev.target.value;
         ctx.refresh();
@@ -446,6 +451,7 @@ async function renderEntriesView(root, scopes, ctx) {
   const statusSel = el(
     "select",
     {
+      "aria-label": "Filter by status",
       onchange: (ev) => {
         memState.status = ev.target.value;
         ctx.refresh();
@@ -457,7 +463,10 @@ async function renderEntriesView(root, scopes, ctx) {
     el("option", { value: "superseded", text: "superseded", selected: memState.status === "superseded" }),
   );
 
-  root.appendChild(
+  const filterBlock = el(
+    "div",
+    null,
+    el("div", { className: "chips-row mb-2" }, scopeChips),
     el(
       "div",
       { className: "toolbar" },
@@ -474,46 +483,38 @@ async function renderEntriesView(root, scopes, ctx) {
       kindSel,
       tierSel,
       statusSel,
-      el("button", {
-        type: "button",
-        className: "btn btn-sm btn-primary",
-        text: "+ New Memory",
-        onclick: () => openNewMemoryModal(scopes, () => ctx.refresh()),
-      }),
     ),
   );
 
+  let resultsNode;
   if (items.length === 0) {
-    root.appendChild(el("div", { className: "empty-state", text: "No memory entries match the current filter." }));
-    return;
-  }
-
-  const tbody = el("tbody");
-  for (const it of items) {
-    tbody.appendChild(
-      el(
-        "tr",
-        {
-          className: "row-clickable",
-          onclick: () => openMemoryDetailModal(it.scope, it.key, () => ctx.refresh()),
-        },
-        el("td", null, el("div", { className: "mono small muted", text: it.scope }), el("strong", { className: "mono", text: it.key })),
-        el("td", null, badge(it.kind, "neutral")),
-        el("td", null, badge(it.tier, it.tier === "always" ? "info" : "neutral")),
-        el("td", null, badge(it.status, it.status === "active" ? "ok" : "warn")),
-        el("td", null, el("span", { className: "small", text: `${it.source} r${it.revision}` }), it.locked ? " " : null, it.locked ? badge("locked", "info") : null),
-        el("td", { text: relTime(it.updated_at) }),
-        el("td", { className: "small", text: it.summary }),
-      ),
-    );
-  }
-  root.appendChild(
-    el(
+    resultsNode = el("div", { className: "empty-state", text: "No memory entries match the current filter." });
+  } else {
+    const tbody = el("tbody");
+    for (const it of items) {
+      tbody.appendChild(
+        el(
+          "tr",
+          {
+            className: "row-clickable",
+            onclick: () => openMemoryDetailModal(it.scope, it.key, () => ctx.refresh()),
+          },
+          cell("Scope / Key", { className: "cell-primary" }, el("div", { className: "mono small muted", text: it.scope }), el("strong", { className: "mono", text: it.key })),
+          cell("Kind", null, badge(it.kind, "neutral")),
+          cell("Tier", null, badge(it.tier, it.tier === "always" ? "info" : "neutral")),
+          cell("Status", null, badge(it.status, it.status === "active" ? "ok" : "warn")),
+          cell("Source", null, el("span", { className: "small", text: `${it.source} r${it.revision}` }), it.locked ? " " : null, it.locked ? badge("locked", "info") : null),
+          cell("Updated", { text: relTime(it.updated_at) }),
+          cell("Summary", { className: "small", text: it.summary }),
+        ),
+      );
+    }
+    resultsNode = el(
       "div",
       { className: "table-wrap" },
       el(
         "table",
-        null,
+        { className: "responsive-table" },
         el(
           "thead",
           null,
@@ -531,8 +532,10 @@ async function renderEntriesView(root, scopes, ctx) {
         ),
         tbody,
       ),
-    ),
-  );
+    );
+  }
+
+  root.appendChild(section("Memory Entries", { className: "ui-section" }, filterBlock, resultsNode));
 }
 
 async function renderProposalsView(root, ctx) {
@@ -562,6 +565,7 @@ async function renderProposalsView(root, ctx) {
   const statusSel = el(
     "select",
     {
+      "aria-label": "Proposal status filter",
       onchange: (ev) => {
         memState.propStatus = ev.target.value;
         memState.selectedProps.clear();
@@ -611,7 +615,7 @@ async function renderProposalsView(root, ctx) {
       text: "Approve All Pending",
       disabled: pendingProps.length === 0,
       onclick: async () => {
-        if (await confirmDialog("Approve All Pending?", `Approve all pending proposals?`, "Approve All", false)) {
+        if (await confirmDialog("Approve All Pending?", "Approve all pending proposals?", "Approve All", false)) {
           await runBatch({ all_pending: true, decision: "approve" }, "Approved");
         }
       },
@@ -622,84 +626,86 @@ async function renderProposalsView(root, ctx) {
       text: "Reject All Pending",
       disabled: pendingProps.length === 0,
       onclick: async () => {
-        if (await confirmDialog("Reject All Pending?", `Reject all pending proposals?`, "Reject All", true)) {
+        if (await confirmDialog("Reject All Pending?", "Reject all pending proposals?", "Reject All", true)) {
           await runBatch({ all_pending: true, decision: "reject" }, "Rejected");
         }
       },
     }),
   );
-  root.appendChild(batchBar);
 
+  const listWrap = el("div");
   if (proposals.length === 0) {
-    root.appendChild(el("div", { className: "empty-state", text: "No proposals found." }));
-    return;
-  }
+    listWrap.appendChild(el("div", { className: "empty-state", text: "No proposals found." }));
+  } else {
+    for (const p of proposals) {
+      const isPending = p.status === "pending";
+      const cb = isPending
+        ? el("input", {
+            type: "checkbox",
+            "aria-label": `Select proposal #${p.id}`,
+            checked: memState.selectedProps.has(p.id),
+            onchange: (ev) => {
+              if (ev.target.checked) {
+                memState.selectedProps.add(p.id);
+              } else {
+                memState.selectedProps.delete(p.id);
+              }
+              ctx.refresh();
+            },
+          })
+        : null;
 
-  for (const p of proposals) {
-    const isPending = p.status === "pending";
-    const cb = isPending
-      ? el("input", {
-          type: "checkbox",
-          checked: memState.selectedProps.has(p.id),
-          onchange: (ev) => {
-            if (ev.target.checked) {
-              memState.selectedProps.add(p.id);
-            } else {
-              memState.selectedProps.delete(p.id);
-            }
-            ctx.refresh();
-          },
-        })
-      : null;
+      const resolveOne = async (decision) => {
+        try {
+          await api("POST", "/v1/memory/proposals/resolve", { id: p.id, decision });
+          memState.selectedProps.delete(p.id);
+          toast(`Proposal #${p.id} ${decision}d`, "ok");
+          ctx.refresh();
+        } catch (err) {
+          toast(err.message, "error");
+        }
+      };
 
-    const resolveOne = async (decision) => {
-      try {
-        await api("POST", "/v1/memory/proposals/resolve", { id: p.id, decision });
-        memState.selectedProps.delete(p.id);
-        toast(`Proposal #${p.id} ${decision}d`, "ok");
-        ctx.refresh();
-      } catch (err) {
-        toast(err.message, "error");
-      }
-    };
-
-    root.appendChild(
-      el(
-        "div",
-        { className: "card mb-2" },
+      listWrap.appendChild(
         el(
-          "div",
-          { className: "actions-row flex-between mb-2" },
+          "article",
+          { className: "card mb-2" },
           el(
             "div",
-            { className: "actions-row" },
-            cb,
-            el("strong", { className: "mono", text: `#${p.id} ${p.target_scope}/${p.target_key}` }),
-            badge(p.action, "info"),
-            badge(p.tier, "neutral"),
-            badge(p.status, p.status === "approved" ? "ok" : p.status === "rejected" ? "danger" : "warn"),
-          ),
-          el("span", { className: "small muted", text: `${p.model || "curator"} · ${relTime(p.created_at)}` }),
-        ),
-        el("div", { className: "small mb-2", text: p.summary }),
-        el("div", { className: "small muted mb-2", text: `Reason: ${p.reason}` }),
-        el(
-          "details",
-          { className: "details-box mt-1" },
-          el("summary", { text: "Proposed Body" }),
-          el("pre", { className: "code-block mt-2", text: p.body }),
-        ),
-        isPending
-          ? el(
+            { className: "actions-row flex-between mb-2" },
+            el(
               "div",
-              { className: "actions-row flex-end mt-2" },
-              el("button", { type: "button", className: "btn btn-sm btn-danger", text: "Reject", onclick: () => resolveOne("reject") }),
-              el("button", { type: "button", className: "btn btn-sm btn-primary", text: "Approve", onclick: () => resolveOne("approve") }),
-            )
-          : null,
-      ),
-    );
+              { className: "actions-row" },
+              cb,
+              el("strong", { className: "mono", text: `#${p.id} ${p.target_scope}/${p.target_key}` }),
+              badge(p.action, "info"),
+              badge(p.tier, "neutral"),
+              badge(p.status, p.status === "approved" ? "ok" : p.status === "rejected" ? "danger" : "warn"),
+            ),
+            el("span", { className: "small muted", text: `${p.model || "curator"} · ${relTime(p.created_at)}` }),
+          ),
+          el("div", { className: "small mb-2", text: p.summary }),
+          el("div", { className: "small muted mb-2", text: `Reason: ${p.reason}` }),
+          el(
+            "details",
+            { className: "details-box mt-1" },
+            el("summary", { text: "Proposed Body" }),
+            el("pre", { className: "code-block mt-2", text: p.body }),
+          ),
+          isPending
+            ? el(
+                "div",
+                { className: "actions-row flex-end mt-2" },
+                el("button", { type: "button", className: "btn btn-sm btn-danger", text: "Reject", onclick: () => resolveOne("reject") }),
+                el("button", { type: "button", className: "btn btn-sm btn-primary", text: "Approve", onclick: () => resolveOne("approve") }),
+              )
+            : null,
+        ),
+      );
+    }
   }
+
+  root.appendChild(section("Curator Proposals", { className: "ui-section" }, batchBar, listWrap));
 }
 
 async function renderContextView(root, scopes) {
@@ -732,7 +738,7 @@ async function renderContextView(root, scopes) {
       clear(resultBox);
       resultBox.appendChild(
         el(
-          "div",
+          "article",
           { className: "card" },
           el(
             "div",
@@ -756,20 +762,28 @@ async function renderContextView(root, scopes) {
   };
 
   root.appendChild(
-    el(
-      "div",
-      { className: "card" },
-      el("datalist", { id: "ctx-repos" }, ...repoChoices.map((r) => el("option", { value: r }))),
+    section(
+      "SessionStart Context Preview",
+      { className: "ui-section" },
       el(
         "div",
-        { className: "toolbar m-0" },
-        el("div", { className: "field" }, el("label", { text: "Repo" }), repoInput),
-        el("div", { className: "field" }, el("label", { text: "Device" }), devInput),
-        el("button", { type: "button", className: "btn btn-primary", text: "Preview SessionStart Context", onclick: loadContext }),
+        { className: "card form-grid" },
+        el("datalist", { id: "ctx-repos" }, ...repoChoices.map((r) => el("option", { value: r }))),
+        el(
+          "div",
+          { className: "form-row-2" },
+          field("Repo", repoInput),
+          field("Device", devInput),
+        ),
+        el(
+          "div",
+          { className: "actions-row flex-end" },
+          el("button", { type: "button", className: "btn btn-primary", text: "Preview SessionStart Context", onclick: loadContext }),
+        ),
       ),
+      resultBox,
     ),
   );
-  root.appendChild(resultBox);
   await loadContext();
 }
 
@@ -783,20 +797,24 @@ async function renderHistoryView(root, ctx) {
     return;
   }
   if (revs.length === 0) {
-    root.appendChild(el("div", { className: "empty-state", text: "No memory revisions recorded yet." }));
+    root.appendChild(section("Audit History", { className: "ui-section" }, el("div", { className: "empty-state", text: "No memory revisions recorded yet." })));
     return;
   }
 
+  const list = el("div", { className: "form-grid" });
   for (const r of revs) {
-    root.appendChild(
+    list.appendChild(
       el(
         "details",
-        { className: "details-box mt-2" },
+        { className: "details-box m-0" },
         el(
           "summary",
-          null,
+          { className: "history-summary" },
           el("span", { className: "mono", text: `${r.scope}/${r.key} r${r.revision}` }),
-          ` · ${r.status} · ${r.source} · ${r.device || "-"} · ${relTime(r.created_at)} · ${r.reason}`,
+          " ",
+          badge(r.status, r.status === "active" ? "ok" : "warn"),
+          " ",
+          el("span", { className: "small muted", text: `${r.source} · ${r.device || "-"} · ${relTime(r.created_at)} · ${r.reason}` }),
         ),
         el(
           "div",
@@ -833,6 +851,7 @@ async function renderHistoryView(root, ctx) {
       ),
     );
   }
+  root.appendChild(section("Audit History", { className: "ui-section" }, list));
 }
 
 async function renderCuratorView(root, ctx) {
@@ -845,36 +864,35 @@ async function renderCuratorView(root, ctx) {
   }
 
   const stateLabel = st.enabled ? "Enabled" : st.configured ? "Disabled" : "Not configured";
-  root.appendChild(
+  const statusCard = el(
+    "article",
+    { className: "card" },
     el(
       "div",
-      { className: "card mb-3" },
-      el(
-        "div",
-        { className: "card-header" },
-        el("h3", { className: "card-title", text: "LLM Memory Curator Status" }),
-        badge(stateLabel, st.enabled ? "ok" : "neutral"),
-      ),
-      el(
-        "dl",
-        { className: "kv-list" },
-        el("dt", { className: "kv-label", text: "Provider / URL" }),
-        el("dd", { className: "kv-value mono", text: st.configured ? `${st.provider} (${st.base_url})` : "-" }),
-        el("dt", { className: "kv-label", text: "Model" }),
-        el("dd", { className: "kv-value mono", text: st.model || "-" }),
-        el("dt", { className: "kv-label", text: "API Key" }),
-        el("dd", { className: "kv-value mono", text: st.api_key_hint || "-" }),
-        el("dt", { className: "kv-label", text: "Global Mode" }),
-        el("dd", { className: "kv-value", text: st.review_global ? "Review queue (opt-in)" : "Auto-apply (opt-out)" }),
-        el("dt", { className: "kv-label", text: "Queue" }),
-        el("dd", { className: "kv-value", text: `${st.pending_jobs} pending · ${st.failed_jobs} failed · ${st.pending_proposals} proposals · ${st.processed_count} processed` }),
-        el("dt", { className: "kv-label", text: "Last Run" }),
-        el("dd", { className: "kv-value", text: st.last_run_at ? relTime(st.last_run_at) : "never" }),
-        st.last_error ? el("dt", { className: "kv-label", text: "Last Error" }) : null,
-        st.last_error ? el("dd", { className: "kv-value", text: st.last_error }) : null,
-      ),
+      { className: "card-header" },
+      el("h3", { className: "card-title", text: "LLM Memory Curator" }),
+      badge(stateLabel, st.enabled ? "ok" : "neutral"),
+    ),
+    el(
+      "dl",
+      { className: "kv-list" },
+      el("dt", { className: "kv-label", text: "Provider / URL" }),
+      el("dd", { className: "kv-value mono", text: st.configured ? `${st.provider} (${st.base_url})` : "-" }),
+      el("dt", { className: "kv-label", text: "Model" }),
+      el("dd", { className: "kv-value mono", text: st.model || "-" }),
+      el("dt", { className: "kv-label", text: "API Key" }),
+      el("dd", { className: "kv-value mono", text: st.api_key_hint || "-" }),
+      el("dt", { className: "kv-label", text: "Global Mode" }),
+      el("dd", { className: "kv-value", text: st.review_global ? "Review queue (opt-in)" : "Auto-apply (opt-out)" }),
+      el("dt", { className: "kv-label", text: "Queue" }),
+      el("dd", { className: "kv-value", text: `${st.pending_jobs} pending · ${st.failed_jobs} failed · ${st.pending_proposals} proposals · ${st.processed_count} processed` }),
+      el("dt", { className: "kv-label", text: "Last Run" }),
+      el("dd", { className: "kv-value", text: st.last_run_at ? relTime(st.last_run_at) : "never" }),
+      st.last_error ? el("dt", { className: "kv-label", text: "Last Error" }) : null,
+      st.last_error ? el("dd", { className: "kv-value", text: st.last_error }) : null,
     ),
   );
+  root.appendChild(section("Curator Status", { className: "ui-section" }, statusCard));
 
   if (!state.isAdmin) {
     root.appendChild(el("div", { className: "muted small", text: "Only admin devices can configure or manually trigger the curator." }));
@@ -899,11 +917,11 @@ async function renderCuratorView(root, ctx) {
         el(
           "tr",
           null,
-          el("td", { className: "mono small", text: `${r.memory_scope}/${r.memory_key}` }),
-          el("td", null, badge(r.action, r.error ? "danger" : r.applied ? "ok" : "info")),
-          el("td", { className: "mono small", text: r.target_key ? `${r.target_scope || r.memory_scope}/${r.target_key}` : "-" }),
-          el("td", { text: r.applied ? "yes" : r.queued_proposal_id ? `#${r.queued_proposal_id}` : "no" }),
-          el("td", { className: "small", text: r.error || r.reason || "-" }),
+          cell("Memory", { className: "mono small cell-primary", text: `${r.memory_scope}/${r.memory_key}` }),
+          cell("Action", null, badge(r.action, r.error ? "danger" : r.applied ? "ok" : "info")),
+          cell("Target", { className: "mono small", text: r.target_key ? `${r.target_scope || r.memory_scope}/${r.target_key}` : "-" }),
+          cell("Applied", { text: r.applied ? "yes" : r.queued_proposal_id ? `#${r.queued_proposal_id}` : "no" }),
+          cell("Reason / Error", { className: "small", text: r.error || r.reason || "-" }),
         ),
       );
     }
@@ -913,7 +931,7 @@ async function renderCuratorView(root, ctx) {
         { className: "table-wrap" },
         el(
           "table",
-          null,
+          { className: "responsive-table" },
           el("thead", null, el("tr", null, el("th", { text: "Memory" }), el("th", { text: "Action" }), el("th", { text: "Target" }), el("th", { text: "Applied" }), el("th", { text: "Reason / Error" }))),
           tbody,
         ),
@@ -945,20 +963,18 @@ async function renderCuratorView(root, ctx) {
 
   const runCard = el(
     "div",
-    { className: "card mb-3" },
-    el("h3", { className: "card-title mb-2", text: "Run Curator Now" }),
+    { className: "card" },
     el(
       "div",
-      { className: "toolbar" },
-      el("label", { className: "small", text: "Limit:" }),
-      limitIn,
+      { className: "toolbar m-0" },
+      field("Batch Limit", limitIn),
       el("label", { className: "checkbox-row" }, dryRunCheck, "Dry run"),
       el("label", { className: "checkbox-row" }, includeAllCheck, "Include all active"),
       runBtn,
     ),
     reportsBox,
   );
-  root.appendChild(runCard);
+  root.appendChild(section("Manual Run", { className: "ui-section" }, runCard));
 
   const provSel = el(
     "select",
@@ -1020,26 +1036,25 @@ async function renderCuratorView(root, ctx) {
         }
       },
     },
-    el("h3", { className: "card-title m-0", text: "Curator Configuration" }),
     el(
       "div",
       { className: "form-row-2" },
-      el("div", { className: "field" }, el("label", { text: "Provider" }), provSel),
-      el("div", { className: "field" }, el("label", { text: "Model" }), modelIn),
+      field("Provider", provSel),
+      field("Model", modelIn),
     ),
     el(
       "div",
       { className: "form-row-2" },
-      el("div", { className: "field" }, el("label", { text: "Base URL" }), urlIn),
-      el("div", { className: "field" }, el("label", { text: "API Key" }), keyIn),
+      field("Base URL", urlIn),
+      field("API Key", keyIn),
     ),
     el(
       "div",
       { className: "form-row-2" },
-      el("div", { className: "field" }, el("label", { text: "OpenRouter Data Collection" }), dataCollSel),
-      el("div", { className: "field" }, el("label", { text: "Ollama Keep Alive" }), keepAliveIn),
+      field("OpenRouter Data Collection", dataCollSel),
+      field("Ollama Keep Alive", keepAliveIn),
     ),
-    el("div", { className: "field" }, el("label", { text: "Ollama Num Ctx" }), numCtxIn),
+    field("Ollama Num Ctx", numCtxIn),
     el(
       "div",
       { className: "actions-row" },
@@ -1068,7 +1083,7 @@ async function renderCuratorView(root, ctx) {
       saveCfgBtn,
     ),
   );
-  root.appendChild(cfgForm);
+  root.appendChild(section("Curator Configuration", { className: "ui-section" }, cfgForm));
 }
 
 export async function renderMemory(root, ctx, subRoute = "") {
@@ -1093,7 +1108,7 @@ export async function renderMemory(root, ctx, subRoute = "") {
   clear(root);
   root.appendChild(
     el(
-      "div",
+      "header",
       { className: "page-header" },
       el(
         "div",
@@ -1106,6 +1121,12 @@ export async function renderMemory(root, ctx, subRoute = "") {
             : "Cross-harness memory store & curator",
         }),
       ),
+      el("button", {
+        type: "button",
+        className: "btn btn-primary",
+        text: "+ New Memory",
+        onclick: () => openNewMemoryModal(scopes, () => ctx.refresh()),
+      }),
     ),
   );
 
@@ -1118,6 +1139,8 @@ export async function renderMemory(root, ctx, subRoute = "") {
   ].map(([id, label, hash]) =>
     el("button", {
       type: "button",
+      role: "tab",
+      "aria-selected": memState.tab === id ? "true" : "false",
       className: `sub-tab${memState.tab === id ? " active" : ""}`,
       text: label,
       onclick: () => {
@@ -1126,7 +1149,7 @@ export async function renderMemory(root, ctx, subRoute = "") {
       },
     }),
   );
-  root.appendChild(el("div", { className: "sub-tabs" }, tabs));
+  root.appendChild(el("div", { className: "sub-tabs", role: "tablist", "aria-label": "Memory views" }, tabs));
 
   switch (memState.tab) {
     case "proposals":

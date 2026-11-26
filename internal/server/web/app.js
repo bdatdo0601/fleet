@@ -1,4 +1,4 @@
-import { api, clear, closeModal, el, state, toast } from "./lib.js";
+import { api, clear, closeModal, el, state, svgIcon, toast } from "./lib.js";
 import { renderOverview } from "./overview.js";
 import { renderDevices } from "./devices.js";
 import { renderAgents } from "./agents.js";
@@ -6,18 +6,74 @@ import { renderMemory } from "./memory.js";
 import { renderSlacker } from "./slacker.js";
 import { renderSystem } from "./system.js";
 
+const NAV_ITEMS = [
+  {
+    id: "overview",
+    label: "Overview",
+    href: "#overview",
+    adminOnly: false,
+    icon: ["M3 9.5L12 3l9 6.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1V9.5z"],
+  },
+  {
+    id: "agents",
+    label: "Agents",
+    href: "#agents",
+    adminOnly: false,
+    icon: ["M12 2a3 3 0 0 0-3 3v1H7a3 3 0 0 0-3 3v7a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3V9a3 3 0 0 0-3-3h-2V5a3 3 0 0 0-3-3z", "M9 13h.01M15 13h.01"],
+  },
+  {
+    id: "memory",
+    label: "Memory",
+    href: "#memory",
+    adminOnly: false,
+    icon: ["M4 6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6z", "M8 9h8M8 13h6M8 17h4"],
+  },
+  {
+    id: "devices",
+    label: "Devices",
+    href: "#devices",
+    adminOnly: true,
+    icon: ["M4 5h16v10H4z", "M8 19h8M12 15v4"],
+  },
+  {
+    id: "slacker",
+    label: "Slacker",
+    href: "#slacker",
+    adminOnly: true,
+    icon: ["M4 9h16M4 15h16M9 4v16M15 4v16"],
+  },
+  {
+    id: "system",
+    label: "System",
+    href: "#system",
+    adminOnly: true,
+    icon: ["M12 3v3M12 18v3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M3 12h3M18 12h3M4.9 19.1L7 17M17 7l2.1-2.1", "M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7z"],
+  },
+];
+
 function parseHash() {
   const raw = (window.location.hash || "#overview").replace(/^#/, "");
   const [section, sub = ""] = raw.split("/", 2);
   return { section: section || "overview", sub };
 }
 
+function updateThemeUI(mode) {
+  const themeBtn = document.getElementById("theme-btn");
+  if (themeBtn) {
+    const label = mode === "dark" ? "Theme: Dark" : mode === "light" ? "Theme: Light" : "Theme: Auto";
+    themeBtn.textContent = label;
+    themeBtn.setAttribute("aria-label", `${label}. Click to cycle theme.`);
+  }
+}
+
 function applySavedTheme() {
   const saved = localStorage.getItem("fleet_theme");
   if (saved === "light" || saved === "dark") {
     document.documentElement.setAttribute("data-theme", saved);
+    updateThemeUI(saved);
   } else {
     document.documentElement.removeAttribute("data-theme");
+    updateThemeUI("auto");
   }
 }
 
@@ -40,53 +96,99 @@ function toggleTheme() {
   applySavedTheme();
 }
 
+function setControlsOpen(open) {
+  const controls = document.getElementById("topbar-controls");
+  const toggle = document.getElementById("controls-toggle");
+  if (controls) {
+    controls.classList.toggle("open", open);
+  }
+  if (toggle) {
+    toggle.setAttribute("aria-expanded", open ? "true" : "false");
+  }
+}
+
+function updateOfflineBanner(forceOffline = false) {
+  const banner = document.getElementById("offline-banner");
+  if (!banner) {
+    return;
+  }
+  const show = forceOffline || (typeof navigator !== "undefined" && navigator.onLine === false);
+  banner.classList.toggle("hidden", !show);
+}
+
 function renderTopbar(ov, activeSection) {
   const nav = document.getElementById("main-nav");
+  const mobileNav = document.getElementById("mobile-nav");
   const pills = document.getElementById("status-pills");
   const callerBadge = document.getElementById("caller-badge");
 
+  const visibleItems = NAV_ITEMS.filter((item) => !item.adminOnly || state.isAdmin);
+  const waitingCount = ov && ov.agents ? ov.agents.waiting || 0 : 0;
+  const propCount = ov && ov.memory ? ov.memory.pending_proposals || 0 : 0;
+
   if (nav) {
     clear(nav);
-    const links = [
-      ["overview", "Overview", "#overview", false],
-      ["devices", "Devices", "#devices", true],
-      ["agents", "Agents", "#agents", false],
-      ["memory", "Memory", "#memory", false],
-      ["slacker", "Slacker", "#slacker", true],
-      ["system", "System", "#system", true],
-    ];
-    for (const [id, label, href, adminOnly] of links) {
-      if (adminOnly && !state.isAdmin) {
-        continue;
-      }
+    for (const item of visibleItems) {
+      const isActive = activeSection === item.id;
       nav.appendChild(
         el("a", {
-          href,
-          className: `nav-link${activeSection === id ? " active" : ""}`,
-          text: label,
+          href: item.href,
+          className: `nav-link${isActive ? " active" : ""}`,
+          "aria-current": isActive ? "page" : null,
+          text: item.label,
         }),
+      );
+    }
+  }
+
+  if (mobileNav) {
+    clear(mobileNav);
+    for (const item of visibleItems) {
+      const isActive = activeSection === item.id;
+      const badgeCount = item.id === "agents" ? waitingCount : item.id === "memory" ? propCount : 0;
+      mobileNav.appendChild(
+        el(
+          "a",
+          {
+            href: item.href,
+            className: `bottom-nav-link${isActive ? " active" : ""}`,
+            "aria-current": isActive ? "page" : null,
+          },
+          el(
+            "span",
+            { className: "bottom-nav-icon-wrap" },
+            svgIcon(item.icon, "bottom-nav-icon"),
+            badgeCount > 0
+              ? el("span", {
+                  className: `bottom-nav-dot ${item.id === "agents" ? "dot-warn" : "dot-info"}`,
+                  text: badgeCount > 9 ? "9+" : String(badgeCount),
+                })
+              : null,
+          ),
+          el("span", { className: "bottom-nav-label", text: item.label }),
+        ),
       );
     }
   }
 
   if (pills && ov) {
     clear(pills);
-    if (ov.agents && ov.agents.waiting > 0) {
+    if (waitingCount > 0) {
       pills.appendChild(
         el("button", {
           type: "button",
           className: "badge badge-warn pill-btn",
-          text: `${ov.agents.waiting} waiting`,
+          text: `${waitingCount} waiting`,
           onclick: () => navigate("#agents/waiting"),
         }),
       );
     }
-    if (ov.memory && ov.memory.pending_proposals > 0) {
+    if (propCount > 0) {
       pills.appendChild(
         el("button", {
           type: "button",
           className: "badge badge-info pill-btn",
-          text: `${ov.memory.pending_proposals} proposals`,
+          text: `${propCount} proposals`,
           onclick: () => navigate("#memory/proposals"),
         }),
       );
@@ -99,6 +201,7 @@ function renderTopbar(ov, activeSection) {
 }
 
 function navigate(hash) {
+  setControlsOpen(false);
   if (window.location.hash === hash) {
     renderRoute();
   } else {
@@ -115,10 +218,12 @@ async function refresh() {
     if (seq !== renderSeq) {
       return;
     }
+    updateOfflineBanner(false);
     state.overview = ov;
     state.caller = ov.caller;
     state.isAdmin = Boolean(ov.caller && ov.caller.is_admin);
   } catch (err) {
+    updateOfflineBanner(err.status === 503 || navigator.onLine === false);
     const main = document.getElementById("app-main");
     if (main) {
       clear(main);
@@ -130,6 +235,7 @@ async function refresh() {
 }
 
 async function renderRoute() {
+  setControlsOpen(false);
   if (!state.overview) {
     await refresh();
     return;
@@ -166,7 +272,7 @@ async function renderCurrentRoute(seq) {
       await renderMemory(main, ctx, sub);
       break;
     case "slacker":
-      await renderSlacker(main, ctx);
+      await renderSlacker(main, ctx, sub);
       break;
     case "system":
       await renderSystem(main, ctx);
@@ -191,7 +297,7 @@ function setAutoRefresh(ms) {
       const skipSection = section === "system" || section === "slacker" || (section === "memory" && sub === "curator") || (section === "agents" && sub === "messages");
       const ae = document.activeElement;
       const typing = Boolean(ae && ae.closest("#app-main") && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName));
-      if (document.hidden || state.modalOpen || state.editing || typing || skipSection) {
+      if (document.hidden || state.modalOpen || state.editing || typing || skipSection || navigator.onLine === false) {
         return;
       }
       refresh();
@@ -199,8 +305,48 @@ function setAutoRefresh(ms) {
   }
 }
 
+function setupPWA() {
+  if ("serviceWorker" in navigator && window.isSecureContext) {
+    navigator.serviceWorker.register("/sw.js").catch(() => {});
+  }
+
+  let deferredPrompt = null;
+  const installBtn = document.getElementById("install-btn");
+  if (!installBtn) {
+    return;
+  }
+
+  window.addEventListener("beforeinstallprompt", (ev) => {
+    ev.preventDefault();
+    deferredPrompt = ev;
+    installBtn.classList.remove("hidden");
+  });
+
+  installBtn.addEventListener("click", async () => {
+    if (!deferredPrompt) {
+      return;
+    }
+    deferredPrompt.prompt();
+    try {
+      await deferredPrompt.userChoice;
+    } catch {
+      // ignore cancelled prompt
+    }
+    deferredPrompt = null;
+    installBtn.classList.add("hidden");
+  });
+
+  window.addEventListener("appinstalled", () => {
+    deferredPrompt = null;
+    installBtn.classList.add("hidden");
+    toast("Fleet installed as app", "ok");
+  });
+}
+
 function init() {
   applySavedTheme();
+  setupPWA();
+  updateOfflineBanner(false);
 
   const refreshSel = document.getElementById("refresh-select");
   const savedRefresh = Number.parseInt(localStorage.getItem("fleet_refresh_ms") || "15000", 10);
@@ -223,6 +369,23 @@ function init() {
     themeBtn.addEventListener("click", toggleTheme);
   }
 
+  const controlsToggle = document.getElementById("controls-toggle");
+  if (controlsToggle) {
+    controlsToggle.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      const controls = document.getElementById("topbar-controls");
+      setControlsOpen(!(controls && controls.classList.contains("open")));
+    });
+  }
+
+  document.addEventListener("click", (ev) => {
+    const controls = document.getElementById("topbar-controls");
+    const toggle = document.getElementById("controls-toggle");
+    if (controls && controls.classList.contains("open") && !controls.contains(ev.target) && ev.target !== toggle) {
+      setControlsOpen(false);
+    }
+  });
+
   const modalClose = document.getElementById("modal-close");
   if (modalClose) {
     modalClose.addEventListener("click", closeModal);
@@ -238,9 +401,21 @@ function init() {
   }
 
   document.addEventListener("keydown", (ev) => {
-    if (ev.key === "Escape" && state.modalOpen) {
-      closeModal();
+    if (ev.key === "Escape") {
+      if (state.modalOpen) {
+        closeModal();
+      } else {
+        setControlsOpen(false);
+      }
     }
+  });
+
+  window.addEventListener("online", () => {
+    updateOfflineBanner(false);
+    refresh();
+  });
+  window.addEventListener("offline", () => {
+    updateOfflineBanner(true);
   });
 
   window.addEventListener("hashchange", () => {

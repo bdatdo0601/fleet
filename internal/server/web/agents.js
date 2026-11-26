@@ -2,24 +2,27 @@ import {
   api,
   badge,
   buildRepoSuggestions,
+  cell,
   clear,
   closeModal,
   confirmDialog,
   el,
   fetchPathsCatalog,
+  field,
   formatDuration,
   makeCopyBtn,
   openModal,
   populateDatalist,
   relTime,
   renderTrackedPathsBox,
+  section,
   state,
   toast,
 } from "./lib.js";
 import { renderUsageCard } from "./usage.js";
 
 const agentsFilter = {
-  tab: "sessions", // sessions | messages
+  tab: "sessions", // sessions | messages | usage
   stateChip: "live", // live | waiting | working | idle | all
   device: "",
   harness: "",
@@ -98,7 +101,7 @@ function buildSendMessageForm(initialTo = "", opts = {}, onSent = null) {
   };
   bodyInput.addEventListener("input", markEditing);
 
-  const form = el(
+  return el(
     "form",
     {
       className: "form-grid",
@@ -151,22 +154,19 @@ function buildSendMessageForm(initialTo = "", opts = {}, onSent = null) {
         }
       },
     },
-    opts.hideTo
-      ? null
-      : el("div", { className: "field" }, el("label", { text: "To" }), toInput, targetList),
+    opts.hideTo ? null : field("To", toInput, targetList),
     opts.compact
       ? null
       : el(
           "div",
           { className: "form-row-2" },
-          el("div", { className: "field" }, el("label", { text: "Thread ID (optional)" }), threadInput),
-          el("div", { className: "field" }, el("label", { text: "Reply-To ID (optional)" }), replyToInput),
+          field("Thread ID (optional)", threadInput),
+          field("Reply-To ID (optional)", replyToInput),
         ),
-    el("div", { className: "field" }, el("label", { text: "Message Body" }), bodyInput),
+    field("Message Body", bodyInput),
     el("div", { className: "actions-row flex-end" }, sendBtn),
     reportBox,
   );
-  return form;
 }
 
 export function openQuickMessageModal(target, opts = {}, onSent = null) {
@@ -367,31 +367,27 @@ export async function openSpawnSessionModal(onSpawned = null, initial = {}) {
     el(
       "div",
       { className: "form-row-2" },
-      el("div", { className: "field" }, el("label", { text: "Harness" }), harnessSel),
-      el("div", { className: "field" }, el("label", { text: "Permission Policy" }), policySel),
+      field("Harness", harnessSel),
+      field("Permission Policy", policySel),
     ),
     el(
       "div",
       { className: "field" },
-      el("label", { text: "Target Machine(s)" }),
+      el("span", { className: "field-label", text: "Target Machine(s)" }),
       el("div", { className: "chips-row" }, ...chipButtons, poolHint),
     ),
     el(
       "div",
       { className: "form-row-2" },
-      el("div", { className: "field" }, el("label", { text: "Routing Strategy" }), stratSel),
-      el("div", { className: "field" }, el("label", { text: "Session Name (optional)" }), nameIn),
+      field("Routing Strategy", stratSel),
+      field("Session Name (optional)", nameIn),
     ),
-    el(
-      "div",
-      { className: "field" },
-      el("label", { text: "Directory / Repo" }),
+    field(
+      "Directory / Repo",
       repoIn,
-      repoDatalist,
-      repoChipsRow,
-      wsHints.length > 0 ? el("div", { className: "field-hint mono", text: `Workspaces: ${wsHints.join(" · ")}` }) : null,
+      el("div", null, repoDatalist, repoChipsRow, wsHints.length > 0 ? el("div", { className: "field-hint mono mt-1", text: `Workspaces: ${wsHints.join(" · ")}` }) : null),
     ),
-    el("div", { className: "field" }, el("label", { text: "Initial Prompt (optional)" }), promptIn),
+    field("Initial Prompt (optional)", promptIn),
     el("label", { className: "checkbox-row" }, tmuxChk, "Use tmux"),
     el(
       "div",
@@ -435,7 +431,7 @@ async function renameSessionPrompt(ag, onDone) {
         }
       },
     },
-    el("div", { className: "field" }, el("label", { text: "Session Handle" }), input),
+    field("Session Handle", input),
     el(
       "div",
       { className: "actions-row flex-end" },
@@ -538,7 +534,7 @@ export async function openAgentInspectModal(sessionID, onDone) {
       el(
         "div",
         { className: "card-header" },
-        el("h4", { className: "card-title", text: detail.name || detail.session_id }),
+        el("h3", { className: "card-title", text: detail.name || detail.session_id }),
         el(
           "div",
           { className: "actions-row" },
@@ -567,7 +563,7 @@ export async function openAgentInspectModal(sessionID, onDone) {
   );
 
   if (canControlSession(detail)) {
-    const renameInput = el("input", { type: "text", className: "grow", value: detail.name || "", placeholder: "session name" });
+    const renameInput = el("input", { type: "text", className: "grow", "aria-label": "Session handle", value: detail.name || "", placeholder: "session name" });
     const controlRow = el(
       "div",
       { className: "actions-row" },
@@ -617,7 +613,7 @@ export async function openAgentInspectModal(sessionID, onDone) {
     );
   }
 
-  const tailCard = el("div", { className: "card" }, el("h4", { className: "card-title mb-2", text: `Transcript Tail (${(detail.tail || []).length})` }));
+  const tailCard = el("div", { className: "card" }, el("h3", { className: "card-title mb-2", text: `Transcript Tail (${(detail.tail || []).length})` }));
   if (!detail.tail || detail.tail.length === 0) {
     tailCard.appendChild(el("div", { className: "muted small", text: "No transcript turns captured." }));
   } else {
@@ -631,7 +627,7 @@ export async function openAgentInspectModal(sessionID, onDone) {
   }
   root.appendChild(tailCard);
 
-  const msgsCard = el("div", { className: "card" }, el("h4", { className: "card-title mb-2", text: `Messages (${msgData.length})` }));
+  const msgsCard = el("div", { className: "card" }, el("h3", { className: "card-title mb-2", text: `Messages (${msgData.length})` }));
   if (msgData.length === 0) {
     msgsCard.appendChild(el("div", { className: "muted small", text: "No messages for this session." }));
   } else {
@@ -657,7 +653,7 @@ export async function openAgentInspectModal(sessionID, onDone) {
     el(
       "div",
       { className: "card" },
-      el("h4", { className: "card-title mb-2", text: "Send Message to Session" }),
+      el("h3", { className: "card-title mb-2", text: "Send Message to Session" }),
       buildSendMessageForm(detail.session_id, { hideTo: true, compact: true }, () => {
         openAgentInspectModal(detail.session_id, onDone);
       }),
@@ -702,6 +698,7 @@ function renderSessionsView(root, sessions, ctx, pathsCatalog) {
   const devSel = el(
     "select",
     {
+      "aria-label": "Filter by device",
       onchange: (ev) => {
         agentsFilter.device = ev.target.value;
         drawTable();
@@ -714,6 +711,7 @@ function renderSessionsView(root, sessions, ctx, pathsCatalog) {
   const harSel = el(
     "select",
     {
+      "aria-label": "Filter by harness",
       onchange: (ev) => {
         agentsFilter.harness = ev.target.value;
         drawTable();
@@ -726,6 +724,7 @@ function renderSessionsView(root, sessions, ctx, pathsCatalog) {
   const repoSel = el(
     "select",
     {
+      "aria-label": "Filter by repo",
       onchange: (ev) => {
         agentsFilter.repo = ev.target.value;
         drawTable();
@@ -737,6 +736,8 @@ function renderSessionsView(root, sessions, ctx, pathsCatalog) {
 
   const queryInput = el("input", {
     type: "search",
+    className: "grow",
+    "aria-label": "Search sessions",
     placeholder: "Search name, title, repo, session…",
     value: agentsFilter.query,
     oninput: (ev) => {
@@ -760,48 +761,6 @@ function renderSessionsView(root, sessions, ctx, pathsCatalog) {
       liveByHarness[s.harness]++;
     }
   }
-
-  const killControls = el(
-    "div",
-    { className: "actions-row mb-3" },
-    el("span", { className: "small muted", text: scopeDevice ? `Actions (${scopeDevice}):` : "Actions (all devices):" }),
-    ...[
-      ["claude", "Claude", liveByHarness.claude],
-      ["codex", "Codex", liveByHarness.codex],
-      ["antigravity", "Antigravity", liveByHarness.antigravity],
-    ].map(([h, label, cnt]) =>
-      el("button", {
-        type: "button",
-        className: "btn btn-sm",
-        text: cnt > 0 ? `Kill ${label} (${cnt})` : `Kill ${label}`,
-        onclick: () => killAllAgents(h, `${label} Agents`, scopeDevice, cnt, () => ctx.refresh()),
-      }),
-    ),
-    el("button", {
-      type: "button",
-      className: "btn btn-sm btn-danger",
-      text: totalLiveForScope > 0 ? `Kill All Agents (${totalLiveForScope})` : "Kill All Agents",
-      onclick: () => killAllAgents("all", "All Agents", scopeDevice, totalLiveForScope, () => ctx.refresh()),
-    }),
-  );
-
-  root.appendChild(renderUsageCard((state.overview && state.overview.usage) || []));
-  root.appendChild(killControls);
-  root.appendChild(el("div", { className: "toolbar" }, el("div", { className: "chips-row" }, chips), devSel, harSel, repoSel, el("div", { className: "toolbar-spacer" }), queryInput));
-  root.appendChild(tableContainer);
-  root.appendChild(
-    renderTrackedPathsBox(
-      pathsCatalog,
-      {
-        devices,
-        onUse: state.isAdmin
-          ? (p) => openSpawnSessionModal(() => ctx.refresh(), { device: p.device, repo_path: p.subpath || p.tilde_path || p.path })
-          : null,
-        useLabel: "Spawn",
-      },
-      () => ctx.refresh(),
-    ),
-  );
 
   const drawTable = () => {
     clear(tableContainer);
@@ -903,24 +862,24 @@ function renderSessionsView(root, sessions, ctx, pathsCatalog) {
             className: "row-clickable",
             onclick: () => openAgentInspectModal(ag.session_id, () => ctx.refresh()),
           },
-          el(
-            "td",
-            null,
+          cell(
+            "Session",
+            { className: "cell-primary" },
             el("div", null, el("strong", { text: ag.name || "-" })),
             ag.title || ag.summary ? el("div", { className: "small muted", text: ag.title || ag.summary }) : null,
             el("div", { className: "mono small muted", text: ag.session_id }),
           ),
-          el("td", null, el("div", { text: ag.device }), badge(ag.harness, "neutral")),
-          el("td", { className: "mono small", text: repoLabel }),
-          el(
-            "td",
+          cell("Device / Harness", null, el("div", { text: ag.device }), badge(ag.harness, "neutral")),
+          cell("Repo", { className: "mono small", text: repoLabel }),
+          cell(
+            "State",
             null,
             badge(`${ag.state}${!ag.live ? " (stale)" : waitStr}`, stateVariant(ag.state, ag.live)),
             pendingText ? el("div", { className: "mono small mt-1", text: pendingText }) : null,
           ),
-          el("td", null, badge(ag.delivery, deliveryVariant(ag.delivery)), ag.listening ? el("div", { className: "small muted mt-1", text: "listening" }) : null),
-          el("td", { text: relTime(ag.updated_at) }),
-          el("td", null, actions),
+          cell("Delivery", null, badge(ag.delivery, deliveryVariant(ag.delivery)), ag.listening ? el("div", { className: "small muted mt-1", text: "listening" }) : null),
+          cell("Last Seen", { text: relTime(ag.updated_at) }),
+          cell("Actions", { className: "cell-actions" }, actions),
         ),
       );
     }
@@ -931,7 +890,7 @@ function renderSessionsView(root, sessions, ctx, pathsCatalog) {
         { className: "table-wrap" },
         el(
           "table",
-          null,
+          { className: "responsive-table" },
           el(
             "thead",
             null,
@@ -952,6 +911,46 @@ function renderSessionsView(root, sessions, ctx, pathsCatalog) {
       ),
     );
   };
+
+  root.appendChild(
+    section(
+      "Agent Sessions",
+      { className: "ui-section" },
+      el("div", { className: "toolbar" }, el("div", { className: "chips-row" }, chips), devSel, harSel, repoSel, queryInput),
+      tableContainer,
+    ),
+  );
+
+  const killControls = el(
+    "details",
+    { className: "details-box m-0" },
+    el("summary", {
+      text: scopeDevice ? `Bulk Session Controls (${scopeDevice})` : "Bulk Session Controls (all devices)",
+    }),
+    el(
+      "div",
+      { className: "actions-row mt-2" },
+      ...[
+        ["claude", "Claude", liveByHarness.claude],
+        ["codex", "Codex", liveByHarness.codex],
+        ["antigravity", "Antigravity", liveByHarness.antigravity],
+      ].map(([h, label, cnt]) =>
+        el("button", {
+          type: "button",
+          className: "btn btn-sm",
+          text: cnt > 0 ? `Kill ${label} (${cnt})` : `Kill ${label}`,
+          onclick: () => killAllAgents(h, `${label} Agents`, scopeDevice, cnt, () => ctx.refresh()),
+        }),
+      ),
+      el("button", {
+        type: "button",
+        className: "btn btn-sm btn-danger",
+        text: totalLiveForScope > 0 ? `Kill All Agents (${totalLiveForScope})` : "Kill All Agents",
+        onclick: () => killAllAgents("all", "All Agents", scopeDevice, totalLiveForScope, () => ctx.refresh()),
+      }),
+    ),
+  );
+  root.appendChild(section(null, { ariaLabel: "Bulk session controls", className: "ui-section" }, killControls));
 
   drawTable();
 }
@@ -993,7 +992,7 @@ async function renderMessagesView(root, sessions, ctx, pathsCatalog) {
       const sender = m.from_name ? `${m.from_name} (${m.from_device})` : m.from_session;
       feedBox.appendChild(
         el(
-          "div",
+          "article",
           { className: "message-card" },
           el(
             "div",
@@ -1038,7 +1037,7 @@ async function renderMessagesView(root, sessions, ctx, pathsCatalog) {
 
   const presetSel = el(
     "select",
-    null,
+    { "aria-label": "Recipient preset" },
     el("option", { value: "", text: "Pick recipient preset…" }),
     el("option", { value: "all", text: "all (broadcast to fleet)" }),
     ...devices.map((d) => el("option", { value: `device:${d}`, text: `device:${d}` })),
@@ -1054,8 +1053,8 @@ async function renderMessagesView(root, sessions, ctx, pathsCatalog) {
   ];
   const composeCard = el(
     "div",
-    { className: "card mb-3" },
-    el("div", { className: "card-header" }, el("h3", { className: "card-title", text: "Send Message" }), presetSel),
+    { className: "card" },
+    el("div", { className: "card-header" }, el("h3", { className: "card-title", text: "New Message" }), presetSel),
   );
   const composeForm = buildSendMessageForm("", { targets: targetSuggestions }, () => loadFeed());
   const toField = composeForm.querySelector('input[type="text"]');
@@ -1065,21 +1064,23 @@ async function renderMessagesView(root, sessions, ctx, pathsCatalog) {
     }
   });
   composeCard.appendChild(composeForm);
-  root.appendChild(composeCard);
+  root.appendChild(section("Compose Message", { className: "ui-section" }, composeCard));
 
   const sessionFilterInput = el("input", {
     type: "text",
+    "aria-label": "Filter by session ID",
     placeholder: "Filter session_id…",
     value: agentsFilter.msgSession,
   });
   const threadFilterInput = el("input", {
     type: "text",
+    "aria-label": "Filter by thread ID",
     placeholder: "Filter thread_id…",
     value: agentsFilter.msgThread,
   });
   const devFilterSel = el(
     "select",
-    null,
+    { "aria-label": "Filter messages by device" },
     el("option", { value: "", text: "All devices", selected: agentsFilter.msgDevice === "" }),
     ...devices.map((d) => el("option", { value: d, text: d, selected: agentsFilter.msgDevice === d })),
   );
@@ -1109,9 +1110,50 @@ async function renderMessagesView(root, sessions, ctx, pathsCatalog) {
     },
   });
 
-  root.appendChild(el("div", { className: "toolbar" }, devFilterSel, sessionFilterInput, threadFilterInput, applyBtn, clearBtn));
-  root.appendChild(feedBox);
+  root.appendChild(
+    section(
+      "Message Feed",
+      { className: "ui-section" },
+      el("div", { className: "toolbar" }, devFilterSel, sessionFilterInput, threadFilterInput, applyBtn, clearBtn),
+      feedBox,
+    ),
+  );
   await loadFeed();
+}
+
+function renderUsageAndPathsView(root, sessions, ctx, pathsCatalog) {
+  const devices = [...new Set(sessions.map((s) => s.device).filter(Boolean))].sort();
+  root.appendChild(
+    section(
+      "Harness Usage & Quotas",
+      {
+        subtitle: "Claude statusLine · Codex app-server · Antigravity",
+        className: "ui-section",
+      },
+      renderUsageCard((state.overview && state.overview.usage) || [], { omitHeader: true }),
+    ),
+  );
+  root.appendChild(
+    section(
+      "Known Directories & Repos",
+      {
+        subtitle: "Captured automatically from heartbeats, spawns, and Slacker configs",
+        className: "ui-section",
+      },
+      renderTrackedPathsBox(
+        pathsCatalog,
+        {
+          open: true,
+          devices,
+          onUse: state.isAdmin
+            ? (p) => openSpawnSessionModal(() => ctx.refresh(), { device: p.device, repo_path: p.subpath || p.tilde_path || p.path })
+            : null,
+          useLabel: "Spawn",
+        },
+        () => ctx.refresh(),
+      ),
+    ),
+  );
 }
 
 export async function renderAgents(root, ctx, subRoute = "") {
@@ -1120,6 +1162,8 @@ export async function renderAgents(root, ctx, subRoute = "") {
     agentsFilter.stateChip = "waiting";
   } else if (subRoute === "messages") {
     agentsFilter.tab = "messages";
+  } else if (subRoute === "usage") {
+    agentsFilter.tab = "usage";
   } else if (subRoute === "sessions") {
     agentsFilter.tab = "sessions";
   }
@@ -1163,44 +1207,47 @@ export async function renderAgents(root, ctx, subRoute = "") {
 
     root.appendChild(
       el(
-        "div",
+        "header",
         { className: "page-header" },
         el(
           "div",
           null,
-          el("h1", { className: "page-title", text: "AI Agent Sessions & Messages" }),
+          el("h1", { className: "page-title", text: "AI Agents" }),
           el("p", { className: "page-subtitle", text: `${liveCount} live · ${waitCount} waiting · ${sessions.length} retained` }),
         ),
         headerActions,
       ),
     );
 
-    const tabs = el(
-      "div",
-      { className: "sub-tabs" },
-      el("button", {
-        type: "button",
-        className: `sub-tab${agentsFilter.tab === "sessions" ? " active" : ""}`,
-        text: `Sessions (${liveCount} live)`,
-        onclick: () => {
-          agentsFilter.tab = "sessions";
-          ctx.navigate("#agents");
-        },
-      }),
-      el("button", {
-        type: "button",
-        className: `sub-tab${agentsFilter.tab === "messages" ? " active" : ""}`,
-        text: "Messages",
-        onclick: () => {
-          agentsFilter.tab = "messages";
-          ctx.navigate("#agents/messages");
-        },
-      }),
+    const tabDefs = [
+      ["sessions", `Sessions (${liveCount})`, "#agents"],
+      ["messages", "Messages", "#agents/messages"],
+      ["usage", "Quotas & Paths", "#agents/usage"],
+    ];
+    root.appendChild(
+      el(
+        "div",
+        { className: "sub-tabs", role: "tablist", "aria-label": "Agent views" },
+        ...tabDefs.map(([id, label, hash]) =>
+          el("button", {
+            type: "button",
+            role: "tab",
+            "aria-selected": agentsFilter.tab === id ? "true" : "false",
+            className: `sub-tab${agentsFilter.tab === id ? " active" : ""}`,
+            text: label,
+            onclick: () => {
+              agentsFilter.tab = id;
+              ctx.navigate(hash);
+            },
+          }),
+        ),
+      ),
     );
-    root.appendChild(tabs);
 
     if (agentsFilter.tab === "messages") {
       await renderMessagesView(root, sessions, ctx, pathsCatalog);
+    } else if (agentsFilter.tab === "usage") {
+      renderUsageAndPathsView(root, sessions, ctx, pathsCatalog);
     } else {
       renderSessionsView(root, sessions, ctx, pathsCatalog);
     }

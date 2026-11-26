@@ -1,20 +1,13 @@
-import { api, badge, clear, el, formatDuration, relTime, shortDate, state, toast } from "./lib.js";
+import { api, badge, clear, el, formatDuration, relTime, section, shortDate, state, toast } from "./lib.js";
 import { openAgentInspectModal, openQuickMessageModal } from "./agents.js";
 import { renderUsageCard } from "./usage.js";
 
-function summaryCard(title, value, subtitle, onClick, badgeNode = null) {
+function summaryCard(title, value, subtitle, href, badgeNode = null) {
   return el(
-    "div",
+    "a",
     {
-      className: "card card-clickable",
-      onclick: onClick,
-      tabindex: "0",
-      onkeydown: (ev) => {
-        if (ev.key === "Enter" || ev.key === " ") {
-          ev.preventDefault();
-          onClick();
-        }
-      },
+      href,
+      className: "card card-clickable card-link",
     },
     el("div", { className: "card-header" }, el("h3", { className: "card-title", text: title }), badgeNode),
     el("div", { className: "stat-value", text: String(value) }),
@@ -23,7 +16,7 @@ function summaryCard(title, value, subtitle, onClick, badgeNode = null) {
 }
 
 function buildAlerts(ov, navigate) {
-  const stack = el("div", { className: "alerts-stack" });
+  const stack = el("section", { className: "alerts-stack", "aria-label": "Attention required" });
   const pushAlert = (variant, text, btnLabel, hash) => {
     stack.appendChild(
       el(
@@ -82,7 +75,7 @@ function buildAlerts(ov, navigate) {
 
 function renderWaitingCard(waiting, ctx) {
   const card = el(
-    "div",
+    "article",
     { className: "card" },
     el(
       "div",
@@ -154,7 +147,7 @@ function formatMsgTarget(m) {
 
 function renderMessagesCard(messages) {
   const card = el(
-    "div",
+    "article",
     { className: "card" },
     el(
       "div",
@@ -210,7 +203,7 @@ export async function renderOverview(root, ctx) {
   clear(root);
   root.appendChild(
     el(
-      "div",
+      "header",
       { className: "page-header" },
       el(
         "div",
@@ -229,74 +222,90 @@ export async function renderOverview(root, ctx) {
     root.appendChild(alerts);
   }
 
-  const cards = el("div", { className: "cards-grid" });
-  if (state.isAdmin && ov.devices) {
-    cards.appendChild(
-      summaryCard(
-        "Devices",
-        `${ov.devices.active} active`,
-        `${ov.devices.admins} admin · ${ov.devices.managed} managed · ${ov.devices.mobiles} mobile · ${ov.devices.revoked} revoked`,
-        () => ctx.navigate("#devices"),
-        badge("admin", "info"),
-      ),
-    );
-  }
-  cards.appendChild(
+  const curLabel = ov.curator.enabled ? "Enabled" : ov.curator.configured ? "Disabled" : "Not set";
+  const workloadCards = el(
+    "div",
+    { className: "cards-grid" },
     summaryCard(
       "AI Agents",
       `${ov.agents.live} live`,
       `${ov.agents.working} working · ${ov.agents.waiting} waiting · ${ov.agents.idle} idle · ${ov.agents.listening} listening`,
-      () => ctx.navigate("#agents"),
+      "#agents",
       ov.agents.waiting > 0 ? badge(`${ov.agents.waiting} waiting`, "warn") : badge(`${ov.agents.stale} stale`, "neutral"),
     ),
-  );
-  cards.appendChild(
     summaryCard(
       "Shared Memory",
       `${ov.memory.active} active`,
       `${ov.memory.always_count} always · ${ov.memory.searchable_count} searchable · ${(ov.memory.scopes || []).length} scopes · ${ov.memory.total_revisions} rev`,
-      () => ctx.navigate("#memory"),
+      "#memory",
       ov.memory.pending_proposals > 0 ? badge(`${ov.memory.pending_proposals} proposals`, "info") : null,
     ),
-  );
-  const curLabel = ov.curator.enabled ? "Enabled" : ov.curator.configured ? "Disabled" : "Not set";
-  cards.appendChild(
     summaryCard(
       "LLM Curator",
       curLabel,
       `${ov.curator.model || "no model"} · ${ov.curator.pending_jobs} queued · ${ov.curator.processed_count} processed`,
-      () => ctx.navigate("#memory/curator"),
+      "#memory/curator",
       badge(curLabel, ov.curator.enabled ? "ok" : "neutral"),
     ),
   );
-  if (state.isAdmin && ov.slacker) {
-    const slk = ov.slacker;
-    const slkLabel = slk.enabled ? (slk.listener_connected ? "Online" : "Enabled") : slk.configured ? "Disabled" : "Not set";
-    cards.appendChild(
-      summaryCard(
-        "Slacker",
-        slkLabel,
-        `${slk.channels || 0} channel(s) · ${slk.queued_jobs || 0} queued · ${slk.failed_jobs || 0} failed`,
-        () => ctx.navigate("#slacker"),
-        badge(slkLabel, slk.listener_connected ? "ok" : slk.enabled ? "warn" : "neutral"),
-      ),
-    );
+  root.appendChild(section("Agents & Memory", { className: "ui-section" }, workloadCards));
+
+  if (state.isAdmin && (ov.devices || ov.slacker || ov.ca)) {
+    const infraCards = el("div", { className: "cards-grid" });
+    if (ov.devices) {
+      infraCards.appendChild(
+        summaryCard(
+          "Devices",
+          `${ov.devices.active} active`,
+          `${ov.devices.admins} admin · ${ov.devices.managed} managed · ${ov.devices.mobiles} mobile · ${ov.devices.revoked} revoked`,
+          "#devices",
+          badge("admin", "info"),
+        ),
+      );
+    }
+    if (ov.slacker) {
+      const slk = ov.slacker;
+      const slkLabel = slk.enabled ? (slk.listener_connected ? "Online" : "Enabled") : slk.configured ? "Disabled" : "Not set";
+      infraCards.appendChild(
+        summaryCard(
+          "Slacker",
+          slkLabel,
+          `${slk.channels || 0} channel(s) · ${slk.queued_jobs || 0} queued · ${slk.failed_jobs || 0} failed`,
+          "#slacker",
+          badge(slkLabel, slk.listener_connected ? "ok" : slk.enabled ? "warn" : "neutral"),
+        ),
+      );
+    }
+    if (ov.ca) {
+      infraCards.appendChild(
+        summaryCard(
+          "Lighthouse & PKI",
+          `CA ${ov.ca.ca_id}`,
+          `${(ov.settings && ov.settings.lighthouse_host) || ov.server.lighthouse_ip}:${(ov.settings && ov.settings.lighthouse_port) || "443"} · expires ${shortDate(ov.ca.not_after)} · up ${formatDuration(ov.server.uptime_seconds)}`,
+          "#system",
+          ov.ddns && ov.ddns.configured ? badge("DDNS on", "ok") : badge("DDNS off", "neutral"),
+        ),
+      );
+    }
+    root.appendChild(section("Mesh & Services", { className: "ui-section" }, infraCards));
   }
-  if (state.isAdmin && ov.ca) {
-    cards.appendChild(
-      summaryCard(
-        "Lighthouse & PKI",
-        `CA ${ov.ca.ca_id}`,
-        `${(ov.settings && ov.settings.lighthouse_host) || ov.server.lighthouse_ip}:${(ov.settings && ov.settings.lighthouse_port) || "443"} · expires ${shortDate(ov.ca.not_after)} · up ${formatDuration(ov.server.uptime_seconds)}`,
-        () => ctx.navigate("#system"),
-        ov.ddns && ov.ddns.configured ? badge("DDNS on", "ok") : badge("DDNS off", "neutral"),
-      ),
-    );
-  }
-  root.appendChild(cards);
-  root.appendChild(renderUsageCard(ov.usage || []));
 
   root.appendChild(
-    el("div", { className: "split-grid" }, renderWaitingCard(waiting, ctx), renderMessagesCard(messages)),
+    section(
+      "Harness Usage & Quotas",
+      {
+        subtitle: "Claude statusLine · Codex app-server · Antigravity",
+        className: "ui-section",
+      },
+      renderUsageCard(ov.usage || [], { omitHeader: true }),
+    ),
+  );
+
+  root.appendChild(
+    section(
+      "Live Activity",
+      { className: "ui-section" },
+      el("div", { className: "split-grid" }, renderWaitingCard(waiting, ctx), renderMessagesCard(messages)),
+    ),
   );
 }

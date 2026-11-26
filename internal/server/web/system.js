@@ -1,4 +1,4 @@
-import { api, badge, clear, el, formatBytes, formatDuration, makeCopyBtn, relTime, shortDate, state, toast } from "./lib.js";
+import { api, badge, cell, clear, el, field, formatBytes, formatDuration, makeCopyBtn, relTime, section, shortDate, state, toast } from "./lib.js";
 
 const sysState = {
   logName: "serve",
@@ -12,7 +12,7 @@ function renderLighthouseCard(ov) {
   const ca = ov.ca || {};
   const cfg = ov.settings || {};
   return el(
-    "div",
+    "article",
     { className: "card" },
     el("div", { className: "card-header" }, el("h3", { className: "card-title", text: "Lighthouse & PKI" }), badge(`CA ${ca.ca_id || "-"}`, "info")),
     el(
@@ -39,7 +39,7 @@ function renderLighthouseCard(ov) {
 function renderBinariesCard(ov) {
   const m = ov.manifest;
   const card = el(
-    "div",
+    "article",
     { className: "card" },
     el(
       "div",
@@ -61,10 +61,10 @@ function renderBinariesCard(ov) {
       el(
         "tr",
         null,
-        el("td", { className: "mono", text: platform }),
-        el("td", { className: "mono small", text: entry.file }),
-        el("td", { text: formatBytes(entry.size) }),
-        el("td", null, el("div", { className: "actions-row" }, el("span", { className: "mono small", text: `${entry.sha256.slice(0, 12)}…` }), makeCopyBtn(entry.sha256))),
+        cell("Platform", { className: "mono cell-primary", text: platform }),
+        cell("File", { className: "mono small", text: entry.file }),
+        cell("Size", { text: formatBytes(entry.size) }),
+        cell("SHA-256", { className: "cell-actions" }, el("div", { className: "actions-row" }, el("span", { className: "mono small", text: `${entry.sha256.slice(0, 12)}…` }), makeCopyBtn(entry.sha256))),
       ),
     );
   }
@@ -74,7 +74,7 @@ function renderBinariesCard(ov) {
       { className: "table-wrap" },
       el(
         "table",
-        null,
+        { className: "responsive-table" },
         el("thead", null, el("tr", null, el("th", { text: "Platform" }), el("th", { text: "File" }), el("th", { text: "Size" }), el("th", { text: "SHA-256" }))),
         tbody,
       ),
@@ -83,10 +83,10 @@ function renderBinariesCard(ov) {
   return card;
 }
 
-function renderDDNSCard(ddnsData, ov, ctx) {
+function renderDDNSCard(ddnsData, ov) {
   const card = el(
-    "div",
-    { className: "card mb-3" },
+    "article",
+    { className: "card" },
     el(
       "div",
       { className: "card-header" },
@@ -209,7 +209,17 @@ function renderDDNSCard(ddnsData, ov, ctx) {
       "details",
       { className: "details-box" },
       el("summary", { text: "Route 53 Least-Privilege IAM Policy Generator" }),
-      el("div", { className: "toolbar mt-2 m-0" }, zoneIn, nameIn, genBtn),
+      el(
+        "div",
+        { className: "form-grid mt-2" },
+        el(
+          "div",
+          { className: "form-row-2" },
+          field("Route 53 Zone ID", zoneIn),
+          field("DNS Record Name", nameIn),
+        ),
+        el("div", { className: "actions-row flex-end" }, genBtn),
+      ),
       polOut,
     ),
   );
@@ -241,6 +251,7 @@ async function renderLogsCard(container) {
   const linesSel = el(
     "select",
     {
+      "aria-label": "Log lines count",
       onchange: (ev) => {
         sysState.logLines = Number.parseInt(ev.target.value, 10) || 150;
         renderLogsCard(container);
@@ -259,6 +270,8 @@ async function renderLogsCard(container) {
 
   const filterIn = el("input", {
     type: "search",
+    className: "grow",
+    "aria-label": "Filter log lines",
     placeholder: "Filter log lines…",
     value: sysState.logFilter,
     oninput: (ev) => {
@@ -269,12 +282,12 @@ async function renderLogsCard(container) {
 
   container.appendChild(
     el(
-      "div",
+      "article",
       { className: "card" },
       el(
         "div",
         { className: "card-header" },
-        el("h3", { className: "card-title", text: "Lighthouse Logs" }),
+        el("h3", { className: "card-title", text: "Service Log Tail" }),
         el("span", {
           className: "mono small muted",
           text: `${logRes.path} (${formatBytes(logRes.size || 0)}${logRes.updated_at ? `, ${relTime(logRes.updated_at)}` : ""})`,
@@ -296,7 +309,7 @@ async function renderLogsCard(container) {
   updateFiltered();
 }
 
-export async function renderSystem(root, ctx) {
+export async function renderSystem(root) {
   if (!state.isAdmin) {
     root.appendChild(el("div", { className: "empty-state", text: "Admin privileges required to inspect lighthouse system internals." }));
     return;
@@ -315,7 +328,7 @@ export async function renderSystem(root, ctx) {
   clear(root);
   root.appendChild(
     el(
-      "div",
+      "header",
       { className: "page-header" },
       el(
         "div",
@@ -326,10 +339,16 @@ export async function renderSystem(root, ctx) {
     ),
   );
 
-  root.appendChild(el("div", { className: "split-grid" }, renderLighthouseCard(ov), renderBinariesCard(ov)));
-  root.appendChild(renderDDNSCard(ddnsData, ov, ctx));
+  root.appendChild(
+    section(
+      "Infrastructure & Binaries",
+      { className: "ui-section" },
+      el("div", { className: "split-grid" }, renderLighthouseCard(ov), renderBinariesCard(ov)),
+    ),
+  );
+  root.appendChild(section("Dynamic DNS", { className: "ui-section" }, renderDDNSCard(ddnsData, ov)));
 
   const logsContainer = el("div");
-  root.appendChild(logsContainer);
+  root.appendChild(section("Lighthouse Logs", { className: "ui-section" }, logsContainer));
   await renderLogsCard(logsContainer);
 }

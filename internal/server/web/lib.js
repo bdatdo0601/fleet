@@ -7,6 +7,8 @@ export const state = {
   editing: false,
 };
 
+let nextFieldID = 0;
+
 export async function api(method, path, body) {
   const opts = {
     method,
@@ -88,6 +90,83 @@ export function el(tag, props, ...children) {
   return node;
 }
 
+export function svgIcon(paths, className = "nav-icon") {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "1.9");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  svg.setAttribute("aria-hidden", "true");
+  if (className) {
+    svg.setAttribute("class", className);
+  }
+  for (const d of Array.isArray(paths) ? paths : [paths]) {
+    const p = document.createElementNS(ns, "path");
+    p.setAttribute("d", d);
+    svg.appendChild(p);
+  }
+  return svg;
+}
+
+export function field(labelText, control, hint = null, extraClass = "") {
+  if (control && typeof control.getAttribute === "function") {
+    let id = control.getAttribute("id");
+    if (!id) {
+      id = `fleet-field-${++nextFieldID}`;
+      control.setAttribute("id", id);
+    }
+    return el(
+      "div",
+      { className: extraClass ? `field ${extraClass}` : "field" },
+      el("label", { for: id, text: labelText }),
+      control,
+      hint,
+    );
+  }
+  return el(
+    "div",
+    { className: extraClass ? `field ${extraClass}` : "field" },
+    el("span", { className: "field-label", text: labelText }),
+    control,
+    hint,
+  );
+}
+
+export function section(title, opts = {}, ...children) {
+  const headingId = title ? `fleet-sec-${++nextFieldID}` : null;
+  const head = title
+    ? el(
+        "header",
+        { className: "section-head" },
+        el(
+          "div",
+          { className: "section-head-text" },
+          el("h2", { id: headingId, className: "section-title", text: title }),
+          opts.subtitle ? el("p", { className: "section-subtitle", text: opts.subtitle }) : null,
+        ),
+        opts.actions || null,
+      )
+    : null;
+  return el(
+    "section",
+    {
+      className: opts.className ? `ui-section ${opts.className}` : "ui-section",
+      "aria-labelledby": headingId,
+      "aria-label": !headingId ? opts.ariaLabel || null : null,
+    },
+    head,
+    ...children,
+  );
+}
+
+export function cell(label, props, ...children) {
+  const merged = { ...(props || {}), "data-label": label };
+  return el("td", merged, ...children);
+}
+
 export function clear(node) {
   while (node.firstChild) {
     node.removeChild(node.firstChild);
@@ -148,12 +227,14 @@ export async function copyText(text, triggerBtn) {
 }
 
 let modalCleanup = null;
+let lastFocusedEl = null;
 
 export function closeModal() {
   const backdrop = document.getElementById("modal-backdrop");
   const body = document.getElementById("modal-body");
   if (backdrop) {
     backdrop.classList.add("hidden");
+    backdrop.setAttribute("aria-hidden", "true");
   }
   if (body) {
     clear(body);
@@ -164,6 +245,10 @@ export function closeModal() {
     modalCleanup = null;
     fn();
   }
+  if (lastFocusedEl && typeof lastFocusedEl.focus === "function" && lastFocusedEl.isConnected) {
+    lastFocusedEl.focus();
+  }
+  lastFocusedEl = null;
 }
 
 export function openModal(title, contentEl, opts = {}) {
@@ -172,6 +257,9 @@ export function openModal(title, contentEl, opts = {}) {
   const body = document.getElementById("modal-body");
   if (!backdrop || !titleEl || !body) {
     return;
+  }
+  if (!state.modalOpen && document.activeElement instanceof HTMLElement) {
+    lastFocusedEl = document.activeElement;
   }
   if (modalCleanup) {
     modalCleanup();
@@ -185,6 +273,11 @@ export function openModal(title, contentEl, opts = {}) {
   modalCleanup = opts.onClose || null;
   state.modalOpen = true;
   backdrop.classList.remove("hidden");
+  backdrop.setAttribute("aria-hidden", "false");
+  const focusTarget = body.querySelector("input:not([disabled]), textarea:not([disabled]), select:not([disabled]), button:not([disabled])") || document.getElementById("modal-close");
+  if (focusTarget && typeof focusTarget.focus === "function") {
+    requestAnimationFrame(() => focusTarget.focus());
+  }
 }
 
 export function confirmDialog(title, message, confirmLabel = "Confirm", danger = false) {
@@ -219,6 +312,7 @@ export function confirmDialog(title, message, confirmLabel = "Confirm", danger =
       state.modalOpen = true;
       if (backdrop) {
         backdrop.classList.remove("hidden");
+        backdrop.setAttribute("aria-hidden", "false");
       }
     };
 
@@ -473,7 +567,11 @@ export function renderTrackedPathsBox(catalog, opts = {}, onChanged = null) {
     ? opts.devices
     : Array.from(new Set([state.caller ? state.caller.name : "", ...paths.map((p) => p.device)].filter(Boolean))).sort();
 
-  const details = el("details", { className: "details-box mt-3 mb-3" }, el("summary", { text: `Known Directories & Repos (${paths.length})` }));
+  const details = el(
+    "details",
+    { className: "details-box mt-3 mb-3", open: Boolean(opts.open) },
+    el("summary", { text: `Known Directories & Repos (${paths.length})` }),
+  );
   const content = el("div", { className: "form-grid mt-2" });
 
   if (paths.length === 0) {
@@ -514,7 +612,7 @@ export function renderTrackedPathsBox(catalog, opts = {}, onChanged = null) {
           }),
         );
       }
-      const dirCell = el("td", { className: "mono small" }, p.path);
+      const dirCell = cell("Directory", { className: "mono small cell-primary" }, p.path);
       if (p.subpath) {
         dirCell.appendChild(el("div", { className: "mt-1" }, badge(`subpath: ${p.subpath}`, "info")));
       }
@@ -522,12 +620,12 @@ export function renderTrackedPathsBox(catalog, opts = {}, onChanged = null) {
         el(
           "tr",
           null,
-          el("td", { className: "mono small", text: p.device }),
-          el("td", { className: "mono small", text: p.repo || "-" }),
+          cell("Device", { className: "mono small", text: p.device }),
+          cell("Repo", { className: "mono small", text: p.repo || "-" }),
           dirCell,
-          el("td", { className: "small muted", text: `${p.source || "-"} (${p.use_count || 1})` }),
-          el("td", { className: "small", text: relTime(p.last_seen) }),
-          el("td", null, acts),
+          cell("Source", { className: "small muted", text: `${p.source || "-"} (${p.use_count || 1})` }),
+          cell("Last Seen", { className: "small", text: relTime(p.last_seen) }),
+          cell("Actions", { className: "cell-actions" }, acts),
         ),
       );
     }
@@ -537,7 +635,7 @@ export function renderTrackedPathsBox(catalog, opts = {}, onChanged = null) {
         { className: "table-wrap" },
         el(
           "table",
-          null,
+          { className: "responsive-table" },
           el(
             "thead",
             null,
@@ -559,10 +657,10 @@ export function renderTrackedPathsBox(catalog, opts = {}, onChanged = null) {
   }
 
   const devInput = state.isAdmin && knownDevices.length > 0
-    ? el("select", null, ...knownDevices.map((d) => el("option", { value: d, text: d, selected: state.caller && d === state.caller.name })))
-    : el("input", { type: "text", value: state.caller ? state.caller.name : "", disabled: true });
-  const pathInput = el("input", { type: "text", className: "grow", placeholder: "Add directory (/abs/path, ~/path, or workspace subpath)" });
-  const repoInput = el("input", { type: "text", className: "max-w-sm", placeholder: "Repo name (optional)" });
+    ? el("select", { "aria-label": "Device" }, ...knownDevices.map((d) => el("option", { value: d, text: d, selected: state.caller && d === state.caller.name })))
+    : el("input", { type: "text", "aria-label": "Device", value: state.caller ? state.caller.name : "", disabled: true });
+  const pathInput = el("input", { type: "text", className: "grow", "aria-label": "Directory path", placeholder: "Add directory (/abs/path, ~/path, or workspace subpath)" });
+  const repoInput = el("input", { type: "text", className: "max-w-sm", "aria-label": "Repo name", placeholder: "Repo name (optional)" });
   const addBtn = el("button", { type: "submit", className: "btn btn-sm btn-primary", text: "+ Track Path" });
 
   content.appendChild(

@@ -2,12 +2,24 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="description" content="Fleet mesh, AI agent sessions, shared memory, and Slacker control plane">
+  <meta name="theme-color" content="#f8fafc" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0b1120" media="(prefers-color-scheme: dark)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Fleet">
   <title>Fleet Console</title>
+  <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+  <link rel="icon" type="image/png" sizes="192x192" href="/assets/icon-192.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="/assets/apple-touch-icon.png">
   <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
+  <a href="#app-main" class="skip-link">Skip to content</a>
+
   <div class="app-shell">
     <header class="topbar">
       <div class="topbar-left">
@@ -18,32 +30,42 @@
         <nav id="main-nav" class="main-nav" aria-label="Primary"></nav>
       </div>
       <div class="topbar-right">
-        <div id="status-pills" class="status-pills"></div>
-        <div id="caller-badge" class="caller-badge">connecting…</div>
-        <label class="refresh-control" title="Auto-refresh interval">
-          <span class="sr-only">Auto refresh</span>
-          <select id="refresh-select" aria-label="Auto refresh">
-            <option value="0">Auto: Off</option>
-            <option value="5000">Auto: 5s</option>
-            <option value="15000">Auto: 15s</option>
-            <option value="30000">Auto: 30s</option>
-          </select>
-        </label>
-        <button id="refresh-btn" type="button" class="btn btn-sm">Refresh</button>
-        <button id="theme-btn" type="button" class="btn btn-sm" title="Toggle theme">Theme</button>
+        <div id="status-pills" class="status-pills" aria-live="polite"></div>
+        <button id="install-btn" type="button" class="btn btn-sm btn-primary hidden" aria-label="Install Fleet app">Install</button>
+        <button id="refresh-btn" type="button" class="btn btn-sm" aria-label="Refresh now">Refresh</button>
+        <button id="controls-toggle" type="button" class="btn btn-sm mobile-only" aria-expanded="false" aria-controls="topbar-controls" aria-label="Session info and preferences">Menu</button>
+        <div id="topbar-controls" class="topbar-controls">
+          <div id="caller-badge" class="caller-badge">connecting…</div>
+          <label class="refresh-control" for="refresh-select" title="Auto-refresh interval">
+            <span class="sr-only">Auto refresh</span>
+            <select id="refresh-select" aria-label="Auto refresh">
+              <option value="0">Auto: Off</option>
+              <option value="5000">Auto: 5s</option>
+              <option value="15000">Auto: 15s</option>
+              <option value="30000">Auto: 30s</option>
+            </select>
+          </label>
+          <button id="theme-btn" type="button" class="btn btn-sm" title="Cycle theme (Auto / Light / Dark)">Theme</button>
+        </div>
       </div>
     </header>
+
+    <div id="offline-banner" class="offline-banner hidden" role="status">
+      Offline — unable to reach lighthouse. Reconnect to load live fleet state.
+    </div>
 
     <main id="app-main" class="main-content" tabindex="-1">
       <div class="loading-box">Loading fleet console…</div>
     </main>
+
+    <nav id="mobile-nav" class="bottom-nav" aria-label="Mobile navigation"></nav>
   </div>
 
-  <div id="modal-backdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+  <div id="modal-backdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-title" aria-hidden="true">
     <div class="modal">
       <div class="modal-header">
         <h2 id="modal-title" class="modal-title"></h2>
-        <button id="modal-close" type="button" class="btn btn-sm btn-ghost" aria-label="Close">Close</button>
+        <button id="modal-close" type="button" class="btn btn-sm btn-ghost" aria-label="Close modal">Close</button>
       </div>
       <div id="modal-body" class="modal-body"></div>
     </div>

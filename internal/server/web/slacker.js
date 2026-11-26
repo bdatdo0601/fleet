@@ -3,17 +3,24 @@ import {
   api,
   badge,
   buildRepoSuggestions,
+  cell,
   clear,
   confirmDialog,
   el,
   fetchPathsCatalog,
+  field,
   makeCopyBtn,
   populateDatalist,
   relTime,
   renderTrackedPathsBox,
+  section,
   state,
   toast,
 } from "./lib.js";
+
+const slackerState = {
+  tab: "jobs", // jobs | routing | accounts
+};
 
 function renderStatusCard(statusRes) {
   const cfg = statusRes.config || {};
@@ -24,12 +31,12 @@ function renderStatusCard(statusRes) {
   const workers = runtimes.filter((r) => r.role.startsWith("worker:"));
 
   const card = el(
-    "div",
-    { className: "card mb-3" },
+    "article",
+    { className: "card" },
     el(
       "div",
       { className: "card-header" },
-      el("h3", { className: "card-title", text: "Slacker Runtime" }),
+      el("h3", { className: "card-title", text: "Socket Mode & Worker Queue" }),
       badge(cfg.enabled ? (listener && listener.connected ? "connected" : "enabled (offline)") : "disabled", cfg.enabled && listener && listener.connected ? "ok" : cfg.enabled ? "warn" : "neutral"),
     ),
     el(
@@ -58,9 +65,9 @@ function renderStatusCard(statusRes) {
 function renderAccountsCard(cfg, runtimes, ctx) {
   const accounts = Object.values(cfg.accounts || {}).sort((a, b) => a.id.localeCompare(b.id));
   const card = el(
-    "div",
-    { className: "card mb-3" },
-    el("div", { className: "card-header" }, el("h3", { className: "card-title", text: "Slack Accounts" }), badge(`${accounts.length} account(s)`, "info")),
+    "article",
+    { className: "card" },
+    el("div", { className: "card-header" }, el("h3", { className: "card-title", text: "Configured Workspaces" }), badge(`${accounts.length} account(s)`, "info")),
   );
 
   const idIn = el("input", { type: "text", value: accounts.length === 0 ? "default" : "", placeholder: "account id (e.g. default, work, personal)" });
@@ -81,13 +88,13 @@ function renderAccountsCard(cfg, runtimes, ctx) {
         el(
           "tr",
           null,
-          el("td", { className: "mono", text: a.id }),
-          el("td", { className: "small", text: `${a.team_name || a.team_id || "-"} · ${a.authorized_user || a.authorized_user_id || "-"}` }),
-          el("td", { className: "mono small", text: `app:${a.app_token_hint || "-"} · user:${a.user_token_hint || "-"}${a.bot_token_hint ? ` · bot:${a.bot_token_hint}` : ""}` }),
-          el("td", null, stBadge, a.allow_unmapped_send ? " unmapped-send" : ""),
-          el(
-            "td",
-            null,
+          cell("Account", { className: "mono cell-primary", text: a.id }),
+          cell("Workspace / User", { className: "small", text: `${a.team_name || a.team_id || "-"} · ${a.authorized_user || a.authorized_user_id || "-"}` }),
+          cell("Tokens", { className: "mono small", text: `app:${a.app_token_hint || "-"} · user:${a.user_token_hint || "-"}${a.bot_token_hint ? ` · bot:${a.bot_token_hint}` : ""}` }),
+          cell("Status", null, stBadge, a.allow_unmapped_send ? " unmapped-send" : ""),
+          cell(
+            "Actions",
+            { className: "cell-actions" },
             el(
               "div",
               { className: "actions-row" },
@@ -130,7 +137,12 @@ function renderAccountsCard(cfg, runtimes, ctx) {
       el(
         "div",
         { className: "table-wrap mb-3" },
-        el("table", null, el("thead", null, el("tr", null, el("th", { text: "Account" }), el("th", { text: "Workspace / User" }), el("th", { text: "Tokens" }), el("th", { text: "Status" }), el("th", { text: "Actions" }))), tbody),
+        el(
+          "table",
+          { className: "responsive-table" },
+          el("thead", null, el("tr", null, el("th", { text: "Account" }), el("th", { text: "Workspace / User" }), el("th", { text: "Tokens" }), el("th", { text: "Status" }), el("th", { text: "Actions" }))),
+          tbody,
+        ),
       ),
     );
   }
@@ -175,23 +187,23 @@ function renderAccountsCard(cfg, runtimes, ctx) {
       el(
         "div",
         { className: "form-row-2" },
-        el("div", { className: "field" }, el("label", { text: "Account ID" }), idIn),
-        el("div", { className: "field" }, el("label", { text: "Authorized Slack User ID" }), authUserIn),
+        field("Account ID", idIn),
+        field("Authorized Slack User ID", authUserIn),
       ),
       el(
         "div",
         { className: "form-row-2" },
-        el("div", { className: "field" }, el("label", { text: "App-Level Token (xapp-...)" }), appTokIn),
-        el("div", { className: "field" }, el("label", { text: "User OAuth Token (xoxp-...)" }), userTokIn),
+        field("App-Level Token (xapp-...)", appTokIn),
+        field("User OAuth Token (xoxp-...)", userTokIn),
       ),
       el(
         "div",
         { className: "form-row-2" },
-        el("div", { className: "field" }, el("label", { text: "Optional Bot Token (xoxb-...)" }), botTokIn),
+        field("Optional Bot Token (xoxb-...)", botTokIn),
         el(
           "div",
           { className: "field" },
-          el("label", { text: "Options" }),
+          el("span", { className: "field-label", text: "Options" }),
           el("div", { className: "actions-row" }, el("label", { className: "checkbox-row" }, enabledChk, "Enabled"), el("label", { className: "checkbox-row" }, unmappedChk, "Allow unmapped send"), el("label", { className: "checkbox-row" }, verifyChk, "Verify")),
         ),
       ),
@@ -259,7 +271,9 @@ function renderMachinesCard(cfg, statusRes, knownDevices, pathsCatalog, ctx) {
     const wsDatalist = el("datalist", { id: wsListID }, ...wsChoices.map((w) => el("option", { value: w })));
     const wsIn = el("input", {
       type: "text",
+      className: "w-full",
       list: wsListID,
+      "aria-label": `Default workspace for ${row.name}`,
       value: row.workspaceDir,
       placeholder: "~/workspace",
       oninput: (e) => { row.workspaceDir = e.target.value; },
@@ -268,9 +282,9 @@ function renderMachinesCard(cfg, statusRes, knownDevices, pathsCatalog, ctx) {
       el(
         "tr",
         null,
-        el("td", null, el("label", { className: "checkbox-row" }, defChk, el("span", { className: "mono", text: row.name }))),
-        el(
-          "td",
+        cell("Default Pool / Machine", { className: "cell-primary" }, el("label", { className: "checkbox-row" }, defChk, el("span", { className: "mono", text: row.name }))),
+        cell(
+          "Worker & Load",
           null,
           el(
             "div",
@@ -279,7 +293,7 @@ function renderMachinesCard(cfg, statusRes, knownDevices, pathsCatalog, ctx) {
             badge(`${liveN} agent${liveN === 1 ? "" : "s"}${pendN > 0 ? ` + ${pendN} queued` : ""}`, liveN + pendN > 0 ? "info" : "neutral"),
           ),
         ),
-        el("td", null, wsIn, wsDatalist),
+        cell("Workspace Dir", null, wsIn, wsDatalist),
       ),
     );
   }
@@ -288,7 +302,7 @@ function renderMachinesCard(cfg, statusRes, knownDevices, pathsCatalog, ctx) {
   return el(
     "form",
     {
-      className: "card mb-3 form-grid",
+      className: "card form-grid",
       onsubmit: async (ev) => {
         ev.preventDefault();
         saveBtn.disabled = true;
@@ -319,62 +333,29 @@ function renderMachinesCard(cfg, statusRes, knownDevices, pathsCatalog, ctx) {
         }
       },
     },
-    el("div", { className: "card-header" }, el("h3", { className: "card-title", text: "Machine Workspaces & Default Routing" }), badge(`${rowState.filter((r) => r.inDefault).length} in default pool`, "info")),
+    el("div", { className: "card-header" }, el("h3", { className: "card-title", text: "Machine Workspaces & Default Pool" }), badge(`${rowState.filter((r) => r.inDefault).length} in default pool`, "info")),
     allDevs.length === 0
       ? el("div", { className: "muted small", text: "No active Mac/desktop devices registered yet." })
       : el(
           "div",
           { className: "table-wrap" },
-          el("table", null, el("thead", null, el("tr", null, el("th", { text: "Default Pool / Machine" }), el("th", { text: "Worker & Load" }), el("th", { text: "Default Workspace Dir" }))), tbody),
+          el("table", { className: "responsive-table" }, el("thead", null, el("tr", null, el("th", { text: "Default Pool / Machine" }), el("th", { text: "Worker & Load" }), el("th", { text: "Default Workspace Dir" }))), tbody),
         ),
     el(
       "div",
-      { className: "actions-row flex-between" },
-      el(
-        "div",
-        { className: "actions-row" },
-        el("label", { className: "small muted", text: "Default routing:" }),
-        stratSel,
-        el("label", { className: "small muted", text: "Default policy:" }),
-        policySel,
-      ),
-      saveBtn,
+      { className: "form-row-2" },
+      field("Default Routing Strategy", stratSel),
+      field("Default Permission Policy", policySel),
     ),
+    el("div", { className: "actions-row flex-end" }, saveBtn),
   );
 }
 
-export async function renderSlacker(root, ctx) {
-  if (!state.isAdmin) {
-    root.appendChild(el("div", { className: "empty-state", text: "Admin privileges required to configure Slacker." }));
-    return;
-  }
-
-  let statusRes;
-  let cfgRes;
-  let jobsRes;
-  let devicesRes;
-  let pathsCatalog;
-  try {
-    [statusRes, cfgRes, jobsRes, devicesRes, pathsCatalog] = await Promise.all([
-      api("GET", "/v1/slacker/status"),
-      api("GET", "/v1/slacker/config"),
-      api("GET", "/v1/slacker/jobs?limit=50"),
-      api("GET", "/v1/devices"),
-      fetchPathsCatalog(),
-    ]);
-  } catch (err) {
-    clear(root);
-    root.appendChild(el("div", { className: "alert-banner alert-danger", text: err.message }));
-    return;
-  }
-
-  const cfg = cfgRes.config || {};
-  const runtimes = statusRes.runtimes || [];
+function renderMappingsCard(cfg, cfgRes, statusRes, devices, pathsCatalog, ctx) {
   const accountIDs = Object.keys(cfg.accounts || {}).sort();
   if (accountIDs.length === 0) {
     accountIDs.push("default");
   }
-  const devices = (devicesRes.devices || []).filter((d) => !d.revoked_at && d.kind !== "mobile").map((d) => d.name);
   const defaultDevices = Array.isArray(cfg.default_devices) ? cfg.default_devices : [];
   const globalStrategyLabel = (cfg.default_strategy || "least_agents") === "round_robin" ? "round-robin" : "least agents";
   const globalPolicyLabel = cfg.default_policy || "auto";
@@ -388,33 +369,13 @@ export async function renderSlacker(root, ctx) {
     emojis.push({ emoji: "claude", harness: "claude" }, { emoji: "agy", harness: "agy" }, { emoji: "codex", harness: "codex" });
   }
 
-  clear(root);
-  root.appendChild(
-    el(
-      "div",
-      { className: "page-header" },
-      el(
-        "div",
-        null,
-        el("h1", { className: "page-title", text: "Slack Reaction Dispatcher" }),
-        el("p", { className: "page-subtitle", text: "Multi-account Slack Socket Mode routing and agent read/send access over Nebula" }),
-      ),
-      el("button", {
-        type: "button",
-        className: "btn btn-primary",
-        text: "+ Spawn Session",
-        onclick: () => openSpawnSessionModal(() => ctx.refresh()),
-      }),
-    ),
-  );
-
-  root.appendChild(renderStatusCard(statusRes));
-  root.appendChild(renderAccountsCard(cfg, runtimes, ctx));
-  root.appendChild(renderMachinesCard(cfg, statusRes, devices, pathsCatalog, ctx));
-
   const chanList = el("div", { className: "form-grid" });
   const renderChannels = () => {
     clear(chanList);
+    if (channels.length === 0) {
+      chanList.appendChild(el("div", { className: "muted small", text: "No channel mappings configured yet." }));
+      return;
+    }
     for (let i = 0; i < channels.length; i++) {
       const ch = channels[i];
       const acctSel = el(
@@ -438,7 +399,6 @@ export async function renderSlacker(root, ctx) {
         oninput: (e) => { ch.repo_path = e.target.value; },
       });
       const repoPickSel = el("select", {
-        className: "max-w-sm",
         onchange: (e) => {
           if (e.target.value) {
             repoIn.value = e.target.value;
@@ -452,7 +412,7 @@ export async function renderSlacker(root, ctx) {
         const suggestions = buildRepoSuggestions(pathsCatalog, effDevs, cfg.devices || {});
         populateDatalist(repoDatalist, suggestions);
         clear(repoPickSel);
-        repoPickSel.appendChild(el("option", { value: "", text: suggestions.length > 0 ? "Pick dir/repo…" : "No tracked dirs" }));
+        repoPickSel.appendChild(el("option", { value: "", text: suggestions.length > 0 ? "Pick tracked dir/repo…" : "No tracked dirs" }));
         for (const s of suggestions) {
           repoPickSel.appendChild(el("option", { value: s.value, text: s.label, title: s.detail }));
         }
@@ -492,7 +452,7 @@ export async function renderSlacker(root, ctx) {
       const polSel = el(
         "select",
         { onchange: (e) => { ch.policy = e.target.value; } },
-        el("option", { value: "", text: `Policy: Default (${globalPolicyLabel})`, selected: !ch.policy }),
+        el("option", { value: "", text: `Default (${globalPolicyLabel})`, selected: !ch.policy }),
         el("option", { value: "auto", text: "Auto", selected: ch.policy === "auto" }),
         el("option", { value: "bypass", text: "Bypass", selected: ch.policy === "bypass" }),
         el("option", { value: "safe", text: "Safe", selected: ch.policy === "safe" }),
@@ -510,17 +470,17 @@ export async function renderSlacker(root, ctx) {
       chanList.appendChild(
         el(
           "div",
-          { className: "toolbar m-0" },
-          acctSel,
-          idIn,
-          devChipsBox,
-          stratSel,
-          polSel,
-          repoIn,
-          repoDatalist,
-          repoPickSel,
-          el("label", { className: "checkbox-row" }, tmuxChk, "tmux"),
-          rmBtn,
+          { className: "mapping-card form-grid" },
+          el(
+            "div",
+            { className: "actions-row flex-between" },
+            el("strong", { className: "small mono", text: ch.channel_id ? `#${ch.channel_name || ch.channel_id}` : `Channel #${i + 1}` }),
+            el("div", { className: "actions-row" }, el("label", { className: "checkbox-row" }, tmuxChk, "Use tmux"), rmBtn),
+          ),
+          el("div", { className: "form-row-2" }, field("Account", acctSel), field("Channel ID", idIn)),
+          el("div", { className: "field" }, el("span", { className: "field-label", text: "Target Machine(s)" }), devChipsBox),
+          el("div", { className: "form-row-2" }, field("Routing Strategy", stratSel), field("Permission Policy", polSel)),
+          el("div", { className: "form-row-2" }, field("Repo / Directory", repoIn, repoDatalist), field("Tracked Preset", repoPickSel)),
         ),
       );
     }
@@ -532,10 +492,10 @@ export async function renderSlacker(root, ctx) {
     clear(emojiList);
     for (let i = 0; i < emojis.length; i++) {
       const row = emojis[i];
-      const emIn = el("input", { type: "text", value: row.emoji, placeholder: "emoji_name", oninput: (e) => { row.emoji = e.target.value; } });
+      const emIn = el("input", { type: "text", className: "grow", "aria-label": "Emoji name", value: row.emoji, placeholder: "emoji_name", oninput: (e) => { row.emoji = e.target.value; } });
       const hSel = el(
         "select",
-        { onchange: (e) => { row.harness = e.target.value; } },
+        { "aria-label": "Harness", onchange: (e) => { row.harness = e.target.value; } },
         ...["claude", "agy", "codex"].map((h) => el("option", { value: h, text: h, selected: row.harness === h })),
       );
       const rmBtn = el("button", {
@@ -553,103 +513,80 @@ export async function renderSlacker(root, ctx) {
   renderEmojis();
 
   const saveMapBtn = el("button", { type: "submit", className: "btn btn-primary", text: "Save Mappings" });
-  root.appendChild(
-    el(
-      "form",
-      {
-        className: "card mb-3 form-grid",
-        onsubmit: async (ev) => {
-          ev.preventDefault();
-          saveMapBtn.disabled = true;
-          try {
-            const chMap = {};
-            for (const ch of channels) {
-              const cid = (ch.channel_id || "").trim();
-              const acct = (ch.account || "default").trim();
-              const devs = Array.isArray(ch.devices) ? ch.devices.map((d) => d.trim()).filter(Boolean) : [];
-              if (cid) {
-                const key = acct === "default" ? cid : `${acct}:${cid}`;
-                chMap[key] = {
-                  account: acct,
-                  channel_id: cid,
-                  channel_name: (ch.channel_name || "").trim(),
-                  device: devs.length === 1 ? devs[0] : "",
-                  devices: devs,
-                  strategy: (ch.strategy || "").trim(),
-                  policy: (ch.policy || "").trim(),
-                  repo_path: (ch.repo_path || "").trim(),
-                  use_tmux: Boolean(ch.use_tmux),
-                };
-              }
+  return el(
+    "form",
+    {
+      className: "card form-grid",
+      onsubmit: async (ev) => {
+        ev.preventDefault();
+        saveMapBtn.disabled = true;
+        try {
+          const chMap = {};
+          for (const ch of channels) {
+            const cid = (ch.channel_id || "").trim();
+            const acct = (ch.account || "default").trim();
+            const devs = Array.isArray(ch.devices) ? ch.devices.map((d) => d.trim()).filter(Boolean) : [];
+            if (cid) {
+              const key = acct === "default" ? cid : `${acct}:${cid}`;
+              chMap[key] = {
+                account: acct,
+                channel_id: cid,
+                channel_name: (ch.channel_name || "").trim(),
+                device: devs.length === 1 ? devs[0] : "",
+                devices: devs,
+                strategy: (ch.strategy || "").trim(),
+                policy: (ch.policy || "").trim(),
+                repo_path: (ch.repo_path || "").trim(),
+                use_tmux: Boolean(ch.use_tmux),
+              };
             }
-            const emMap = {};
-            for (const e of emojis) {
-              const name = (e.emoji || "").trim();
-              if (name) {
-                emMap[name] = e.harness;
-              }
-            }
-            await api("POST", "/v1/slacker/config", { channels: chMap, emojis: emMap });
-            toast("Mappings saved", "ok");
-            ctx.refresh();
-          } catch (err) {
-            toast(err.message, "error");
-          } finally {
-            saveMapBtn.disabled = false;
           }
-        },
+          const emMap = {};
+          for (const e of emojis) {
+            const name = (e.emoji || "").trim();
+            if (name) {
+              emMap[name] = e.harness;
+            }
+          }
+          await api("POST", "/v1/slacker/config", { channels: chMap, emojis: emMap });
+          toast("Mappings saved", "ok");
+          ctx.refresh();
+        } catch (err) {
+          toast(err.message, "error");
+        } finally {
+          saveMapBtn.disabled = false;
+        }
       },
-      el(
-        "div",
-        { className: "actions-row flex-between" },
-        el("strong", { text: "Channel → Account / Machines / Repo" }),
-        el("button", {
-          type: "button",
-          className: "btn btn-sm",
-          text: "+ Add Channel",
-          onclick: () => {
-            channels.push({
-              account: accountIDs[0] || "default",
-              channel_id: "",
-              devices: defaultDevices.length > 0 ? [] : devices.length > 0 ? [devices[0]] : [],
-              strategy: "",
-              policy: "",
-              repo_path: "",
-            });
-            renderChannels();
-          },
-        }),
-      ),
-      chanList,
-      el("div", { className: "actions-row flex-between" }, el("strong", { text: "Emoji → Harness" }), el("button", { type: "button", className: "btn btn-sm", text: "+ Add Emoji", onclick: () => { emojis.push({ emoji: "", harness: "claude" }); renderEmojis(); } })),
-      emojiList,
-      el("div", { className: "actions-row flex-end" }, saveMapBtn),
-    ),
-  );
-
-  root.appendChild(
+    },
     el(
-      "details",
-      { className: "card details-box mb-3" },
-      el("summary", { text: "Slack App Manifest (YAML)" }),
-      el("div", { className: "actions-row flex-end mt-2 mb-2" }, makeCopyBtn(cfgRes.manifest_yaml || "", "Copy Manifest")),
-      el("pre", { className: "code-block", text: cfgRes.manifest_yaml || "" }),
+      "div",
+      { className: "card-header" },
+      el("h3", { className: "card-title", text: "Channel → Account / Machines / Repo" }),
+      el("button", {
+        type: "button",
+        className: "btn btn-sm",
+        text: "+ Add Channel",
+        onclick: () => {
+          channels.push({
+            account: accountIDs[0] || "default",
+            channel_id: "",
+            devices: defaultDevices.length > 0 ? [] : devices.length > 0 ? [devices[0]] : [],
+            strategy: "",
+            policy: "",
+            repo_path: "",
+          });
+          renderChannels();
+        },
+      }),
     ),
+    chanList,
+    el("div", { className: "card-header mt-2" }, el("h3", { className: "card-title", text: "Emoji → Harness" }), el("button", { type: "button", className: "btn btn-sm", text: "+ Add Emoji", onclick: () => { emojis.push({ emoji: "", harness: "claude" }); renderEmojis(); } })),
+    emojiList,
+    el("div", { className: "actions-row flex-end" }, saveMapBtn),
   );
+}
 
-  root.appendChild(
-    renderTrackedPathsBox(
-      pathsCatalog,
-      {
-        devices,
-        onUse: (p) => openSpawnSessionModal(() => ctx.refresh(), { device: p.device, repo_path: p.subpath || p.tilde_path || p.path }),
-        useLabel: "Spawn",
-      },
-      () => ctx.refresh(),
-    ),
-  );
-
-  const jobs = jobsRes.jobs || [];
+function renderJobsSection(jobs, ctx) {
   const tbody = el("tbody");
   for (const j of jobs) {
     const acts = el("div", { className: "actions-row" });
@@ -665,45 +602,157 @@ export async function renderSlacker(root, ctx) {
       el(
         "tr",
         null,
-        el("td", { className: "mono small", text: j.session_name }),
-        el("td", { className: "mono small", text: `${j.account || "default"} · ${j.target_device}/${j.harness}` }),
-        el("td", { className: "mono small", text: triggerText }),
-        el("td", null, badge(j.status, variant)),
-        el("td", { className: "small", text: `${j.backend || "-"} · ${relTime(j.updated_at)}${j.error ? ` (${j.error})` : ""}` }),
-        el("td", null, acts),
+        cell("Session", { className: "mono small cell-primary", text: j.session_name }),
+        cell("Account / Target", { className: "mono small", text: `${j.account || "default"} · ${j.target_device}/${j.harness}` }),
+        cell("Trigger", { className: "mono small", text: triggerText }),
+        cell("Status", null, badge(j.status, variant)),
+        cell("Detail", { className: "small", text: `${j.backend || "-"} · ${relTime(j.updated_at)}${j.error ? ` (${j.error})` : ""}` }),
+        cell("Actions", { className: acts.childElementCount > 0 ? "cell-actions" : "cell-actions cell-empty" }, acts),
       ),
     );
   }
 
+  return section(
+    "Recent Dispatch Jobs",
+    {
+      className: "ui-section",
+      actions: el("button", {
+        type: "button",
+        className: "btn btn-sm",
+        text: "Prune Completed",
+        onclick: async () => {
+          if (!(await confirmDialog("Prune terminal jobs", "Delete launched, failed, and cancelled job records? Active sessions and repos are untouched.", "Prune"))) {
+            return;
+          }
+          const res = await api("POST", "/v1/slacker/cleanup", { all_terminal: true });
+          toast(`Pruned ${res.pruned_jobs || 0} job(s)`, "ok");
+          ctx.refresh();
+        },
+      }),
+    },
+    jobs.length === 0
+      ? el("div", { className: "empty-state", text: "No Slack dispatch jobs recorded yet." })
+      : el(
+          "div",
+          { className: "table-wrap" },
+          el(
+            "table",
+            { className: "responsive-table" },
+            el("thead", null, el("tr", null, el("th", { text: "Session" }), el("th", { text: "Account / Target" }), el("th", { text: "Trigger" }), el("th", { text: "Status" }), el("th", { text: "Detail" }), el("th", { text: "Actions" }))),
+            tbody,
+          ),
+        ),
+  );
+}
+
+export async function renderSlacker(root, ctx, subRoute = "") {
+  if (!state.isAdmin) {
+    root.appendChild(el("div", { className: "empty-state", text: "Admin privileges required to configure Slacker." }));
+    return;
+  }
+
+  if (["jobs", "routing", "accounts"].includes(subRoute)) {
+    slackerState.tab = subRoute;
+  }
+
+  let statusRes;
+  let cfgRes;
+  let jobsRes;
+  let devicesRes;
+  let pathsCatalog;
+  try {
+    [statusRes, cfgRes, jobsRes, devicesRes, pathsCatalog] = await Promise.all([
+      api("GET", "/v1/slacker/status"),
+      api("GET", "/v1/slacker/config"),
+      api("GET", "/v1/slacker/jobs?limit=50"),
+      api("GET", "/v1/devices"),
+      fetchPathsCatalog(),
+    ]);
+  } catch (err) {
+    clear(root);
+    root.appendChild(el("div", { className: "alert-banner alert-danger", text: err.message }));
+    return;
+  }
+
+  const cfg = cfgRes.config || {};
+  const runtimes = statusRes.runtimes || [];
+  const devices = (devicesRes.devices || []).filter((d) => !d.revoked_at && d.kind !== "mobile").map((d) => d.name);
+  const jobs = jobsRes.jobs || [];
+
+  clear(root);
   root.appendChild(
     el(
-      "div",
-      { className: "card" },
+      "header",
+      { className: "page-header" },
       el(
         "div",
-        { className: "card-header" },
-        el("h3", { className: "card-title", text: "Recent Dispatch Jobs" }),
-        el("button", {
-          type: "button",
-          className: "btn btn-sm",
-          text: "Prune Completed",
-          onclick: async () => {
-            if (!(await confirmDialog("Prune terminal jobs", "Delete launched, failed, and cancelled job records? Active sessions and repos are untouched.", "Prune"))) {
-              return;
-            }
-            const res = await api("POST", "/v1/slacker/cleanup", { all_terminal: true });
-            toast(`Pruned ${res.pruned_jobs || 0} job(s)`, "ok");
-            ctx.refresh();
-          },
-        }),
+        null,
+        el("h1", { className: "page-title", text: "Slack Reaction Dispatcher" }),
+        el("p", { className: "page-subtitle", text: "Multi-account Slack Socket Mode routing and agent read/send access over Nebula" }),
       ),
-      jobs.length === 0
-        ? el("div", { className: "muted small", text: "No Slack dispatch jobs recorded yet." })
-        : el(
-            "div",
-            { className: "table-wrap" },
-            el("table", null, el("thead", null, el("tr", null, el("th", { text: "Session" }), el("th", { text: "Account / Target" }), el("th", { text: "Trigger" }), el("th", { text: "Status" }), el("th", { text: "Detail" }), el("th", { text: "Actions" }))), tbody),
-          ),
+      el("button", {
+        type: "button",
+        className: "btn btn-primary",
+        text: "+ Spawn Session",
+        onclick: () => openSpawnSessionModal(() => ctx.refresh()),
+      }),
     ),
   );
+
+  const tabs = [
+    ["jobs", `Runtime & Jobs (${jobs.length})`, "#slacker"],
+    ["routing", "Routing & Mappings", "#slacker/routing"],
+    ["accounts", "Accounts & Manifest", "#slacker/accounts"],
+  ].map(([id, label, hash]) =>
+    el("button", {
+      type: "button",
+      role: "tab",
+      "aria-selected": slackerState.tab === id ? "true" : "false",
+      className: `sub-tab${slackerState.tab === id ? " active" : ""}`,
+      text: label,
+      onclick: () => {
+        slackerState.tab = id;
+        ctx.navigate(hash);
+      },
+    }),
+  );
+  root.appendChild(el("div", { className: "sub-tabs", role: "tablist", "aria-label": "Slacker views" }, tabs));
+
+  if (slackerState.tab === "routing") {
+    root.appendChild(section("Machines & Defaults", { className: "ui-section" }, renderMachinesCard(cfg, statusRes, devices, pathsCatalog, ctx)));
+    root.appendChild(section("Channel & Emoji Mappings", { className: "ui-section" }, renderMappingsCard(cfg, cfgRes, statusRes, devices, pathsCatalog, ctx)));
+    root.appendChild(
+      section(
+        "Known Directories & Repos",
+        { className: "ui-section" },
+        renderTrackedPathsBox(
+          pathsCatalog,
+          {
+            devices,
+            onUse: (p) => openSpawnSessionModal(() => ctx.refresh(), { device: p.device, repo_path: p.subpath || p.tilde_path || p.path }),
+            useLabel: "Spawn",
+          },
+          () => ctx.refresh(),
+        ),
+      ),
+    );
+  } else if (slackerState.tab === "accounts") {
+    root.appendChild(section("Slack Accounts", { className: "ui-section" }, renderAccountsCard(cfg, runtimes, ctx)));
+    root.appendChild(
+      section(
+        "Slack App Manifest",
+        { className: "ui-section" },
+        el(
+          "details",
+          { className: "card details-box m-0" },
+          el("summary", { text: "Slack App Manifest (YAML)" }),
+          el("div", { className: "actions-row flex-end mt-2 mb-2" }, makeCopyBtn(cfgRes.manifest_yaml || "", "Copy Manifest")),
+          el("pre", { className: "code-block", text: cfgRes.manifest_yaml || "" }),
+        ),
+      ),
+    );
+  } else {
+    root.appendChild(section("Slacker Runtime", { className: "ui-section" }, renderStatusCard(statusRes)));
+    root.appendChild(renderJobsSection(jobs, ctx));
+  }
 }

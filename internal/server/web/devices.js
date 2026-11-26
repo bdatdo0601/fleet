@@ -1,14 +1,17 @@
 import {
   api,
   badge,
+  cell,
   clear,
   closeModal,
   confirmDialog,
   daysUntil,
   el,
+  field,
   makeCopyBtn,
   openModal,
   relTime,
+  section,
   shortDate,
   state,
   toast,
@@ -29,26 +32,26 @@ function expectedClientVersion() {
 
 function renderMobileResult(resp, onDone) {
   const lh = resp.lighthouse || {};
-  const box = el(
+  return el(
     "div",
     { className: "form-grid" },
     el("div", { className: "alert-banner alert-ok", text: `${resp.name} approved at ${resp.ip} (expires ${shortDate(resp.not_after)}).` }),
     el(
       "div",
       { className: "field" },
-      el("div", { className: "actions-row flex-between" }, el("label", { text: "Certificate (paste into Mobile Nebula)" }), makeCopyBtn(resp.cert)),
+      el("div", { className: "actions-row flex-between" }, el("span", { className: "field-label", text: "Certificate (paste into Mobile Nebula)" }), makeCopyBtn(resp.cert)),
       el("pre", { className: "code-block", text: String(resp.cert || "").trim() }),
     ),
     el(
       "div",
       { className: "field" },
-      el("div", { className: "actions-row flex-between" }, el("label", { text: "CA Certificate" }), makeCopyBtn(resp.ca)),
+      el("div", { className: "actions-row flex-between" }, el("span", { className: "field-label", text: "CA Certificate" }), makeCopyBtn(resp.ca)),
       el("pre", { className: "code-block", text: String(resp.ca || "").trim() }),
     ),
     el(
       "div",
       { className: "card" },
-      el("h4", { className: "card-title mb-2", text: "Lighthouse Host Settings" }),
+      el("h3", { className: "card-title mb-2", text: "Lighthouse Host Settings" }),
       el(
         "dl",
         { className: "kv-list" },
@@ -76,12 +79,12 @@ function renderMobileResult(resp, onDone) {
       }),
     ),
   );
-  return box;
 }
 
 function openApproveMacModal(onDone) {
   let decoded = null;
   const blockInput = el("textarea", {
+    id: "approve-mac-block",
     rows: 6,
     placeholder: "-----BEGIN FLEET JOIN REQUEST-----\n...\n-----END FLEET JOIN REQUEST-----",
   });
@@ -181,7 +184,7 @@ function openApproveMacModal(onDone) {
                 el(
                   "div",
                   { className: "actions-row flex-between" },
-                  el("label", { text: "FLEET JOIN RESPONSE (paste into `fleet join`)" }),
+                  el("span", { className: "field-label", text: "FLEET JOIN RESPONSE (paste into `fleet join`)" }),
                   makeCopyBtn(resp.response_block || ""),
                 ),
                 el("pre", { className: "code-block", text: resp.response_block || "" }),
@@ -211,18 +214,18 @@ function openApproveMacModal(onDone) {
     el(
       "div",
       { className: "field" },
-      el("div", { className: "actions-row flex-between" }, el("label", { text: "Join Request Block" }), el("button", { type: "button", className: "btn btn-sm", text: "Parse Block", onclick: parseBlock })),
+      el("div", { className: "actions-row flex-between" }, el("label", { for: "approve-mac-block", text: "Join Request Block" }), el("button", { type: "button", className: "btn btn-sm", text: "Parse Block", onclick: parseBlock })),
       blockInput,
       decodeBox,
     ),
     el(
       "div",
       { className: "form-row-2" },
-      el("div", { className: "field" }, el("label", { text: "Device Name" }), nameInput),
-      el("div", { className: "field" }, el("label", { text: "Group" }), groupSelect),
+      field("Device Name", nameInput),
+      field("Group", groupSelect),
     ),
     el("label", { className: "checkbox-row" }, replaceCheck, "Replace existing device certificate (keep IP)"),
-    el("div", { className: "field" }, el("label", { text: "CA Passphrase" }), passInput),
+    field("CA Passphrase", passInput),
     el(
       "div",
       { className: "actions-row flex-end" },
@@ -244,6 +247,7 @@ function openApproveMobileModal(onDone) {
     el("option", { value: "managed", text: "managed" }),
   );
   const pubInput = el("textarea", {
+    id: "approve-mobile-pub",
     rows: 4,
     placeholder: "-----BEGIN NEBULA X25519 PUBLIC KEY-----\n...\n-----END NEBULA X25519 PUBLIC KEY-----",
   });
@@ -303,18 +307,18 @@ function openApproveMobileModal(onDone) {
     el(
       "div",
       { className: "form-row-2" },
-      el("div", { className: "field" }, el("label", { text: "Device Name" }), nameInput),
-      el("div", { className: "field" }, el("label", { text: "Group" }), groupSelect),
+      field("Device Name", nameInput),
+      field("Group", groupSelect),
     ),
     el(
       "div",
       { className: "field" },
-      el("div", { className: "actions-row flex-between" }, el("label", { text: "Nebula X25519 Public Key" }), el("button", { type: "button", className: "btn btn-sm", text: "Verify Key ID", onclick: verifyKey })),
+      el("div", { className: "actions-row flex-between" }, el("label", { for: "approve-mobile-pub", text: "Nebula X25519 Public Key" }), el("button", { type: "button", className: "btn btn-sm", text: "Verify Key ID", onclick: verifyKey })),
       pubInput,
       keyBadgeBox,
     ),
     el("label", { className: "checkbox-row" }, replaceCheck, "Replace existing device certificate (keep IP)"),
-    el("div", { className: "field" }, el("label", { text: "CA Passphrase" }), passInput),
+    field("CA Passphrase", passInput),
     el(
       "div",
       { className: "actions-row flex-end" },
@@ -376,8 +380,8 @@ function openSetGroupModal(dev, onDone) {
       className: "m-0 muted small",
       text: `Re-signs ${dev.name} (${dev.ip}, ${dev.kind}) and immediately blocklists its previous certificate.`,
     }),
-    el("div", { className: "field" }, el("label", { text: "Target Group" }), groupSelect),
-    el("div", { className: "field" }, el("label", { text: "CA Passphrase" }), passInput),
+    field("Target Group", groupSelect),
+    field("CA Passphrase", passInput),
     el(
       "div",
       { className: "actions-row flex-end" },
@@ -452,7 +456,7 @@ export async function renderDevices(root, ctx) {
   clear(root);
   root.appendChild(
     el(
-      "div",
+      "header",
       { className: "page-header" },
       el(
         "div",
@@ -488,6 +492,8 @@ export async function renderDevices(root, ctx) {
 
   const searchInput = el("input", {
     type: "search",
+    className: "grow",
+    "aria-label": "Filter devices",
     placeholder: "Filter name, IP, kind, group…",
     value: devFilter.query,
     oninput: (ev) => {
@@ -495,9 +501,6 @@ export async function renderDevices(root, ctx) {
       drawTable();
     },
   });
-
-  root.appendChild(el("div", { className: "toolbar" }, el("div", { className: "chips-row" }, statusChips), el("div", { className: "toolbar-spacer" }), searchInput));
-  root.appendChild(tableContainer);
 
   const drawTable = () => {
     clear(tableContainer);
@@ -546,19 +549,19 @@ export async function renderDevices(root, ctx) {
         el(
           "tr",
           null,
-          el("td", null, el("strong", { text: d.name })),
-          el(
-            "td",
+          cell("Name", { className: "cell-primary" }, el("strong", { text: d.name })),
+          cell(
+            "IP",
             null,
             el("div", { className: "actions-row" }, makeCopyBtn(d.ip, d.ip), d.kind !== "mobile" ? makeCopyBtn(`ssh ${d.ip}`, "ssh") : null),
           ),
-          el("td", { text: d.kind }),
-          el("td", null, badge(d.group, d.group === "admin" || d.group === "lighthouse" ? "info" : "neutral")),
-          el("td", null, badge(revoked ? "revoked" : "active", revoked ? "danger" : "ok")),
-          el("td", { text: relTime(d.last_seen) }),
-          el("td", null, expBadges),
-          el("td", null, clientCell),
-          el("td", null, actions),
+          cell("Kind", { text: d.kind }),
+          cell("Group", null, badge(d.group, d.group === "admin" || d.group === "lighthouse" ? "info" : "neutral")),
+          cell("Status", null, badge(revoked ? "revoked" : "active", revoked ? "danger" : "ok")),
+          cell("Last Seen", { text: relTime(d.last_seen) }),
+          cell("Cert Expires", null, expBadges),
+          cell("Client", null, clientCell),
+          cell("Actions", { className: actions.childElementCount > 0 ? "cell-actions" : "cell-actions cell-empty" }, actions),
         ),
       );
     }
@@ -573,7 +576,7 @@ export async function renderDevices(root, ctx) {
         { className: "table-wrap" },
         el(
           "table",
-          null,
+          { className: "responsive-table" },
           el(
             "thead",
             null,
@@ -597,6 +600,15 @@ export async function renderDevices(root, ctx) {
     );
   };
 
+  root.appendChild(
+    section(
+      "Registered Devices",
+      { className: "ui-section" },
+      el("div", { className: "toolbar" }, el("div", { className: "chips-row" }, statusChips), el("div", { className: "toolbar-spacer" }), searchInput),
+      tableContainer,
+    ),
+  );
+
   drawTable();
 
   const revRows = el("tbody");
@@ -605,34 +617,38 @@ export async function renderDevices(root, ctx) {
       el(
         "tr",
         null,
-        el("td", { text: r.name }),
-        el("td", { className: "mono", text: r.fingerprint }),
-        el("td", { text: r.reason }),
-        el("td", { text: relTime(r.revoked_at) }),
+        cell("Device", { className: "cell-primary", text: r.name }),
+        cell("Fingerprint", { className: "mono", text: r.fingerprint }),
+        cell("Reason", { text: r.reason }),
+        cell("Revoked", { text: relTime(r.revoked_at) }),
       ),
     );
   }
   root.appendChild(
-    el(
-      "details",
-      { className: "details-box" },
-      el("summary", { text: `Revoked Certificates / PKI Blocklist (${revocations.length})` }),
-      revocations.length === 0
-        ? el("p", { className: "muted small mt-2 m-0", text: "No revoked or replaced certificates recorded." })
-        : el(
-            "div",
-            { className: "table-wrap mt-2" },
-            el(
-              "table",
-              null,
+    section(
+      "PKI Blocklist",
+      { className: "ui-section" },
+      el(
+        "details",
+        { className: "details-box m-0" },
+        el("summary", { text: `Revoked Certificates (${revocations.length})` }),
+        revocations.length === 0
+          ? el("p", { className: "muted small mt-2 m-0", text: "No revoked or replaced certificates recorded." })
+          : el(
+              "div",
+              { className: "table-wrap mt-2" },
               el(
-                "thead",
-                null,
-                el("tr", null, el("th", { text: "Device" }), el("th", { text: "Fingerprint" }), el("th", { text: "Reason" }), el("th", { text: "Revoked" })),
+                "table",
+                { className: "responsive-table" },
+                el(
+                  "thead",
+                  null,
+                  el("tr", null, el("th", { text: "Device" }), el("th", { text: "Fingerprint" }), el("th", { text: "Reason" }), el("th", { text: "Revoked" })),
+                ),
+                revRows,
               ),
-              revRows,
             ),
-          ),
+      ),
     ),
   );
 }

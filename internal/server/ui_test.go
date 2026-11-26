@@ -111,7 +111,13 @@ func TestWebUIAssetsSecurityAndStrangers(t *testing.T) {
 		{"/assets/usage.js", "text/javascript"},
 		{"/assets/app.css", "text/css"},
 		{"/assets/favicon.svg", "image/svg+xml"},
+		{"/assets/icon-192.png", "image/png"},
+		{"/assets/icon-512.png", "image/png"},
+		{"/assets/apple-touch-icon.png", "image/png"},
 		{"/favicon.ico", "image/svg+xml"},
+		{"/apple-touch-icon.png", "image/png"},
+		{"/manifest.webmanifest", "application/manifest+json"},
+		{"/sw.js", "text/javascript"},
 	}
 	for _, tc := range assetCases {
 		st, h, b := doRawReq(t, srv.URL+tc.path, http.MethodGet, "", nil, "")
@@ -128,7 +134,7 @@ func TestWebUIAssetsSecurityAndStrangers(t *testing.T) {
 	}
 
 	f.IdentifyOverride = func(string) *registry.Device { return nil }
-	for _, p := range []string{"/", "/assets/app.js", "/v1/overview"} {
+	for _, p := range []string{"/", "/assets/app.js", "/manifest.webmanifest", "/sw.js", "/v1/overview"} {
 		st, _, _ := doRawReq(t, srv.URL+p, http.MethodGet, "", nil, "")
 		if st != http.StatusForbidden {
 			t.Fatalf("stranger GET %s: expected 403, got %d", p, st)
