@@ -33,15 +33,19 @@ func TestNebulaLabelAndPlistValidation(t *testing.T) {
 	}
 
 	plist, err := BuildDaemonPlist(DaemonOpts{
-		Label:     paths.SyncLabel,
-		Args:      []string{"/usr/local/libexec/fleet/fleet", "sync"},
-		Interval:  300,
-		LogPath:   "/var/log/fleet-sync.log",
-		WorkDir:   "/usr/local/libexec/fleet",
-		KeepAlive: false,
+		Label:      paths.SyncLabel,
+		Args:       []string{"/usr/local/libexec/fleet/fleet", "sync"},
+		Interval:   300,
+		LogPath:    "/var/log/fleet-sync.log",
+		WorkDir:    "/usr/local/libexec/fleet",
+		KeepAlive:  false,
+		WatchPaths: []string{"/Users/test/.fleet/nebula-restart.req"},
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !strings.Contains(plist, "<key>WatchPaths</key>") || !strings.Contains(plist, "/Users/test/.fleet/nebula-restart.req") {
+		t.Fatalf("expected WatchPaths in daemon plist:\n%s", plist)
 	}
 	if _, err := exec.LookPath("plutil"); err == nil {
 		pFile := filepath.Join(t.TempDir(), "test.plist")

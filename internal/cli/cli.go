@@ -34,6 +34,8 @@ import (
 	"github.com/bdatdo0601/fleet/internal/memory"
 	"github.com/bdatdo0601/fleet/internal/paths"
 	"github.com/bdatdo0601/fleet/internal/pki"
+	"github.com/bdatdo0601/fleet/internal/registry"
+	"github.com/bdatdo0601/fleet/internal/render"
 	"github.com/bdatdo0601/fleet/internal/server"
 	"github.com/bdatdo0601/fleet/internal/system"
 	"github.com/bdatdo0601/fleet/internal/usage"
@@ -352,7 +354,8 @@ func printMobile(cio *IO, resp core.ApproveResult) {
 	cio.printf("\n--- Certificate (paste into the app) ---\n%s\n", strings.TrimSpace(resp.Cert))
 	cio.printf("\n--- CA (paste into the app) ---\n%s\n", strings.TrimSpace(resp.CA))
 	if resp.Lighthouse != nil {
-		cio.printf("\n--- Hosts ---\n  %s  lighthouse: yes  address: %s\n\n", resp.Lighthouse.IP, resp.Lighthouse.Address)
+		cio.printf("\n--- Hosts ---\n  %s  lighthouse: yes  address: %s\n", resp.Lighthouse.IP, resp.Lighthouse.Address)
+		cio.printf("\n--- Relays ---\n  %s  (add under Relays in Mobile Nebula for bidirectional relay)\n\n", resp.Lighthouse.IP)
 	}
 	cio.info(fmt.Sprintf("%s -> %s, cert expires %s", resp.Name, resp.IP, resp.NotAfter))
 }
@@ -418,12 +421,16 @@ func activateNodeRuntime(cio *IO, owner, root, syncWorkDir string, serve bool) (
 	if err != nil {
 		return "", err
 	}
+	var syncWatch []string
 	if serve {
 		if err := system.InstallServeDaemon(instBin, owner, root, syncWorkDir); err != nil {
 			return "", err
 		}
+		if root != "" {
+			syncWatch = append(syncWatch, filepath.Join(root, core.NebulaRestartReqFile))
+		}
 	}
-	if err := system.InstallSyncDaemon(instBin, syncWorkDir, false); err != nil {
+	if err := system.InstallSyncDaemon(instBin, syncWorkDir, false, syncWatch...); err != nil {
 		return "", err
 	}
 	if serve {
@@ -892,9 +899,9 @@ func backfillSyncNode(node client.NodeConfig, isLighthouse bool) client.NodeConf
 	return node
 }
 
-func reexecSyncUpdated(cio *IO, stamp, syncWorkDir string) {
+func reexecSyncUpdated(cio *IO, stamp, syncWorkDir string, watchPaths ...string) {
 	targetBin := paths.InstalledBinaryPath()
-	_ = system.InstallSyncDaemon(targetBin, syncWorkDir, true)
+	_ = system.InstallSyncDaemon(targetBin, syncWorkDir, true, watchPaths...)
 	if err := syscall.Exec(targetBin, []string{targetBin, "sync", "--no-update"}, os.Environ()); err != nil {
 		cio.printf("%s re-exec warning: %v\n", stamp, err)
 	}
@@ -922,7 +929,12 @@ func waitSyncPayload(cio *IO, api, stamp string, waitSec int) (core.SyncResult, 
 
 func applySyncedFiles(cio *IO, stamp string, payload core.SyncResult) error {
 	etc := paths.NebulaEtc()
+	var oldCfg string
+	if raw, err := os.ReadFile(filepath.Join(etc, "config.yml")); err == nil {
+		oldCfg = string(raw)
+	}
 	var changed []string
+	cfgChanged := false
 	cfgContent := ""
 	if payload.Config != nil {
 		cfgContent = *payload.Config
@@ -944,20 +956,74 @@ func applySyncedFiles(cio *IO, stamp string, payload core.SyncResult) error {
 		}
 		if wrote {
 			changed = append(changed, f.name)
+			if f.name == "config.yml" {
+				cfgChanged = true
+			}
 		}
 	}
 	if neb, err := exec.LookPath("nebula"); err == nil {
 		system.FirewallAllow(neb) // brew upgrades move Cellar path
 	}
+	actionNote := ""
 	if label := system.NebulaLabel(""); len(changed) > 0 && label != "" && system.LaunchdLoaded(label) {
-		system.Restart(label)
+		needRestart := cfgChanged && render.ConfigChangeRequiresRestart(oldCfg, cfgContent)
+		if !needRestart {
+			if err := system.Reload(label); err == nil {
+				actionNote = " (reloaded nebula)"
+			} else {
+				system.Restart(label)
+				actionNote = " (restarted nebula)"
+			}
+		} else {
+			system.Restart(label)
+			actionNote = " (restarted nebula)"
+		}
 	}
 	if len(changed) > 0 {
-		cio.printf("%s synced %s: updated %s\n", stamp, payload.Name, strings.Join(changed, ", "))
+		cio.printf("%s synced %s: updated %s%s\n", stamp, payload.Name, strings.Join(changed, ", "), actionNote)
 	} else {
 		cio.printf("%s synced %s: no changes\n", stamp, payload.Name)
 	}
 	return nil
+}
+
+func handlePendingNebulaRestart(cio *IO, stamp string, node client.NodeConfig) bool {
+	if node.StateDir == "" {
+		return false
+	}
+	req, err := core.PendingNebulaRestart(node.StateDir)
+	if err != nil {
+		cio.printf("%s nebula restart check warning: %v\n", stamp, err)
+		return false
+	}
+	if req == nil {
+		return false
+	}
+	label := system.NebulaLabel("")
+	var rErr error
+	if label == "" || !system.LaunchdLoaded(label) {
+		rErr = fmt.Errorf("nebula launchd service is not loaded")
+	} else {
+		rErr = system.RestartService(label)
+	}
+	st := core.NebulaRestartStatus{
+		HandledID:   req.ID,
+		RestartedAt: registry.NowISO(),
+		Reason:      req.Reason,
+		By:          req.By,
+		OK:          rErr == nil,
+	}
+	if rErr != nil {
+		st.Error = rErr.Error()
+		cio.printf("%s nebula restart failed: %v\n", stamp, rErr)
+	} else {
+		cio.printf("%s restarted %s (reason: %s, by: %s)\n", stamp, label, req.Reason, req.By)
+	}
+	uid, gid := system.OwnerIDs(node.Owner)
+	if recErr := core.RecordNebulaRestartStatus(node.StateDir, st, uid, gid); recErr != nil {
+		cio.printf("%s nebula restart status warning: %v\n", stamp, recErr)
+	}
+	return true
 }
 
 func harvestSyncedOwnerMemories(cio *IO, stamp string, node client.NodeConfig) {
@@ -974,6 +1040,46 @@ func harvestSyncedOwnerMemories(cio *IO, stamp string, node client.NodeConfig) {
 func warnStaleMCPServers(cio *IO, prefix, binPath string) {
 	for _, s := range mcpinstall.FindStaleMCPServers(binPath) {
 		cio.printf("%s: %s\n", prefix, mcpinstall.FormatStaleWarning(s))
+	}
+}
+
+func syncOwnerPre(cio *IO, stamp string, node client.NodeConfig) {
+	if node.Owner == "" {
+		return
+	}
+	if mcpUpdated, err := mcpinstall.SyncOwnerConfigs(node.Owner); err == nil && len(mcpUpdated) > 0 {
+		names := make([]string, len(mcpUpdated))
+		for i, p := range mcpUpdated {
+			names[i] = filepath.Base(p)
+		}
+		cio.printf("%s updated MCP/hook configs: %s\n", stamp, strings.Join(names, ", "))
+	}
+}
+
+func syncOwnerPost(cio *IO, stamp string, node client.NodeConfig) {
+	if node.Owner == "" {
+		return
+	}
+	for _, item := range []struct {
+		label string
+		name  string
+	}{
+		{paths.SlackerWorkerLabel, "slacker-worker"},
+		{paths.AgentRelayLabel, "agent-relay"},
+	} {
+		if restarted, rErr := system.RestartStaleUserAgent(node.Owner, item.label, paths.InstalledBinaryPath()); rErr != nil {
+			cio.printf("%s %s restart warning: %v\n", stamp, item.name, rErr)
+		} else if restarted {
+			cio.printf("%s restarted %s (binary updated)\n", stamp, item.label)
+		}
+	}
+	if ownerHome := paths.HomeForUser(node.Owner); ownerHome != "" {
+		syncItems := usage.CollectAll(context.Background(), usage.CollectOpts{
+			Home:      ownerHome,
+			Device:    node.Name,
+			SkipCodex: true,
+		})
+		_ = usage.ReportToLighthouse(node.API, syncItems)
 	}
 }
 
@@ -1000,6 +1106,15 @@ func cmdSync(args []string, cio *IO) error {
 	isLighthouse := strings.HasPrefix(node.API, "http://127.0.0.1")
 	node = backfillSyncNode(node, isLighthouse)
 
+	if isLighthouse && handlePendingNebulaRestart(cio, stamp, node) {
+		return nil
+	}
+
+	var lhWatch []string
+	if isLighthouse && node.StateDir != "" {
+		lhWatch = append(lhWatch, filepath.Join(node.StateDir, core.NebulaRestartReqFile))
+	}
+
 	if !*noUpdate && isLighthouse && node.Repo != "" {
 		updated, err := system.SelfUpdateLighthouse(system.LighthouseUpdateOpts{
 			RepoDir:     node.Repo,
@@ -1014,19 +1129,11 @@ func cmdSync(args []string, cio *IO) error {
 			cio.printf("%s lighthouse build/update warning: %v\n", stamp, err)
 		} else if updated {
 			cio.printf("%s code updated and binaries published\n", stamp)
-			reexecSyncUpdated(cio, stamp, node.Repo)
+			reexecSyncUpdated(cio, stamp, node.Repo, lhWatch...)
 		}
 	}
 
-	if node.Owner != "" {
-		if mcpUpdated, err := mcpinstall.SyncOwnerConfigs(node.Owner); err == nil && len(mcpUpdated) > 0 {
-			names := make([]string, len(mcpUpdated))
-			for i, p := range mcpUpdated {
-				names[i] = filepath.Base(p)
-			}
-			cio.printf("%s updated MCP/hook configs: %s\n", stamp, strings.Join(names, ", "))
-		}
-	}
+	syncOwnerPre(cio, stamp, node)
 
 	payload, ok, err := waitSyncPayload(cio, node.API, stamp, *waitSec)
 	if err != nil || !ok {
@@ -1052,26 +1159,7 @@ func cmdSync(args []string, cio *IO) error {
 		return err
 	}
 	harvestSyncedOwnerMemories(cio, stamp, node)
-	if node.Owner != "" {
-		if restarted, rErr := system.RestartStaleUserAgent(node.Owner, paths.SlackerWorkerLabel, paths.InstalledBinaryPath()); rErr != nil {
-			cio.printf("%s slacker-worker restart warning: %v\n", stamp, rErr)
-		} else if restarted {
-			cio.printf("%s restarted %s (binary updated)\n", stamp, paths.SlackerWorkerLabel)
-		}
-		if restarted, rErr := system.RestartStaleUserAgent(node.Owner, paths.AgentRelayLabel, paths.InstalledBinaryPath()); rErr != nil {
-			cio.printf("%s agent-relay restart warning: %v\n", stamp, rErr)
-		} else if restarted {
-			cio.printf("%s restarted %s (binary updated)\n", stamp, paths.AgentRelayLabel)
-		}
-		if ownerHome := paths.HomeForUser(node.Owner); ownerHome != "" {
-			syncItems := usage.CollectAll(context.Background(), usage.CollectOpts{
-				Home:      ownerHome,
-				Device:    node.Name,
-				SkipCodex: true,
-			})
-			_ = usage.ReportToLighthouse(node.API, syncItems)
-		}
-	}
+	syncOwnerPost(cio, stamp, node)
 	warnStaleMCPServers(cio, stamp+" warning", paths.InstalledBinaryPath())
 	return nil
 }

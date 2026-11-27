@@ -289,6 +289,7 @@ func registerAdminRoutes(
 	mux *http.ServeMux,
 	fleet *core.Fleet,
 	startedAt time.Time,
+	watchdog *NebulaWatchdog,
 	route func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc,
 ) {
 	mux.HandleFunc("GET /v1/overview", route(false, func(w http.ResponseWriter, _ *http.Request, c *registry.Device) error {
@@ -335,6 +336,7 @@ func registerAdminRoutes(
 	}))
 
 	registerDDNSRoutes(mux, fleet, route)
+	registerNebulaRoutes(mux, fleet, watchdog, route)
 
 	mux.HandleFunc("GET /v1/logs", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
 		name, path, err := resolveLogPath(fleet, r.URL.Query().Get("name"))
@@ -405,6 +407,45 @@ func registerDDNSRoutes(
 			return &core.FleetError{Msg: err.Error(), Status: http.StatusBadRequest}
 		}
 		writeJSON(w, http.StatusOK, pol)
+		return nil
+	}))
+}
+
+func registerNebulaRoutes(
+	mux *http.ServeMux,
+	fleet *core.Fleet,
+	watchdog *NebulaWatchdog,
+	route func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc,
+) {
+	mux.HandleFunc("GET /v1/nebula/status", route(true, func(w http.ResponseWriter, _ *http.Request, _ *registry.Device) error {
+		health, err := core.ReadNebulaHealth(fleet.Root)
+		if err != nil {
+			return err
+		}
+		if watchdog != nil {
+			wd := watchdog.State()
+			health.Watchdog = &wd
+		}
+		writeJSON(w, http.StatusOK, health)
+		return nil
+	}))
+
+	mux.HandleFunc("POST /v1/nebula/restart", route(true, func(w http.ResponseWriter, r *http.Request, caller *registry.Device) error {
+		var req struct {
+			Reason string `json:"reason"`
+		}
+		if err := readJSONBody(r, &req); err != nil {
+			return err
+		}
+		reason := cmp.Or(strings.TrimSpace(req.Reason), "manual")
+		queued, err := core.RequestNebulaRestart(fleet.Root, caller.Name, reason)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":  "queued",
+			"request": queued,
+		})
 		return nil
 	}))
 }

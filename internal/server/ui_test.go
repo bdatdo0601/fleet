@@ -390,6 +390,32 @@ func TestAdminJoinDecodeConfigRevocationsDDNSAndLogs(t *testing.T) {
 		t.Fatalf("unexpected IAM policy: %+v", polRes)
 	}
 
+	// Nebula status & restart queue.
+	var nebBefore core.NebulaHealthStatus
+	if err := client.Call(srv.URL, http.MethodGet, "/v1/nebula/status", nil, 5*time.Second, nil, &nebBefore); err != nil {
+		t.Fatal(err)
+	}
+	if nebBefore.Pending {
+		t.Fatalf("expected no pending nebula restart initially, got %+v", nebBefore)
+	}
+	var nebRestartRes struct {
+		Status  string                    `json:"status"`
+		Request core.NebulaRestartRequest `json:"request"`
+	}
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/nebula/restart", map[string]string{"reason": "ui test"}, 5*time.Second, nil, &nebRestartRes); err != nil {
+		t.Fatal(err)
+	}
+	if nebRestartRes.Status != "queued" || nebRestartRes.Request.ID == "" || nebRestartRes.Request.By != "mini" || nebRestartRes.Request.Reason != "ui test" {
+		t.Fatalf("unexpected nebula restart response: %+v", nebRestartRes)
+	}
+	var nebAfter core.NebulaHealthStatus
+	if err := client.Call(srv.URL, http.MethodGet, "/v1/nebula/status", nil, 5*time.Second, nil, &nebAfter); err != nil {
+		t.Fatal(err)
+	}
+	if !nebAfter.Pending || nebAfter.PendingRequest == nil || nebAfter.PendingRequest.ID != nebRestartRes.Request.ID {
+		t.Fatalf("expected pending nebula restart after POST, got %+v", nebAfter)
+	}
+
 	// Managed device blocked from all admin endpoints.
 	f.IdentifyOverride = func(string) *registry.Device { return office }
 	for _, ep := range []struct {
@@ -403,6 +429,8 @@ func TestAdminJoinDecodeConfigRevocationsDDNSAndLogs(t *testing.T) {
 		{http.MethodGet, "/v1/ddns", nil},
 		{http.MethodGet, "/v1/ddns/policy?zone_id=Z123ABC&name=home.example.com", nil},
 		{http.MethodGet, "/v1/logs?name=serve", nil},
+		{http.MethodGet, "/v1/nebula/status", nil},
+		{http.MethodPost, "/v1/nebula/restart", map[string]string{}},
 	} {
 		err := client.Call(srv.URL, ep.method, ep.path, ep.body, 5*time.Second, nil, nil)
 		if err == nil || !strings.Contains(err.Error(), "HTTP 403") {

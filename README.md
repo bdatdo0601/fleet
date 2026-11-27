@@ -148,7 +148,7 @@ The approval travels through the mesh to the lighthouse, and the new Mac joins r
 
 1. In **Mobile Nebula** (Defined Networking), add a site, have it generate a key, and copy the **public key**.
 2. On an admin Mac, run `fleet approve-mobile phone` and paste the key. It prints a certificate, the CA and the lighthouse address.
-3. Paste the certificate and CA into the app. Add host `10.213.0.1`, marked as a **lighthouse**, with address `lighthouse.example.com:443`.
+3. Paste the certificate and CA into the app. Under **Hosts**, add `10.213.0.1`, marked as a **lighthouse**, with address `lighthouse.example.com:443`. Under **Relays**, also add `10.213.0.1` so Macs can initiate a fresh relay back if a mobile relay goes stale.
 4. In an SSH client (Blink, Termius), create a key and authorize it on the Macs you want to reach.
 
 ### Making a Mac reachable

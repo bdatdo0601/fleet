@@ -43,6 +43,10 @@ tun:
   drop_multicast: false
   mtu: 1300
 
+tunnels:
+  drop_inactive: true
+  inactivity_timeout: 12h
+
 logging:
   level: info
   format: text

@@ -38,7 +38,8 @@ func rootIDs() (*int, *int) {
 	return new(0), new(0)
 }
 
-func ownerIDs(owner string) (*int, *int) {
+// OwnerIDs returns the numeric UID and GID for owner when running as root, or (nil, nil) otherwise.
+func OwnerIDs(owner string) (*int, *int) {
 	if !IsRoot() || owner == "" || owner == "root" {
 		return nil, nil
 	}
@@ -200,7 +201,25 @@ func LaunchdLoaded(label string) bool {
 
 // Restart kickstarts a launchd system service.
 func Restart(label string) {
-	_, _, _, _ = Sudo(false, "launchctl", "kickstart", "-k", "system/"+label)
+	_ = RestartService(label)
+}
+
+// RestartService kickstarts a launchd system service and returns any error.
+func RestartService(label string) error {
+	_, stderrStr, rc, err := Sudo(false, "launchctl", "kickstart", "-k", "system/"+label)
+	if err != nil || rc != 0 {
+		return fmt.Errorf("launchctl kickstart system/%s failed: %w (%s)", label, err, strings.TrimSpace(stderrStr))
+	}
+	return nil
+}
+
+// Reload sends SIGHUP to a launchd system service for live configuration reloads.
+func Reload(label string) error {
+	_, stderrStr, rc, err := Sudo(false, "launchctl", "kill", "HUP", "system/"+label)
+	if err != nil || rc != 0 {
+		return fmt.Errorf("launchctl kill HUP system/%s failed: %w (%s)", label, err, strings.TrimSpace(stderrStr))
+	}
+	return nil
 }
 
 // StartNebula loads or restarts the Homebrew nebula service.
@@ -226,6 +245,7 @@ type DaemonOpts struct {
 	LogPath        string
 	WorkDir        string
 	ReloadDetached bool
+	WatchPaths     []string
 }
 
 // AgentOpts configures a per-user launchd LaunchAgent plist.
@@ -250,6 +270,7 @@ type plistSpec struct {
 	User          string
 	WorkDir       string
 	LimitLoadType string
+	WatchPaths    []string
 }
 
 func xmlEscape(s string) string {
@@ -302,6 +323,13 @@ func buildPlistXML(spec plistSpec) string {
 	if spec.User != "" {
 		b.WriteString("\t<key>UserName</key>\n\t<string>" + xmlEscape(spec.User) + "</string>\n")
 	}
+	if len(spec.WatchPaths) > 0 {
+		b.WriteString("\t<key>WatchPaths</key>\n\t<array>\n")
+		for _, wp := range spec.WatchPaths {
+			b.WriteString("\t\t<string>" + xmlEscape(wp) + "</string>\n")
+		}
+		b.WriteString("\t</array>\n")
+	}
 	if spec.WorkDir != "" {
 		b.WriteString("\t<key>WorkingDirectory</key>\n\t<string>" + xmlEscape(spec.WorkDir) + "</string>\n")
 	}
@@ -322,14 +350,15 @@ func BuildDaemonPlist(opts DaemonOpts) (string, error) {
 		}
 	}
 	return buildPlistXML(plistSpec{
-		Label:     opts.Label,
-		Args:      opts.Args,
-		Env:       env,
-		Interval:  opts.Interval,
-		KeepAlive: opts.KeepAlive,
-		LogPath:   opts.LogPath,
-		User:      opts.User,
-		WorkDir:   opts.WorkDir,
+		Label:      opts.Label,
+		Args:       opts.Args,
+		Env:        env,
+		Interval:   opts.Interval,
+		KeepAlive:  opts.KeepAlive,
+		LogPath:    opts.LogPath,
+		User:       opts.User,
+		WorkDir:    opts.WorkDir,
+		WatchPaths: opts.WatchPaths,
 	}), nil
 }
 
@@ -436,7 +465,7 @@ exit 1`
 }
 
 // InstallSyncDaemon installs/updates the root 5-minute sync LaunchDaemon.
-func InstallSyncDaemon(binPath, workDir string, reloadDetached bool) error {
+func InstallSyncDaemon(binPath, workDir string, reloadDetached bool, watchPaths ...string) error {
 	if binPath == "" {
 		binPath = paths.InstalledBinaryPath()
 	}
@@ -450,6 +479,7 @@ func InstallSyncDaemon(binPath, workDir string, reloadDetached bool) error {
 		LogPath:        "/var/log/fleet-sync.log",
 		WorkDir:        workDir,
 		ReloadDetached: reloadDetached,
+		WatchPaths:     watchPaths,
 	})
 }
 
@@ -1009,7 +1039,7 @@ func waitHealthy(apiURL string, timeout time.Duration, checkFn func(string) bool
 }
 
 func writeOwnerFile(path string, data []byte, mode os.FileMode, owner string) error {
-	uid, gid := ownerIDs(owner)
+	uid, gid := OwnerIDs(owner)
 	_, err := paths.WriteFileAtomic(path, data, mode, uid, gid)
 	return err
 }
@@ -1039,7 +1069,7 @@ func buildDarwinBinaries(repoDir, binDir, owner, headSHA, builtAt string) (map[s
 	if goBin == "" {
 		return nil, fmt.Errorf("go not found on lighthouse (install with: brew install go)")
 	}
-	uid, gid := ownerIDs(owner)
+	uid, gid := OwnerIDs(owner)
 	if err := paths.EnsureDir(binDir, 0o755, uid, gid); err != nil {
 		return nil, err
 	}
@@ -1094,7 +1124,7 @@ func restartAndVerifyLighthouse(opts LighthouseUpdateOpts, targetBin, prevBin, o
 }
 
 func publishManifest(binDir, owner, headSHA, builtAt string, tmpBins map[string]string) error {
-	uid, gid := ownerIDs(owner)
+	uid, gid := OwnerIDs(owner)
 	manifest := core.BinaryManifest{Version: version.Version, Commit: headSHA, BuiltAt: builtAt, Binaries: map[string]core.BinaryEntry{}}
 	for _, arch := range []string{"arm64", "amd64"} {
 		finalName := "fleet-darwin-" + arch

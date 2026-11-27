@@ -66,3 +66,77 @@ func Render(kind string, settings map[string]string, blocklist []string, pkiDir 
 	}
 	return text, nil
 }
+
+var reloadableSections = map[string]bool{
+	"pki":      true,
+	"firewall": true,
+	"logging":  true,
+}
+
+func splitTopLevelYAML(src string) (map[string]string, bool) {
+	sections := make(map[string]string)
+	var curKey string
+	var curLines []string
+	flush := func() {
+		if curKey != "" {
+			sections[curKey] = strings.Join(curLines, "\n")
+		}
+	}
+	norm := strings.ReplaceAll(src, "\r\n", "\n")
+	for line := range strings.SplitSeq(norm, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
+			key, _, ok := strings.Cut(trimmed, ":")
+			key = strings.TrimSpace(key)
+			if !ok || key == "" {
+				return nil, false
+			}
+			flush()
+			curKey = key
+			curLines = []string{strings.TrimRight(line, " \t")}
+			continue
+		}
+		if curKey == "" {
+			return nil, false
+		}
+		curLines = append(curLines, strings.TrimRight(line, " \t"))
+	}
+	flush()
+	if len(sections) == 0 {
+		return nil, false
+	}
+	return sections, true
+}
+
+// ConfigChangeRequiresRestart reports whether changing from oldYAML to newYAML
+// modifies anything outside Nebula's SIGHUP-reloadable sections (pki, firewall, logging).
+func ConfigChangeRequiresRestart(oldYAML, newYAML string) bool {
+	if strings.TrimSpace(oldYAML) == "" {
+		return true
+	}
+	oldSec, okOld := splitTopLevelYAML(oldYAML)
+	newSec, okNew := splitTopLevelYAML(newYAML)
+	if !okOld || !okNew {
+		return true
+	}
+	for k, v := range oldSec {
+		if reloadableSections[k] {
+			continue
+		}
+		if nv, exists := newSec[k]; !exists || nv != v {
+			return true
+		}
+	}
+	for k := range newSec {
+		if reloadableSections[k] {
+			continue
+		}
+		if _, exists := oldSec[k]; !exists {
+			return true
+		}
+	}
+	return false
+}

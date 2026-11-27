@@ -1,4 +1,4 @@
-import { api, badge, cell, clear, el, field, formatBytes, formatDuration, makeCopyBtn, relTime, section, shortDate, state, toast } from "./lib.js";
+import { api, badge, cell, clear, confirmDialog, el, field, formatBytes, formatDuration, makeCopyBtn, relTime, section, shortDate, state, toast } from "./lib.js";
 
 const sysState = {
   logName: "serve",
@@ -7,14 +7,81 @@ const sysState = {
   ddnsLive: null,
 };
 
-function renderLighthouseCard(ov) {
+function formatWatchdogSummary(nebStatus) {
+  const wd = nebStatus && nebStatus.watchdog;
+  if (!wd || !wd.enabled) {
+    return "inactive";
+  }
+  const base = `active (≥${wd.burst_threshold} relay errors/${wd.burst_window_sec}s)`;
+  if (wd.last_error) {
+    return `${base} · error: ${wd.last_error}`;
+  }
+  if (wd.recent_errors > 0) {
+    return `${base} · ${wd.recent_errors} recent`;
+  }
+  return base;
+}
+
+function formatNebulaRestartSummary(nebStatus) {
+  if (!nebStatus) {
+    return "-";
+  }
+  if (nebStatus.pending && nebStatus.pending_request) {
+    const req = nebStatus.pending_request;
+    return `Pending (${req.reason || "manual"} by ${req.by || "admin"}, ${relTime(req.requested_at)})`;
+  }
+  const lr = nebStatus.last_restart;
+  if (!lr) {
+    return "none";
+  }
+  const status = lr.ok ? "ok" : `failed (${lr.error || "error"})`;
+  return `${relTime(lr.restarted_at)} · ${status} (${lr.reason || "manual"} by ${lr.by || "admin"})`;
+}
+
+function renderLighthouseCard(ov, nebStatus, onRefresh) {
   const s = ov.server || {};
   const ca = ov.ca || {};
   const cfg = ov.settings || {};
+
+  const restartBtn = el("button", {
+    type: "button",
+    className: "btn btn-sm btn-danger",
+    text: nebStatus && nebStatus.pending ? "Restart Queued…" : "Restart Nebula",
+    disabled: Boolean(nebStatus && nebStatus.pending),
+    onclick: async () => {
+      const ok = await confirmDialog(
+        "Restart Nebula",
+        "Restart the lighthouse Nebula daemon now? This flushes stale relay mappings; relayed peers will re-handshake for ~1–2 seconds.",
+        "Restart Nebula",
+        true,
+      );
+      if (!ok) {
+        return;
+      }
+      restartBtn.disabled = true;
+      try {
+        await api("POST", "/v1/nebula/restart", { reason: "manual (web ui)" });
+        toast("Nebula restart queued on lighthouse", "ok");
+        if (onRefresh) {
+          onRefresh();
+          setTimeout(onRefresh, 2000);
+        }
+      } catch (err) {
+        toast(err.message, "error");
+        restartBtn.disabled = false;
+      }
+    },
+  });
+
   return el(
     "article",
     { className: "card" },
-    el("div", { className: "card-header" }, el("h3", { className: "card-title", text: "Lighthouse & PKI" }), badge(`CA ${ca.ca_id || "-"}`, "info")),
+    el(
+      "div",
+      { className: "card-header" },
+      el("h3", { className: "card-title", text: "Lighthouse & PKI" }),
+      el("div", { className: "actions-row" }, badge(`CA ${ca.ca_id || "-"}`, "info"), restartBtn),
+    ),
     el(
       "dl",
       { className: "kv-list" },
@@ -32,6 +99,10 @@ function renderLighthouseCard(ov) {
       el("dd", { className: "kv-value mono", text: `${s.version} (${s.commit}) · ${s.os}/${s.arch}` }),
       el("dt", { className: "kv-label", text: "Built / Uptime" }),
       el("dd", { className: "kv-value", text: `${s.built_at || "dev"} · up ${formatDuration(s.uptime_seconds)}` }),
+      el("dt", { className: "kv-label", text: "Relay Watchdog" }),
+      el("dd", { className: "kv-value", text: formatWatchdogSummary(nebStatus) }),
+      el("dt", { className: "kv-label", text: "Last Nebula Restart" }),
+      el("dd", { className: "kv-value", text: formatNebulaRestartSummary(nebStatus) }),
     ),
   );
 }
@@ -316,8 +387,12 @@ export async function renderSystem(root) {
   }
 
   let ddnsData;
+  let nebStatus = null;
   try {
-    ddnsData = await api("GET", "/v1/ddns");
+    [ddnsData, nebStatus] = await Promise.all([
+      api("GET", "/v1/ddns"),
+      api("GET", "/v1/nebula/status"),
+    ]);
   } catch (err) {
     clear(root);
     root.appendChild(el("div", { className: "alert-banner alert-danger", text: err.message }));
@@ -339,11 +414,28 @@ export async function renderSystem(root) {
     ),
   );
 
+  const infraWrap = el("div");
+  const drawInfra = (st) => {
+    clear(infraWrap);
+    infraWrap.appendChild(
+      el("div", { className: "split-grid" }, renderLighthouseCard(ov, st, refreshNebula), renderBinariesCard(ov)),
+    );
+  };
+  const refreshNebula = async () => {
+    try {
+      const latest = await api("GET", "/v1/nebula/status");
+      drawInfra(latest);
+    } catch {
+      // Ignore transient refresh failure right after daemon restart.
+    }
+  };
+  drawInfra(nebStatus);
+
   root.appendChild(
     section(
       "Infrastructure & Binaries",
       { className: "ui-section" },
-      el("div", { className: "split-grid" }, renderLighthouseCard(ov), renderBinariesCard(ov)),
+      infraWrap,
     ),
   );
   root.appendChild(section("Dynamic DNS", { className: "ui-section" }, renderDDNSCard(ddnsData, ov)));

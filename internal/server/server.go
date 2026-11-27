@@ -280,7 +280,11 @@ func registerDeviceRoutes(
 }
 
 // NewHandler returns the HTTP handler for the lighthouse API.
-func NewHandler(fleet *core.Fleet, quiet bool) http.Handler {
+func NewHandler(fleet *core.Fleet, quiet bool, watchdogs ...*NebulaWatchdog) http.Handler {
+	var watchdog *NebulaWatchdog
+	if len(watchdogs) > 0 {
+		watchdog = watchdogs[0]
+	}
 	startedAt := time.Now().UTC()
 	mux := http.NewServeMux()
 	route := makeAuthRoute(fleet, quiet)
@@ -321,7 +325,7 @@ func NewHandler(fleet *core.Fleet, quiet bool) http.Handler {
 	registerAgentRoutes(mux, fleet, route)
 	registerMemoryRoutes(mux, fleet, route)
 	registerSlackerRoutes(mux, fleet, route)
-	registerAdminRoutes(mux, fleet, startedAt, route)
+	registerAdminRoutes(mux, fleet, startedAt, watchdog, route)
 	registerWebRoutes(mux, route)
 	registerDeviceRoutes(mux, fleet, route)
 
@@ -670,10 +674,10 @@ func handleAgentWaitHarness(w http.ResponseWriter, r *http.Request, fleet *core.
 // NewServer constructs an *http.Server configured with safe mesh timeouts.
 // WriteTimeout is intentionally omitted so long-poll /v1/agents/wait and /v1/agents/ask
 // requests can stay open up to 120 seconds.
-func NewServer(fleet *core.Fleet, addr string, quiet bool) *http.Server {
+func NewServer(fleet *core.Fleet, addr string, quiet bool, watchdogs ...*NebulaWatchdog) *http.Server {
 	return &http.Server{
 		Addr:              addr,
-		Handler:           NewHandler(fleet, quiet),
+		Handler:           NewHandler(fleet, quiet, watchdogs...),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       90 * time.Second,
 		MaxHeaderBytes:    64 * 1024,
@@ -696,12 +700,14 @@ func Serve(port int, host string) error {
 	if err != nil {
 		return err
 	}
-	srv := NewServer(fleet, addr, false)
+	watchdog := NewNebulaWatchdog(fleet.Root)
+	srv := NewServer(fleet, addr, false, watchdog)
 	_, _ = fmt.Fprintf(os.Stderr, "fleet serve listening on %s\n", addr)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	watchdog.Start(ctx)
 	if fleet.Curator != nil {
 		fleet.Curator.Start(ctx)
 		defer fleet.Curator.Stop()

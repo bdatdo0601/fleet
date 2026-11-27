@@ -61,6 +61,8 @@ function renderMobileResult(resp, onDone) {
         el("dd", { className: "kv-value", text: "yes" }),
         el("dt", { className: "kv-label", text: "Address" }),
         el("dd", { className: "kv-value mono", text: lh.address || "-" }),
+        el("dt", { className: "kv-label", text: "Relay" }),
+        el("dd", { className: "kv-value mono", text: `${lh.ip || "10.213.0.1"} (add under Relays in Mobile Nebula)` }),
       ),
     ),
     el(
