@@ -5,6 +5,8 @@ import { renderAgents } from "./agents.js";
 import { renderMemory } from "./memory.js";
 import { renderSlacker } from "./slacker.js";
 import { renderSystem } from "./system.js";
+import { renderChat } from "./chat.js";
+import { renderSkills } from "./skills.js";
 
 const NAV_ITEMS = [
   {
@@ -13,6 +15,20 @@ const NAV_ITEMS = [
     href: "#overview",
     adminOnly: false,
     icon: ["M3 9.5L12 3l9 6.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1V9.5z"],
+  },
+  {
+    id: "chat",
+    label: "Chat",
+    href: "#chat",
+    adminOnly: true,
+    icon: ["M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"],
+  },
+  {
+    id: "skills",
+    label: "Skills",
+    href: "#skills",
+    adminOnly: true,
+    icon: ["M4 19.5A2.5 2.5 0 0 1 6.5 17H20", "M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"],
   },
   {
     id: "agents",
@@ -125,6 +141,7 @@ function renderTopbar(ov, activeSection) {
   const visibleItems = NAV_ITEMS.filter((item) => !item.adminOnly || state.isAdmin);
   const waitingCount = ov && ov.agents ? ov.agents.waiting || 0 : 0;
   const propCount = ov && ov.memory ? ov.memory.pending_proposals || 0 : 0;
+  const aprCount = ov && ov.assistant ? ov.assistant.pending_approvals || 0 : 0;
 
   if (nav) {
     clear(nav);
@@ -145,7 +162,7 @@ function renderTopbar(ov, activeSection) {
     clear(mobileNav);
     for (const item of visibleItems) {
       const isActive = activeSection === item.id;
-      const badgeCount = item.id === "agents" ? waitingCount : item.id === "memory" ? propCount : 0;
+      const badgeCount = item.id === "agents" ? waitingCount : item.id === "memory" ? propCount : item.id === "chat" ? aprCount : 0;
       mobileNav.appendChild(
         el(
           "a",
@@ -180,6 +197,16 @@ function renderTopbar(ov, activeSection) {
           className: "badge badge-warn pill-btn",
           text: `${waitingCount} waiting`,
           onclick: () => navigate("#agents/waiting"),
+        }),
+      );
+    }
+    if (aprCount > 0) {
+      pills.appendChild(
+        el("button", {
+          type: "button",
+          className: "badge badge-warn pill-btn",
+          text: `${aprCount} approvals`,
+          onclick: () => navigate("#chat"),
         }),
       );
     }
@@ -244,8 +271,12 @@ async function renderRoute() {
 }
 
 async function renderCurrentRoute(seq) {
+  if (typeof state.routeCleanup === "function") {
+    state.routeCleanup();
+    state.routeCleanup = null;
+  }
   let { section, sub } = parseHash();
-  if ((section === "devices" || section === "system" || section === "slacker") && !state.isAdmin) {
+  if ((section === "devices" || section === "system" || section === "slacker" || section === "chat" || section === "skills") && !state.isAdmin) {
     toast("Admin device required for that view", "warn");
     section = "overview";
     sub = "";
@@ -262,6 +293,12 @@ async function renderCurrentRoute(seq) {
   const ctx = { refresh, navigate };
 
   switch (section) {
+    case "chat":
+      await renderChat(main, ctx, sub);
+      break;
+    case "skills":
+      await renderSkills(main, ctx, sub);
+      break;
     case "devices":
       await renderDevices(main, ctx);
       break;
@@ -294,7 +331,7 @@ function setAutoRefresh(ms) {
   if (ms > 0) {
     refreshTimer = setInterval(() => {
       const { section, sub } = parseHash();
-      const skipSection = section === "system" || section === "slacker" || (section === "memory" && sub === "curator") || (section === "agents" && sub === "messages");
+      const skipSection = section === "system" || section === "slacker" || section === "chat" || section === "skills" || (section === "memory" && sub === "curator") || (section === "agents" && sub === "messages");
       const ae = document.activeElement;
       const typing = Boolean(ae && ae.closest("#app-main") && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName));
       if (document.hidden || state.modalOpen || state.editing || typing || skipSection || navigator.onLine === false) {

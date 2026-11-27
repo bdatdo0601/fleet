@@ -109,6 +109,8 @@ func TestWebUIAssetsSecurityAndStrangers(t *testing.T) {
 		wantPrefix string
 	}{
 		{"/assets/app.js", "text/javascript"},
+		{"/assets/chat.js", "text/javascript"},
+		{"/assets/skills.js", "text/javascript"},
 		{"/assets/usage.js", "text/javascript"},
 		{"/assets/app.css", "text/css"},
 		{"/assets/favicon.svg", "image/svg+xml"},

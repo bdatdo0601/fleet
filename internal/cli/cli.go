@@ -1588,6 +1588,7 @@ Commands:
   usage           show quota and usage status across claude, codex, and antigravity
   session         manage detached Claude, Antigravity (agy), and Codex sessions
   slacker         lighthouse Slack Socket Mode dispatcher & Mac task workers
+  assistant       always-on lighthouse personal assistant, Obsidian skills & approvals
   memory          manage shared fleet agent memory and LLM curation
   mcp             manage skills, lifecycle hooks, and agent relay for claude, codex, and antigravity
   agent-hook      (internal) handle a harness lifecycle hook
@@ -1596,51 +1597,39 @@ Commands:
 }
 
 func dispatchCommand(cmd string, rest []string, cio *IO) (bool, error) {
-	switch cmd {
-	case "version", "--version", "-V":
+	if cmd == "version" || cmd == "--version" || cmd == "-V" {
 		cio.printf("%s\n", version.String())
 		return true, nil
-	case "init":
-		return true, cmdInit(rest, cio)
-	case "join":
-		return true, cmdJoin(rest, cio)
-	case "approve":
-		return true, cmdApprove(rest, cio)
-	case "approve-mobile":
-		return true, cmdApproveMobile(rest, cio)
-	case "ls":
-		return true, cmdLS(rest, cio)
-	case "revoke":
-		return true, cmdRevoke(rest, cio)
-	case "set":
-		return true, cmdSet(rest, cio)
-	case "sync":
-		return true, cmdSync(rest, cio)
-	case "serve":
+	}
+	if cmd == "serve" {
 		return true, server.Serve(paths.APIPort(), "0.0.0.0")
-	case "status":
-		return true, cmdStatus(rest, cio)
-	case "ddns":
-		return true, cmdDDNS(rest, cio)
-	case "agents":
-		return true, cmdAgents(rest, cio)
-	case "usage":
-		return true, cmdUsage(rest, cio)
-	case "statusline":
-		return true, cmdStatusLine(rest, cio)
-	case "session":
-		return true, cmdSession(rest, cio)
-	case "slacker":
-		return true, cmdSlacker(rest, cio)
-	case "memory":
-		return true, cmdMemory(rest, cio)
-	case "mcp":
-		return true, cmdMCP(rest, cio)
-	case "agent-hook":
-		return true, cmdAgentHook(rest, cio)
-	default:
+	}
+	handlers := map[string]func([]string, *IO) error{
+		"init":           cmdInit,
+		"join":           cmdJoin,
+		"approve":        cmdApprove,
+		"approve-mobile": cmdApproveMobile,
+		"ls":             cmdLS,
+		"revoke":         cmdRevoke,
+		"set":            cmdSet,
+		"sync":           cmdSync,
+		"status":         cmdStatus,
+		"ddns":           cmdDDNS,
+		"agents":         cmdAgents,
+		"usage":          cmdUsage,
+		"statusline":     cmdStatusLine,
+		"session":        cmdSession,
+		"slacker":        cmdSlacker,
+		"assistant":      cmdAssistant,
+		"memory":         cmdMemory,
+		"mcp":            cmdMCP,
+		"agent-hook":     cmdAgentHook,
+	}
+	fn, ok := handlers[cmd]
+	if !ok {
 		return false, nil
 	}
+	return true, fn(rest, cio)
 }
 
 // Run dispatches CLI args using cio and returns an exit code (0 on success).

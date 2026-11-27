@@ -1,0 +1,493 @@
+package server
+
+import (
+	"cmp"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/bdatdo0601/fleet/internal/assistant"
+	"github.com/bdatdo0601/fleet/internal/core"
+	"github.com/bdatdo0601/fleet/internal/registry"
+)
+
+const assistantWidgetHTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root { color-scheme: light dark; --bg: transparent; --text: #0f172a; --muted: #475569; --border: #cbd5e1; --accent: #0284c7; --surface: #f8fafc; }
+:root[data-theme="dark"] { --text: #f1f5f9; --muted: #94a3b8; --border: #334155; --accent: #38bdf8; --surface: #0f172a; }
+html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 13px; line-height: 1.45; }
+#root { padding: 8px 10px; }
+button { font: inherit; cursor: pointer; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); color: var(--text); padding: 4px 10px; }
+button:hover { border-color: var(--accent); }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--border); }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+const root = document.getElementById("root");
+function sendHeight() {
+  parent.postMessage({ type: "fleet-widget-resize", height: Math.max(48, document.documentElement.scrollHeight) }, "*");
+}
+window.addEventListener("message", (ev) => {
+  if (!ev.data || ev.data.type !== "render") return;
+  if (ev.data.theme === "dark") document.documentElement.setAttribute("data-theme", "dark");
+  else document.documentElement.removeAttribute("data-theme");
+  root.innerHTML = String(ev.data.html || "");
+  for (const sc of root.querySelectorAll("script")) {
+    const s = document.createElement("script");
+    s.textContent = sc.textContent;
+    sc.replaceWith(s);
+  }
+  sendHeight();
+});
+root.addEventListener("click", (ev) => {
+  const btn = ev.target && ev.target.closest("[data-fleet-action]");
+  if (!btn) return;
+  parent.postMessage({ type: "fleet-widget-action", action: btn.getAttribute("data-fleet-action") || "" }, "*");
+});
+if (typeof ResizeObserver !== "undefined") {
+  new ResizeObserver(sendHeight).observe(root);
+}
+parent.postMessage({ type: "fleet-widget-ready" }, "*");
+</script>
+</body>
+</html>`
+
+func buildAssistantSummary(fleet *core.Fleet) map[string]any {
+	if fleet.Assistant == nil {
+		return map[string]any{"enabled": false, "configured": false}
+	}
+	view := fleet.Assistant.ConfigView()
+	sc := fleet.Assistant.Store().Summary()
+	skillsCount := 0
+	if v, err := fleet.Assistant.Vault(); err == nil {
+		if list, lErr := v.ListSkills(); lErr == nil {
+			skillsCount = len(list)
+		}
+	}
+	return map[string]any{
+		"enabled":           view.Enabled,
+		"configured":        view.Configured,
+		"default_model":     view.Models.DefaultChat,
+		"zdr":               view.ZDR,
+		"channels":          sc.Channels,
+		"pending_approvals": sc.PendingApprovals,
+		"enabled_timers":    sc.EnabledTimers,
+		"skills":            skillsCount,
+	}
+}
+
+func registerAssistantRoutes(
+	mux *http.ServeMux,
+	fleet *core.Fleet,
+	route func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc,
+) {
+	if fleet.Assistant == nil {
+		return
+	}
+	registerAssistantAdminRoutes(mux, fleet, route)
+	registerAssistantChatRoutes(mux, fleet, route)
+	registerAssistantSkillRoutes(mux, fleet, route)
+	registerAssistantVaultRoutes(mux, fleet, route)
+}
+
+func registerAssistantAdminRoutes(
+	mux *http.ServeMux,
+	fleet *core.Fleet,
+	route func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc,
+) {
+	mux.HandleFunc("GET /v1/assistant/status", route(true, func(w http.ResponseWriter, _ *http.Request, _ *registry.Device) error {
+		writeJSON(w, http.StatusOK, fleet.Assistant.Status())
+		return nil
+	}))
+	mux.HandleFunc("GET /v1/assistant/config", route(true, func(w http.ResponseWriter, _ *http.Request, _ *registry.Device) error {
+		writeJSON(w, http.StatusOK, map[string]any{"config": fleet.Assistant.ConfigView()})
+		return nil
+	}))
+	mux.HandleFunc("POST /v1/assistant/config", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		var req struct {
+			assistant.Config
+			ClearAPIKey bool  `json:"clear_api_key"`
+			Test        *bool `json:"test"`
+		}
+		if err := readJSONBody(r, &req); err != nil {
+			return err
+		}
+		view, err := fleet.Assistant.UpdateConfig(req.Config, req.ClearAPIKey)
+		if err != nil {
+			return err
+		}
+		if req.Test != nil && *req.Test {
+			if tErr := fleet.Assistant.TestConnection(r.Context()); tErr != nil {
+				return &core.FleetError{Msg: "saved config but connection test failed: " + tErr.Error(), Status: http.StatusBadRequest}
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"config": view})
+		return nil
+	}))
+	mux.HandleFunc("POST /v1/assistant/test", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		if err := fleet.Assistant.TestConnection(r.Context()); err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return nil
+	}))
+	mux.HandleFunc("GET /assistant-widget", route(true, func(w http.ResponseWriter, _ *http.Request, _ *registry.Device) error {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Frame-Options", "SAMEORIGIN")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; frame-ancestors 'self'")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(assistantWidgetHTML))
+		return nil
+	}))
+}
+
+func registerAssistantChatRoutes(
+	mux *http.ServeMux,
+	fleet *core.Fleet,
+	route func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc,
+) {
+	mux.HandleFunc("GET /v1/assistant/channels", route(true, func(w http.ResponseWriter, _ *http.Request, _ *registry.Device) error {
+		chs, err := fleet.Assistant.Store().ListChannels()
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"channels": chs})
+		return nil
+	}))
+	mux.HandleFunc("POST /v1/assistant/channels", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		var req struct {
+			ID          string `json:"id"`
+			Title       string `json:"title"`
+			Description string `json:"description"`
+			Model       string `json:"model"`
+		}
+		if err := readJSONBody(r, &req); err != nil {
+			return err
+		}
+		ch, err := fleet.Assistant.Store().UpsertChannel(req.ID, req.Title, req.Description, req.Model)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"channel": ch})
+		return nil
+	}))
+	mux.HandleFunc("PATCH /v1/assistant/channels/{id}", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		id := r.PathValue("id")
+		cur, err := fleet.Assistant.Store().GetChannel(id)
+		if err != nil {
+			return err
+		}
+		var req struct {
+			Title       *string `json:"title"`
+			Description *string `json:"description"`
+			Model       *string `json:"model"`
+		}
+		if err := readJSONBody(r, &req); err != nil {
+			return err
+		}
+		title := cur.Title
+		if req.Title != nil {
+			title = *req.Title
+		}
+		desc := cur.Description
+		if req.Description != nil {
+			desc = *req.Description
+		}
+		model := cur.Model
+		if req.Model != nil {
+			model = *req.Model
+		}
+		ch, err := fleet.Assistant.Store().UpsertChannel(id, title, desc, model)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"channel": ch})
+		return nil
+	}))
+	mux.HandleFunc("POST /v1/assistant/channels/{id}/reset", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		ch, err := fleet.Assistant.Store().ResetChannelContext(r.PathValue("id"))
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"channel": ch})
+		return nil
+	}))
+	mux.HandleFunc("GET /v1/assistant/messages", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		ch := cmp.Or(strings.TrimSpace(r.URL.Query().Get("channel")), "general")
+		msgs, err := fleet.Assistant.Store().ListMessages(ch, queryInt(r, "limit"))
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"channel": ch, "messages": msgs})
+		return nil
+	}))
+	mux.HandleFunc("POST /v1/assistant/messages", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		var req struct {
+			Channel string `json:"channel"`
+			Content string `json:"content"`
+			Model   string `json:"model"`
+		}
+		if err := readJSONBody(r, &req); err != nil {
+			return err
+		}
+		msg, ev, err := fleet.Assistant.EnqueueUserMessage(req.Channel, req.Content, req.Model)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{"message": msg, "event": ev})
+		return nil
+	}))
+	mux.HandleFunc("GET /v1/assistant/stream", route(true, handleAssistantSSE(fleet)))
+	registerAssistantActionRoutes(mux, fleet, route)
+}
+
+func handleAssistantSSE(fleet *core.Fleet) func(http.ResponseWriter, *http.Request, *registry.Device) error {
+	return func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			return &core.FleetError{Msg: "streaming unsupported", Status: http.StatusInternalServerError}
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.WriteHeader(http.StatusOK)
+
+		sub := fleet.Assistant.Subscribe()
+		defer fleet.Assistant.Unsubscribe(sub)
+
+		_, _ = fmt.Fprintf(w, "event: ready\ndata: {}\n\n")
+		flusher.Flush()
+
+		keepalive := time.NewTicker(25 * time.Second)
+		defer keepalive.Stop()
+		for {
+			select {
+			case <-r.Context().Done():
+				return nil
+			case <-keepalive.C:
+				_, _ = fmt.Fprintf(w, ": keepalive\n\n")
+				flusher.Flush()
+			case ev := <-sub:
+				b, err := json.Marshal(ev)
+				if err != nil {
+					continue
+				}
+				_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, b)
+				flusher.Flush()
+			}
+		}
+	}
+}
+
+func registerAssistantActionRoutes(
+	mux *http.ServeMux,
+	fleet *core.Fleet,
+	route func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc,
+) {
+	mux.HandleFunc("GET /v1/assistant/approvals", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		list, err := fleet.Assistant.Store().ListApprovals(r.URL.Query().Get("status"), queryInt(r, "limit"))
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"approvals": list})
+		return nil
+	}))
+	mux.HandleFunc("POST /v1/assistant/approvals/{id}/decide", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		var req struct {
+			Decision string `json:"decision"`
+			Note     string `json:"note"`
+		}
+		if err := readJSONBody(r, &req); err != nil {
+			return err
+		}
+		dec := strings.ToLower(strings.TrimSpace(req.Decision))
+		if dec != "approve" && dec != "deny" && dec != "approved" && dec != "denied" {
+			return &core.FleetError{Msg: "decision must be approve or deny", Status: http.StatusBadRequest}
+		}
+		apr, err := fleet.Assistant.DecideApproval(r.PathValue("id"), dec == "approve" || dec == "approved", req.Note)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"approval": apr})
+		return nil
+	}))
+	mux.HandleFunc("GET /v1/assistant/timers", route(true, func(w http.ResponseWriter, _ *http.Request, _ *registry.Device) error {
+		list, err := fleet.Assistant.Store().ListTimers()
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"timers": list})
+		return nil
+	}))
+	mux.HandleFunc("POST /v1/assistant/timers", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		var req assistant.Timer
+		if err := readJSONBody(r, &req); err != nil {
+			return err
+		}
+		if strings.TrimSpace(req.Name) == "" || strings.TrimSpace(req.Prompt) == "" {
+			return &core.FleetError{Msg: "name and prompt are required", Status: http.StatusBadRequest}
+		}
+		req.Enabled = true
+		tmr, err := fleet.Assistant.Store().UpsertTimer(req)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"timer": tmr})
+		return nil
+	}))
+	mux.HandleFunc("DELETE /v1/assistant/timers/{id}", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		if err := fleet.Assistant.Store().DeleteTimer(r.PathValue("id")); err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return nil
+	}))
+}
+
+func registerAssistantSkillRoutes(
+	mux *http.ServeMux,
+	fleet *core.Fleet,
+	route func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc,
+) {
+	mux.HandleFunc("GET /v1/assistant/skills", route(true, func(w http.ResponseWriter, _ *http.Request, _ *registry.Device) error {
+		v, err := fleet.Assistant.Vault()
+		if err != nil {
+			return err
+		}
+		skills, err := v.ListSkills()
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"skills": skills})
+		return nil
+	}))
+	mux.HandleFunc("GET /v1/assistant/skills/{name}", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		v, err := fleet.Assistant.Vault()
+		if err != nil {
+			return err
+		}
+		sk, err := v.GetSkill(r.PathValue("name"))
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"skill": sk})
+		return nil
+	}))
+	mux.HandleFunc("PUT /v1/assistant/skills/{name}", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		var req struct {
+			Content string `json:"content"`
+		}
+		if err := readJSONBody(r, &req); err != nil {
+			return err
+		}
+		v, err := fleet.Assistant.Vault()
+		if err != nil {
+			return err
+		}
+		sk, err := v.SaveSkill(r.PathValue("name"), req.Content)
+		if err != nil {
+			return err
+		}
+		v.MaybeGitCommit(fleet.Assistant.Config().GitAutoCommit, "ui: save skill "+sk.Name)
+		writeJSON(w, http.StatusOK, map[string]any{"skill": sk})
+		return nil
+	}))
+	mux.HandleFunc("DELETE /v1/assistant/skills/{name}", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		v, err := fleet.Assistant.Vault()
+		if err != nil {
+			return err
+		}
+		if err := v.DeleteSkill(r.PathValue("name")); err != nil {
+			return err
+		}
+		v.MaybeGitCommit(fleet.Assistant.Config().GitAutoCommit, "ui: delete skill "+r.PathValue("name"))
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return nil
+	}))
+}
+
+func registerAssistantVaultRoutes(
+	mux *http.ServeMux,
+	fleet *core.Fleet,
+	route func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc,
+) {
+	mux.HandleFunc("GET /v1/assistant/vault/file", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		rel := r.URL.Query().Get("path")
+		v, err := fleet.Assistant.Vault()
+		if err != nil {
+			return err
+		}
+		content, err := v.ReadFile(rel)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"path": rel, "content": content})
+		return nil
+	}))
+	mux.HandleFunc("PUT /v1/assistant/vault/file", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		var req struct {
+			Path    string `json:"path"`
+			Content string `json:"content"`
+		}
+		if err := readJSONBody(r, &req); err != nil {
+			return err
+		}
+		v, err := fleet.Assistant.Vault()
+		if err != nil {
+			return err
+		}
+		norm, err := v.WriteFile(req.Path, req.Content)
+		if err != nil {
+			return err
+		}
+		v.MaybeGitCommit(fleet.Assistant.Config().GitAutoCommit, "ui: update "+norm)
+		writeJSON(w, http.StatusOK, map[string]string{"path": norm, "status": "saved"})
+		return nil
+	}))
+	mux.HandleFunc("GET /v1/assistant/vault/search", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		v, err := fleet.Assistant.Vault()
+		if err != nil {
+			return err
+		}
+		hits, err := v.Search(r.URL.Query().Get("q"), queryInt(r, "limit"))
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"hits": hits})
+		return nil
+	}))
+	mux.HandleFunc("POST /v1/assistant/memory/observe", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		var req struct {
+			Channel string `json:"channel"`
+			Reflect bool   `json:"reflect"`
+		}
+		if err := readJSONBody(r, &req); err != nil {
+			return err
+		}
+		if req.Reflect {
+			txt, err := fleet.Assistant.RunReflector(r.Context())
+			if err != nil {
+				return err
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"reflected": true, "reflections": txt})
+			return nil
+		}
+		res, err := fleet.Assistant.RunObserver(r.Context(), req.Channel)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, res)
+		return nil
+	}))
+}

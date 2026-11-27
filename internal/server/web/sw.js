@@ -1,4 +1,4 @@
-const CACHE_NAME = "fleet-console-v1";
+const CACHE_NAME = "fleet-console-v2";
 const APP_SHELL = [
   "/",
   "/manifest.webmanifest",
@@ -14,6 +14,8 @@ const APP_SHELL = [
   "/assets/slacker.js",
   "/assets/system.js",
   "/assets/usage.js",
+  "/assets/chat.js",
+  "/assets/skills.js",
   "/assets/favicon.svg",
   "/assets/icon-192.png",
   "/assets/icon-512.png",
@@ -48,7 +50,10 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // Never serve stale /v1/* API data from cache.
+  // Never intercept SSE streams or cache /v1/* API data.
+  if (url.pathname === "/v1/assistant/stream" || (req.headers.get("accept") || "").includes("text/event-stream")) {
+    return;
+  }
   if (url.pathname.startsWith("/v1/")) {
     event.respondWith(
       fetch(req).catch(

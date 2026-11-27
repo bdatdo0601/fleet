@@ -325,6 +325,7 @@ func NewHandler(fleet *core.Fleet, quiet bool, watchdogs ...*NebulaWatchdog) htt
 	registerAgentRoutes(mux, fleet, route)
 	registerMemoryRoutes(mux, fleet, route)
 	registerSlackerRoutes(mux, fleet, route)
+	registerAssistantRoutes(mux, fleet, route)
 	registerAdminRoutes(mux, fleet, startedAt, watchdog, route)
 	registerWebRoutes(mux, route)
 	registerDeviceRoutes(mux, fleet, route)
@@ -711,6 +712,10 @@ func Serve(port int, host string) error {
 	if fleet.Curator != nil {
 		fleet.Curator.Start(ctx)
 		defer fleet.Curator.Stop()
+	}
+	if fleet.Assistant != nil {
+		fleet.Assistant.Start(ctx)
+		defer fleet.Assistant.Stop()
 	}
 
 	errCh := make(chan error, 1)

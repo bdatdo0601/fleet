@@ -199,6 +199,7 @@ func buildOverviewPayload(fleet *core.Fleet, c *registry.Device, startedAt time.
 	payload["manifest"] = manifest
 	payload["ddns"] = buildDDNSSummary(ddnsCfg)
 	payload["slacker"] = slkSummary
+	payload["assistant"] = buildAssistantSummary(fleet)
 	return payload, nil
 }
 

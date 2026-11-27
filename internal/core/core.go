@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"github.com/bdatdo0601/fleet/internal/agents"
+	"github.com/bdatdo0601/fleet/internal/assistant"
 	"github.com/bdatdo0601/fleet/internal/codes"
 	"github.com/bdatdo0601/fleet/internal/ddns"
 	"github.com/bdatdo0601/fleet/internal/memory"
@@ -157,6 +158,7 @@ type Fleet struct {
 	Curator           *memory.Curator
 	Slacker           *slacker.Store
 	SlackClient       *slacker.SlackClient
+	Assistant         *assistant.Engine
 	approveMu         sync.Mutex
 	IdentifyOverride  func(peerIP string) *registry.Device // optional hook for tests
 }
@@ -200,6 +202,20 @@ func Open(root string) (*Fleet, error) {
 		Curator:           curator,
 		Slacker:           slk,
 	}
+	astEngine, err := assistant.Open(
+		filepath.Join(root, "assistant.db"),
+		filepath.Join(root, "assistant.json"),
+		filepath.Join(root, "assistant-vault"),
+		&assistantDeps{fleet: f},
+	)
+	if err != nil {
+		_ = slk.Close()
+		_ = mem.Close()
+		_ = hub.Close()
+		_ = reg.Close()
+		return nil, err
+	}
+	f.Assistant = astEngine
 	f.backfillPathsOnce()
 	return f, nil
 }
@@ -313,6 +329,11 @@ func (f *Fleet) Close() error {
 	var errs []error
 	if f.Curator != nil {
 		f.Curator.Stop()
+	}
+	if f.Assistant != nil {
+		if err := f.Assistant.Close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	if f.Registry != nil {
 		if err := f.Registry.Close(); err != nil {
