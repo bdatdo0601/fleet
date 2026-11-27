@@ -42,6 +42,7 @@ into it from anywhere. No third-party servers are involved.
 |---|---|---|
 | Lighthouse, once | `fleet init --host H [--route53-zone Z] [--lan-ip IP]` | Creates the CA, the registry and the lighthouse's cert, and starts nebula, the API, sync and (optionally) DNS updates |
 | Lighthouse | `fleet ddns setup\|status\|policy` | Keeps the public DNS name pointed at home (Route 53) |
+| Lighthouse / Admin | `fleet tls setup\|status\|renew\|policy\|disable` | Issues Let's Encrypt cert (Route 53 DNS-01), runs mesh HTTPS (`:443`) + private split-DNS (`:53`) |
 | New Mac | `fleet join NAME` | Prints a join request, waits for you to paste the approval, then installs everything |
 | Admin device | `fleet approve [--group admin\|managed] [--replace]` | Turns a pasted join request into the response to paste back |
 | Admin device | `fleet approve-mobile NAME` | Signs a public key from the Mobile Nebula app |
@@ -194,6 +195,23 @@ Each certificate carries one group. The CA signs it into the certificate, so a d
 - **Same Nebula identity model:** Access is verified by mesh source IP (`fleet.Identify`) with anti-CSRF/anti-DNS-rebinding `Host` and `Origin` checks. Strangers and revoked devices receive `403`.
 - **Role-scoped UI:** `admin` devices (`laptop`, `phone`, `ipadpro`, `mini`) see the full console — **Overview**, **Devices & PKI** (approve Mac/mobile blocks, change groups/renew certs, revoke, inspect configs & blocklist), **Agents & Messages** (including live **Harness Usage & Quotas** across Claude, Codex, and Antigravity, plus spawn/kill/kill-by-type/kill-all agent controls), **Shared Memory & Curator**, **Slacker** (Slack reaction dispatcher config & job queue), and **Lighthouse System** (PKI, published binaries, Route 53 DDNS check/sync/IAM policy, and service logs). `managed` devices see **Overview**, **Agents & Messages**, and **Shared Memory**.
 - **Single binary:** All HTML/CSS/JS assets are embedded directly via `go:embed` with zero external CDN or Node runtime dependencies, so `fleet sync` updates the UI automatically with `fleet serve`.
+
+### HTTPS, Private Mesh DNS & PWA
+
+To install the Web UI as a PWA on macOS and iOS/iPadOS, browsers require `https://` with a system-trusted certificate. `fleet tls` wires up **both** a Route 53 `A` record (`fleet.<yourdomain> -> 10.213.0.1`) and an embedded private split-DNS server inside Nebula (`10.213.0.1:53`), paired with an auto-renewing Let's Encrypt certificate via Route 53 DNS-01:
+
+1. **Grant Route 53 IAM permissions** (for `_acme-challenge.<domain>` `TXT` + `<domain>` `A`, alongside your DDNS record if configured):
+   ```bash
+   fleet tls policy --zone-id Z… --domain fleet.example.com
+   ```
+2. **Run setup on the lighthouse** (as your normal user, not `sudo`):
+   ```bash
+   fleet tls setup --domain fleet.example.com
+   ```
+   This upserts `fleet.example.com -> 10.213.0.1` in Route 53, obtains a Let's Encrypt certificate via DNS-01 (no inbound ports opened), starts `fleet edge` (`io.github.bdatdo0601.fleet.edge`, root daemon serving HTTPS `:443` + mesh-only DNS `:53`), opens TCP `443` + UDP/TCP `53` in Nebula's lighthouse firewall, and configures `/etc/resolver/fleet.example.com`.
+3. **Sync Macs:** `fleet sync` automatically manages `/etc/resolver/fleet.example.com -> 10.213.0.1` on every Mac, so `fleet.example.com` and `<device>.fleet.example.com` resolve over Nebula even on networks with DNS-rebinding protection.
+4. **Install PWA on iPhone/iPad/Mac:** Connect Mobile Nebula (optionally configure DNS `10.213.0.1` / match domain `fleet.example.com` if on a DNS-rebinding network), open `https://fleet.example.com/` in Safari or Chrome, and choose **Add to Home Screen** / **Install Fleet**.
+5. **Inspect or renew anytime:** `fleet tls status`, `fleet tls renew [--force]`, or `fleet tls disable`.
 
 ## Agent sessions (MCP)
 

@@ -29,8 +29,11 @@ const (
 	SlackerWorkerLabel = LabelPrefix + ".slacker-worker"
 	AgentRelayLabel    = LabelPrefix + ".agent-relay"
 	ObsidianSyncLabel  = LabelPrefix + ".obsidian-sync"
+	EdgeLabel          = LabelPrefix + ".edge"
 
 	SyncIntervalSeconds = 300
+
+	ResolverDir = "/etc/resolver"
 
 	DefaultInstalledBinary = "/usr/local/libexec/fleet/fleet"
 	DefaultBrewSymlink     = "/opt/homebrew/bin/fleet"
@@ -53,6 +56,36 @@ func APIPort() int {
 		}
 	}
 	return 7443
+}
+
+// HTTPSPort returns the HTTPS edge proxy port (FLEET_HTTPS_PORT or 443).
+func HTTPSPort() int {
+	if raw := os.Getenv("FLEET_HTTPS_PORT"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 443
+}
+
+// DNSPort returns the private mesh DNS port (FLEET_DNS_PORT or 53).
+func DNSPort() int {
+	if raw := os.Getenv("FLEET_DNS_PORT"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 53
+}
+
+// TLSDir returns the directory storing ACME account and TLS certificate files.
+func TLSDir(stateDir string) string {
+	return filepath.Join(stateDir, "tls")
+}
+
+// EdgeTokenPath returns the shared secret file authenticating loopback edge proxy requests.
+func EdgeTokenPath(stateDir string) string {
+	return filepath.Join(stateDir, "edge.token")
 }
 
 func homeDir() string {

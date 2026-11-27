@@ -33,6 +33,13 @@ func TestAllPlaceholdersRendered(t *testing.T) {
 		if !strings.Contains(out, "drop_inactive: true") || !strings.Contains(out, "inactivity_timeout: 12h") {
 			t.Fatalf("expected 12h inactive tunnel cleanup in %s:\n%s", kind, out)
 		}
+		if kind == "lighthouse" {
+			for _, want := range []string{"port: 443", "port: 53", "proto: udp", "proto: tcp"} {
+				if !strings.Contains(out, want) {
+					t.Fatalf("expected %q in lighthouse config:\n%s", want, out)
+				}
+			}
+		}
 	}
 	out, err := Render("mac", settings, nil, "")
 	if err != nil {

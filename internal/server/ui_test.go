@@ -16,8 +16,10 @@ import (
 	"github.com/bdatdo0601/fleet/internal/codes"
 	"github.com/bdatdo0601/fleet/internal/core"
 	"github.com/bdatdo0601/fleet/internal/memory"
+	"github.com/bdatdo0601/fleet/internal/paths"
 	"github.com/bdatdo0601/fleet/internal/pki"
 	"github.com/bdatdo0601/fleet/internal/registry"
+	"github.com/bdatdo0601/fleet/internal/tlsdns"
 )
 
 func agentsHeartbeat(device, harness, rawID, state string) agents.HeartbeatParams {
@@ -738,5 +740,77 @@ func TestAgentKillAndKillAllEndpoints(t *testing.T) {
 	liveAfter, err := f.Agents.ListSessions("", "", "", "", false)
 	if err != nil || len(liveAfter) != 0 {
 		t.Fatalf("expected 0 live agents after kill-all, got %+v err=%v", liveAfter, err)
+	}
+}
+
+func TestTLSDNSAndEdgeProxyAuth(t *testing.T) {
+	f, srv, tmp := setupTestServer(t)
+	_, office := approveTestDevice(t, f, tmp, "office", "mac", "managed")
+
+	f.EdgeToken = strings.Repeat("ab", 32)
+	if err := f.SetTLS(tlsdns.Config{
+		Domain:      "fleet.example.com",
+		ZoneID:      "Z0123ABC",
+		Profile:     "fleet-ddns",
+		Nameservers: []string{"ns-1.awsdns.com"},
+		PublicA:     true,
+		PrivateDNS:  true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Host allowlist permits tls_domain while rejecting unknown hosts.
+	st, _, _ := doRawReq(t, srv.URL+"/v1/overview", http.MethodGet, "", nil, "fleet.example.com:443")
+	if st != http.StatusOK {
+		t.Fatalf("expected tls_domain Host to be allowed, got %d", st)
+	}
+	st, _, _ = doRawReq(t, srv.URL+"/v1/overview", http.MethodGet, "", nil, "spoof.example.com:443")
+	if st != http.StatusForbidden {
+		t.Fatalf("expected unknown Host to return 403, got %d", st)
+	}
+
+	// Edge token + loopback resolves X-Fleet-Client-IP to the managed device (admin endpoint returns 403).
+	st, _, _ = doRawReq(t, srv.URL+"/v1/tls", http.MethodGet, "", map[string]string{
+		tlsdns.HeaderEdgeToken: f.EdgeToken,
+		tlsdns.HeaderClientIP:  office.IP,
+	}, "fleet.example.com")
+	if st != http.StatusForbidden {
+		t.Fatalf("expected managed device forwarded via edge token to get 403 on /v1/tls, got %d", st)
+	}
+
+	// Invalid edge token is ignored (falls back to loopback = mini admin).
+	st, _, _ = doRawReq(t, srv.URL+"/v1/tls", http.MethodGet, "", map[string]string{
+		tlsdns.HeaderEdgeToken: "wrong-token",
+		tlsdns.HeaderClientIP:  office.IP,
+	}, "fleet.example.com")
+	if st != http.StatusOK {
+		t.Fatalf("expected wrong edge token to ignore X-Fleet-Client-IP and use loopback mini, got %d", st)
+	}
+
+	// GET /v1/dns/records returns active devices mapped under fleet.example.com.
+	var snap tlsdns.DNSSnapshot
+	if err := client.Call(srv.URL, http.MethodGet, "/v1/dns/records", nil, 5*time.Second, nil, &snap); err != nil {
+		t.Fatalf("GET /v1/dns/records failed: %v", err)
+	}
+	if !snap.Enabled || snap.Domain != "fleet.example.com" || snap.Records["office.fleet.example.com"] != office.IP || snap.Records["fleet.example.com"] != paths.LighthouseIP {
+		t.Fatalf("unexpected DNS records snapshot: %+v", snap)
+	}
+
+	// GET /v1/tls/policy returns TXT + A statements.
+	var pol map[string]any
+	if err := client.Call(srv.URL, http.MethodGet, "/v1/tls/policy?zone_id=Z0123ABC&domain=fleet.example.com", nil, 5*time.Second, nil, &pol); err != nil {
+		t.Fatalf("GET /v1/tls/policy failed: %v", err)
+	}
+	if pol["Version"] != "2012-10-17" {
+		t.Fatalf("unexpected TLS policy: %+v", pol)
+	}
+
+	// GET /v1/logs?name=edge is accepted as a valid log name.
+	var logRes map[string]any
+	if err := client.Call(srv.URL, http.MethodGet, "/v1/logs?name=edge", nil, 5*time.Second, nil, &logRes); err != nil {
+		t.Fatalf("GET /v1/logs?name=edge failed: %v", err)
+	}
+	if logRes["name"] != "edge" {
+		t.Fatalf("unexpected edge log response: %+v", logRes)
 	}
 }

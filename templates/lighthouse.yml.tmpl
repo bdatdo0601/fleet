@@ -62,3 +62,12 @@ firewall:
     - port: @API_PORT@ # fleet API: sync for every device, admin calls checked by the API
       proto: tcp
       host: any
+    - port: 443 # fleet HTTPS edge proxy (mesh-only TCP; router only forwards UDP 443)
+      proto: tcp
+      host: any
+    - port: 53 # fleet private mesh DNS
+      proto: udp
+      host: any
+    - port: 53 # fleet private mesh DNS over TCP
+      proto: tcp
+      host: any

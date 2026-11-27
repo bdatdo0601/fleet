@@ -548,6 +548,26 @@ func InstallSlackerDaemon(binPath, username, stateDir, workDir string) error {
 	})
 }
 
+// InstallEdgeDaemon installs/updates the root-owned `fleet edge` LaunchDaemon (HTTPS :443 + mesh DNS :53).
+func InstallEdgeDaemon(binPath, stateDir, workDir string) error {
+	if binPath == "" {
+		binPath = paths.InstalledBinaryPath()
+	}
+	if stateDir == "" {
+		stateDir = paths.StateDir()
+	}
+	if workDir == "" {
+		workDir = stateDir
+	}
+	return InstallDaemon(DaemonOpts{
+		Label:     paths.EdgeLabel,
+		Args:      []string{binPath, "edge", "--state-dir", stateDir},
+		KeepAlive: true,
+		LogPath:   "/var/log/fleet-edge.log",
+		WorkDir:   workDir,
+	})
+}
+
 // StartDaemon kickstarts or bootstraps a system LaunchDaemon.
 func StartDaemon(label string) error {
 	plistPath := filepath.Join(LaunchDaemonsDir, label+".plist")
@@ -1113,6 +1133,9 @@ func restartAndVerifyLighthouse(opts LighthouseUpdateOpts, targetBin, prevBin, o
 	}
 	if LaunchdLoaded(paths.SlackerLabel) {
 		_ = InstallSlackerDaemon(targetBin, owner, stateDir, stateDir)
+	}
+	if LaunchdLoaded(paths.EdgeLabel) {
+		_ = InstallEdgeDaemon(targetBin, stateDir, stateDir)
 	}
 	localAPI := cmp.Or(opts.LocalAPI, fmt.Sprintf("http://127.0.0.1:%d", paths.APIPort()))
 	if !waitHealthy(localAPI, opts.HealthcheckTimeout, opts.HealthcheckFn) {

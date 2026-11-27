@@ -16,6 +16,7 @@ import (
 	"github.com/bdatdo0601/fleet/internal/ddns"
 	"github.com/bdatdo0601/fleet/internal/paths"
 	"github.com/bdatdo0601/fleet/internal/registry"
+	"github.com/bdatdo0601/fleet/internal/tlsdns"
 	"github.com/bdatdo0601/fleet/internal/version"
 )
 
@@ -141,6 +142,23 @@ func buildOverviewPayload(fleet *core.Fleet, c *registry.Device, startedAt time.
 		usageList = []agents.HarnessUsage{}
 	}
 	isAdmin := core.IsAdmin(c)
+	serverInfo := map[string]any{
+		"version":        version.Version,
+		"commit":         version.ShortCommit(),
+		"built_at":       version.BuiltAt,
+		"os":             runtime.GOOS,
+		"arch":           runtime.GOARCH,
+		"started_at":     startedAt.Format(time.RFC3339),
+		"uptime_seconds": max(int(time.Since(startedAt).Seconds()), 0),
+		"api_port":       paths.APIPort(),
+		"https_port":     paths.HTTPSPort(),
+		"dns_port":       paths.DNSPort(),
+		"lighthouse_ip":  paths.LighthouseIP,
+		"mesh_cidr":      paths.MeshCIDR,
+	}
+	if tlsCfg, tErr := fleet.TLSConfig(); tErr == nil && tlsCfg != nil && tlsCfg.Domain != "" {
+		serverInfo["tls_domain"] = tlsCfg.Domain
+	}
 	payload := map[string]any{
 		"caller": map[string]any{
 			"name":     c.Name,
@@ -149,18 +167,7 @@ func buildOverviewPayload(fleet *core.Fleet, c *registry.Device, startedAt time.
 			"group":    c.Grp,
 			"is_admin": isAdmin,
 		},
-		"server": map[string]any{
-			"version":        version.Version,
-			"commit":         version.ShortCommit(),
-			"built_at":       version.BuiltAt,
-			"os":             runtime.GOOS,
-			"arch":           runtime.GOARCH,
-			"started_at":     startedAt.Format(time.RFC3339),
-			"uptime_seconds": max(int(time.Since(startedAt).Seconds()), 0),
-			"api_port":       paths.APIPort(),
-			"lighthouse_ip":  paths.LighthouseIP,
-			"mesh_cidr":      paths.MeshCIDR,
-		},
+		"server":  serverInfo,
 		"agents":  agentSummary,
 		"usage":   usageList,
 		"memory":  memStats,
@@ -198,6 +205,9 @@ func buildOverviewPayload(fleet *core.Fleet, c *registry.Device, startedAt time.
 	payload["settings"] = settings
 	payload["manifest"] = manifest
 	payload["ddns"] = buildDDNSSummary(ddnsCfg)
+	if tlsSummary, err := buildTLSSummary(fleet, nil); err == nil {
+		payload["tls"] = tlsSummary
+	}
 	payload["slacker"] = slkSummary
 	payload["assistant"] = buildAssistantSummary(fleet)
 	return payload, nil
@@ -208,6 +218,8 @@ func resolveLogPath(fleet *core.Fleet, name string) (string, string, error) {
 	switch n {
 	case "serve":
 		return n, filepath.Join(fleet.Root, "serve.log"), nil
+	case "edge":
+		return n, "/var/log/fleet-edge.log", nil
 	case "ddns":
 		return n, filepath.Join(fleet.Root, "ddns.log"), nil
 	case "slacker":
@@ -217,7 +229,7 @@ func resolveLogPath(fleet *core.Fleet, name string) (string, string, error) {
 	case "nebula":
 		return n, "/opt/homebrew/var/log/nebula.log", nil
 	default:
-		return "", "", &core.FleetError{Msg: "unknown log name (expected serve, ddns, slacker, sync, or nebula)", Status: http.StatusBadRequest}
+		return "", "", &core.FleetError{Msg: "unknown log name (expected serve, edge, ddns, slacker, sync, or nebula)", Status: http.StatusBadRequest}
 	}
 }
 
@@ -291,6 +303,7 @@ func registerAdminRoutes(
 	fleet *core.Fleet,
 	startedAt time.Time,
 	watchdog *NebulaWatchdog,
+	tlsMgr *tlsdns.Manager,
 	route func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc,
 ) {
 	mux.HandleFunc("GET /v1/overview", route(false, func(w http.ResponseWriter, _ *http.Request, c *registry.Device) error {
@@ -337,6 +350,7 @@ func registerAdminRoutes(
 	}))
 
 	registerDDNSRoutes(mux, fleet, route)
+	registerTLSRoutes(mux, fleet, tlsMgr, route)
 	registerNebulaRoutes(mux, fleet, watchdog, route)
 
 	mux.HandleFunc("GET /v1/logs", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {

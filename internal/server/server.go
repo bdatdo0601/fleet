@@ -4,6 +4,7 @@ package server
 import (
 	"cmp"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 	"github.com/bdatdo0601/fleet/internal/core"
 	"github.com/bdatdo0601/fleet/internal/paths"
 	"github.com/bdatdo0601/fleet/internal/registry"
+	"github.com/bdatdo0601/fleet/internal/tlsdns"
 )
 
 const MaxBody = 256 * 1024
@@ -151,7 +153,7 @@ func allowedRequestHost(rawHost string, fleet *core.Fleet) bool {
 		}
 	}
 	if settings, err := fleet.Settings(); err == nil {
-		for _, k := range []string{"lighthouse_host", "lighthouse_lan_ip"} {
+		for _, k := range []string{"lighthouse_host", "lighthouse_lan_ip", "tls_domain"} {
 			if v := strings.ToLower(strings.TrimSpace(settings[k])); v != "" && host == v {
 				return true
 			}
@@ -184,6 +186,27 @@ func checkBrowserOrigin(r *http.Request, fleet *core.Fleet) error {
 	return nil
 }
 
+func resolvedPeerIP(r *http.Request, edgeToken string) string {
+	raw := clientIP(r.RemoteAddr)
+	if edgeToken == "" {
+		return raw
+	}
+	addr, err := netip.ParseAddr(raw)
+	if err != nil || !addr.Unmap().IsLoopback() {
+		return raw
+	}
+	gotTok := r.Header.Get(tlsdns.HeaderEdgeToken)
+	if len(gotTok) != len(edgeToken) || subtle.ConstantTimeCompare([]byte(gotTok), []byte(edgeToken)) != 1 {
+		return raw
+	}
+	if fwd := strings.TrimSpace(r.Header.Get(tlsdns.HeaderClientIP)); fwd != "" {
+		if fwdAddr, fErr := netip.ParseAddr(fwd); fErr == nil && fwdAddr.IsValid() {
+			return fwdAddr.Unmap().String()
+		}
+	}
+	return raw
+}
+
 func makeAuthRoute(fleet *core.Fleet, quiet bool) func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc {
 	return func(adminOnly bool, fn func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
@@ -191,7 +214,7 @@ func makeAuthRoute(fleet *core.Fleet, quiet bool) func(bool, func(http.ResponseW
 			w.Header().Set("X-Frame-Options", "DENY")
 			w.Header().Set("Referrer-Policy", "no-referrer")
 
-			peerIP := clientIP(r.RemoteAddr)
+			peerIP := resolvedPeerIP(r, fleet.EdgeToken)
 			if !quiet {
 				_, _ = fmt.Fprintf(os.Stderr, "%s %s %s\n", peerIP, r.Method, r.URL.RequestURI())
 			}
@@ -280,10 +303,21 @@ func registerDeviceRoutes(
 }
 
 // NewHandler returns the HTTP handler for the lighthouse API.
-func NewHandler(fleet *core.Fleet, quiet bool, watchdogs ...*NebulaWatchdog) http.Handler {
+// Watchdogs and an optional *tlsdns.Manager may be passed via extras.
+func NewHandler(fleet *core.Fleet, quiet bool, extras ...any) http.Handler {
 	var watchdog *NebulaWatchdog
-	if len(watchdogs) > 0 {
-		watchdog = watchdogs[0]
+	var tlsMgr *tlsdns.Manager
+	for _, x := range extras {
+		switch v := x.(type) {
+		case *NebulaWatchdog:
+			if v != nil {
+				watchdog = v
+			}
+		case *tlsdns.Manager:
+			if v != nil {
+				tlsMgr = v
+			}
+		}
 	}
 	startedAt := time.Now().UTC()
 	mux := http.NewServeMux()
@@ -326,7 +360,7 @@ func NewHandler(fleet *core.Fleet, quiet bool, watchdogs ...*NebulaWatchdog) htt
 	registerMemoryRoutes(mux, fleet, route)
 	registerSlackerRoutes(mux, fleet, route)
 	registerAssistantRoutes(mux, fleet, route)
-	registerAdminRoutes(mux, fleet, startedAt, watchdog, route)
+	registerAdminRoutes(mux, fleet, startedAt, watchdog, tlsMgr, route)
 	registerWebRoutes(mux, route)
 	registerDeviceRoutes(mux, fleet, route)
 
@@ -675,10 +709,10 @@ func handleAgentWaitHarness(w http.ResponseWriter, r *http.Request, fleet *core.
 // NewServer constructs an *http.Server configured with safe mesh timeouts.
 // WriteTimeout is intentionally omitted so long-poll /v1/agents/wait and /v1/agents/ask
 // requests can stay open up to 120 seconds.
-func NewServer(fleet *core.Fleet, addr string, quiet bool, watchdogs ...*NebulaWatchdog) *http.Server {
+func NewServer(fleet *core.Fleet, addr string, quiet bool, extras ...any) *http.Server {
 	return &http.Server{
 		Addr:              addr,
-		Handler:           NewHandler(fleet, quiet, watchdogs...),
+		Handler:           NewHandler(fleet, quiet, extras...),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       90 * time.Second,
 		MaxHeaderBytes:    64 * 1024,
@@ -696,19 +730,32 @@ func Serve(port int, host string) error {
 	}
 	defer func() { _ = fleet.Close() }()
 
+	if tok, tokErr := tlsdns.EnsureEdgeToken(fleet.Root); tokErr != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "tls edge token warning: %v\n", tokErr)
+	} else {
+		fleet.EdgeToken = tok
+	}
+
 	addr := fmt.Sprintf("%s:%d", host, port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
 	watchdog := NewNebulaWatchdog(fleet.Root)
-	srv := NewServer(fleet, addr, false, watchdog)
+	tlsMgr := tlsdns.NewManager(fleet.Root, fleet.TLSConfig, tlsdns.ACMEDeps{
+		Logf: func(format string, args ...any) {
+			_, _ = fmt.Fprintf(os.Stderr, format+"\n", args...)
+		},
+	})
+	srv := NewServer(fleet, addr, false, watchdog, tlsMgr)
 	_, _ = fmt.Fprintf(os.Stderr, "fleet serve listening on %s\n", addr)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	watchdog.Start(ctx)
+	tlsMgr.Start(ctx)
+	defer tlsMgr.Stop()
 	if fleet.Curator != nil {
 		fleet.Curator.Start(ctx)
 		defer fleet.Curator.Stop()

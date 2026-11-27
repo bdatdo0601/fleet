@@ -23,6 +23,7 @@ import (
 	"github.com/bdatdo0601/fleet/internal/registry"
 	"github.com/bdatdo0601/fleet/internal/render"
 	"github.com/bdatdo0601/fleet/internal/slacker"
+	"github.com/bdatdo0601/fleet/internal/tlsdns"
 )
 
 // WrongPassphraseMsg matches the Python error message inspected by `fleet` passphrase retry logic.
@@ -69,6 +70,7 @@ type SyncResult struct {
 	CA            string  `json:"ca"`
 	Cert          string  `json:"cert"`
 	Config        *string `json:"config"`
+	DNSDomain     string  `json:"dns_domain,omitempty"`
 	BinarySHA256  string  `json:"binary_sha256,omitempty"`
 	BinaryVersion string  `json:"binary_version,omitempty"`
 }
@@ -159,6 +161,7 @@ type Fleet struct {
 	Slacker           *slacker.Store
 	SlackClient       *slacker.SlackClient
 	Assistant         *assistant.Engine
+	EdgeToken         string
 	approveMu         sync.Mutex
 	IdentifyOverride  func(peerIP string) *registry.Device // optional hook for tests
 }
@@ -361,7 +364,7 @@ func (f *Fleet) Close() error {
 // Settings returns persisted lighthouse configuration settings.
 func (f *Fleet) Settings() (map[string]string, error) {
 	out := map[string]string{}
-	for _, k := range []string{"lighthouse_host", "lighthouse_port", "lighthouse_lan_ip"} {
+	for _, k := range []string{"lighthouse_host", "lighthouse_port", "lighthouse_lan_ip", "tls_domain"} {
 		v, ok, err := f.Registry.Setting(k)
 		if err != nil {
 			return nil, err
@@ -371,6 +374,133 @@ func (f *Fleet) Settings() (map[string]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// TLSConfig loads the stored TLS + private mesh DNS configuration, or nil if unconfigured.
+func (f *Fleet) TLSConfig() (*tlsdns.Config, error) {
+	domain, ok, err := f.Registry.Setting("tls_domain")
+	if err != nil || !ok || domain == "" {
+		return nil, err
+	}
+	get := func(key string) (string, error) {
+		v, _, gErr := f.Registry.Setting(key)
+		return v, gErr
+	}
+	zoneID, err := get("tls_zone_id")
+	if err != nil {
+		return nil, err
+	}
+	profile, err := get("tls_profile")
+	if err != nil {
+		return nil, err
+	}
+	email, err := get("tls_email")
+	if err != nil {
+		return nil, err
+	}
+	nsRaw, err := get("tls_nameservers")
+	if err != nil {
+		return nil, err
+	}
+	pubAStr, err := get("tls_public_a")
+	if err != nil {
+		return nil, err
+	}
+	privDNSStr, err := get("tls_private_dns")
+	if err != nil {
+		return nil, err
+	}
+	stagingStr, err := get("tls_staging")
+	if err != nil {
+		return nil, err
+	}
+	var ns []string
+	if nsRaw != "" {
+		ns = strings.Split(nsRaw, ",")
+	}
+	return &tlsdns.Config{
+		Domain:      domain,
+		ZoneID:      zoneID,
+		Profile:     profile,
+		Email:       email,
+		Nameservers: ns,
+		PublicA:     pubAStr != "false",
+		PrivateDNS:  privDNSStr != "false",
+		Staging:     stagingStr == "true",
+	}, nil
+}
+
+// SetTLS persists TLS + private mesh DNS settings in fleet.db.
+func (f *Fleet) SetTLS(cfg tlsdns.Config) error {
+	for _, kv := range [][2]string{
+		{"tls_domain", cfg.Domain},
+		{"tls_zone_id", cfg.ZoneID},
+		{"tls_profile", cfg.Profile},
+		{"tls_email", cfg.Email},
+		{"tls_nameservers", strings.Join(cfg.Nameservers, ",")},
+		{"tls_public_a", strconv.FormatBool(cfg.PublicA)},
+		{"tls_private_dns", strconv.FormatBool(cfg.PrivateDNS)},
+		{"tls_staging", strconv.FormatBool(cfg.Staging)},
+	} {
+		if err := f.Registry.SetSetting(kv[0], kv[1]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ClearTLS disables TLS + private mesh DNS configuration in fleet.db.
+func (f *Fleet) ClearTLS() error {
+	for _, k := range []string{
+		"tls_domain",
+		"tls_zone_id",
+		"tls_profile",
+		"tls_email",
+		"tls_nameservers",
+		"tls_public_a",
+		"tls_private_dns",
+		"tls_staging",
+	} {
+		if err := f.Registry.SetSetting(k, ""); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// DNSRecords builds the authoritative private mesh DNS snapshot from active devices in fleet.db.
+func (f *Fleet) DNSRecords() (tlsdns.DNSSnapshot, error) {
+	cfg, err := f.TLSConfig()
+	if err != nil {
+		return tlsdns.DNSSnapshot{}, err
+	}
+	if cfg == nil || cfg.Domain == "" || !cfg.PrivateDNS {
+		return tlsdns.DNSSnapshot{
+			Enabled:      false,
+			LighthouseIP: paths.LighthouseIP,
+			Records:      map[string]string{},
+		}, nil
+	}
+	devs, err := f.Registry.Devices()
+	if err != nil {
+		return tlsdns.DNSSnapshot{}, err
+	}
+	records := map[string]string{
+		cfg.Domain:          paths.LighthouseIP,
+		"ns1." + cfg.Domain: paths.LighthouseIP,
+	}
+	for _, d := range devs {
+		if !d.Active() || d.Name == "" || d.IP == "" {
+			continue
+		}
+		records[strings.ToLower(d.Name)+"."+cfg.Domain] = d.IP
+	}
+	return tlsdns.DNSSnapshot{
+		Domain:       cfg.Domain,
+		Enabled:      true,
+		LighthouseIP: paths.LighthouseIP,
+		Records:      records,
+	}, nil
 }
 
 // DDNSConfig loads the stored Route 53 configuration, or nil if unconfigured.
@@ -620,6 +750,9 @@ func (f *Fleet) Sync(dev *registry.Device, clientVersion, osName, archName strin
 		CA:     caPEM,
 		Cert:   dev.Cert,
 		Config: cfg,
+	}
+	if tlsCfg, tErr := f.TLSConfig(); tErr == nil && tlsCfg != nil && tlsCfg.Domain != "" && tlsCfg.PrivateDNS {
+		res.DNSDomain = tlsCfg.Domain
 	}
 	if osName != "" && archName != "" {
 		if _, sha, ver, err := f.BinaryForPlatform(osName, archName); err == nil {

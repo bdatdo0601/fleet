@@ -5,6 +5,7 @@ const sysState = {
   logLines: 150,
   logFilter: "",
   ddnsLive: null,
+  tlsLive: null,
 };
 
 function formatWatchdogSummary(nebStatus) {
@@ -297,6 +298,167 @@ function renderDDNSCard(ddnsData, ov) {
   return card;
 }
 
+function renderTLSCard(tlsData, ov) {
+  const configured = Boolean(tlsData && tlsData.configured);
+  const cert = (tlsData && tlsData.cert) || {};
+  let statusBadge = badge("not configured", "neutral");
+  if (configured) {
+    if (cert.exists && !cert.needs_renewal) {
+      statusBadge = badge(`${cert.days_remaining}d left`, "ok");
+    } else if (cert.exists) {
+      statusBadge = badge(`renew soon (${cert.days_remaining}d)`, "warn");
+    } else {
+      statusBadge = badge("missing cert", "danger");
+    }
+  }
+
+  const card = el(
+    "article",
+    { className: "card" },
+    el(
+      "div",
+      { className: "card-header" },
+      el("h3", { className: "card-title", text: "HTTPS & Private Mesh DNS" }),
+      statusBadge,
+    ),
+  );
+
+  const liveArea = el("div", { className: "mt-2" });
+  const renderLive = (d) => {
+    clear(liveArea);
+    if (!d) {
+      return;
+    }
+    const items = [];
+    if (d.public_a) {
+      items.push(`Public A: ${d.public_a_record || "missing"} (${d.public_a_in_sync ? "in sync" : "out of sync"})`);
+    }
+    if (d.private_dns) {
+      items.push(`Mesh DNS: ${d.private_dns_answer || "no reply"} (${d.private_dns_ok ? "ok" : "error"})`);
+    }
+    if (d.live_error) {
+      items.push(d.live_error);
+    }
+    const ok = (!d.public_a || d.public_a_in_sync) && (!d.private_dns || d.private_dns_ok);
+    liveArea.appendChild(
+      el("div", { className: `alert-banner ${ok ? "alert-ok" : "alert-warn"}`, text: items.join(" · ") }),
+    );
+  };
+
+  if (sysState.tlsLive) {
+    renderLive(sysState.tlsLive);
+  }
+
+  if (configured) {
+    const checkBtn = el("button", {
+      type: "button",
+      className: "btn btn-sm",
+      text: "Check Live",
+      onclick: async () => {
+        checkBtn.disabled = true;
+        try {
+          sysState.tlsLive = await api("GET", "/v1/tls?live=true");
+          renderLive(sysState.tlsLive);
+        } catch (err) {
+          toast(err.message, "error");
+        } finally {
+          checkBtn.disabled = false;
+        }
+      },
+    });
+    const renewBtn = el("button", {
+      type: "button",
+      className: "btn btn-sm btn-primary",
+      text: "Renew Cert",
+      onclick: async () => {
+        renewBtn.disabled = true;
+        try {
+          const res = await api("POST", "/v1/tls/renew", { force: false });
+          toast(res.renewed ? `Renewed cert for ${res.cert.domain}` : `Cert healthy (${res.cert.days_remaining}d remaining)`, "ok");
+          sysState.tlsLive = await api("GET", "/v1/tls?live=true");
+          renderLive(sysState.tlsLive);
+        } catch (err) {
+          toast(err.message, "error");
+        } finally {
+          renewBtn.disabled = false;
+        }
+      },
+    });
+
+    const urlEl = tlsData.url
+      ? el("a", { href: tlsData.url, className: "mono", text: tlsData.url })
+      : el("span", { className: "mono", text: tlsData.domain || "-" });
+    const certSummary = cert.exists
+      ? `${cert.issuer || "Let's Encrypt"} · expires ${shortDate(cert.not_after)} (${cert.days_remaining}d left)`
+      : cert.error || "not issued";
+
+    card.appendChild(
+      el(
+        "dl",
+        { className: "kv-list mb-2" },
+        el("dt", { className: "kv-label", text: "Console URL" }),
+        el("dd", { className: "kv-value" }, urlEl),
+        el("dt", { className: "kv-label", text: "Certificate" }),
+        el("dd", { className: "kv-value", text: certSummary }),
+        el("dt", { className: "kv-label", text: "Edge Daemon" }),
+        el("dd", { className: "kv-value mono", text: `${tlsData.edge_loaded ? "loaded" : "not loaded"} (:${tlsData.https_port || 443} HTTPS, :${tlsData.dns_port || 53} DNS)` }),
+        el("dt", { className: "kv-label", text: "DNS Modes" }),
+        el("dd", { className: "kv-value", text: `Public A (${tlsData.public_a ? "on" : "off"}) · Mesh Split-DNS (${tlsData.private_dns ? "on" : "off"})` }),
+      ),
+    );
+    card.appendChild(el("div", { className: "actions-row" }, checkBtn, renewBtn));
+    card.appendChild(liveArea);
+  } else {
+    card.appendChild(
+      el("p", {
+        className: "muted small m-0",
+        text: "Run `fleet tls setup --domain fleet.example.com` on the lighthouse to enable Let's Encrypt HTTPS (:443) and private mesh DNS (:53) for PWA installation.",
+      }),
+    );
+  }
+
+  const zoneIn = el("input", { type: "text", value: (tlsData && tlsData.zone_id) || (ov.ddns && ov.ddns.zone_id) || "", placeholder: "Z1234567890ABC" });
+  const domIn = el("input", { type: "text", value: (tlsData && tlsData.domain) || "", placeholder: "fleet.example.com" });
+  const polOut = el("div", { className: "mt-2" });
+  const genBtn = el("button", {
+    type: "button",
+    className: "btn btn-sm",
+    text: "Generate TLS IAM Policy",
+    onclick: async () => {
+      try {
+        const pol = await api("GET", `/v1/tls/policy?zone_id=${encodeURIComponent(zoneIn.value.trim())}&domain=${encodeURIComponent(domIn.value.trim())}`);
+        const json = JSON.stringify(pol, null, 2);
+        clear(polOut);
+        polOut.appendChild(el("div", { className: "actions-row flex-end mb-2" }, makeCopyBtn(json, "Copy Policy JSON")));
+        polOut.appendChild(el("pre", { className: "code-block", text: json }));
+      } catch (err) {
+        toast(err.message, "error");
+      }
+    },
+  });
+
+  card.appendChild(
+    el(
+      "details",
+      { className: "details-box" },
+      el("summary", { text: "Route 53 TLS + DNS-01 IAM Policy Generator" }),
+      el(
+        "div",
+        { className: "form-grid mt-2" },
+        el(
+          "div",
+          { className: "form-row-2" },
+          field("Route 53 Zone ID", zoneIn),
+          field("TLS / DNS Domain", domIn),
+        ),
+        el("div", { className: "actions-row flex-end" }, genBtn),
+      ),
+      polOut,
+    ),
+  );
+  return card;
+}
+
 async function renderLogsCard(container) {
   clear(container);
   let logRes;
@@ -307,7 +469,7 @@ async function renderLogsCard(container) {
     return;
   }
 
-  const tabs = ["serve", "ddns", "slacker", "sync", "nebula"].map((name) =>
+  const tabs = ["serve", "edge", "ddns", "slacker", "sync", "nebula"].map((name) =>
     el("button", {
       type: "button",
       className: `chip${sysState.logName === name ? " active" : ""}`,
@@ -387,10 +549,12 @@ export async function renderSystem(root) {
   }
 
   let ddnsData;
+  let tlsData;
   let nebStatus = null;
   try {
-    [ddnsData, nebStatus] = await Promise.all([
+    [ddnsData, tlsData, nebStatus] = await Promise.all([
       api("GET", "/v1/ddns"),
+      api("GET", "/v1/tls"),
       api("GET", "/v1/nebula/status"),
     ]);
   } catch (err) {
@@ -439,6 +603,7 @@ export async function renderSystem(root) {
     ),
   );
   root.appendChild(section("Dynamic DNS", { className: "ui-section" }, renderDDNSCard(ddnsData, ov)));
+  root.appendChild(section("TLS & Mesh DNS", { className: "ui-section" }, renderTLSCard(tlsData, ov)));
 
   const logsContainer = el("div");
   root.appendChild(section("Lighthouse Logs", { className: "ui-section" }, logsContainer));

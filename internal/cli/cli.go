@@ -1083,6 +1083,14 @@ func syncOwnerPost(cio *IO, stamp string, node client.NodeConfig) {
 	}
 }
 
+func syncMacResolverForPayload(cio *IO, stamp string, payload core.SyncResult) {
+	if resChanged, resAction, rErr := system.SyncMacResolver(paths.ResolverDir, payload.DNSDomain, paths.LighthouseIP); rErr != nil {
+		cio.printf("%s resolver sync warning: %v\n", stamp, rErr)
+	} else if resChanged && resAction != "" {
+		cio.printf("%s updated %s\n", stamp, resAction)
+	}
+}
+
 func cmdSync(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
 	noUpdate := fs.Bool("no-update", false, "skip binary/git self-update")
@@ -1158,6 +1166,7 @@ func cmdSync(args []string, cio *IO) error {
 	if err := applySyncedFiles(cio, stamp, payload); err != nil {
 		return err
 	}
+	syncMacResolverForPayload(cio, stamp, payload)
 	harvestSyncedOwnerMemories(cio, stamp, node)
 	syncOwnerPost(cio, stamp, node)
 	warnStaleMCPServers(cio, stamp+" warning", paths.InstalledBinaryPath())
@@ -1191,12 +1200,14 @@ func cmdStatus(args []string, cio *IO) error {
 		cio.printf("%-44s %s\n", label+":", st)
 	}
 	if isLighthouse {
-		if _, err := os.Stat(filepath.Join(system.LaunchDaemonsDir, paths.SlackerLabel+".plist")); err == nil {
-			st := "NOT loaded"
-			if system.LaunchdLoaded(paths.SlackerLabel) {
-				st = "loaded"
+		for _, label := range []string{paths.SlackerLabel, paths.EdgeLabel} {
+			if _, err := os.Stat(filepath.Join(system.LaunchDaemonsDir, label+".plist")); err == nil {
+				st := "NOT loaded"
+				if system.LaunchdLoaded(label) {
+					st = "loaded"
+				}
+				cio.printf("%-44s %s\n", label+":", st)
 			}
-			cio.printf("%-44s %s\n", paths.SlackerLabel+":", st)
 		}
 	}
 	if _, err := os.Stat(system.LaunchAgentPath(paths.SlackerWorkerLabel)); err == nil {
@@ -1218,6 +1229,9 @@ func cmdStatus(args []string, cio *IO) error {
 		cio.printf("lighthouse:  %v\n", err)
 	} else {
 		cio.printf("lighthouse:  reachable, this device is %s\n", syncRes.IP)
+		if syncRes.DNSDomain != "" {
+			cio.printf("https:       https://%s/\n", syncRes.DNSDomain)
+		}
 	}
 	warnStaleMCPServers(cio, "mcp warning", "")
 	return nil
@@ -1582,7 +1596,9 @@ Commands:
   set             (admin) change a device's group (re-signs its cert)
   sync            (root, launchd) pull config/certs/revocations and binary updates
   serve           (lighthouse, launchd) run the API
+  edge            (lighthouse, root launchd) run HTTPS :443 proxy & private mesh DNS :53
   ddns            (lighthouse) keep the public DNS name pointed at home
+  tls             (lighthouse/admin) manage Let's Encrypt HTTPS cert & private mesh DNS
   status          show this machine's fleet status
   agents          list, inspect, message, spawn, or kill AI agent sessions across the fleet
   usage           show quota and usage status across claude, codex, and antigravity
@@ -1615,6 +1631,8 @@ func dispatchCommand(cmd string, rest []string, cio *IO) (bool, error) {
 		"sync":           cmdSync,
 		"status":         cmdStatus,
 		"ddns":           cmdDDNS,
+		"tls":            cmdTLS,
+		"edge":           cmdEdge,
 		"agents":         cmdAgents,
 		"usage":          cmdUsage,
 		"statusline":     cmdStatusLine,
