@@ -264,6 +264,23 @@ async function openAssistantSettingsModal(onSaved) {
     className: "mono",
     placeholder: `[{"alias":"linear","op_ref":"op://Fleet-Agent/Linear/token","allowed_hosts":["api.linear.app"],"require_approval":true}]`,
   });
+  const doctorBox = el("div", { className: "stack-sm mt-2" });
+
+  const renderDoctorResults = (rep) => {
+    clear(doctorBox);
+    for (const c of rep.checks || []) {
+      const variant = c.status === "ok" ? "ok" : c.status === "fail" ? "danger" : c.status === "warn" ? "warn" : "neutral";
+      doctorBox.appendChild(
+        el(
+          "div",
+          { className: "gen-native-card" },
+          el("div", { className: "gen-mini-row" }, el("strong", { text: c.name }), badge(c.status, variant)),
+          el("div", { className: "small", text: c.detail || "" }),
+          c.hint ? el("div", { className: "small muted mono mt-1", text: c.hint }) : null,
+        ),
+      );
+    }
+  };
 
   const body = el(
     "div",
@@ -357,7 +374,21 @@ async function openAssistantSettingsModal(onSaved) {
           }
         },
       }),
+      el("button", {
+        type: "button",
+        className: "btn",
+        text: "Run Doctor",
+        onclick: async () => {
+          try {
+            const rep = await api("GET", "/v1/assistant/doctor");
+            renderDoctorResults(rep);
+          } catch (err) {
+            toast(err.message, "error");
+          }
+        },
+      }),
     ),
+    doctorBox,
     el("h4", { className: "mt-3", text: `Timers (${(timersData.timers || []).length})` }),
     (timersData.timers || []).length === 0
       ? el("div", { className: "small muted", text: "No timers scheduled yet." })

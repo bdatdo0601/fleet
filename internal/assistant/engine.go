@@ -24,16 +24,21 @@ type StreamEvent struct {
 
 // Engine coordinates assistant storage, Vault, OpenRouter, Decisions, MCP, timers, and SSE streaming.
 type Engine struct {
-	store      *Store
-	configPath string
-	vaultDir   string
-	deps       FleetDeps
-	llm        *openRouterClient
-	mcp        *MCPManager
-	opReader   OPReaderFunc
+	store       *Store
+	configPath  string
+	opTokenPath string
+	vaultDir    string
+	deps        FleetDeps
+	llm         *openRouterClient
+	mcp         *MCPManager
+	opReader    OPReaderFunc
+	Probes      DoctorProbes
 
-	cfgMu sync.RWMutex
-	cfg   Config
+	cfgMu     sync.RWMutex
+	cfg       Config
+	cachedKey string
+	cachedRef string
+	cachedAt  time.Time
 
 	subMu       sync.Mutex
 	subscribers map[chan StreamEvent]struct{}
@@ -59,13 +64,20 @@ func Open(dbPath, configPath, defaultVaultDir string, deps FleetDeps) (*Engine, 
 		_ = store.Close()
 		return nil, err
 	}
+	opTokenPath := ""
+	if configPath != "" {
+		opTokenPath = filepath.Join(filepath.Dir(configPath), "op-service-account.token")
+	}
+	opReader := NewOPReader(opTokenPath)
 	e := &Engine{
 		store:       store,
 		configPath:  configPath,
+		opTokenPath: opTokenPath,
 		vaultDir:    defaultVaultDir,
 		deps:        deps,
 		llm:         newOpenRouterClient(),
-		mcp:         NewMCPManager(cfg.MCPServers, nil),
+		mcp:         NewMCPManager(cfg.MCPServers, opReader),
+		opReader:    opReader,
 		cfg:         cfg,
 		subscribers: make(map[chan StreamEvent]struct{}),
 		notifyCh:    make(chan struct{}, 1),
@@ -148,8 +160,9 @@ func (e *Engine) Status() map[string]any {
 // UpdateConfig validates, saves, and applies new assistant configuration.
 func (e *Engine) UpdateConfig(next Config, clearAPIKey bool) (ConfigView, error) {
 	cur := e.Config()
-	if !clearAPIKey && strings.TrimSpace(next.APIKey) == "" {
+	if !clearAPIKey && strings.TrimSpace(next.APIKey) == "" && strings.TrimSpace(next.APIKeyOPRef) == "" {
 		next.APIKey = cur.APIKey
+		next.APIKeyOPRef = cur.APIKeyOPRef
 	}
 	if next.Credentials == nil {
 		next.Credentials = append([]CredentialPolicy(nil), cur.Credentials...)
@@ -169,12 +182,58 @@ func (e *Engine) UpdateConfig(next Config, clearAPIKey bool) (ConfigView, error)
 	}
 	e.cfgMu.Lock()
 	e.cfg = next
+	e.cachedKey = ""
+	e.cachedRef = ""
 	e.cfgMu.Unlock()
 	if e.mcp != nil {
 		e.mcp.Reload(next.MCPServers)
 	}
 	e.notify()
 	return next.View(vaultRoot), nil
+}
+
+// SaveOPServiceAccountToken persists or clears the 1Password service account token on disk (0600).
+func (e *Engine) SaveOPServiceAccountToken(token string) error {
+	if err := SaveOPToken(e.opTokenPath, token); err != nil {
+		return err
+	}
+	e.cfgMu.Lock()
+	e.cachedKey = ""
+	e.cachedRef = ""
+	e.cfgMu.Unlock()
+	return nil
+}
+
+func (e *Engine) resolveRuntimeConfig(ctx context.Context) (Config, error) {
+	e.cfgMu.RLock()
+	cfg := e.cfg
+	cachedKey := e.cachedKey
+	cachedRef := e.cachedRef
+	cachedAt := e.cachedAt
+	e.cfgMu.RUnlock()
+
+	if strings.TrimSpace(cfg.APIKey) != "" || strings.TrimSpace(cfg.APIKeyOPRef) == "" {
+		return cfg, nil
+	}
+	if cachedKey != "" && cachedRef == cfg.APIKeyOPRef && time.Since(cachedAt) < 5*time.Minute {
+		cfg.APIKey = cachedKey
+		return cfg, nil
+	}
+	reader := e.opReader
+	if reader == nil {
+		reader = defaultOPReader
+	}
+	secret, err := reader(ctx, cfg.APIKeyOPRef)
+	if err != nil {
+		return cfg, err
+	}
+	e.cfgMu.Lock()
+	e.cachedKey = secret
+	e.cachedRef = cfg.APIKeyOPRef
+	e.cachedAt = time.Now()
+	e.cfgMu.Unlock()
+	cfg.APIKey = secret
+	return cfg, nil
 }
 
 func preserveMaskedMCPEnv(prev, next []MCPServerConfig) []MCPServerConfig {
@@ -203,8 +262,11 @@ func preserveMaskedMCPEnv(prev, next []MCPServerConfig) []MCPServerConfig {
 
 // TestConnection verifies OpenRouter connectivity and model response.
 func (e *Engine) TestConnection(ctx context.Context) error {
-	cfg := e.Config()
-	_, err := e.llm.CompleteText(ctx, cfg, cfg.Models.Fast, "Reply with OK.", "ping", 16)
+	cfg, err := e.resolveRuntimeConfig(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = e.llm.CompleteText(ctx, cfg, cfg.Models.Fast, "Reply with OK.", "ping", 16)
 	return err
 }
 
@@ -331,7 +393,7 @@ func (e *Engine) runScheduler(ctx context.Context) {
 			return
 		case now := <-ticker.C:
 			cfg := e.Config()
-			if !cfg.Enabled || strings.TrimSpace(cfg.APIKey) == "" {
+			if !cfg.Enabled || (strings.TrimSpace(cfg.APIKey) == "" && strings.TrimSpace(cfg.APIKeyOPRef) == "") {
 				continue
 			}
 			nowISO := now.UTC().Truncate(time.Second).Format("2006-01-02T15:04:05+00:00")
@@ -359,7 +421,10 @@ func (e *Engine) runScheduler(ctx context.Context) {
 }
 
 func (e *Engine) processInboxEvent(ctx context.Context, ev InboxEvent) error {
-	cfg := e.Config()
+	cfg, err := e.resolveRuntimeConfig(ctx)
+	if err != nil {
+		return err
+	}
 	if strings.TrimSpace(cfg.APIKey) == "" {
 		return newErr("assistant API key is not configured", http.StatusBadRequest)
 	}
@@ -658,7 +723,10 @@ func (e *Engine) maybeAutoObserve(ctx context.Context, cfg Config, channelID str
 
 // RunObserver distills unobserved messages into _agent/memory/OBSERVATIONS.md and triggers Reflector when large.
 func (e *Engine) RunObserver(ctx context.Context, channelID string) (map[string]any, error) {
-	cfg := e.Config()
+	cfg, err := e.resolveRuntimeConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
 	msgs, err := e.store.ListUnobservedMessages(channelID, 200)
 	if err != nil {
 		return nil, err
@@ -708,7 +776,10 @@ Omit small talk. Output only Markdown bullets.`
 
 // RunReflector condenses _agent/memory/OBSERVATIONS.md into _agent/memory/REFLECTIONS.md and archives old observations.
 func (e *Engine) RunReflector(ctx context.Context) (string, error) {
-	cfg := e.Config()
+	cfg, err := e.resolveRuntimeConfig(ctx)
+	if err != nil {
+		return "", err
+	}
 	v, err := e.vault()
 	if err != nil {
 		return "", err

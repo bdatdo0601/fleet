@@ -140,6 +140,38 @@ func registerAssistantAdminRoutes(
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return nil
 	}))
+	mux.HandleFunc("GET /v1/assistant/doctor", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		writeJSON(w, http.StatusOK, fleet.Assistant.Doctor(r.Context()))
+		return nil
+	}))
+	mux.HandleFunc("POST /v1/assistant/op-token", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		var req struct {
+			Token string `json:"token"`
+			Clear bool   `json:"clear"`
+		}
+		if err := readJSONBody(r, &req); err != nil {
+			return err
+		}
+		tok := strings.TrimSpace(req.Token)
+		if req.Clear {
+			tok = ""
+		} else if tok == "" {
+			return &core.FleetError{Msg: "token or clear=true is required", Status: http.StatusBadRequest}
+		}
+		if err := fleet.Assistant.SaveOPServiceAccountToken(tok); err != nil {
+			return err
+		}
+		rep := fleet.Assistant.Doctor(r.Context())
+		var opCheck assistant.DoctorCheck
+		for _, c := range rep.Checks {
+			if c.Name == "onepassword" {
+				opCheck = c
+				break
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": opCheck.Status == "ok", "check": opCheck})
+		return nil
+	}))
 	mux.HandleFunc("GET /assistant-widget", route(true, func(w http.ResponseWriter, _ *http.Request, _ *registry.Device) error {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache")

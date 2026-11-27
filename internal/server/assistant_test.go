@@ -49,6 +49,12 @@ func TestAssistantRoutesSecurityAndFlow(t *testing.T) {
 	if st, hdr, _ := doRawReq(t, srv.URL+"/assistant-widget", http.MethodGet, "", nil, ""); st != http.StatusOK || hdr.Get("X-Frame-Options") != "SAMEORIGIN" {
 		t.Fatalf("widget frame expected 200 + SAMEORIGIN, got %d %+v", st, hdr)
 	}
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/doctor", http.MethodGet, "", nil, ""); st != http.StatusOK || !strings.Contains(string(b), `"checks"`) {
+		t.Fatalf("GET /v1/assistant/doctor expected 200 with checks, got %d (%s)", st, string(b))
+	}
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/op-token", http.MethodPost, `{"token":"ops_test_token"}`, nil, ""); st != http.StatusOK || !strings.Contains(string(b), `"check"`) {
+		t.Fatalf("POST /v1/assistant/op-token expected 200, got %d (%s)", st, string(b))
+	}
 
 	// Post message and wait until worker persists reply.
 	if st, _, body := doRawReq(t, srv.URL+"/v1/assistant/messages", http.MethodPost, `{"channel":"general","content":"hi"}`, nil, ""); st != http.StatusAccepted {
@@ -84,6 +90,8 @@ func TestAssistantRoutesSecurityAndFlow(t *testing.T) {
 		path   string
 	}{
 		{http.MethodGet, "/v1/assistant/status"},
+		{http.MethodGet, "/v1/assistant/doctor"},
+		{http.MethodPost, "/v1/assistant/op-token"},
 		{http.MethodGet, "/v1/assistant/skills"},
 		{http.MethodPost, "/v1/assistant/messages"},
 	} {

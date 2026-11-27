@@ -3,12 +3,15 @@ package assistant
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -25,23 +28,119 @@ type CredentialHTTPRequest struct {
 	Body    string            `json:"body,omitempty"`
 }
 
-func defaultOPReader(ctx context.Context, ref string) (string, error) {
-	if _, err := exec.LookPath("op"); err != nil {
-		return "", errors.New("1Password CLI (`op`) not found: install with `brew install 1password-cli`")
+// ResolveOPToken returns OP_SERVICE_ACCOUNT_TOKEN from env or tokenPath (0600 file).
+func ResolveOPToken(tokenPath string) string {
+	if v := strings.TrimSpace(os.Getenv("OP_SERVICE_ACCOUNT_TOKEN")); v != "" {
+		return v
 	}
-	out, err := exec.CommandContext(ctx, "op", "read", ref).Output()
+	if strings.TrimSpace(tokenPath) == "" {
+		return ""
+	}
+	b, err := os.ReadFile(tokenPath)
 	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && len(exitErr.Stderr) > 0 {
-			return "", fmt.Errorf("op read %s: %s", ref, strings.TrimSpace(string(exitErr.Stderr)))
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// SaveOPToken atomically persists or removes the 1Password Service Account token file (0600).
+func SaveOPToken(tokenPath, token string) error {
+	if strings.TrimSpace(tokenPath) == "" {
+		return errors.New("op token path is required")
+	}
+	tok := strings.TrimSpace(token)
+	if tok == "" {
+		if err := os.Remove(tokenPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
 		}
-		return "", fmt.Errorf("op read %s: %w", ref, err)
+		return nil
 	}
-	val := strings.TrimSpace(string(out))
-	if val == "" {
-		return "", fmt.Errorf("op read %s returned empty secret", ref)
+	if err := os.MkdirAll(filepath.Dir(tokenPath), 0o700); err != nil {
+		return err
 	}
-	return val, nil
+	tmp := tokenPath + ".tmp"
+	if err := os.WriteFile(tmp, []byte(tok+"\n"), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, tokenPath)
+}
+
+func opCommand(ctx context.Context, tokenPath string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "op", args...)
+	if tok := ResolveOPToken(tokenPath); tok != "" {
+		cmd.Env = append(os.Environ(), "OP_SERVICE_ACCOUNT_TOKEN="+tok)
+	}
+	return cmd
+}
+
+// NewOPReader returns an OPReaderFunc that reads op:// refs using ResolveOPToken(tokenPath).
+func NewOPReader(tokenPath string) OPReaderFunc {
+	return func(ctx context.Context, ref string) (string, error) {
+		if _, err := exec.LookPath("op"); err != nil {
+			return "", errors.New("1Password CLI (`op`) not found: install with `brew install 1password-cli`")
+		}
+		out, err := opCommand(ctx, tokenPath, "read", ref).Output()
+		if err != nil {
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) && len(exitErr.Stderr) > 0 {
+				return "", fmt.Errorf("op read %s: %s", ref, strings.TrimSpace(string(exitErr.Stderr)))
+			}
+			return "", fmt.Errorf("op read %s: %w", ref, err)
+		}
+		val := strings.TrimSpace(string(out))
+		if val == "" {
+			return "", fmt.Errorf("op read %s returned empty secret", ref)
+		}
+		return val, nil
+	}
+}
+
+func defaultOPReader(ctx context.Context, ref string) (string, error) {
+	return NewOPReader("")(ctx, ref)
+}
+
+// CheckOPHealth verifies `op` CLI availability, service account token presence, and non-interactive auth.
+func CheckOPHealth(ctx context.Context, tokenPath string) (binPath string, hasToken bool, identity string, err error) {
+	binPath, err = exec.LookPath("op")
+	if err != nil {
+		return "", false, "", errors.New("op CLI not found")
+	}
+	hasToken = ResolveOPToken(tokenPath) != ""
+	if !hasToken {
+		return binPath, false, "", errors.New("OP_SERVICE_ACCOUNT_TOKEN not configured")
+	}
+	cCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	out, wErr := opCommand(cCtx, tokenPath, "whoami", "--format", "json").Output()
+	if wErr == nil {
+		var who struct {
+			Email       string `json:"email"`
+			AccountUUID string `json:"account_uuid"`
+			UserUUID    string `json:"user_uuid"`
+			URL         string `json:"url"`
+		}
+		if json.Unmarshal(out, &who) == nil {
+			identity = cmp.Or(who.Email, who.URL, who.UserUUID, "service-account")
+		} else {
+			identity = "service-account"
+		}
+		return binPath, true, identity, nil
+	}
+	// Some service accounts only allow `op vault list`.
+	if vOut, vErr := opCommand(cCtx, tokenPath, "vault", "list", "--format", "json").Output(); vErr == nil {
+		var vaults []struct {
+			Name string `json:"name"`
+		}
+		if json.Unmarshal(vOut, &vaults) == nil {
+			return binPath, true, fmt.Sprintf("%d vault(s)", len(vaults)), nil
+		}
+		return binPath, true, "authenticated", nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(wErr, &exitErr) && len(exitErr.Stderr) > 0 {
+		return binPath, true, "", errors.New(strings.TrimSpace(string(exitErr.Stderr)))
+	}
+	return binPath, true, "", wErr
 }
 
 func findCredentialPolicy(cfg Config, alias string) (CredentialPolicy, bool) {

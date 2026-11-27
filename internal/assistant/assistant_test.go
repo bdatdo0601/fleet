@@ -409,3 +409,121 @@ func TestEngineStreamingRoutingApprovalsAndObservationalMemory(t *testing.T) {
 		t.Fatalf("RunReflector failed: %q (%v)", refl, err)
 	}
 }
+
+func TestSaveAndResolveOPToken(t *testing.T) {
+	tmp := t.TempDir()
+	tokPath := filepath.Join(tmp, "op-service-account.token")
+	t.Setenv("OP_SERVICE_ACCOUNT_TOKEN", "")
+	if got := ResolveOPToken(tokPath); got != "" {
+		t.Fatalf("expected empty token before save, got %q", got)
+	}
+	if err := SaveOPToken(tokPath, "ops_test_token_123"); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(tokPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("expected 0600 permissions, got %o", fi.Mode().Perm())
+	}
+	if got := ResolveOPToken(tokPath); got != "ops_test_token_123" {
+		t.Fatalf("expected resolved file token, got %q", got)
+	}
+	t.Setenv("OP_SERVICE_ACCOUNT_TOKEN", "ops_env_override")
+	if got := ResolveOPToken(tokPath); got != "ops_env_override" {
+		t.Fatalf("expected env override, got %q", got)
+	}
+	if err := SaveOPToken(tokPath, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(tokPath); !os.IsNotExist(err) {
+		t.Fatalf("expected token file removed, stat err=%v", err)
+	}
+}
+
+func TestDoctorAndAPIKeyOPRef(t *testing.T) {
+	var seenAuth string
+	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = r.Header.Get("Authorization")
+		switch r.URL.Path {
+		case "/chat/completions":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"OK"}}]}`))
+		case "/decisions":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"answers":[{"id":"tier","value":"fast","confidence":0.95}]}`))
+		}
+	}))
+	defer mockLLM.Close()
+
+	tmp := t.TempDir()
+	cfgPath := filepath.Join(tmp, "assistant.json")
+	vaultDir := filepath.Join(tmp, "vault")
+	eng, err := Open(filepath.Join(tmp, "assistant.db"), cfgPath, vaultDir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = eng.Close() }()
+
+	cfg := DefaultConfig()
+	cfg.Enabled = true
+	cfg.BaseURL = mockLLM.URL
+	cfg.APIKeyOPRef = "op://Fleet-Agent/OpenRouter/credential"
+	view, err := eng.UpdateConfig(cfg, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !view.Configured || view.APIKeyHint != "" || view.APIKeyOPRef != cfg.APIKeyOPRef {
+		t.Fatalf("unexpected view for api_key_op_ref: %+v", view)
+	}
+	rawCfg, _ := os.ReadFile(cfgPath)
+	if strings.Contains(string(rawCfg), "resolved-or-secret") {
+		t.Fatalf("resolved secret must never be written to assistant.json")
+	}
+
+	eng.SetOPReader(func(_ context.Context, ref string) (string, error) {
+		if ref != cfg.APIKeyOPRef {
+			return "", fmt.Errorf("unexpected ref %s", ref)
+		}
+		return "resolved-or-secret", nil
+	})
+	_ = os.MkdirAll(filepath.Join(vaultDir, ".obsidian"), 0o755)
+	eng.Probes = DoctorProbes{
+		FindOB:    func() string { return "/opt/homebrew/bin/ob" },
+		OBRunning: func() bool { return true },
+		CheckOP: func(context.Context, string) (string, bool, string, error) {
+			return "/opt/homebrew/bin/op", true, "fleet-sa", nil
+		},
+	}
+
+	rep := eng.Doctor(t.Context())
+	if !rep.OK {
+		t.Fatalf("expected doctor OK=true, got %+v", rep)
+	}
+	if seenAuth != "Bearer resolved-or-secret" {
+		t.Fatalf("expected resolved OP key in Authorization header, got %q", seenAuth)
+	}
+	statuses := map[string]string{}
+	for _, c := range rep.Checks {
+		statuses[c.Name] = c.Status
+	}
+	for _, k := range []string{"config", "openrouter", "decisions", "vault", "obsidian_sync", "onepassword", "mcp_servers"} {
+		if statuses[k] != "ok" {
+			t.Fatalf("expected check %s=ok, got %q (%+v)", k, statuses[k], rep.Checks)
+		}
+	}
+
+	// Missing op auth when api_key_op_ref is set must fail doctor on onepassword & openrouter.
+	eng.SetOPReader(func(context.Context, string) (string, error) { return "", fmt.Errorf("no token") })
+	if err := eng.SaveOPServiceAccountToken(""); err != nil {
+		t.Fatal(err)
+	}
+	eng.Probes.CheckOP = func(context.Context, string) (string, bool, string, error) {
+		return "/opt/homebrew/bin/op", false, "", fmt.Errorf("no token")
+	}
+	repFail := eng.Doctor(t.Context())
+	if repFail.OK {
+		t.Fatalf("expected doctor OK=false when op fails for api_key_op_ref")
+	}
+}

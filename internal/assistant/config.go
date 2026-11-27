@@ -82,6 +82,7 @@ type Config struct {
 	Enabled                  bool               `json:"enabled"`
 	BaseURL                  string             `json:"base_url"`
 	APIKey                   string             `json:"api_key,omitempty"`
+	APIKeyOPRef              string             `json:"api_key_op_ref,omitempty"`
 	ZDR                      bool               `json:"zdr"`
 	DataCollection           string             `json:"data_collection,omitempty"`
 	VaultPath                string             `json:"vault_path,omitempty"`
@@ -112,6 +113,7 @@ type ConfigView struct {
 	Configured               bool              `json:"configured"`
 	BaseURL                  string            `json:"base_url"`
 	APIKeyHint               string            `json:"api_key_hint"`
+	APIKeyOPRef              string            `json:"api_key_op_ref,omitempty"`
 	ZDR                      bool              `json:"zdr"`
 	DataCollection           string            `json:"data_collection"`
 	VaultPath                string            `json:"vault_path"`
@@ -171,6 +173,7 @@ func NormalizeConfig(cfg Config) Config {
 	def := DefaultConfig()
 	cfg.BaseURL = strings.TrimRight(cmp.Or(strings.TrimSpace(cfg.BaseURL), def.BaseURL), "/")
 	cfg.APIKey = strings.TrimSpace(cfg.APIKey)
+	cfg.APIKeyOPRef = strings.TrimSpace(cfg.APIKeyOPRef)
 	if strings.TrimSpace(cfg.DataCollection) == "" {
 		cfg.DataCollection = def.DataCollection
 	}
@@ -282,9 +285,10 @@ func (c Config) View(effectiveVault string) ConfigView {
 	}
 	return ConfigView{
 		Enabled:                  c.Enabled,
-		Configured:               strings.TrimSpace(c.APIKey) != "",
+		Configured:               strings.TrimSpace(c.APIKey) != "" || strings.TrimSpace(c.APIKeyOPRef) != "",
 		BaseURL:                  c.BaseURL,
 		APIKeyHint:               maskSecret(c.APIKey),
+		APIKeyOPRef:              c.APIKeyOPRef,
 		ZDR:                      c.ZDR,
 		DataCollection:           c.DataCollection,
 		VaultPath:                c.VaultPath,

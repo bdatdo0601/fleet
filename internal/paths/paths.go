@@ -28,6 +28,7 @@ const (
 	SlackerLabel       = LabelPrefix + ".slacker"
 	SlackerWorkerLabel = LabelPrefix + ".slacker-worker"
 	AgentRelayLabel    = LabelPrefix + ".agent-relay"
+	ObsidianSyncLabel  = LabelPrefix + ".obsidian-sync"
 
 	SyncIntervalSeconds = 300
 
