@@ -180,6 +180,50 @@ CREATE TABLE IF NOT EXISTS assistant_mcp_oauth_tokens (
   token_url     TEXT NOT NULL DEFAULT '',
   updated_at    TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS assistant_vault_chunks (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  vault_name      TEXT NOT NULL,
+  rel_path        TEXT NOT NULL,
+  mtime_ns        INTEGER NOT NULL,
+  size_bytes      INTEGER NOT NULL,
+  heading         TEXT NOT NULL DEFAULT '',
+  chunk_idx       INTEGER NOT NULL,
+  text            TEXT NOT NULL,
+  embedding       BLOB,
+  embedding_model TEXT NOT NULL DEFAULT '',
+  updated_at      TEXT NOT NULL,
+  UNIQUE(vault_name, rel_path, chunk_idx)
+);
+CREATE INDEX IF NOT EXISTS idx_vault_chunks_lookup
+  ON assistant_vault_chunks(vault_name, rel_path);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS assistant_vault_chunks_fts USING fts5(
+  vault_name,
+  rel_path,
+  heading,
+  text,
+  content='assistant_vault_chunks',
+  content_rowid='id',
+  tokenize='porter unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS vault_chunks_ai AFTER INSERT ON assistant_vault_chunks BEGIN
+  INSERT INTO assistant_vault_chunks_fts(rowid, vault_name, rel_path, heading, text)
+  VALUES (new.id, new.vault_name, new.rel_path, new.heading, new.text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS vault_chunks_ad AFTER DELETE ON assistant_vault_chunks BEGIN
+  INSERT INTO assistant_vault_chunks_fts(assistant_vault_chunks_fts, rowid, vault_name, rel_path, heading, text)
+  VALUES ('delete', old.id, old.vault_name, old.rel_path, old.heading, old.text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS vault_chunks_au AFTER UPDATE ON assistant_vault_chunks BEGIN
+  INSERT INTO assistant_vault_chunks_fts(assistant_vault_chunks_fts, rowid, vault_name, rel_path, heading, text)
+  VALUES ('delete', old.id, old.vault_name, old.rel_path, old.heading, old.text);
+  INSERT INTO assistant_vault_chunks_fts(rowid, vault_name, rel_path, heading, text)
+  VALUES (new.id, new.vault_name, new.rel_path, new.heading, new.text);
+END;
 `
 
 // Channel represents one persistent assistant conversation stream.
@@ -592,6 +636,17 @@ func (s *Store) AppendMessage(m Message) (Message, error) {
 	}
 	m.ID = id
 	return m, nil
+}
+
+// UpdateMessageContent updates the text content of an existing stored message.
+func (s *Store) UpdateMessageContent(id int64, content string) error {
+	if id <= 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`UPDATE assistant_messages SET content = ? WHERE id = ?`, content, id)
+	return err
 }
 
 func scanMessage(rows *sql.Rows) (Message, error) {

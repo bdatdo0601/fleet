@@ -51,10 +51,12 @@ type Skill struct {
 
 // VaultSearchHit represents one search match in the Obsidian vault.
 type VaultSearchHit struct {
-	Vault   string `json:"vault,omitempty"`
-	Path    string `json:"path"`
-	Title   string `json:"title"`
-	Snippet string `json:"snippet"`
+	Vault   string  `json:"vault,omitempty"`
+	Path    string  `json:"path"`
+	Title   string  `json:"title"`
+	Heading string  `json:"heading,omitempty"`
+	Snippet string  `json:"snippet"`
+	Score   float64 `json:"score,omitempty"`
 }
 
 // Vault manages path-jailed Markdown operations on an Obsidian vault or local assistant workspace.

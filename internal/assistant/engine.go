@@ -80,6 +80,7 @@ type Engine struct {
 	mcp         *MCPManager
 	skills      *SkillRegistry
 	sandbox     *SandboxManager
+	transcriber AudioTranscriber
 	Probes      DoctorProbes
 
 	opMu     sync.RWMutex
@@ -87,6 +88,8 @@ type Engine struct {
 
 	configWriteMu sync.Mutex
 	memoryMu      sync.Mutex
+	vaultSyncMu   sync.Mutex
+	lastEmbedSync map[string]time.Time
 
 	cfgMu      sync.RWMutex
 	cfg        Config
@@ -156,6 +159,7 @@ func Open(dbPath, configPath, defaultVaultDir string, deps FleetDeps) (*Engine, 
 		mcp:             mcpMgr,
 		skills:          NewSkillRegistry(),
 		sandbox:         NewSandboxManager(filepath.Join(stateRoot, "sandbox"), NewSocketSandboxRunner(paths.SandboxSocketPath(stateRoot), NewAppleContainerRunner())),
+		transcriber:     NewLocalWhisperTranscriber(),
 		opReader:        opReader,
 		cfg:             cfg,
 		subscribers:     make(map[chan StreamEvent]struct{}),
@@ -316,6 +320,11 @@ func (e *Engine) ResolveVault(name string) (*Vault, VaultMount, error) {
 
 // SearchVaults searches Markdown notes across a specific vault or all mounted vaults ("all" or empty).
 func (e *Engine) SearchVaults(vaultName, query string, limit int) ([]VaultSearchHit, error) {
+	return e.SearchVaultsContext(context.Background(), vaultName, query, limit)
+}
+
+// SearchVaultsContext searches Markdown notes with caller context across one or all mounted vaults.
+func (e *Engine) SearchVaultsContext(ctx context.Context, vaultName, query string, limit int) ([]VaultSearchHit, error) {
 	if limit <= 0 || limit > 50 {
 		limit = 20
 	}
@@ -325,7 +334,14 @@ func (e *Engine) SearchVaults(vaultName, query string, limit int) ([]VaultSearch
 		if err != nil {
 			return nil, err
 		}
-		hits, err := v.Search(query, limit)
+		idxCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		e.maybeSyncVaultIndex(idxCtx, mount.Name)
+		hits, iErr := e.SearchVaultIndex(idxCtx, mount.Name, query, limit, e.Config().Embeddings)
+		cancel()
+		if iErr == nil && len(hits) > 0 {
+			return hits, nil
+		}
+		hits, err = v.Search(query, limit)
 		if err != nil {
 			return nil, err
 		}
@@ -333,6 +349,13 @@ func (e *Engine) SearchVaults(vaultName, query string, limit int) ([]VaultSearch
 			hits[i].Vault = mount.Name
 		}
 		return hits, nil
+	}
+	idxCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	e.maybeSyncVaultIndex(idxCtx, "all")
+	idxHits, iErr := e.SearchVaultIndex(idxCtx, "all", query, limit, e.Config().Embeddings)
+	cancel()
+	if iErr == nil && len(idxHits) > 0 {
+		return idxHits, nil
 	}
 	var out []VaultSearchHit
 	if pv, err := e.vault(); err == nil {
@@ -689,6 +712,7 @@ func (e *Engine) runWorker(ctx context.Context) {
 func (e *Engine) runScheduler(ctx context.Context) {
 	defer e.wg.Done()
 	lastHeartbeat := time.Now().Add(-time.Hour)
+	var tickCount int
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
@@ -697,11 +721,15 @@ func (e *Engine) runScheduler(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
+			tickCount++
 			cfg := e.Config()
 			if e.sandbox != nil {
 				e.sandbox.ReapIdle(ctx, cfg.Sandbox.IdleMinutes)
 			}
-			if !cfg.Enabled || (strings.TrimSpace(cfg.APIKey) == "" && strings.TrimSpace(cfg.APIKeyOPRef) == "") {
+			if tickCount%10 == 1 {
+				e.SyncAllVaultIndexes(ctx)
+			}
+			if !cfg.Enabled || (strings.TrimSpace(cfg.APIKey) == "" && strings.TrimSpace(cfg.APIKeyOPRef) == "" && !cfg.LocalLLM.Enabled) {
 				continue
 			}
 			e.reconcileActiveDelegations(now)
@@ -734,7 +762,7 @@ func (e *Engine) processInboxEvent(ctx context.Context, ev InboxEvent) error {
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(cfg.APIKey) == "" {
+	if strings.TrimSpace(cfg.APIKey) == "" && !cfg.LocalLLM.Enabled {
 		return newErr("assistant API key is not configured", http.StatusBadRequest)
 	}
 	ch, err := e.store.GetChannel(ev.ChannelID)
@@ -750,6 +778,9 @@ func (e *Engine) processInboxEvent(ctx context.Context, ev InboxEvent) error {
 	userText, _ := payload["content"].(string)
 	if userText == "" {
 		userText, _ = payload["prompt"].(string)
+	}
+	if ev.Source == "chat" {
+		userText = e.autoTranscribeAttachments(ctx, cfg, *ch, payload, userText)
 	}
 	if ev.Source != "chat" && userText != "" {
 		prefix := ev.Source
@@ -779,6 +810,89 @@ func (e *Engine) processInboxEvent(ctx context.Context, ev InboxEvent) error {
 		TriggerUserText:   userText,
 		ReplyToExternalID: replyToExt,
 	})
+}
+
+func (e *Engine) getTranscriber() AudioTranscriber {
+	e.cfgMu.RLock()
+	tr := e.transcriber
+	e.cfgMu.RUnlock()
+	if tr != nil {
+		return tr
+	}
+	return NewLocalWhisperTranscriber()
+}
+
+func extractFileIDsFromPayload(payload map[string]any) []string {
+	raw, ok := payload["file_ids"]
+	if !ok || raw == nil {
+		return nil
+	}
+	switch v := raw.(type) {
+	case []string:
+		return v
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+				out = append(out, strings.TrimSpace(s))
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func (e *Engine) autoTranscribeAttachments(ctx context.Context, cfg Config, ch Channel, payload map[string]any, userText string) string {
+	tcfg := normalizeTranscribeConfig(cfg.Transcribe)
+	if !tcfg.Enabled || (tcfg.AutoTranscribe != nil && !*tcfg.AutoTranscribe) {
+		return userText
+	}
+	fileIDs := extractFileIDsFromPayload(payload)
+	if len(fileIDs) == 0 {
+		return userText
+	}
+	tr := e.getTranscriber()
+	var sections []string
+	for _, id := range fileIDs {
+		f, err := e.store.GetFile(id)
+		if err != nil || f == nil || !IsAudioFile(f.Name, f.MimeType) {
+			continue
+		}
+		text, tErr := tr.Transcribe(ctx, tcfg, f.StoragePath)
+		if tErr != nil {
+			sections = append(sections, fmt.Sprintf("[Audio transcription unavailable for %s: %v]", f.Name, tErr))
+			continue
+		}
+		if strings.TrimSpace(text) == "" {
+			sections = append(sections, fmt.Sprintf("[Voice transcript (%s): (empty/silence)]", f.Name))
+			continue
+		}
+		sections = append(sections, fmt.Sprintf("[Voice transcript (%s)]:\n%s", f.Name, strings.TrimSpace(text)))
+	}
+	if len(sections) == 0 {
+		return userText
+	}
+	joined := strings.Join(sections, "\n\n")
+	updated := joined
+	if trimmed := strings.TrimSpace(userText); trimmed != "" && trimmed != "Please inspect the attached file(s)." {
+		updated = trimmed + "\n\n" + joined
+	}
+	if rawID, ok := payload["message_id"].(float64); ok && rawID > 0 {
+		msgID := int64(rawID)
+		if err := e.store.UpdateMessageContent(msgID, updated); err == nil {
+			e.publishEvent(StreamEvent{
+				Type:      "message_updated",
+				ChannelID: ch.ID,
+				Data: map[string]any{
+					"id":         msgID,
+					"channel_id": ch.ID,
+					"content":    updated,
+				},
+			})
+		}
+	}
+	return updated
 }
 
 func (e *Engine) handleApprovalResume(ctx context.Context, cfg Config, ch Channel, payload map[string]any) error {

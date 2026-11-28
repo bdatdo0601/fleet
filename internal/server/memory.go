@@ -95,6 +95,9 @@ func registerMemoryRoutes(
 		if res.Queued && fleet.Curator != nil {
 			fleet.Curator.Notify()
 		}
+		if (res.Action == "created" || res.Action == "updated") && fleet.Embedder != nil {
+			fleet.Embedder.Notify()
+		}
 		writeJSON(w, http.StatusOK, res)
 		return nil
 	}))
@@ -115,6 +118,9 @@ func registerMemoryRoutes(
 		if res.AnyQueued && fleet.Curator != nil {
 			fleet.Curator.Notify()
 		}
+		if (res.Created > 0 || res.Updated > 0) && fleet.Embedder != nil {
+			fleet.Embedder.Notify()
+		}
 		writeJSON(w, http.StatusOK, res)
 		return nil
 	}))
@@ -131,6 +137,7 @@ func registerMemoryRoutes(
 	registerMemoryHistoryRoutes(mux, fleet, route)
 	registerMemoryProposalRoutes(mux, fleet, route)
 	registerMemoryCuratorRoutes(mux, fleet, route)
+	registerMemoryEmbedRoutes(mux, fleet, route)
 }
 
 func handleMemoryDelete(fleet *core.Fleet) func(http.ResponseWriter, *http.Request, *registry.Device) error {
@@ -377,6 +384,70 @@ func registerMemoryCuratorRoutes(
 		writeJSON(w, http.StatusOK, map[string]any{
 			"reports": reps,
 			"status":  fleet.Curator.Status(),
+		})
+		return nil
+	}))
+}
+
+func registerMemoryEmbedRoutes(
+	mux *http.ServeMux,
+	fleet *core.Fleet,
+	route func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc,
+) {
+	mux.HandleFunc("GET /v1/memory/embed", route(false, func(w http.ResponseWriter, _ *http.Request, _ *registry.Device) error {
+		var st memory.EmbedStatus
+		if fleet.Embedder != nil {
+			st = fleet.Embedder.Status()
+		}
+		writeJSON(w, http.StatusOK, st)
+		return nil
+	}))
+
+	mux.HandleFunc("POST /v1/memory/embed", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		if fleet.Embedder == nil {
+			return &memory.MemoryError{Msg: "memory embedder unavailable", Status: http.StatusServiceUnavailable}
+		}
+		var req struct {
+			memory.EmbedConfig
+			Disable bool  `json:"disable"`
+			Test    *bool `json:"test"`
+		}
+		if err := readJSONBody(r, &req); err != nil {
+			return err
+		}
+		if req.Disable {
+			st, err := fleet.Embedder.Disable()
+			if err != nil {
+				return err
+			}
+			writeJSON(w, http.StatusOK, st)
+			return nil
+		}
+		st, err := fleet.Embedder.Configure(r.Context(), req.EmbedConfig, optBoolDefaultTrue(req.Test))
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, st)
+		return nil
+	}))
+
+	mux.HandleFunc("POST /v1/memory/embed/backfill", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		if fleet.Embedder == nil {
+			return &memory.MemoryError{Msg: "memory embedder unavailable", Status: http.StatusServiceUnavailable}
+		}
+		var req struct {
+			Limit int `json:"limit"`
+		}
+		if err := readJSONBody(r, &req); err != nil {
+			return err
+		}
+		embedded, err := fleet.Embedder.BackfillNow(r.Context(), req.Limit)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"embedded": embedded,
+			"status":   fleet.Embedder.Status(),
 		})
 		return nil
 	}))

@@ -3,7 +3,10 @@ package assistant
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bdatdo0601/fleet/internal/memory"
 	"github.com/bdatdo0601/fleet/internal/paths"
 )
 
@@ -37,6 +41,9 @@ type DoctorProbes struct {
 	CheckOP               func(context.Context, string) (string, bool, string, error)
 	ListVaults            func(context.Context, string) ([]OPVaultMeta, error)
 	SandboxProbe          func(context.Context, SandboxConfig) DoctorCheck
+	LocalLLMProbe         func(context.Context, LocalLLMConfig) DoctorCheck
+	EmbeddingsProbe       func(context.Context, memory.EmbedConfig) DoctorCheck
+	TranscribeProbe       func(TranscribeConfig) DoctorCheck
 	LighthouseWorkerProbe func(context.Context) DoctorCheck
 }
 
@@ -110,6 +117,8 @@ func (e *Engine) Doctor(ctx context.Context) DoctorReport {
 	opCheck := e.checkOPDoctor(ctx, cfg)
 	rtCfg, rtErr := e.resolveRuntimeConfig(ctx)
 	checks = append(checks, e.checkOpenRouterDoctor(ctx, cfg, rtCfg, rtErr))
+	checks = append(checks, e.checkLocalLLMDoctor(ctx, cfg))
+	checks = append(checks, e.checkEmbeddingsDoctor(ctx, cfg))
 	checks = append(checks, e.checkDecisionsDoctor(ctx, rtCfg, rtErr))
 	checks = append(checks, e.checkVaultDoctor(view.EffectiveVaultPath))
 	checks = append(checks, e.checkObsidianSyncForDoctor("", view.EffectiveVaultPath))
@@ -123,6 +132,7 @@ func (e *Engine) Doctor(ctx context.Context) DoctorReport {
 	checks = append(checks, e.checkNotificationsDoctor(ctx, cfg))
 	checks = append(checks, e.checkDiscordBotDoctor(ctx, cfg))
 	checks = append(checks, e.checkSandboxDoctor(ctx, cfg))
+	checks = append(checks, e.checkTranscribeDoctor(cfg))
 	checks = append(checks, e.checkLighthouseWorkerDoctor(ctx))
 
 	ok := true
@@ -600,10 +610,148 @@ func (e *Engine) checkSandboxDoctor(ctx context.Context, cfg Config) DoctorCheck
 			Hint:   "Run `fleet assistant sandbox-build` (or click Build Sandbox Image in Settings)",
 		}
 	}
+	detail := fmt.Sprintf("Apple container ready (%s, net=%s, %d CPU, %d MB, max_active=%d", sb.Image, sb.Network, sb.CPUs, sb.MemoryMB, sb.MaxActive)
+	if len(sb.Profiles) > 0 {
+		detail += ", profiles=" + strings.Join(sb.Profiles, "+")
+	}
+	detail += ")"
 	return DoctorCheck{
 		Name:   "sandbox",
 		Status: "ok",
-		Detail: fmt.Sprintf("Apple container ready (%s, net=%s, %d CPU, %d MB)", sb.Image, sb.Network, sb.CPUs, sb.MemoryMB),
+		Detail: detail,
+	}
+}
+
+func (e *Engine) checkLocalLLMDoctor(ctx context.Context, cfg Config) DoctorCheck {
+	l := normalizeLocalLLMConfig(cfg.LocalLLM)
+	if !l.Enabled {
+		return DoctorCheck{Name: "local_llm", Status: "skip", Detail: "Local LLM routing disabled"}
+	}
+	if e.Probes.LocalLLMProbe != nil {
+		return e.Probes.LocalLLMProbe(ctx, l)
+	}
+	pCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(pCtx, http.MethodGet, strings.TrimRight(l.BaseURL, "/")+"/models", nil)
+	if err != nil {
+		return DoctorCheck{Name: "local_llm", Status: "fail", Detail: err.Error()}
+	}
+	resp, err := (&http.Client{Timeout: 3 * time.Second}).Do(req)
+	if err != nil {
+		return DoctorCheck{
+			Name:   "local_llm",
+			Status: "warn",
+			Detail: fmt.Sprintf("Local LLM unreachable at %s (%v)", l.BaseURL, err),
+			Hint:   fmt.Sprintf("Start Ollama (`ollama serve`) and pull %s (`ollama pull %s`)", l.Model, l.Model),
+		}
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	if resp.StatusCode >= 400 {
+		return DoctorCheck{
+			Name:   "local_llm",
+			Status: "warn",
+			Detail: fmt.Sprintf("Local LLM HTTP %d at %s", resp.StatusCode, l.BaseURL),
+		}
+	}
+	var parsed struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(body, &parsed) == nil && len(parsed.Data) > 0 {
+		found := false
+		for _, m := range parsed.Data {
+			if m.ID == l.Model || strings.HasPrefix(m.ID, l.Model+":") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return DoctorCheck{
+				Name:   "local_llm",
+				Status: "warn",
+				Detail: fmt.Sprintf("Connected to %s (%d models), but %q is not pulled yet", l.BaseURL, len(parsed.Data), l.Model),
+				Hint:   fmt.Sprintf("Run `ollama pull %s` on the lighthouse", l.Model),
+			}
+		}
+	}
+	return DoctorCheck{
+		Name:   "local_llm",
+		Status: "ok",
+		Detail: fmt.Sprintf("Connected (%s, model=%s, keep_alive=%s, num_ctx=%d)", l.BaseURL, l.Model, l.KeepAlive, l.NumCtx),
+	}
+}
+
+func (e *Engine) checkEmbeddingsDoctor(ctx context.Context, cfg Config) DoctorCheck {
+	emb := normalizeAssistantEmbedConfig(cfg.Embeddings)
+	if !emb.Enabled {
+		return DoctorCheck{Name: "embeddings", Status: "skip", Detail: "Vault semantic embeddings disabled"}
+	}
+	if e.Probes.EmbeddingsProbe != nil {
+		return e.Probes.EmbeddingsProbe(ctx, emb)
+	}
+	chunks, embedded, cErr := e.store.VaultChunkCounts(emb.Model)
+	if cErr != nil {
+		return DoctorCheck{Name: "embeddings", Status: "warn", Detail: fmt.Sprintf("Vault index query failed: %v", cErr)}
+	}
+	pCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if _, err := memory.EmbedTexts(pCtx, &http.Client{Timeout: 5 * time.Second}, emb, []string{"vault embedding health check"}); err != nil {
+		return DoctorCheck{
+			Name:   "embeddings",
+			Status: "warn",
+			Detail: fmt.Sprintf("Embedder unreachable (%s, model=%s): %v", emb.BaseURL, emb.Model, err),
+			Hint:   fmt.Sprintf("Run `ollama pull %s` on the lighthouse and ensure Ollama is running", emb.Model),
+		}
+	}
+	return DoctorCheck{
+		Name:   "embeddings",
+		Status: "ok",
+		Detail: fmt.Sprintf("Ready (%s, model=%s, chunks=%d/%d embedded)", emb.Provider, emb.Model, embedded, chunks),
+	}
+}
+
+func (e *Engine) checkTranscribeDoctor(cfg Config) DoctorCheck {
+	tcfg := normalizeTranscribeConfig(cfg.Transcribe)
+	if !tcfg.Enabled {
+		return DoctorCheck{Name: "transcribe", Status: "skip", Detail: "Local audio transcription disabled"}
+	}
+	if e.Probes.TranscribeProbe != nil {
+		return e.Probes.TranscribeProbe(tcfg)
+	}
+	tr := e.getTranscriber()
+	bin := tr.FindBinary(tcfg.Command)
+	if bin == "" {
+		return DoctorCheck{
+			Name:   "transcribe",
+			Status: "fail",
+			Detail: "whisper-cli not found on lighthouse",
+			Hint:   "Install with `brew install whisper-cpp ffmpeg` on the lighthouse",
+		}
+	}
+	ffmpegBin := tr.FindFFmpeg()
+	if ffmpegBin == "" {
+		return DoctorCheck{
+			Name:   "transcribe",
+			Status: "fail",
+			Detail: "ffmpeg not found on lighthouse",
+			Hint:   "Install with `brew install ffmpeg` on the lighthouse",
+		}
+	}
+	modelPath := tr.ResolveModelPath(tcfg.ModelPath)
+	if modelPath == "" {
+		return DoctorCheck{
+			Name:   "transcribe",
+			Status: "warn",
+			Detail: fmt.Sprintf("whisper-cli (%s) and ffmpeg ready, but no GGML model file found", bin),
+			Hint:   "Download ggml-large-v3-turbo-q5_0.bin into ~/.fleet/models/ or set transcribe.model_path",
+		}
+	}
+	return DoctorCheck{
+		Name:   "transcribe",
+		Status: "ok",
+		Detail: fmt.Sprintf("Ready (%s, model=%s, auto=%v)", bin, filepath.Base(modelPath), tcfg.AutoTranscribe == nil || *tcfg.AutoTranscribe),
 	}
 }
 

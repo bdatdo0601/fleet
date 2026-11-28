@@ -21,6 +21,19 @@ func buildSandboxPromptSection(cfg Config) string {
 	b.WriteString("- Use `sandbox_*` tools for reading, analyzing, converting, or generating files (PDF, DOCX, XLSX, PPTX, CSV, static chart image files, OCR, archives); use `render_widget` for inline interactive Generative UI charts in `#chat`. Do NOT use `fleet_spawn_agent` for document/file tasks.\n")
 	b.WriteString("- Uploaded chat attachments are staged in `/work/in/`. Write generated deliverables to `/work/out/` and call `sandbox_publish_file` so the user receives a downloadable card/preview in `#chat`.\n")
 	b.WriteString("- Pre-installed offline tools: Python 3 (`pypdf`, `pdfplumber`, `pymupdf`, `weasyprint`, `reportlab`, `python-docx`, `openpyxl`, `python-pptx`, `pandas`, `duckdb`, `matplotlib`, `pillow`, `tabulate`), `pandoc`, `poppler-utils` (`pdftotext`, `pdftoppm`), `tesseract`, `sqlite3`, `jq`, `ripgrep`, `uv`.\n")
+	if len(cfg.Sandbox.Profiles) > 0 {
+		fmt.Fprintf(&b, "- Enabled sandbox profiles: [%s]\n", strings.Join(cfg.Sandbox.Profiles, ", "))
+		for _, p := range cfg.Sandbox.Profiles {
+			switch p {
+			case "browser":
+				b.WriteString("  - `browser`: `/usr/bin/chromium` + `playwright` installed (always launch Chromium with `--no-sandbox --disable-dev-shm-usage`).\n")
+			case "office":
+				b.WriteString("  - `office`: LibreOffice installed (`libreoffice --headless --convert-to pdf` for `.docx`/`.xlsx`/`.pptx`).\n")
+			case "media":
+				b.WriteString("  - `media`: `ffmpeg` installed for audio/video conversion and frame extraction.\n")
+			}
+		}
+	}
 	if len(cfg.Sandbox.ExtraAptPackages) > 0 || len(cfg.Sandbox.ExtraPipPackages) > 0 {
 		fmt.Fprintf(&b, "- Extra installed packages: apt=[%s] pip=[%s]\n",
 			strings.Join(cfg.Sandbox.ExtraAptPackages, ", "),
@@ -37,7 +50,7 @@ func sandboxToolSpecs() []ToolSpec {
 			"command":       strProp("Shell command to execute via sh -c (alternative to script)"),
 			"lang":          strProp("python (default) or sh"),
 			"workdir":       strProp("Relative working directory inside /work (default .)"),
-			"timeout_sec":   intProp("Execution timeout in seconds (default 30, max 120)"),
+			"timeout_sec":   intProp("Execution timeout in seconds (default 30, max 300)"),
 			"internet":      boolProp("Request approval-gated HTTP/HTTPS egress proxy for this run"),
 			"allowed_hosts": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Optional public hostnames/wildcards allowed when internet=true"},
 			"reason":        strProp("Short reason shown to the user if approval is required"),

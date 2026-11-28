@@ -165,6 +165,7 @@ type Fleet struct {
 	Agents            *agents.Hub
 	Memory            *memory.Store
 	Curator           *memory.Curator
+	Embedder          *memory.Embedder
 	Slacker           *slacker.Store
 	SlackClient       *slacker.SlackClient
 	Assistant         *assistant.Engine
@@ -202,6 +203,8 @@ func Open(root string) (*Fleet, error) {
 		return nil, err
 	}
 	curator := memory.NewCurator(mem, filepath.Join(root, "curator.json"))
+	embedder := memory.NewEmbedder(mem, filepath.Join(root, "embed.json"))
+	mem.SetQueryEmbedder(embedder.QueryEmbedFunc())
 	f := &Fleet{
 		Root:              root,
 		CAKey:             filepath.Join(root, "ca.key"),
@@ -211,6 +214,7 @@ func Open(root string) (*Fleet, error) {
 		Agents:            hub,
 		Memory:            mem,
 		Curator:           curator,
+		Embedder:          embedder,
 		Slacker:           slk,
 	}
 	astEngine, err := assistant.Open(
@@ -354,6 +358,9 @@ func (f *Fleet) Close() error {
 	var errs []error
 	if f.Curator != nil {
 		f.Curator.Stop()
+	}
+	if f.Embedder != nil {
+		f.Embedder.Stop()
 	}
 	if f.Assistant != nil {
 		if err := f.Assistant.Close(); err != nil {

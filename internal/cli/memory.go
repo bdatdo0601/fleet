@@ -39,6 +39,7 @@ Subcommands:
   approve   [--all | ID ...]
   reject    [--all | ID ...]
   curator   setup|status|run|disable
+  embed     setup|status|backfill|disable
 `
 }
 
@@ -952,46 +953,56 @@ func cmdMemoryCuratorRun(args []string, cio *IO) error {
 	return nil
 }
 
-func cmdMemoryCurator(args []string, cio *IO) error {
+func runMemoryWorkerSubcommand[S any](
+	kind, actionName, endpoint string,
+	args []string,
+	cio *IO,
+	setupFn, actionFn func([]string, *IO) error,
+	printFn func(*IO, S),
+) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: fleet memory curator setup|status|run|disable")
+		return fmt.Errorf("usage: fleet memory %s setup|status|%s|disable", kind, actionName)
 	}
 	switch args[0] {
 	case "setup":
-		return cmdMemoryCuratorSetup(args[1:], cio)
-	case "run":
-		return cmdMemoryCuratorRun(args[1:], cio)
+		return setupFn(args[1:], cio)
+	case actionName:
+		return actionFn(args[1:], cio)
 	case "status":
-		if err := parseFlagsNoPositional("memory curator status", args[1:]); err != nil {
+		if err := parseFlagsNoPositional("memory "+kind+" status", args[1:]); err != nil {
 			return err
 		}
 		api, err := client.ResolveAPI("")
 		if err != nil {
 			return err
 		}
-		var st memory.CuratorStatus
-		if err := client.Call(api, http.MethodGet, "/v1/memory/curator", nil, 15*time.Second, nil, &st); err != nil {
+		var st S
+		if err := client.Call(api, http.MethodGet, endpoint, nil, 15*time.Second, nil, &st); err != nil {
 			return err
 		}
-		printCuratorStatus(cio, st)
+		printFn(cio, st)
 		return nil
 	case "disable":
-		if err := parseFlagsNoPositional("memory curator disable", args[1:]); err != nil {
+		if err := parseFlagsNoPositional("memory "+kind+" disable", args[1:]); err != nil {
 			return err
 		}
 		api, err := client.ResolveAPI("")
 		if err != nil {
 			return err
 		}
-		var st memory.CuratorStatus
-		if err := client.Call(api, http.MethodPost, "/v1/memory/curator", map[string]any{"disable": true}, 15*time.Second, nil, &st); err != nil {
+		var st S
+		if err := client.Call(api, http.MethodPost, endpoint, map[string]any{"disable": true}, 15*time.Second, nil, &st); err != nil {
 			return err
 		}
-		printCuratorStatus(cio, st)
+		printFn(cio, st)
 		return nil
 	default:
-		return fmt.Errorf("unknown curator subcommand %q", args[0])
+		return fmt.Errorf("unknown %s subcommand %q", kind, args[0])
 	}
+}
+
+func cmdMemoryCurator(args []string, cio *IO) error {
+	return runMemoryWorkerSubcommand("curator", "run", "/v1/memory/curator", args, cio, cmdMemoryCuratorSetup, cmdMemoryCuratorRun, printCuratorStatus)
 }
 
 func cmdMemory(args []string, cio *IO) error {
@@ -1031,7 +1042,124 @@ func cmdMemory(args []string, cio *IO) error {
 		return cmdMemoryResolve(rest, "reject", cio)
 	case "curator":
 		return cmdMemoryCurator(rest, cio)
+	case "embed":
+		return cmdMemoryEmbed(rest, cio)
 	default:
 		return fmt.Errorf("unknown memory subcommand %q\n\n%s", sub, memoryUsageText())
 	}
+}
+
+func printEmbedStatus(cio *IO, st memory.EmbedStatus) {
+	state := "disabled"
+	if st.Enabled {
+		state = "enabled"
+	}
+	cio.printf("status:     %s\n", state)
+	cio.printf("provider:   %s (%s)\n", cmp.Or(st.Provider, "-"), cmp.Or(st.BaseURL, "-"))
+	cio.printf("model:      %s\n", cmp.Or(st.Model, "-"))
+	if st.APIKeyHint != "" {
+		cio.printf("api key:    %s\n", st.APIKeyHint)
+	}
+	if st.KeepAlive != "" {
+		cio.printf("keep_alive: %s\n", st.KeepAlive)
+	}
+	cio.printf("index:      %d embedded, %d pending, %d total\n", st.EmbeddedCount, st.PendingCount, st.TotalCount)
+	if st.LastRunAt != "" {
+		cio.printf("last run:   %s (session embedded=%d)\n", st.LastRunAt, st.ProcessedCount)
+	}
+	if st.LastError != "" {
+		cio.printf("last error: %s\n", st.LastError)
+	}
+}
+
+func cmdMemoryEmbedSetup(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("memory embed setup", flag.ContinueOnError)
+	provider := fs.String("provider", "ollama", "embedding provider (ollama|openai|custom)")
+	baseURL := fs.String("url", "", "embedding base URL override")
+	model := fs.String("model", "", "embedding model (default nomic-embed-text for ollama)")
+	opRef := fs.String("op-ref", "", "1Password secret reference for API key")
+	apiKeyStdin := fs.Bool("api-key-stdin", false, "read API key from stdin")
+	keepAlive := fs.String("keep-alive", "", "Ollama keep_alive duration (e.g. 5m)")
+	noTest := fs.Bool("no-test", false, "skip preflight test before saving")
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(pos, " "))
+	}
+	api, err := client.ResolveAPI("")
+	if err != nil {
+		return err
+	}
+	var apiKey string
+	switch {
+	case *opRef != "":
+		if apiKey, err = cio.readOPRef(*opRef); err != nil {
+			return err
+		}
+	case *apiKeyStdin:
+		b, rErr := io.ReadAll(cio.Stdin)
+		if rErr != nil {
+			return rErr
+		}
+		apiKey = strings.TrimSpace(string(b))
+		if apiKey == "" {
+			return fmt.Errorf("empty API key on stdin")
+		}
+	case *provider == "openai":
+		var existing memory.EmbedStatus
+		_ = client.Call(api, http.MethodGet, "/v1/memory/embed", nil, 10*time.Second, nil, &existing)
+		prompt := "API key: "
+		if existing.APIKeyHint != "" && existing.Provider == *provider {
+			prompt = fmt.Sprintf("API key (Enter to keep %s): ", existing.APIKeyHint)
+		}
+		if apiKey, err = cio.askSecret(prompt); err != nil {
+			return err
+		}
+	}
+	var st memory.EmbedStatus
+	if err := client.Call(api, http.MethodPost, "/v1/memory/embed", map[string]any{
+		"enabled":    true,
+		"provider":   *provider,
+		"base_url":   *baseURL,
+		"model":      *model,
+		"api_key":    apiKey,
+		"keep_alive": *keepAlive,
+		"test":       !*noTest,
+	}, 45*time.Second, nil, &st); err != nil {
+		return err
+	}
+	printEmbedStatus(cio, st)
+	return nil
+}
+
+func cmdMemoryEmbedBackfill(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("memory embed backfill", flag.ContinueOnError)
+	limit := fs.Int("limit", 32, "max entries to embed in one batch")
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf("usage: fleet memory embed backfill [--limit N]")
+	}
+	api, err := client.ResolveAPI("")
+	if err != nil {
+		return err
+	}
+	var resp struct {
+		Embedded int                `json:"embedded"`
+		Status   memory.EmbedStatus `json:"status"`
+	}
+	if err := client.Call(api, http.MethodPost, "/v1/memory/embed/backfill", map[string]any{"limit": *limit}, 120*time.Second, nil, &resp); err != nil {
+		return err
+	}
+	cio.printf("embedded %d memory item(s)\n", resp.Embedded)
+	printEmbedStatus(cio, resp.Status)
+	return nil
+}
+
+func cmdMemoryEmbed(args []string, cio *IO) error {
+	return runMemoryWorkerSubcommand("embed", "backfill", "/v1/memory/embed", args, cio, cmdMemoryEmbedSetup, cmdMemoryEmbedBackfill, printEmbedStatus)
 }

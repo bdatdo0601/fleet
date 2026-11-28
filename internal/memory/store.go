@@ -335,9 +335,36 @@ type Stats struct {
 
 // Store wraps access to memory.db.
 type Store struct {
-	Path string
-	mu   sync.Mutex
-	db   *sql.DB
+	Path          string
+	mu            sync.Mutex
+	db            *sql.DB
+	embedMu       sync.RWMutex
+	queryEmbedder func(string) ([]float32, string, error)
+	vecCacheModel string
+	vecCache      map[int64][]float32
+	vecCacheValid bool
+}
+
+// SetQueryEmbedder registers an optional query embedding callback for hybrid semantic search.
+func (s *Store) SetQueryEmbedder(fn func(string) ([]float32, string, error)) {
+	s.embedMu.Lock()
+	s.queryEmbedder = fn
+	s.embedMu.Unlock()
+}
+
+func (s *Store) getQueryEmbedder() func(string) ([]float32, string, error) {
+	s.embedMu.RLock()
+	fn := s.queryEmbedder
+	s.embedMu.RUnlock()
+	return fn
+}
+
+func (s *Store) invalidateVectorCache() {
+	s.embedMu.Lock()
+	s.vecCacheValid = false
+	s.vecCache = nil
+	s.vecCacheModel = ""
+	s.embedMu.Unlock()
 }
 
 // Open opens or initializes memory.db at path.

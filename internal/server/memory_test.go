@@ -142,3 +142,82 @@ func TestMemoryHTTPEndpointsAndPermissions(t *testing.T) {
 		t.Fatalf("admin resolve failed: %v", err)
 	}
 }
+
+func TestMemoryEmbedHTTPEndpointsAndPermissions(t *testing.T) {
+	f, srv, tmp := setupTestServer(t)
+
+	offPubFile := filepath.Join(tmp, "off.pub")
+	_ = pki.Keygen(filepath.Join(tmp, "off.key"), offPubFile)
+	offPub, _ := os.ReadFile(offPubFile)
+	if _, err := f.Approve(core.ApproveOpts{Name: "office", Pubkey: string(offPub), Kind: "mac", Group: "managed", Passphrase: testPass}); err != nil {
+		t.Fatal(err)
+	}
+	office, _ := f.Registry.Get("office")
+
+	embedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/embed" {
+			http.NotFound(w, r)
+			return
+		}
+		var req struct {
+			Input []string `json:"input"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		vecs := make([][]float64, len(req.Input))
+		for i := range req.Input {
+			vecs[i] = []float64{1, 0}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"embeddings": vecs})
+	}))
+	defer embedSrv.Close()
+
+	if _, err := f.Memory.Upsert(memory.UpsertParams{
+		Scope: "global", Key: "embed-test-note", Kind: "reference", Body: "Local semantic vector note.", Source: "human",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var embSt memory.EmbedStatus
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/memory/embed", map[string]any{
+		"enabled":  true,
+		"provider": "ollama",
+		"base_url": embedSrv.URL,
+		"model":    "nomic-embed-text",
+		"test":     true,
+	}, 5*time.Second, nil, &embSt); err != nil {
+		t.Fatalf("POST /v1/memory/embed failed: %v", err)
+	}
+	if !embSt.Enabled || embSt.Model != "nomic-embed-text" {
+		t.Fatalf("unexpected embed status: %+v", embSt)
+	}
+
+	var bfOut struct {
+		Embedded int                `json:"embedded"`
+		Status   memory.EmbedStatus `json:"status"`
+	}
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/memory/embed/backfill", map[string]any{"limit": 10}, 5*time.Second, nil, &bfOut); err != nil {
+		t.Fatalf("POST /v1/memory/embed/backfill failed: %v", err)
+	}
+	if bfOut.Status.EmbeddedCount < 1 || bfOut.Status.PendingCount != 0 {
+		t.Fatalf("unexpected backfill output: %+v", bfOut)
+	}
+
+	var gotSt memory.EmbedStatus
+	if err := client.Call(srv.URL, http.MethodGet, "/v1/memory/embed", nil, 5*time.Second, nil, &gotSt); err != nil || !gotSt.Enabled {
+		t.Fatalf("GET /v1/memory/embed failed: st=%+v err=%v", gotSt, err)
+	}
+
+	// Managed device cannot mutate embedder config or trigger backfill.
+	f.IdentifyOverride = func(string) *registry.Device { return office }
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/memory/embed", map[string]any{"enabled": false}, 5*time.Second, nil, nil); err == nil || !strings.Contains(err.Error(), "HTTP 403") {
+		t.Fatalf("expected 403 for managed POST /v1/memory/embed, got %v", err)
+	}
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/memory/embed/backfill", map[string]any{}, 5*time.Second, nil, nil); err == nil || !strings.Contains(err.Error(), "HTTP 403") {
+		t.Fatalf("expected 403 for managed POST /v1/memory/embed/backfill, got %v", err)
+	}
+
+	f.IdentifyOverride = nil
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/memory/embed", map[string]any{"disable": true}, 5*time.Second, nil, &gotSt); err != nil || gotSt.Enabled {
+		t.Fatalf("disable POST /v1/memory/embed failed: st=%+v err=%v", gotSt, err)
+	}
+}

@@ -179,10 +179,38 @@ export async function openAssistantSettingsModal(onSaved, onNavigate) {
   });
   const sbCfg = cfg.sandbox || {};
   const sbEnabledChk = el("input", { type: "checkbox", checked: Boolean(sbCfg.enabled) });
-  const sbCPUsIn = el("input", { type: "number", min: "1", max: "4", value: String(sbCfg.cpus ?? 2) });
-  const sbMemIn = el("input", { type: "number", min: "256", max: "8192", step: "128", value: String(sbCfg.memory_mb ?? 2048) });
-  const sbIdleIn = el("input", { type: "number", min: "1", max: "120", value: String(sbCfg.idle_minutes ?? 10) });
-  const sbMaxFileIn = el("input", { type: "number", min: "1", max: "100", value: String(sbCfg.max_file_mb ?? 25) });
+  const sbCPUsIn = el("input", { type: "number", min: "1", max: "8", value: String(sbCfg.cpus ?? 4) });
+  const sbMemIn = el("input", { type: "number", min: "256", max: "8192", step: "128", value: String(sbCfg.memory_mb ?? 4096) });
+  const sbIdleIn = el("input", { type: "number", min: "1", max: "120", value: String(sbCfg.idle_minutes ?? 20) });
+  const sbMaxFileIn = el("input", { type: "number", min: "1", max: "100", value: String(sbCfg.max_file_mb ?? 50) });
+  const sbMaxActiveIn = el("input", { type: "number", min: "1", max: "3", value: String(sbCfg.max_active ?? 2) });
+  const sbProfiles = new Set(sbCfg.profiles || []);
+  const sbProfileChks = {
+    browser: el("input", { type: "checkbox", checked: sbProfiles.has("browser") }),
+    office: el("input", { type: "checkbox", checked: sbProfiles.has("office") }),
+    media: el("input", { type: "checkbox", checked: sbProfiles.has("media") }),
+  };
+  const localCfg = cfg.local_llm || {};
+  const localEnabledChk = el("input", { type: "checkbox", checked: Boolean(localCfg.enabled) });
+  const localURLIn = el("input", { type: "text", value: localCfg.base_url || "", placeholder: "http://127.0.0.1:11434/v1" });
+  const localModelIn = el("input", { type: "text", value: localCfg.model || "", placeholder: "qwen3:8b" });
+  const localKeepAliveIn = el("input", { type: "text", value: localCfg.keep_alive || "", placeholder: "2m" });
+  const localNumCtxIn = el("input", { type: "number", min: "2048", max: "65536", step: "1024", value: String(localCfg.num_ctx ?? 16384) });
+  const embedCfg = cfg.embeddings || {};
+  const embedEnabledChk = el("input", { type: "checkbox", checked: Boolean(embedCfg.enabled) });
+  const embedProvSel = el(
+    "select",
+    null,
+    ...["ollama", "openai"].map((p) => el("option", { value: p, text: p, selected: (embedCfg.provider || "ollama") === p })),
+  );
+  const embedURLIn = el("input", { type: "text", value: embedCfg.base_url || "", placeholder: "http://127.0.0.1:11434" });
+  const embedModelIn = el("input", { type: "text", value: embedCfg.model || "", placeholder: "nomic-embed-text" });
+  const embedKeepAliveIn = el("input", { type: "text", value: embedCfg.keep_alive || "", placeholder: "5m" });
+  const transCfg = cfg.transcribe || {};
+  const transEnabledChk = el("input", { type: "checkbox", checked: Boolean(transCfg.enabled) });
+  const transAutoChk = el("input", { type: "checkbox", checked: transCfg.auto_transcribe !== false });
+  const transModelIn = el("input", { type: "text", value: transCfg.model_path || "", placeholder: "~/.fleet/models/ggml-small.en.bin" });
+  const transLangIn = el("input", { type: "text", value: transCfg.language || "", placeholder: "auto" });
   const extraPkgsSummary = [
     ...(sbCfg.extra_apt_packages || []).map((p) => `apt:${p}`),
     ...(sbCfg.extra_pip_packages || []).map((p) => `pip:${p}`),
@@ -307,10 +335,48 @@ export async function openAssistantSettingsModal(onSaved, onNavigate) {
     el(
       "div",
       { className: "grid-2" },
-      field("CPUs (1-4)", sbCPUsIn),
+      field("CPUs (1-8)", sbCPUsIn),
       field("Memory MB (256-8192)", sbMemIn),
       field("Idle Auto-Stop (mins)", sbIdleIn),
       field("Max File Size (MB)", sbMaxFileIn),
+      field("Max Active VMs (1-3)", sbMaxActiveIn),
+    ),
+    el(
+      "div",
+      { className: "stack-sm" },
+      el("div", { className: "small muted", text: "Optional sandbox capability profiles (rebuild image after toggling):" }),
+      el("label", { className: "check-row" }, sbProfileChks.browser, el("span", { text: "browser (headless Chromium + Playwright)" })),
+      el("label", { className: "check-row" }, sbProfileChks.office, el("span", { text: "office (LibreOffice headless DOCX/XLSX/PPTX → PDF)" })),
+      el("label", { className: "check-row" }, sbProfileChks.media, el("span", { text: "media (ffmpeg audio/video processing)" })),
+    ),
+    el("h4", { className: "mt-2", text: "Local LLM (Ollama / MLX for local/<model>)" }),
+    el("label", { className: "check-row" }, localEnabledChk, el("span", { text: "Enable local LLM routing (/local alias & private Observer/Reflector)" })),
+    el(
+      "div",
+      { className: "grid-2" },
+      field("Base URL", localURLIn),
+      field("Default Model", localModelIn),
+      field("Keep Alive", localKeepAliveIn),
+      field("Num Context (tokens)", localNumCtxIn),
+    ),
+    el("h4", { className: "mt-2", text: "Vault Semantic Search (Embeddings)" }),
+    el("label", { className: "check-row" }, embedEnabledChk, el("span", { text: "Enable hybrid FTS5 + cosine vector search for Obsidian vaults" })),
+    el(
+      "div",
+      { className: "grid-2" },
+      field("Provider", embedProvSel),
+      field("Base URL", embedURLIn),
+      field("Model", embedModelIn),
+      field("Keep Alive", embedKeepAliveIn),
+    ),
+    el("h4", { className: "mt-2", text: "Local Voice Transcription (Whisper)" }),
+    el("label", { className: "check-row" }, transEnabledChk, el("span", { text: "Enable local whisper-cli + ffmpeg transcription" })),
+    el("label", { className: "check-row" }, transAutoChk, el("span", { text: "Auto-transcribe uploaded voice/audio attachments on arrival" })),
+    el(
+      "div",
+      { className: "grid-2" },
+      field("Whisper Model Path (optional auto-detect)", transModelIn),
+      field("Language (auto or ISO code)", transLangIn),
     ),
     extraPkgsSummary.length > 0
       ? el("div", { className: "small muted mono", text: `Custom packages: ${extraPkgsSummary.join(", ")}` })
@@ -448,10 +514,37 @@ export async function openAssistantSettingsModal(onSaved, onNavigate) {
             sandbox: {
               ...sbCfg,
               enabled: sbEnabledChk.checked,
-              cpus: Number.parseInt(sbCPUsIn.value || "2", 10) || 2,
-              memory_mb: Number.parseInt(sbMemIn.value || "2048", 10) || 2048,
-              idle_minutes: Number.parseInt(sbIdleIn.value || "10", 10) || 10,
-              max_file_mb: Number.parseInt(sbMaxFileIn.value || "25", 10) || 25,
+              cpus: Number.parseInt(sbCPUsIn.value || "4", 10) || 4,
+              memory_mb: Number.parseInt(sbMemIn.value || "4096", 10) || 4096,
+              idle_minutes: Number.parseInt(sbIdleIn.value || "20", 10) || 20,
+              max_file_mb: Number.parseInt(sbMaxFileIn.value || "50", 10) || 50,
+              max_active: Number.parseInt(sbMaxActiveIn.value || "2", 10) || 2,
+              profiles: Object.entries(sbProfileChks)
+                .filter(([, chk]) => chk.checked)
+                .map(([name]) => name),
+            },
+            local_llm: {
+              ...localCfg,
+              enabled: localEnabledChk.checked,
+              base_url: localURLIn.value.trim(),
+              model: localModelIn.value.trim(),
+              keep_alive: localKeepAliveIn.value.trim(),
+              num_ctx: Number.parseInt(localNumCtxIn.value || "16384", 10) || 16384,
+            },
+            embeddings: {
+              ...embedCfg,
+              enabled: embedEnabledChk.checked,
+              provider: embedProvSel.value,
+              base_url: embedURLIn.value.trim(),
+              model: embedModelIn.value.trim(),
+              keep_alive: embedKeepAliveIn.value.trim(),
+            },
+            transcribe: {
+              ...transCfg,
+              enabled: transEnabledChk.checked,
+              auto_transcribe: transAutoChk.checked,
+              model_path: transModelIn.value.trim(),
+              language: transLangIn.value.trim(),
             },
             test: Boolean(apiKeyIn.value.trim()),
           };

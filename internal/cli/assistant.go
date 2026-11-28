@@ -117,6 +117,24 @@ type assistantSetupFlags struct {
 	discordChPairs        []string
 	sandboxEnable         bool
 	sandboxDisable        bool
+	sandboxCPUs           int
+	sandboxMemory         int
+	sandboxIdle           int
+	sandboxMaxActive      int
+	sandboxProfiles       string
+	sandboxProfilesSet    bool
+	localLLMEnable        bool
+	localLLMDisable       bool
+	localLLMURL           string
+	localLLMModel         string
+	embedEnable           bool
+	embedDisable          bool
+	embedURL              string
+	embedModel            string
+	transcribeEnable      bool
+	transcribeDisable     bool
+	transcribeModel       string
+	transcribeLang        string
 }
 
 func applyAutoApproveSetupFlags(cfg *assistant.Config, opts assistantSetupFlags) error {
@@ -221,12 +239,110 @@ func applyAssistantSetupFlags(cfg *assistant.Config, opts assistantSetupFlags, c
 	if err := applyDiscordSetupFlags(cfg, opts); err != nil {
 		return err
 	}
+	if err := applySandboxSetupFlags(cfg, opts); err != nil {
+		return err
+	}
+	return applyLocalFeatureSetupFlags(cfg, opts)
+}
+
+func applySandboxSetupFlags(cfg *assistant.Config, opts assistantSetupFlags) error {
 	if opts.sandboxEnable {
 		cfg.Sandbox.Enabled = true
 	} else if opts.sandboxDisable {
 		cfg.Sandbox.Enabled = false
 	}
+	if opts.sandboxCPUs > 0 {
+		cfg.Sandbox.CPUs = opts.sandboxCPUs
+	}
+	if opts.sandboxMemory > 0 {
+		cfg.Sandbox.MemoryMB = opts.sandboxMemory
+	}
+	if opts.sandboxIdle > 0 {
+		cfg.Sandbox.IdleMinutes = opts.sandboxIdle
+	}
+	if opts.sandboxMaxActive > 0 {
+		cfg.Sandbox.MaxActive = opts.sandboxMaxActive
+	}
+	if opts.sandboxProfilesSet {
+		raw := strings.TrimSpace(opts.sandboxProfiles)
+		if raw == "" || strings.EqualFold(raw, "none") || raw == "-" {
+			cfg.Sandbox.Profiles = nil
+			return nil
+		}
+		var profiles []string
+		for p := range strings.SplitSeq(raw, ",") {
+			if clean := strings.TrimSpace(p); clean != "" {
+				profiles = append(profiles, clean)
+			}
+		}
+		if err := assistant.ValidateSandboxProfiles(profiles); err != nil {
+			return err
+		}
+		cfg.Sandbox.Profiles = profiles
+	}
 	return nil
+}
+
+func applyLocalFeatureSetupFlags(cfg *assistant.Config, opts assistantSetupFlags) error {
+	if err := applyLocalLLMSetupFlags(cfg, opts); err != nil {
+		return err
+	}
+	if err := applyEmbedSetupFlags(cfg, opts); err != nil {
+		return err
+	}
+	return applyTranscribeSetupFlags(cfg, opts)
+}
+
+func applyToggleURLModel(enabled *bool, baseURL, model *string, enableFlag, disableFlag bool, urlVal, modelVal, pairErr string) error {
+	if enableFlag && disableFlag {
+		return errors.New(pairErr)
+	}
+	if urlVal != "" {
+		*baseURL = strings.TrimSpace(urlVal)
+		if !disableFlag {
+			*enabled = true
+		}
+	}
+	if modelVal != "" {
+		*model = strings.TrimSpace(modelVal)
+		if !disableFlag {
+			*enabled = true
+		}
+	}
+	if enableFlag {
+		*enabled = true
+	} else if disableFlag {
+		*enabled = false
+	}
+	return nil
+}
+
+func applyLocalLLMSetupFlags(cfg *assistant.Config, opts assistantSetupFlags) error {
+	return applyToggleURLModel(
+		&cfg.LocalLLM.Enabled, &cfg.LocalLLM.BaseURL, &cfg.LocalLLM.Model,
+		opts.localLLMEnable, opts.localLLMDisable, opts.localLLMURL, opts.localLLMModel,
+		"--local-llm and --local-llm-disable cannot be combined",
+	)
+}
+
+func applyEmbedSetupFlags(cfg *assistant.Config, opts assistantSetupFlags) error {
+	return applyToggleURLModel(
+		&cfg.Embeddings.Enabled, &cfg.Embeddings.BaseURL, &cfg.Embeddings.Model,
+		opts.embedEnable, opts.embedDisable, opts.embedURL, opts.embedModel,
+		"--embed and --embed-disable cannot be combined",
+	)
+}
+
+func applyTranscribeSetupFlags(cfg *assistant.Config, opts assistantSetupFlags) error {
+	if opts.transcribeLang != "" {
+		cfg.Transcribe.Language = strings.TrimSpace(opts.transcribeLang)
+	}
+	var unusedURL string
+	return applyToggleURLModel(
+		&cfg.Transcribe.Enabled, &unusedURL, &cfg.Transcribe.ModelPath,
+		opts.transcribeEnable, opts.transcribeDisable, "", opts.transcribeModel,
+		"--transcribe and --transcribe-disable cannot be combined",
+	)
 }
 
 func applyDiscordChannelPairs(cfg *assistant.Config, pairs []string) error {
@@ -246,11 +362,7 @@ func applyDiscordChannelPairs(cfg *assistant.Config, pairs []string) error {
 	return nil
 }
 
-func cmdAssistantSetup(args []string, cio *IO) error {
-	fs := flag.NewFlagSet("assistant setup", flag.ContinueOnError)
-	checkOnly := fs.Bool("check", false, "run lighthouse doctor check without modifying config")
-	noTest := fs.Bool("no-test", false, "skip live connection test")
-	var opts assistantSetupFlags
+func registerAssistantSetupFlags(fs *flag.FlagSet, opts *assistantSetupFlags) {
 	fs.StringVar(&opts.opRef, "op-ref", "", "resolve OpenRouter API key once from local 1Password ref")
 	fs.StringVar(&opts.apiKeyOPRef, "api-key-op-ref", "", "store 1Password op:// ref on lighthouse (resolved in memory via Service Account)")
 	fs.StringVar(&opts.apiKey, "api-key", "", "OpenRouter API key")
@@ -278,6 +390,31 @@ func cmdAssistantSetup(args []string, cio *IO) error {
 	})
 	fs.BoolVar(&opts.sandboxEnable, "sandbox-enable", false, "enable the sandboxed computer runtime")
 	fs.BoolVar(&opts.sandboxDisable, "sandbox-disable", false, "disable the sandboxed computer runtime")
+	fs.IntVar(&opts.sandboxCPUs, "sandbox-cpus", 0, "sandbox VM CPUs (1-8)")
+	fs.IntVar(&opts.sandboxMemory, "sandbox-memory", 0, "sandbox VM memory in MB (256-8192)")
+	fs.IntVar(&opts.sandboxIdle, "sandbox-idle", 0, "sandbox idle auto-stop in minutes")
+	fs.IntVar(&opts.sandboxMaxActive, "sandbox-max-active", 0, "warm LRU sandbox VM pool capacity (1-3)")
+	fs.StringVar(&opts.sandboxProfiles, "sandbox-profiles", "", "comma-separated capability profiles (browser,office,media, or none)")
+	fs.BoolVar(&opts.localLLMEnable, "local-llm", false, "enable local OpenAI-compatible/Ollama LLM endpoint for local/<model> routing")
+	fs.BoolVar(&opts.localLLMDisable, "local-llm-disable", false, "disable local LLM routing")
+	fs.StringVar(&opts.localLLMURL, "local-llm-url", "", "local LLM base URL (e.g. http://127.0.0.1:11434/v1)")
+	fs.StringVar(&opts.localLLMModel, "local-llm-model", "", "local LLM default model (e.g. qwen3:8b)")
+	fs.BoolVar(&opts.embedEnable, "embed", false, "enable hybrid semantic vector search for Obsidian vaults")
+	fs.BoolVar(&opts.embedDisable, "embed-disable", false, "disable hybrid semantic vector search for Obsidian vaults")
+	fs.StringVar(&opts.embedURL, "embed-url", "", "embedding endpoint base URL (e.g. http://127.0.0.1:11434)")
+	fs.StringVar(&opts.embedModel, "embed-model", "", "embedding model (e.g. nomic-embed-text)")
+	fs.BoolVar(&opts.transcribeEnable, "transcribe", false, "enable local whisper-cli + ffmpeg voice transcription")
+	fs.BoolVar(&opts.transcribeDisable, "transcribe-disable", false, "disable local voice transcription")
+	fs.StringVar(&opts.transcribeModel, "transcribe-model", "", "path to ggml Whisper model file")
+	fs.StringVar(&opts.transcribeLang, "transcribe-lang", "", "whisper language code or 'auto'")
+}
+
+func cmdAssistantSetup(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("assistant setup", flag.ContinueOnError)
+	checkOnly := fs.Bool("check", false, "run lighthouse doctor check without modifying config")
+	noTest := fs.Bool("no-test", false, "skip live connection test")
+	var opts assistantSetupFlags
+	registerAssistantSetupFlags(fs, &opts)
 	pos, err := parseFlagsInterspersed(fs, args)
 	if err != nil {
 		return err
@@ -295,6 +432,8 @@ func cmdAssistantSetup(args []string, cio *IO) error {
 			opts.autoApproveSet = true
 		case "discord-auto-approve":
 			opts.discordAutoApproveSet = true
+		case "sandbox-profiles":
+			opts.sandboxProfilesSet = true
 		}
 	})
 	if *checkOnly {
@@ -330,6 +469,9 @@ func cmdAssistantSetup(args []string, cio *IO) error {
 		"observer_threshold_tokens":  cfg.ObserverThresholdTokens,
 		"reflector_threshold_bytes":  cfg.ReflectorThresholdBytes,
 		"models":                     cfg.Models,
+		"local_llm":                  cfg.LocalLLM,
+		"embeddings":                 cfg.Embeddings,
+		"transcribe":                 cfg.Transcribe,
 		"routing":                    cfg.Routing,
 		"notifications":              cfg.Notifications,
 		"discord":                    cfg.Discord,
@@ -593,7 +735,20 @@ func cmdAssistantStatus(args []string, cio *IO) error {
 	}
 	cio.printf("default model:     %s (decision=%s, observer=%s)\n", res.Config.Models.DefaultChat, res.Config.Models.Decision, res.Config.Models.Observer)
 	cio.printf("auto routing:      %s (frontier=%s, grant=%d turns / $%.2f)\n", res.Config.Routing.Mode, res.Config.Models.Frontier, res.Config.Routing.GrantMaxTurns, res.Config.Routing.GrantMaxCostUSD)
-	cio.printf("sandbox:           enabled=%v image=%s (%d CPU, %d MB, idle=%dm)\n", res.Config.Sandbox.Enabled, res.Config.Sandbox.Image, res.Config.Sandbox.CPUs, res.Config.Sandbox.MemoryMB, res.Config.Sandbox.IdleMinutes)
+	profiles := ""
+	if len(res.Config.Sandbox.Profiles) > 0 {
+		profiles = ", profiles=" + strings.Join(res.Config.Sandbox.Profiles, ",")
+	}
+	cio.printf("sandbox:           enabled=%v image=%s (%d CPU, %d MB, idle=%dm, max_active=%d%s)\n", res.Config.Sandbox.Enabled, res.Config.Sandbox.Image, res.Config.Sandbox.CPUs, res.Config.Sandbox.MemoryMB, res.Config.Sandbox.IdleMinutes, res.Config.Sandbox.MaxActive, profiles)
+	if res.Config.LocalLLM.Enabled {
+		cio.printf("local llm:         enabled=true model=%s (%s, num_ctx=%d)\n", res.Config.LocalLLM.Model, res.Config.LocalLLM.BaseURL, res.Config.LocalLLM.NumCtx)
+	}
+	if res.Config.Embeddings.Enabled {
+		cio.printf("vault embeddings:  enabled=true model=%s (%s @ %s)\n", res.Config.Embeddings.Model, res.Config.Embeddings.Provider, res.Config.Embeddings.BaseURL)
+	}
+	if res.Config.Transcribe.Enabled {
+		cio.printf("transcribe:        enabled=true lang=%s model=%s\n", res.Config.Transcribe.Language, cmp.Or(res.Config.Transcribe.ModelPath, "auto"))
+	}
 	cio.printf("channels/timers:   %d channels, %d timers, %d pending approvals\n", res.Summary.Channels, res.Summary.EnabledTimers, res.Summary.PendingApprovals)
 	return nil
 }

@@ -804,6 +804,10 @@ func Serve(port int, host string) error {
 		fleet.Curator.Start(ctx)
 		defer fleet.Curator.Stop()
 	}
+	if fleet.Embedder != nil {
+		fleet.Embedder.Start(ctx)
+		defer fleet.Embedder.Stop()
+	}
 	if fleet.Assistant != nil {
 		fleet.Assistant.Start(ctx)
 		defer fleet.Assistant.Stop()

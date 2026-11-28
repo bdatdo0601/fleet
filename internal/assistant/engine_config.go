@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/bdatdo0601/fleet/internal/memory"
 )
 
 // Config returns a copy of the current assistant Config.
@@ -48,7 +50,20 @@ func isZeroDiscordConfig(d DiscordConfig) bool {
 func isZeroSandboxConfig(s SandboxConfig) bool {
 	return !s.Enabled && s.Image == "" && s.BaseImage == "" && s.Network == "" &&
 		s.CPUs == 0 && s.MemoryMB == 0 && s.IdleMinutes == 0 && s.MaxFileMB == 0 &&
+		s.MaxActive == 0 && len(s.Profiles) == 0 &&
 		len(s.ExtraAptPackages) == 0 && len(s.ExtraPipPackages) == 0
+}
+
+func isZeroLocalLLMConfig(l LocalLLMConfig) bool {
+	return !l.Enabled && l.BaseURL == "" && l.Model == "" && l.KeepAlive == "" && l.NumCtx == 0
+}
+
+func isZeroEmbedConfig(e memory.EmbedConfig) bool {
+	return !e.Enabled && e.Provider == "" && e.BaseURL == "" && e.Model == "" && e.APIKey == "" && e.KeepAlive == ""
+}
+
+func isZeroTranscribeConfig(t TranscribeConfig) bool {
+	return !t.Enabled && t.Command == "" && t.ModelPath == "" && t.Language == "" && t.AutoTranscribe == nil
 }
 
 func mergePreservedConfig(cur, next Config, clearAPIKey bool) Config {
@@ -72,6 +87,17 @@ func mergePreservedConfig(cur, next Config, clearAPIKey bool) Config {
 	}
 	if next.Routing == (RoutingConfig{}) {
 		next.Routing = cur.Routing
+	}
+	if isZeroLocalLLMConfig(next.LocalLLM) {
+		next.LocalLLM = cur.LocalLLM
+	}
+	if isZeroEmbedConfig(next.Embeddings) {
+		next.Embeddings = cur.Embeddings
+	} else if cur.Embeddings.APIKey != "" && (next.Embeddings.APIKey == "" || next.Embeddings.APIKey == maskSecret(cur.Embeddings.APIKey)) {
+		next.Embeddings.APIKey = cur.Embeddings.APIKey
+	}
+	if isZeroTranscribeConfig(next.Transcribe) {
+		next.Transcribe = cur.Transcribe
 	}
 	if isZeroSandboxConfig(next.Sandbox) {
 		next.Sandbox = cur.Sandbox
@@ -133,6 +159,14 @@ func (e *Engine) updateConfigLocked(next Config, clearAPIKey bool) (ConfigView, 
 	next = mergePreservedConfig(e.Config(), next, clearAPIKey)
 	if err := validateSandboxPackages(next.Sandbox); err != nil {
 		return ConfigView{}, err
+	}
+	if err := ValidateLocalLLMConfig(next.LocalLLM); err != nil {
+		return ConfigView{}, err
+	}
+	if next.Embeddings.Enabled {
+		if _, err := memory.NormalizeEmbedConfig(next.Embeddings, memory.EmbedConfig{}); err != nil {
+			return ConfigView{}, newErr(err.Error(), http.StatusBadRequest)
+		}
 	}
 	if err := ValidateDiscordConfig(next.Discord); err != nil {
 		return ConfigView{}, err

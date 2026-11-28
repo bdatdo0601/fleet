@@ -882,3 +882,129 @@ func TestTrimBodyAndRenderContextUTF8Boundaries(t *testing.T) {
 		}
 	}
 }
+
+func TestEmbeddingsAndHybridSearchAndDefaults(t *testing.T) {
+	if DefaultOllamaModel != "qwen3:8b" {
+		t.Fatalf("expected DefaultOllamaModel qwen3:8b, got %q", DefaultOllamaModel)
+	}
+	st := openTestStore(t)
+	curCfgPath := filepath.Join(t.TempDir(), "curator.json")
+	cur := NewCurator(st, curCfgPath)
+	if _, err := cur.Configure(context.Background(), CuratorConfig{Enabled: true, Provider: "ollama", Model: "qwen3:8b"}, false); err != nil {
+		t.Fatal(err)
+	}
+	if stCur := cur.Status(); stCur.NumCtx != 8192 || stCur.Model != "qwen3:8b" {
+		t.Fatalf("expected Ollama curator defaults qwen3:8b/8192, got %+v", stCur)
+	}
+
+	// Vector codec & cosine math.
+	blob := EncodeVector([]float32{3, 4})
+	vec := DecodeVector(blob)
+	if len(vec) != 2 || DotProduct(vec, vec) < 0.99 {
+		t.Fatalf("expected normalized unit vector, got %v", vec)
+	}
+	if DotProduct([]float32{1, 0}, nil) != 0 || EncodeVector([]float32{0, 0}) != nil {
+		t.Fatalf("expected zero-vector safety")
+	}
+
+	// Mock both Ollama /api/embed and OpenAI /embeddings.
+	embedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/embed":
+			var req struct {
+				Input []string `json:"input"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			vecs := make([][]float64, len(req.Input))
+			for i, txt := range req.Input {
+				if strings.Contains(strings.ToLower(txt), "automobile") || strings.Contains(strings.ToLower(txt), "sedan") {
+					vecs[i] = []float64{1, 0}
+				} else {
+					vecs[i] = []float64{0, 1}
+				}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"embeddings": vecs})
+		case "/embeddings":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": []map[string]any{{"embedding": []float64{0, 1}}},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer embedSrv.Close()
+
+	vecsOA, err := EmbedTexts(context.Background(), embedSrv.Client(), EmbedConfig{
+		Enabled: true, Provider: "openai", BaseURL: embedSrv.URL, Model: "text-embedding-3-small",
+	}, []string{"hello"})
+	if err != nil || len(vecsOA) != 1 || len(vecsOA[0]) != 2 {
+		t.Fatalf("OpenAI EmbedTexts failed: vecs=%v err=%v", vecsOA, err)
+	}
+
+	// Seed memories: one about automobile tires, one about deployment keys.
+	resAuto, err := st.Upsert(UpsertParams{
+		Scope: "global", Key: "garage-rule", Kind: "project", Tier: "searchable",
+		Summary: "Winter tire pressure check", Body: "Keep sedan cold tire pressure at 35 PSI.", Source: "human",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Upsert(UpsertParams{
+		Scope: "global", Key: "deploy-rule", Kind: "project", Tier: "searchable",
+		Summary: "Release process", Body: "Tag releases on Friday morning only.", Source: "human",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	emb := NewEmbedder(st, filepath.Join(t.TempDir(), "embed.json"))
+	st.SetQueryEmbedder(emb.QueryEmbedFunc())
+	if _, err := emb.Configure(context.Background(), EmbedConfig{
+		Enabled: true, Provider: "ollama", BaseURL: embedSrv.URL, Model: "nomic-embed-text",
+	}, true); err != nil {
+		t.Fatalf("Embedder.Configure failed: %v", err)
+	}
+	if _, err := emb.BackfillNow(context.Background(), 20); err != nil {
+		t.Fatalf("BackfillNow failed: %v", err)
+	}
+	stEmb := emb.Status()
+	if !stEmb.Enabled || stEmb.EmbeddedCount != 2 || stEmb.PendingCount != 0 {
+		t.Fatalf("unexpected embedder status after backfill: %+v", stEmb)
+	}
+
+	// Hybrid search matches "automobile" -> "garage-rule" despite zero lexical overlap.
+	hits, err := st.Search(SearchFilter{Query: "automobile", Scope: "global", Limit: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) == 0 || hits[0].Key != "garage-rule" {
+		t.Fatalf("expected garage-rule top hybrid hit, got %+v", hits)
+	}
+
+	// Updating memory clears stale embedding so PendingCount becomes 1.
+	if _, err := st.Upsert(UpsertParams{
+		Scope: "global", Key: "garage-rule", Kind: "project", Tier: "searchable",
+		Summary: "Updated tire pressure", Body: "Keep sedan tires at 36 PSI.", Source: "human",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stAfterUpd := emb.Status()
+	if stAfterUpd.PendingCount != 1 || resAuto.Item.ID == 0 {
+		t.Fatalf("expected UPDATE to invalidate stale embedding, got %+v", stAfterUpd)
+	}
+
+	// Graceful fallback to FTS5 if query embedder errors.
+	st.SetQueryEmbedder(func(string) ([]float32, string, error) {
+		return nil, "", context.DeadlineExceeded
+	})
+	ftsHits, err := st.Search(SearchFilter{Query: "Friday", Scope: "global", Limit: 5})
+	if err != nil || len(ftsHits) == 0 || ftsHits[0].Key != "deploy-rule" {
+		t.Fatalf("expected FTS5 fallback hit when embedder errors, got hits=%+v err=%v", ftsHits, err)
+	}
+
+	if _, err := emb.Disable(); err != nil {
+		t.Fatal(err)
+	}
+	if emb.Status().Enabled {
+		t.Fatalf("expected Embedder disabled")
+	}
+}

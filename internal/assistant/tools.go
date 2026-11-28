@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"slices"
 	"strings"
@@ -203,6 +204,9 @@ func (e *Engine) buildToolSpecs(ctx context.Context) []ToolSpec {
 	if e.Config().Sandbox.Enabled {
 		specs = append(specs, sandboxToolSpecs()...)
 	}
+	if e.Config().Transcribe.Enabled {
+		specs = append(specs, transcribeToolSpec())
+	}
 	if e.mcp != nil {
 		for _, ext := range e.mcp.ListTools(ctx) {
 			specs = append(specs, makeToolSpec(ext.FullName, ext.Description, ext.InputSchema))
@@ -385,6 +389,9 @@ func (e *Engine) dispatchTool(ctx context.Context, name string, args map[string]
 	if strings.HasPrefix(name, "sandbox_") {
 		return e.dispatchSandboxTool(ctx, name, args, rawArgs, tctx)
 	}
+	if name == "transcribe_audio" {
+		return e.execTranscribeAudioTool(ctx, args, tctx)
+	}
 	if strings.HasPrefix(name, "mcp__") && e.mcp != nil {
 		return e.dispatchExternalMCPTool(ctx, name, args, rawArgs, tctx)
 	}
@@ -541,7 +548,7 @@ func (e *Engine) execSkillFetchTool(ctx context.Context, args map[string]any) (a
 func (e *Engine) dispatchVaultTool(ctx context.Context, name string, args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {
 	switch name {
 	case "vault_search":
-		return e.SearchVaults(strArg(args, "vault"), strArg(args, "query"), intArg(args, "limit", 15))
+		return e.SearchVaultsContext(ctx, strArg(args, "vault"), strArg(args, "query"), intArg(args, "limit", 15))
 	case "vault_read":
 		v, mount, err := e.ResolveVault(strArg(args, "vault"))
 		if err != nil {
@@ -588,7 +595,75 @@ func (e *Engine) execVaultWriteTool(ctx context.Context, name string, args map[s
 		return nil, wErr
 	}
 	v.MaybeGitCommitContext(ctx, tctx.Config.GitAutoCommit, "assistant: update "+norm)
+	_ = e.SyncVaultIndex(ctx, mount.Name, v.Root, tctx.Config.Embeddings)
 	return map[string]string{"vault": mount.Name, "path": norm, "status": "saved"}, nil
+}
+
+func transcribeToolSpec() ToolSpec {
+	return makeToolSpec("transcribe_audio", "Transcribe a local audio or voice-note file from sandbox /work or a mounted Obsidian vault using local whisper-cli.", schemaObj(map[string]any{
+		"source":   strProp("File location: sandbox (default) or vault"),
+		"path":     strProp("Relative path inside sandbox /work (e.g. in/memo.m4a) or inside the Obsidian vault"),
+		"vault":    strProp("Optional vault name when source=vault (default \"agent\")"),
+		"language": strProp("Optional language code (e.g. en, vi) or auto"),
+	}, "path"))
+}
+
+func (e *Engine) execTranscribeAudioTool(ctx context.Context, args map[string]any, tctx *toolExecContext) (any, error) {
+	tcfg := normalizeTranscribeConfig(tctx.Config.Transcribe)
+	if !tcfg.Enabled {
+		return nil, newErr("audio transcription is disabled; enable transcribe in Assistant Settings", http.StatusBadRequest)
+	}
+	source := strings.ToLower(cmp.Or(strArg(args, "source"), "sandbox"))
+	rawPath := strArg(args, "path")
+	if rawPath == "" {
+		return nil, newErr("path is required", http.StatusBadRequest)
+	}
+	if lang := strArg(args, "language"); lang != "" {
+		tcfg.Language = lang
+	}
+	var absPath string
+	switch source {
+	case "sandbox":
+		if e.sandbox == nil {
+			return nil, newErr("sandbox unavailable", http.StatusServiceUnavailable)
+		}
+		abs, _, err := e.sandbox.ResolveWorkPath(tctx.ChannelID, rawPath)
+		if err != nil {
+			return nil, err
+		}
+		absPath = abs
+	case "vault":
+		v, _, err := e.ResolveVault(strArg(args, "vault"))
+		if err != nil {
+			return nil, err
+		}
+		_, full, err := v.ResolveRel(rawPath)
+		if err != nil {
+			return nil, err
+		}
+		absPath = full
+	default:
+		return nil, newErr("source must be \"sandbox\" or \"vault\"", http.StatusBadRequest)
+	}
+	fi, err := os.Stat(absPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, newErr(fmt.Sprintf("audio file %q not found", rawPath), http.StatusNotFound)
+		}
+		return nil, err
+	}
+	if fi.IsDir() {
+		return nil, newErr(fmt.Sprintf("%q is a directory", rawPath), http.StatusBadRequest)
+	}
+	text, err := e.getTranscriber().Transcribe(ctx, tcfg, absPath)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"source":     source,
+		"path":       rawPath,
+		"transcript": text,
+	}, nil
 }
 
 func (e *Engine) dispatchAutomationTool(ctx context.Context, name string, args map[string]any, tctx *toolExecContext) (any, error) {

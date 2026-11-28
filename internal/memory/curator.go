@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -24,7 +23,7 @@ const (
 	DefaultOpenAIURL       = "https://api.openai.com/v1"
 	DefaultOpenAIModel     = "gpt-5-nano"
 	DefaultOllamaURL       = "http://127.0.0.1:11434/v1"
-	DefaultOllamaModel     = "qwen2.5:3b"
+	DefaultOllamaModel     = "qwen3:8b"
 )
 
 // CuratorConfig persists the lighthouse memory curator LLM configuration.
@@ -174,7 +173,7 @@ func normalizeCuratorConfig(cfg, prev CuratorConfig) (CuratorConfig, error) {
 		cfg.Model = cmp.Or(cfg.Model, DefaultOllamaModel)
 		cfg.KeepAlive = cmp.Or(cfg.KeepAlive, "2m")
 		if cfg.NumCtx <= 0 {
-			cfg.NumCtx = 2048
+			cfg.NumCtx = 8192
 		}
 	case "custom":
 		if cfg.BaseURL == "" {
@@ -224,17 +223,10 @@ func NewCurator(store *Store, configPath string) *Curator {
 	c := &Curator{
 		store:      store,
 		configPath: configPath,
-		httpClient: &http.Client{Timeout: 45 * time.Second},
+		httpClient: &http.Client{Timeout: 120 * time.Second},
 		notifyCh:   make(chan struct{}, 1),
 	}
-	if configPath != "" {
-		if raw, err := os.ReadFile(configPath); err == nil && len(bytes.TrimSpace(raw)) > 0 {
-			var loaded CuratorConfig
-			if json.Unmarshal(raw, &loaded) == nil {
-				c.cfg = loaded
-			}
-		}
-	}
+	loadJSONConfigFile(configPath, &c.cfg)
 	return c
 }
 

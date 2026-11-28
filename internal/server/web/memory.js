@@ -1048,7 +1048,7 @@ async function renderCuratorView(root, ctx, signal) {
   );
   const zdrCheck = el("input", { type: "checkbox", checked: Boolean(st.zdr) });
   const keepAliveIn = el("input", { type: "text", value: st.keep_alive || "", placeholder: "e.g. 2m" });
-  const numCtxIn = el("input", { type: "number", value: st.num_ctx ? String(st.num_ctx) : "", placeholder: "e.g. 2048" });
+  const numCtxIn = el("input", { type: "number", value: st.num_ctx ? String(st.num_ctx) : "", placeholder: "e.g. 8192" });
   const testCheck = el("input", { type: "checkbox", checked: true });
   const saveCfgBtn = el("button", { type: "submit", className: "btn btn-primary", text: "Save & Enable Curator" });
 

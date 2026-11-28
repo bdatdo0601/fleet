@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/bdatdo0601/fleet/internal/memory"
 	"github.com/bdatdo0601/fleet/internal/registry"
 )
 
@@ -47,14 +48,21 @@ const (
 	DefaultFrontierGrantIdleMinutes = 25
 	DefaultDecisionTimeoutMS        = 2000
 
-	DefaultSandboxImage       = "fleet-sandbox:latest"
-	DefaultSandboxBaseImage   = "fleet-sandbox:base"
-	DefaultSandboxNetwork     = "fleet-sandbox-offline"
-	DefaultSandboxSubnet      = "192.168.127.0/24"
-	DefaultSandboxCPUs        = 2
-	DefaultSandboxMemoryMB    = 2048
-	DefaultSandboxIdleMinutes = 10
-	DefaultSandboxMaxFileMB   = 25
+	DefaultSandboxImage         = "fleet-sandbox:latest"
+	DefaultSandboxBaseImage     = "fleet-sandbox:base"
+	DefaultSandboxNetwork       = "fleet-sandbox-offline"
+	DefaultSandboxSubnet        = "192.168.127.0/24"
+	DefaultSandboxCPUs          = 4
+	DefaultSandboxMemoryMB      = 4096
+	DefaultSandboxIdleMinutes   = 20
+	DefaultSandboxMaxFileMB     = 50
+	DefaultSandboxMaxActive     = 2
+	DefaultSandboxMaxTimeoutSec = 300
+
+	DefaultLocalLLMURL       = "http://127.0.0.1:11434/v1"
+	DefaultLocalLLMModel     = "qwen3:8b"
+	DefaultLocalLLMKeepAlive = "2m"
+	DefaultLocalLLMNumCtx    = 16384
 
 	MCPApprovalPolicyAll        = "all"
 	MCPApprovalPolicyWritesOnly = "writes_only"
@@ -179,6 +187,27 @@ type VaultMount struct {
 	AutoWriteDirs []string `json:"auto_write_dirs,omitempty"`
 }
 
+// ValidSandboxProfiles lists optional heavier capability layers baked into the sandbox OCI image.
+var ValidSandboxProfiles = []string{"browser", "office", "media"}
+
+// LocalLLMConfig configures an optional local OpenAI-compatible/Ollama LLM endpoint for local/<model> routing.
+type LocalLLMConfig struct {
+	Enabled   bool   `json:"enabled"`
+	BaseURL   string `json:"base_url,omitempty"`
+	Model     string `json:"model,omitempty"`
+	KeepAlive string `json:"keep_alive,omitempty"`
+	NumCtx    int    `json:"num_ctx,omitempty"`
+}
+
+// TranscribeConfig configures local audio/voice-note transcription via whisper-cli and ffmpeg.
+type TranscribeConfig struct {
+	Enabled        bool   `json:"enabled"`
+	Command        string `json:"command,omitempty"`
+	ModelPath      string `json:"model_path,omitempty"`
+	Language       string `json:"language,omitempty"`
+	AutoTranscribe *bool  `json:"auto_transcribe,omitempty"`
+}
+
 // SandboxConfig configures the assistant's disposable Apple container micro-VM sandbox.
 type SandboxConfig struct {
 	Enabled          bool     `json:"enabled"`
@@ -189,6 +218,8 @@ type SandboxConfig struct {
 	MemoryMB         int      `json:"memory_mb,omitempty"`
 	IdleMinutes      int      `json:"idle_minutes,omitempty"`
 	MaxFileMB        int      `json:"max_file_mb,omitempty"`
+	MaxActive        int      `json:"max_active,omitempty"`
+	Profiles         []string `json:"profiles,omitempty"`
 	ExtraAptPackages []string `json:"extra_apt_packages,omitempty"`
 	ExtraPipPackages []string `json:"extra_pip_packages,omitempty"`
 }
@@ -226,6 +257,9 @@ type Config struct {
 	ObserverThresholdTokens  int                 `json:"observer_threshold_tokens"`
 	ReflectorThresholdBytes  int                 `json:"reflector_threshold_bytes"`
 	Models                   ModelConfig         `json:"models"`
+	LocalLLM                 LocalLLMConfig      `json:"local_llm"`
+	Embeddings               memory.EmbedConfig  `json:"embeddings"`
+	Transcribe               TranscribeConfig    `json:"transcribe"`
 	Routing                  RoutingConfig       `json:"routing"`
 	MCPServers               []MCPServerConfig   `json:"mcp_servers,omitempty"`
 	Credentials              []CredentialPolicy  `json:"credentials,omitempty"`
@@ -264,6 +298,9 @@ type ConfigView struct {
 	ObserverThresholdTokens  int                 `json:"observer_threshold_tokens"`
 	ReflectorThresholdBytes  int                 `json:"reflector_threshold_bytes"`
 	Models                   ModelConfig         `json:"models"`
+	LocalLLM                 LocalLLMConfig      `json:"local_llm"`
+	Embeddings               memory.EmbedConfig  `json:"embeddings"`
+	Transcribe               TranscribeConfig    `json:"transcribe"`
 	Routing                  RoutingConfig       `json:"routing"`
 	MCPServers               []MCPServerConfig   `json:"mcp_servers"`
 	Credentials              []CredentialView    `json:"credentials"`
@@ -277,6 +314,7 @@ type ConfigView struct {
 func DefaultAliases() map[string]string {
 	return map[string]string{
 		"auto":         "auto",
+		"local":        "local/default",
 		"mini":         DefaultFastModel,
 		"inkling-mini": DefaultFastModel,
 		"nano":         DefaultFastModel,
@@ -326,9 +364,24 @@ func DefaultConfig() Config {
 			Heartbeat:   DefaultFastModel,
 			Aliases:     DefaultAliases(),
 		},
-		Routing: normalizeRoutingConfig(RoutingConfig{Mode: DefaultRoutingMode}),
-		Sandbox: normalizeSandboxConfig(SandboxConfig{}),
+		LocalLLM:   normalizeLocalLLMConfig(LocalLLMConfig{}),
+		Embeddings: normalizeAssistantEmbedConfig(memory.EmbedConfig{}),
+		Transcribe: normalizeTranscribeConfig(TranscribeConfig{}),
+		Routing:    normalizeRoutingConfig(RoutingConfig{Mode: DefaultRoutingMode}),
+		Sandbox:    normalizeSandboxConfig(SandboxConfig{}),
 	}
+}
+
+func normalizeAssistantEmbedConfig(e memory.EmbedConfig) memory.EmbedConfig {
+	norm, err := memory.NormalizeEmbedConfig(e, memory.EmbedConfig{})
+	if err == nil {
+		return norm
+	}
+	e.Provider = cmp.Or(strings.ToLower(strings.TrimSpace(e.Provider)), memory.DefaultEmbedProvider)
+	e.BaseURL = strings.TrimRight(cmp.Or(strings.TrimSpace(e.BaseURL), memory.DefaultEmbedBaseURL), "/")
+	e.Model = cmp.Or(strings.TrimSpace(e.Model), memory.DefaultEmbedModel)
+	e.KeepAlive = cmp.Or(strings.TrimSpace(e.KeepAlive), memory.DefaultEmbedKeepAlive)
+	return e
 }
 
 func normalizeRoutingConfig(r RoutingConfig) RoutingConfig {
@@ -416,6 +469,9 @@ func NormalizeConfig(cfg Config) Config {
 		}
 	}
 	cfg.Models.Aliases = aliases
+	cfg.LocalLLM = normalizeLocalLLMConfig(cfg.LocalLLM)
+	cfg.Embeddings = normalizeAssistantEmbedConfig(cfg.Embeddings)
+	cfg.Transcribe = normalizeTranscribeConfig(cfg.Transcribe)
 	cfg.Routing = normalizeRoutingConfig(cfg.Routing)
 	cfg.ExtraVaults = normalizeVaultMounts(cfg.ExtraVaults)
 	cfg.MCPServers = normalizeMCPServers(cfg.MCPServers)
@@ -423,6 +479,44 @@ func NormalizeConfig(cfg Config) Config {
 	cfg.Discord = normalizeDiscordConfig(cfg.Discord)
 	cfg.Sandbox = normalizeSandboxConfig(cfg.Sandbox)
 	return cfg
+}
+
+func normalizeTranscribeConfig(t TranscribeConfig) TranscribeConfig {
+	t.Command = strings.TrimSpace(t.Command)
+	t.ModelPath = strings.TrimSpace(t.ModelPath)
+	t.Language = cmp.Or(strings.TrimSpace(t.Language), "auto")
+	if t.AutoTranscribe == nil {
+		on := true
+		t.AutoTranscribe = &on
+	}
+	return t
+}
+
+func normalizeLocalLLMConfig(l LocalLLMConfig) LocalLLMConfig {
+	l.BaseURL = strings.TrimRight(cmp.Or(strings.TrimSpace(l.BaseURL), DefaultLocalLLMURL), "/")
+	l.Model = cmp.Or(strings.TrimSpace(l.Model), DefaultLocalLLMModel)
+	l.KeepAlive = cmp.Or(strings.TrimSpace(l.KeepAlive), DefaultLocalLLMKeepAlive)
+	if l.NumCtx <= 0 {
+		l.NumCtx = DefaultLocalLLMNumCtx
+	} else {
+		l.NumCtx = min(max(l.NumCtx, 2048), 65536)
+	}
+	return l
+}
+
+// ValidateLocalLLMConfig checks LocalLLMConfig when enabled.
+func ValidateLocalLLMConfig(l LocalLLMConfig) error {
+	l = normalizeLocalLLMConfig(l)
+	if !l.Enabled {
+		return nil
+	}
+	if err := validateHTTPURLField(l.BaseURL, "local_llm.base_url"); err != nil {
+		return err
+	}
+	if strings.TrimSpace(l.Model) == "" {
+		return newErr("local_llm.model is required when local_llm is enabled", http.StatusBadRequest)
+	}
+	return nil
 }
 
 func normalizeStringList(items []string) []string {
@@ -453,7 +547,7 @@ func normalizeSandboxConfig(s SandboxConfig) SandboxConfig {
 	if s.CPUs <= 0 {
 		s.CPUs = DefaultSandboxCPUs
 	} else {
-		s.CPUs = min(max(s.CPUs, 1), 4)
+		s.CPUs = min(max(s.CPUs, 1), 8)
 	}
 	if s.MemoryMB <= 0 {
 		s.MemoryMB = DefaultSandboxMemoryMB
@@ -470,6 +564,18 @@ func normalizeSandboxConfig(s SandboxConfig) SandboxConfig {
 	} else {
 		s.MaxFileMB = min(max(s.MaxFileMB, 1), 100)
 	}
+	if s.MaxActive <= 0 {
+		s.MaxActive = DefaultSandboxMaxActive
+	} else {
+		s.MaxActive = min(max(s.MaxActive, 1), 3)
+	}
+	if len(s.Profiles) > 0 {
+		lower := make([]string, len(s.Profiles))
+		for i, p := range s.Profiles {
+			lower[i] = strings.ToLower(strings.TrimSpace(p))
+		}
+		s.Profiles = normalizeStringList(lower)
+	}
 	s.ExtraAptPackages = normalizeStringList(s.ExtraAptPackages)
 	s.ExtraPipPackages = normalizeStringList(s.ExtraPipPackages)
 	return s
@@ -477,6 +583,9 @@ func normalizeSandboxConfig(s SandboxConfig) SandboxConfig {
 
 func copySandboxConfig(s SandboxConfig) SandboxConfig {
 	cp := normalizeSandboxConfig(s)
+	if len(cp.Profiles) > 0 {
+		cp.Profiles = append([]string(nil), cp.Profiles...)
+	}
 	if len(cp.ExtraAptPackages) > 0 {
 		cp.ExtraAptPackages = append([]string(nil), cp.ExtraAptPackages...)
 	}
@@ -484,6 +593,17 @@ func copySandboxConfig(s SandboxConfig) SandboxConfig {
 		cp.ExtraPipPackages = append([]string(nil), cp.ExtraPipPackages...)
 	}
 	return cp
+}
+
+// ValidateSandboxProfiles validates optional sandbox capability profile names.
+func ValidateSandboxProfiles(profiles []string) error {
+	for _, p := range profiles {
+		clean := strings.ToLower(strings.TrimSpace(p))
+		if !slices.Contains(ValidSandboxProfiles, clean) {
+			return newErr(fmt.Sprintf("invalid sandbox profile %q (valid: %s)", p, strings.Join(ValidSandboxProfiles, ", ")), http.StatusBadRequest)
+		}
+	}
+	return nil
 }
 
 // ValidateAptPackageName validates a Debian apt package name for sandbox image customization.
@@ -506,6 +626,9 @@ func ValidatePipPackageSpec(spec string) error {
 }
 
 func validateSandboxPackages(s SandboxConfig) error {
+	if err := ValidateSandboxProfiles(s.Profiles); err != nil {
+		return err
+	}
 	for _, pkg := range s.ExtraAptPackages {
 		if err := ValidateAptPackageName(pkg); err != nil {
 			return err
@@ -976,9 +1099,11 @@ func (c Config) View(effectiveVault string) ConfigView {
 			RequireApproval: cp.RequireApproval,
 		})
 	}
+	embView := normalizeAssistantEmbedConfig(c.Embeddings)
+	embView.APIKey = maskSecret(embView.APIKey)
 	return ConfigView{
 		Enabled:                  c.Enabled,
-		Configured:               strings.TrimSpace(c.APIKey) != "" || strings.TrimSpace(c.APIKeyOPRef) != "",
+		Configured:               strings.TrimSpace(c.APIKey) != "" || strings.TrimSpace(c.APIKeyOPRef) != "" || c.LocalLLM.Enabled,
 		BaseURL:                  c.BaseURL,
 		APIKeyHint:               maskSecret(c.APIKey),
 		APIKeyOPRef:              c.APIKeyOPRef,
@@ -994,6 +1119,9 @@ func (c Config) View(effectiveVault string) ConfigView {
 		ObserverThresholdTokens:  c.ObserverThresholdTokens,
 		ReflectorThresholdBytes:  c.ReflectorThresholdBytes,
 		Models:                   c.Models,
+		LocalLLM:                 normalizeLocalLLMConfig(c.LocalLLM),
+		Embeddings:               embView,
+		Transcribe:               normalizeTranscribeConfig(c.Transcribe),
 		Routing:                  normalizeRoutingConfig(c.Routing),
 		MCPServers:               redactMCPServers(c.MCPServers),
 		Credentials:              creds,

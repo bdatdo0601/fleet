@@ -80,13 +80,21 @@ ENV HOME=/tmp MPLCONFIGDIR=/tmp/matplotlib
 
 // RenderCustomContainerfile builds a single-stage Containerfile directly from an upstream base image
 // so BuildKit caches base layers without triggering local FROM oci-layout HTTP 500 lookups.
-func RenderCustomContainerfile(baseImage string, extraApt, extraPip []string) (string, error) {
+func RenderCustomContainerfile(baseImage string, profiles, extraApt, extraPip []string) (string, error) {
 	base := strings.TrimSpace(baseImage)
 	if base == "" || base == DefaultSandboxBaseImage {
 		base = defaultSandboxUpstreamOS
 	}
 	if strings.ContainsAny(base, "\r\n\t ") {
 		return "", newErr(fmt.Sprintf("invalid base image %q", base), http.StatusBadRequest)
+	}
+	normProfiles := make([]string, len(profiles))
+	for i, p := range profiles {
+		normProfiles[i] = strings.ToLower(strings.TrimSpace(p))
+	}
+	normProfiles = normalizeStringList(normProfiles)
+	if err := ValidateSandboxProfiles(normProfiles); err != nil {
+		return "", err
 	}
 	var aptClean, pipClean []string
 	for _, raw := range normalizeStringList(extraApt) {
@@ -104,6 +112,7 @@ func RenderCustomContainerfile(baseImage string, extraApt, extraPip []string) (s
 	var b strings.Builder
 	fmt.Fprintf(&b, "FROM %s\n", base)
 	b.WriteString(sandboxBaseSteps)
+	writeSandboxProfileLayers(&b, normProfiles)
 	if len(aptClean) > 0 {
 		fmt.Fprintf(&b, "RUN apt-get -o Acquire::ForceIPv4=true update && apt-get install -y -o Acquire::ForceIPv4=true -o Acquire::Retries=3 --no-install-recommends %s && rm -rf /var/lib/apt/lists/*\n", strings.Join(aptClean, " "))
 	}
@@ -116,6 +125,21 @@ func RenderCustomContainerfile(baseImage string, extraApt, extraPip []string) (s
 	}
 	b.WriteString(sandboxFooter)
 	return b.String(), nil
+}
+
+func writeSandboxProfileLayers(b *strings.Builder, profiles []string) {
+	for _, p := range profiles {
+		switch p {
+		case "media":
+			b.WriteString("RUN apt-get -o Acquire::ForceIPv4=true update && apt-get install -y -o Acquire::ForceIPv4=true -o Acquire::Retries=3 --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*\n")
+		case "office":
+			b.WriteString("RUN apt-get -o Acquire::ForceIPv4=true update && apt-get install -y -o Acquire::ForceIPv4=true -o Acquire::Retries=3 --no-install-recommends libreoffice-writer libreoffice-calc libreoffice-impress && rm -rf /var/lib/apt/lists/*\n")
+		case "browser":
+			b.WriteString("RUN apt-get -o Acquire::ForceIPv4=true update && apt-get install -y -o Acquire::ForceIPv4=true -o Acquire::Retries=3 --no-install-recommends chromium fonts-liberation && rm -rf /var/lib/apt/lists/*\n")
+			b.WriteString("RUN UV_COMPILE_BYTECODE=0 UV_LINK_MODE=copy uv pip install --system --no-cache playwright\n")
+			b.WriteString("ENV PLAYWRIGHT_BROWSERS_PATH=/usr/bin CHROMIUM_PATH=/usr/bin/chromium\n")
+		}
+	}
 }
 
 // SandboxStartOpts describes container launch arguments passed to a SandboxRunner.
@@ -180,6 +204,7 @@ type SandboxBuildResult struct {
 	Image            string   `json:"image"`
 	Network          string   `json:"network"`
 	BaseRebuilt      bool     `json:"base_rebuilt"`
+	Profiles         []string `json:"profiles,omitempty"`
 	ExtraAptPackages []string `json:"extra_apt_packages,omitempty"`
 	ExtraPipPackages []string `json:"extra_pip_packages,omitempty"`
 }
@@ -527,7 +552,7 @@ type SandboxManager struct {
 	mu      sync.Mutex
 	rootDir string
 	runner  SandboxRunner
-	active  *activeSandbox
+	active  map[string]*activeSandbox
 }
 
 // NewSandboxManager creates a SandboxManager rooted at rootDir using runner (or AppleContainerRunner by default).
@@ -535,7 +560,11 @@ func NewSandboxManager(rootDir string, runner SandboxRunner) *SandboxManager {
 	if runner == nil {
 		runner = NewAppleContainerRunner()
 	}
-	return &SandboxManager{rootDir: rootDir, runner: runner}
+	return &SandboxManager{
+		rootDir: rootDir,
+		runner:  runner,
+		active:  make(map[string]*activeSandbox),
+	}
 }
 
 func (m *SandboxManager) setRunner(r SandboxRunner) {
@@ -679,18 +708,48 @@ func (m *SandboxManager) WriteTextFile(channelID, relPath, content string) (stri
 	return cleanRel, nil
 }
 
+func (m *SandboxManager) ensureActiveMapLocked() {
+	if m.active == nil {
+		m.active = make(map[string]*activeSandbox)
+	}
+}
+
+func (m *SandboxManager) evictLRULocked(ctx context.Context, maxActive int) error {
+	for len(m.active) >= maxActive {
+		var oldest *activeSandbox
+		for _, cand := range m.active {
+			if cand.inFlight > 0 {
+				continue
+			}
+			if oldest == nil || cand.lastUsed.Before(oldest.lastUsed) {
+				oldest = cand
+			}
+		}
+		if oldest == nil {
+			return newErr("all sandbox container slots are currently busy executing commands", http.StatusConflict)
+		}
+		_ = m.runner.StopRemoveContainer(ctx, oldest.containerName)
+		delete(m.active, oldest.channelID)
+	}
+	return nil
+}
+
 func (m *SandboxManager) ensureActiveLocked(ctx context.Context, cfg SandboxConfig, channelID string) (*activeSandbox, error) {
+	m.ensureActiveMapLocked()
 	norm := normalizeSandboxConfig(cfg)
-	if m.active != nil && (m.active.channelID != channelID || m.active.image != norm.Image || m.active.network != norm.Network) {
-		if m.active.inFlight > 0 {
+	if cur, ok := m.active[channelID]; ok {
+		if cur.image == norm.Image && cur.network == norm.Network {
+			cur.lastUsed = time.Now()
+			return cur, nil
+		}
+		if cur.inFlight > 0 {
 			return nil, newErr("sandbox container is currently busy executing another command", http.StatusConflict)
 		}
-		_ = m.runner.StopRemoveContainer(ctx, m.active.containerName)
-		m.active = nil
+		_ = m.runner.StopRemoveContainer(ctx, cur.containerName)
+		delete(m.active, channelID)
 	}
-	if m.active != nil {
-		m.active.lastUsed = time.Now()
-		return m.active, nil
+	if err := m.evictLRULocked(ctx, norm.MaxActive); err != nil {
+		return nil, err
 	}
 	if err := m.runner.SystemStatus(ctx); err != nil {
 		return nil, err
@@ -717,7 +776,7 @@ func (m *SandboxManager) ensureActiveLocked(ctx context.Context, cfg SandboxConf
 	}); err != nil {
 		return nil, err
 	}
-	m.active = &activeSandbox{
+	act := &activeSandbox{
 		channelID:     channelID,
 		containerName: cName,
 		image:         norm.Image,
@@ -725,7 +784,8 @@ func (m *SandboxManager) ensureActiveLocked(ctx context.Context, cfg SandboxConf
 		gatewayIP:     gw,
 		lastUsed:      time.Now(),
 	}
-	return m.active, nil
+	m.active[channelID] = act
+	return act, nil
 }
 
 func snapshotDirMtimes(dir string) map[string]int64 {
@@ -823,7 +883,7 @@ func (m *SandboxManager) Exec(ctx context.Context, cfg SandboxConfig, channelID 
 	if timeoutSec <= 0 {
 		timeoutSec = 30
 	}
-	timeoutSec = min(timeoutSec, 120)
+	timeoutSec = min(timeoutSec, DefaultSandboxMaxTimeoutSec)
 	runCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 
@@ -905,7 +965,7 @@ func (m *SandboxManager) BuildImages(ctx context.Context, cfg SandboxConfig, reb
 	}
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 
-	cfBody, err := RenderCustomContainerfile("", norm.ExtraAptPackages, norm.ExtraPipPackages)
+	cfBody, err := RenderCustomContainerfile("", norm.Profiles, norm.ExtraAptPackages, norm.ExtraPipPackages)
 	if err != nil {
 		return SandboxBuildResult{}, err
 	}
@@ -913,22 +973,36 @@ func (m *SandboxManager) BuildImages(ctx context.Context, cfg SandboxConfig, reb
 	if err := os.WriteFile(cfPath, []byte(cfBody), 0o644); err != nil {
 		return SandboxBuildResult{}, err
 	}
-	if _, err := m.runner.BuildImage(ctx, norm.Image, cfPath, tmpDir, max(norm.CPUs, 4), max(norm.MemoryMB, 4096), rebuildBase); err != nil {
+	buildMemMB := max(norm.MemoryMB, 4096)
+	if len(norm.Profiles) > 0 {
+		for _, p := range norm.Profiles {
+			if p == "browser" || p == "office" {
+				buildMemMB = max(buildMemMB, 6144)
+				break
+			}
+		}
+	}
+	if _, err := m.runner.BuildImage(ctx, norm.Image, cfPath, tmpDir, max(norm.CPUs, 4), buildMemMB, rebuildBase); err != nil {
 		return SandboxBuildResult{}, err
 	}
 
 	m.mu.Lock()
-	if m.active != nil {
-		_ = m.runner.StopRemoveContainer(ctx, m.active.containerName)
-		m.active = nil
+	var toStop []string
+	for chID, act := range m.active {
+		toStop = append(toStop, act.containerName)
+		delete(m.active, chID)
 	}
 	m.mu.Unlock()
+	for _, cName := range toStop {
+		_ = m.runner.StopRemoveContainer(ctx, cName)
+	}
 
 	return SandboxBuildResult{
 		BaseImage:        defaultSandboxUpstreamOS,
 		Image:            norm.Image,
 		Network:          norm.Network,
 		BaseRebuilt:      rebuildBase,
+		Profiles:         append([]string(nil), norm.Profiles...),
 		ExtraAptPackages: append([]string(nil), norm.ExtraAptPackages...),
 		ExtraPipPackages: append([]string(nil), norm.ExtraPipPackages...),
 	}, nil
@@ -940,9 +1014,9 @@ func (m *SandboxManager) Reset(ctx context.Context, channelID string, clearOutpu
 	cName := "fleet-sb-" + SanitizeFileName(channelID)
 
 	m.mu.Lock()
-	if m.active != nil && m.active.channelID == channelID {
-		cName = m.active.containerName
-		m.active = nil
+	if act, ok := m.active[channelID]; ok {
+		cName = act.containerName
+		delete(m.active, channelID)
 	}
 	m.mu.Unlock()
 
@@ -961,29 +1035,37 @@ func (m *SandboxManager) Reset(ctx context.Context, channelID string, clearOutpu
 	return nil
 }
 
-// ReapIdle stops and removes an active sandbox container when idle for >= idleMinutes.
+// ReapIdle stops and removes active sandbox containers when idle for >= idleMinutes.
 func (m *SandboxManager) ReapIdle(ctx context.Context, idleMinutes int) {
 	if idleMinutes <= 0 {
 		idleMinutes = DefaultSandboxIdleMinutes
 	}
+	threshold := time.Duration(idleMinutes) * time.Minute
 	m.mu.Lock()
-	act := m.active
-	if act == nil || act.inFlight > 0 || time.Since(act.lastUsed) < time.Duration(idleMinutes)*time.Minute {
-		m.mu.Unlock()
-		return
+	var expired []string
+	for chID, act := range m.active {
+		if act.inFlight > 0 || time.Since(act.lastUsed) < threshold {
+			continue
+		}
+		expired = append(expired, act.containerName)
+		delete(m.active, chID)
 	}
-	m.active = nil
 	m.mu.Unlock()
-	_ = m.runner.StopRemoveContainer(ctx, act.containerName)
+	for _, cName := range expired {
+		_ = m.runner.StopRemoveContainer(ctx, cName)
+	}
 }
 
-// Close stops and removes any active sandbox container during shutdown.
+// Close stops and removes all active sandbox containers during shutdown.
 func (m *SandboxManager) Close(ctx context.Context) {
 	m.mu.Lock()
-	act := m.active
-	m.active = nil
+	var toStop []string
+	for chID, act := range m.active {
+		toStop = append(toStop, act.containerName)
+		delete(m.active, chID)
+	}
 	m.mu.Unlock()
-	if act != nil {
-		_ = m.runner.StopRemoveContainer(ctx, act.containerName)
+	for _, cName := range toStop {
+		_ = m.runner.StopRemoveContainer(ctx, cName)
 	}
 }

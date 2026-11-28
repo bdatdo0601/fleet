@@ -127,17 +127,68 @@ func newOpenRouterClient() *openRouterClient {
 	}
 }
 
-func applyOpenRouterHeaders(req *http.Request, apiKey string) {
+func applyOpenRouterHeaders(req *http.Request, apiKey string, isLocal bool) {
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("HTTP-Referer", "https://github.com/bdatdo0601/fleet")
-	req.Header.Set("X-Title", "fleet-assistant")
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	if !isLocal {
+		req.Header.Set("HTTP-Referer", "https://github.com/bdatdo0601/fleet")
+		req.Header.Set("X-Title", "fleet-assistant")
+	}
 }
 
-func buildChatRequestBody(cfg Config, model string, msgs []ChatMessage, tools []ToolSpec, stream bool, maxTokens int) map[string]any {
+func resolveLLMTarget(cfg Config, model string) (baseURL, apiKey, effModel string, isLocal bool, err error) {
+	trimmed := strings.TrimSpace(model)
+	if len(trimmed) >= 6 && strings.EqualFold(trimmed[:6], "local/") {
+		if !cfg.LocalLLM.Enabled {
+			return "", "", "", true, newErr("local LLM is disabled; enable local_llm in Assistant Settings", http.StatusBadRequest)
+		}
+		localCfg := normalizeLocalLLMConfig(cfg.LocalLLM)
+		suffix := strings.TrimSpace(trimmed[6:])
+		if suffix == "" || strings.EqualFold(suffix, "default") {
+			suffix = localCfg.Model
+		}
+		if suffix == "" {
+			return "", "", "", true, newErr("local_llm.model is not configured", http.StatusBadRequest)
+		}
+		return localCfg.BaseURL, "", suffix, true, nil
+	}
+	if strings.TrimSpace(cfg.APIKey) == "" {
+		return "", "", "", false, newErr("assistant API key is not configured", http.StatusBadRequest)
+	}
+	return cfg.BaseURL, cfg.APIKey, cmp.Or(trimmed, concreteDefaultChat(cfg)), false, nil
+}
+
+func flattenPromptParts(msgs []ChatMessage) []ChatMessage {
+	out := make([]ChatMessage, len(msgs))
+	for i, m := range msgs {
+		out[i] = m
+		if parts, ok := m.Content.([]PromptPart); ok {
+			var b strings.Builder
+			for _, p := range parts {
+				if p.Text == "" {
+					continue
+				}
+				if b.Len() > 0 {
+					b.WriteString("\n\n")
+				}
+				b.WriteString(p.Text)
+			}
+			out[i].Content = b.String()
+		}
+	}
+	return out
+}
+
+func buildChatRequestBody(cfg Config, targetBaseURL, model string, msgs []ChatMessage, tools []ToolSpec, stream bool, maxTokens int, isLocal bool) map[string]any {
+	sendMsgs := msgs
+	if isLocal {
+		sendMsgs = flattenPromptParts(msgs)
+	}
 	body := map[string]any{
 		"model":    model,
-		"messages": msgs,
+		"messages": sendMsgs,
 		"stream":   stream,
 	}
 	if maxTokens > 0 {
@@ -150,7 +201,19 @@ func buildChatRequestBody(cfg Config, model string, msgs []ChatMessage, tools []
 	if stream {
 		body["stream_options"] = map[string]any{"include_usage": true}
 	}
-	if strings.Contains(strings.ToLower(cfg.BaseURL), "openrouter.ai") {
+	if isLocal {
+		if strings.Contains(strings.ToLower(targetBaseURL), ":11434") {
+			localCfg := normalizeLocalLLMConfig(cfg.LocalLLM)
+			if localCfg.KeepAlive != "" {
+				body["keep_alive"] = localCfg.KeepAlive
+			}
+			if localCfg.NumCtx > 0 {
+				body["options"] = map[string]any{"num_ctx": localCfg.NumCtx}
+			}
+		}
+		return body
+	}
+	if strings.Contains(strings.ToLower(targetBaseURL), "openrouter.ai") {
 		prov := map[string]any{}
 		if cfg.ZDR {
 			prov["zdr"] = true
@@ -174,19 +237,20 @@ func (c *openRouterClient) StreamChat(
 	tools []ToolSpec,
 	onDelta func(string),
 ) (ChatTurnResult, error) {
-	if strings.TrimSpace(cfg.APIKey) == "" {
-		return ChatTurnResult{}, newErr("assistant API key is not configured", http.StatusBadRequest)
+	baseURL, apiKey, effModel, isLocal, err := resolveLLMTarget(cfg, model)
+	if err != nil {
+		return ChatTurnResult{}, err
 	}
-	payload := buildChatRequestBody(cfg, model, msgs, tools, true, 8192)
+	payload := buildChatRequestBody(cfg, baseURL, effModel, msgs, tools, true, 8192, isLocal)
 	rawBody, err := json.Marshal(payload)
 	if err != nil {
 		return ChatTurnResult{}, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.BaseURL+"/chat/completions", bytes.NewReader(rawBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+"/chat/completions", bytes.NewReader(rawBody))
 	if err != nil {
 		return ChatTurnResult{}, err
 	}
-	applyOpenRouterHeaders(req, cfg.APIKey)
+	applyOpenRouterHeaders(req, apiKey, isLocal)
 
 	httpCli := c.streamHTTP
 	if httpCli == nil {
@@ -358,23 +422,24 @@ func sortedToolCalls(tcMap map[int]*ToolCall) []ToolCall {
 
 // CompleteText performs a non-streaming completion for Observer, Reflector, or connectivity checks.
 func (c *openRouterClient) CompleteText(ctx context.Context, cfg Config, model, sysPrompt, userPrompt string, maxTokens int) (string, error) {
-	if strings.TrimSpace(cfg.APIKey) == "" {
-		return "", newErr("assistant API key is not configured", http.StatusBadRequest)
+	baseURL, apiKey, effModel, isLocal, err := resolveLLMTarget(cfg, model)
+	if err != nil {
+		return "", err
 	}
 	msgs := []ChatMessage{
 		{Role: "system", Content: sysPrompt},
 		{Role: "user", Content: userPrompt},
 	}
-	payload := buildChatRequestBody(cfg, model, msgs, nil, false, maxTokens)
+	payload := buildChatRequestBody(cfg, baseURL, effModel, msgs, nil, false, maxTokens, isLocal)
 	rawBody, err := json.Marshal(payload)
 	if err != nil {
 		return "", err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.BaseURL+"/chat/completions", bytes.NewReader(rawBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+"/chat/completions", bytes.NewReader(rawBody))
 	if err != nil {
 		return "", err
 	}
-	applyOpenRouterHeaders(req, cfg.APIKey)
+	applyOpenRouterHeaders(req, apiKey, isLocal)
 	httpCli := c.streamHTTP
 	if httpCli == nil {
 		httpCli = c.http
@@ -484,7 +549,7 @@ func (c *openRouterClient) DecideState(ctx context.Context, cfg Config, state ma
 	if err != nil {
 		return nil, err
 	}
-	applyOpenRouterHeaders(req, cfg.APIKey)
+	applyOpenRouterHeaders(req, cfg.APIKey, false)
 	httpCli := c.streamHTTP
 	if httpCli == nil {
 		httpCli = c.http

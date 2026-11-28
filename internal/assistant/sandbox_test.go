@@ -126,7 +126,7 @@ func TestSandboxPackageValidationAndContainerfile(t *testing.T) {
 		}
 	}
 
-	cf, err := RenderCustomContainerfile("fleet-sandbox:base", []string{"graphviz"}, []string{"seaborn>=0.13"})
+	cf, err := RenderCustomContainerfile("fleet-sandbox:base", nil, []string{"graphviz"}, []string{"seaborn>=0.13"})
 	if err != nil {
 		t.Fatalf("RenderCustomContainerfile failed: %v", err)
 	}
@@ -373,7 +373,12 @@ func TestSandboxManagerAndAssistantTools(t *testing.T) {
 		t.Fatalf("expected heartbeat sandbox_exec to require HITL approval, got %v", err)
 	}
 
-	// Switching channel evicts the previous active container (max 1 running).
+	// Switching channel with MaxActive=1 evicts the previous active container.
+	cfgOne := eng.Config()
+	cfgOne.Sandbox.MaxActive = 1
+	if _, err := eng.UpdateConfig(cfgOne, false); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := eng.executeTool(t.Context(), ToolCall{
 		ID: "tc9", Type: "function",
 		Function: ToolCallFunction{Name: "sandbox_exec", Arguments: `{"command":"echo briefing"}`},
@@ -386,11 +391,14 @@ func TestSandboxManagerAndAssistantTools(t *testing.T) {
 
 	// Idle reap stops active container.
 	eng.sandbox.mu.Lock()
-	eng.sandbox.active.lastUsed = time.Now().Add(-5 * time.Minute)
+	eng.sandbox.active["briefing"].lastUsed = time.Now().Add(-5 * time.Minute)
 	eng.sandbox.mu.Unlock()
 	eng.sandbox.ReapIdle(t.Context(), 1)
-	if eng.sandbox.active != nil {
-		t.Fatalf("expected active sandbox to be reaped when idle")
+	eng.sandbox.mu.Lock()
+	remaining := len(eng.sandbox.active)
+	eng.sandbox.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("expected active sandbox to be reaped when idle, remaining=%d", remaining)
 	}
 
 	// sandbox_install_packages: validates upfront, gates with HITL, persists & rebuilds on approval.
@@ -691,5 +699,112 @@ func TestEgressProxyCloseTerminatesActiveTunnels(t *testing.T) {
 	case <-upstreamDone:
 	case <-time.After(2 * time.Second):
 		t.Fatalf("expected upstream tunnel connection to close on px.Close()")
+	}
+}
+
+func TestSandboxWarmLRUPoolAndProfiles(t *testing.T) {
+	if err := ValidateSandboxProfiles([]string{"browser", "office", "media"}); err != nil {
+		t.Fatalf("ValidateSandboxProfiles failed: %v", err)
+	}
+	if err := ValidateSandboxProfiles([]string{"invalid-profile"}); err == nil {
+		t.Fatalf("expected invalid sandbox profile to be rejected")
+	}
+
+	cf, err := RenderCustomContainerfile("", []string{"browser", "office", "media"}, nil, nil)
+	if err != nil {
+		t.Fatalf("RenderCustomContainerfile with profiles failed: %v", err)
+	}
+	for _, want := range []string{"chromium", "playwright", "libreoffice-writer", "ffmpeg"} {
+		if !strings.Contains(cf, want) {
+			t.Fatalf("expected profile package %q in Containerfile:\n%s", want, cf)
+		}
+	}
+
+	runner := newMockSandboxRunner()
+	mgr := NewSandboxManager(t.TempDir(), runner)
+	cfg := DefaultConfig().Sandbox
+	cfg.Enabled = true
+	if cfg.CPUs != 4 || cfg.MemoryMB != 4096 || cfg.IdleMinutes != 20 || cfg.MaxFileMB != 50 || cfg.MaxActive != 2 {
+		t.Fatalf("unexpected 16GB default sandbox config: %+v", cfg)
+	}
+
+	// Start two channels concurrently -> both remain warm in pool.
+	if _, err := mgr.Exec(t.Context(), cfg, "ch1", SandboxExecRequest{Command: "echo 1"}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(15 * time.Millisecond)
+	if _, err := mgr.Exec(t.Context(), cfg, "ch2", SandboxExecRequest{Command: "echo 2"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.stopped) != 0 {
+		t.Fatalf("expected 0 evictions for MaxActive=2 with 2 channels, got %v", runner.stopped)
+	}
+
+	// Third channel evicts LRU ("ch1"), keeping "ch2" and "ch3".
+	if _, err := mgr.Exec(t.Context(), cfg, "ch3", SandboxExecRequest{Command: "echo 3"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.stopped) != 1 || runner.stopped[0] != "fleet-sb-ch1" {
+		t.Fatalf("expected LRU fleet-sb-ch1 to be evicted, got stopped=%v", runner.stopped)
+	}
+
+	// Reset removes only target channel.
+	if err := mgr.Reset(t.Context(), "ch2", false); err != nil {
+		t.Fatal(err)
+	}
+	mgr.mu.Lock()
+	_, hasCH2 := mgr.active["ch2"]
+	_, hasCH3 := mgr.active["ch3"]
+	mgr.mu.Unlock()
+	if hasCH2 || !hasCH3 {
+		t.Fatalf("expected only ch2 removed on Reset, hasCH2=%v hasCH3=%v", hasCH2, hasCH3)
+	}
+
+	// Selective idle reap only removes expired entries.
+	if _, err := mgr.Exec(t.Context(), cfg, "ch4", SandboxExecRequest{Command: "echo 4"}); err != nil {
+		t.Fatal(err)
+	}
+	mgr.mu.Lock()
+	mgr.active["ch3"].lastUsed = time.Now().Add(-30 * time.Minute)
+	mgr.active["ch4"].lastUsed = time.Now()
+	mgr.mu.Unlock()
+	mgr.ReapIdle(t.Context(), 20)
+	mgr.mu.Lock()
+	_, hasCH3After := mgr.active["ch3"]
+	_, hasCH4After := mgr.active["ch4"]
+	mgr.mu.Unlock()
+	if hasCH3After || !hasCH4After {
+		t.Fatalf("expected selective reap to drop ch3 and keep ch4, hasCH3=%v hasCH4=%v", hasCH3After, hasCH4After)
+	}
+
+	// BuildImages flushes active containers and allocates 6144 MB floor for browser/office profiles.
+	cfg.Profiles = []string{"browser"}
+	res, err := mgr.BuildImages(t.Context(), cfg, false)
+	if err != nil {
+		t.Fatalf("BuildImages failed: %v", err)
+	}
+	if len(res.Profiles) != 1 || res.Profiles[0] != "browser" {
+		t.Fatalf("expected browser profile in build result: %+v", res)
+	}
+	if len(runner.buildMemMB) == 0 || runner.buildMemMB[len(runner.buildMemMB)-1] < 6144 {
+		t.Fatalf("expected >=6144 MB build memory for browser profile, got %v", runner.buildMemMB)
+	}
+	mgr.mu.Lock()
+	activeAfterBuild := len(mgr.active)
+	mgr.mu.Unlock()
+	if activeAfterBuild != 0 {
+		t.Fatalf("expected active pool flushed after BuildImages, got %d", activeAfterBuild)
+	}
+
+	// Close stops all remaining warm containers.
+	if _, err := mgr.Exec(t.Context(), cfg, "ch5", SandboxExecRequest{Command: "echo 5"}); err != nil {
+		t.Fatal(err)
+	}
+	mgr.Close(t.Context())
+	mgr.mu.Lock()
+	activeAfterClose := len(mgr.active)
+	mgr.mu.Unlock()
+	if activeAfterClose != 0 {
+		t.Fatalf("expected 0 active after Close, got %d", activeAfterClose)
 	}
 }

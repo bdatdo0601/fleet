@@ -261,6 +261,9 @@ func (e *Engine) buildPromptMessages(ctx context.Context, ch Channel, tail []Mes
 	if sbSection := buildSandboxPromptSection(e.Config()); sbSection != "" {
 		sysStatic.WriteString(sbSection)
 	}
+	if e.Config().Transcribe.Enabled {
+		sysStatic.WriteString("\n## Local Audio Transcription\n- Uploaded voice notes/audio files are transcribed locally on the lighthouse; use `transcribe_audio` to transcribe audio files in sandbox `/work` or mounted vaults.\n")
+	}
 	if lhSection := e.buildLighthouseWorkerPromptSection(); lhSection != "" {
 		sysStatic.WriteString(lhSection)
 	}

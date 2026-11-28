@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"flag"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -340,5 +341,76 @@ func TestCLIAssistantSetupPreservesEnableZDRAndRejectsSandboxConflict(t *testing
 	rc = Run([]string{"assistant", "setup", "--sandbox-enable", "--sandbox-disable", "--no-test"}, &IO{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errBuf})
 	if rc == 0 || !strings.Contains(errBuf.String(), "cannot be combined") {
 		t.Fatalf("expected sandbox flag conflict error, got rc=%d err=%q", rc, errBuf.String())
+	}
+}
+
+func TestCLIAssistant16GBAndMemoryEmbedCommands(t *testing.T) {
+	f, _, _ := setupCLIServer(t)
+
+	var out, errBuf bytes.Buffer
+	rc := Run([]string{
+		"assistant", "setup",
+		"--sandbox-max-active", "3",
+		"--sandbox-profiles", "browser,media",
+		"--local-llm", "--local-llm-url", "http://127.0.0.1:11434/v1", "--local-llm-model", "qwen3:8b",
+		"--embed", "--embed-url", "http://127.0.0.1:11434", "--embed-model", "nomic-embed-text",
+		"--transcribe", "--transcribe-lang", "en",
+		"--no-test",
+	}, &IO{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errBuf})
+	if rc != 0 {
+		t.Fatalf("assistant setup 16GB flags failed: rc=%d out=%q err=%q", rc, out.String(), errBuf.String())
+	}
+	cfg := f.Assistant.Config()
+	if cfg.Sandbox.MaxActive != 3 || len(cfg.Sandbox.Profiles) != 2 || !cfg.LocalLLM.Enabled || !cfg.Embeddings.Enabled || !cfg.Transcribe.Enabled || cfg.Transcribe.Language != "en" {
+		t.Fatalf("unexpected 16GB config after CLI setup: %+v", cfg)
+	}
+
+	out.Reset()
+	errBuf.Reset()
+	rc = Run([]string{"assistant", "status"}, &IO{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errBuf})
+	if rc != 0 || !strings.Contains(out.String(), "max_active=3") || !strings.Contains(out.String(), "local llm:") || !strings.Contains(out.String(), "vault embeddings:") || !strings.Contains(out.String(), "transcribe:") {
+		t.Fatalf("unexpected assistant status output: rc=%d out=%q err=%q", rc, out.String(), errBuf.String())
+	}
+
+	// `fleet memory embed` CLI subcommands against httptest embed server.
+	embedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Input []string `json:"input"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		vecs := make([][]float64, len(req.Input))
+		for i := range req.Input {
+			vecs[i] = []float64{1, 0}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"embeddings": vecs})
+	}))
+	defer embedSrv.Close()
+
+	out.Reset()
+	errBuf.Reset()
+	rc = Run([]string{"memory", "embed", "setup", "--provider", "ollama", "--url", embedSrv.URL, "--model", "nomic-embed-text"}, &IO{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errBuf})
+	if rc != 0 || !strings.Contains(out.String(), "enabled") || !strings.Contains(out.String(), "nomic-embed-text") {
+		t.Fatalf("memory embed setup failed: rc=%d out=%q err=%q", rc, out.String(), errBuf.String())
+	}
+
+	out.Reset()
+	errBuf.Reset()
+	rc = Run([]string{"memory", "embed", "status"}, &IO{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errBuf})
+	if rc != 0 || !strings.Contains(out.String(), "nomic-embed-text") {
+		t.Fatalf("memory embed status failed: rc=%d out=%q err=%q", rc, out.String(), errBuf.String())
+	}
+
+	out.Reset()
+	errBuf.Reset()
+	rc = Run([]string{"memory", "embed", "backfill"}, &IO{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errBuf})
+	if rc != 0 || !strings.Contains(out.String(), "embedded") {
+		t.Fatalf("memory embed backfill failed: rc=%d out=%q err=%q", rc, out.String(), errBuf.String())
+	}
+
+	out.Reset()
+	errBuf.Reset()
+	rc = Run([]string{"memory", "embed", "disable"}, &IO{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errBuf})
+	if rc != 0 || !strings.Contains(out.String(), "disabled") {
+		t.Fatalf("memory embed disable failed: rc=%d out=%q err=%q", rc, out.String(), errBuf.String())
 	}
 }

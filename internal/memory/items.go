@@ -188,7 +188,8 @@ func writeMemoryInTx(tx *sql.Tx, existing *Item, p UpsertParams, hash string, lo
 			`UPDATE memories
 			 SET kind = ?, tier = ?, status = ?, summary = ?, body = ?, content_hash = ?,
 			     source = ?, locked = ?, device = ?, harness = ?, session_id = ?, origin_path = ?,
-			     superseded_by = ?, revision = ?, updated_at = ?, source_mtime = ?
+			     superseded_by = ?, revision = ?, updated_at = ?, source_mtime = ?,
+			     embedding = NULL, embedding_model = ''
 			 WHERE id = ?`,
 			p.Kind, p.Tier, p.Status, p.Summary, p.Body, hash,
 			p.Source, boolToInt(locked), p.Device, p.Harness, p.SessionID, cmp.Or(p.OriginPath, existing.OriginPath),
@@ -270,6 +271,9 @@ func (s *Store) upsertLocked(db *sql.DB, p UpsertParams) (UpsertResult, error) {
 	if err := tx.Commit(); err != nil {
 		return UpsertResult{}, err
 	}
+	if res.Action == "created" || res.Action == "updated" {
+		s.invalidateVectorCache()
+	}
 	return res, nil
 }
 
@@ -332,6 +336,9 @@ func (s *Store) SyncBatch(device string, items []UpsertParams) (SyncBatchResult,
 	}
 	if err := tx.Commit(); err != nil {
 		return SyncBatchResult{}, err
+	}
+	if res.Created > 0 || res.Updated > 0 {
+		s.invalidateVectorCache()
 	}
 	return res, nil
 }
@@ -448,7 +455,11 @@ func (s *Store) Delete(scope, key string, hard bool, device, harness, sessionID,
 	if err := insertRevisionTx(tx, existing.ID, existing.Scope, existing.Key, rev, existing.Kind, existing.Tier, "archived", existing.Summary, existing.Body, src, device, harness, sessionID, cmp.Or(reason, "archived"), now); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.invalidateVectorCache()
+	return nil
 }
 
 func (s *Store) historyLocked(db *sql.DB, scope, key string, limit int) ([]Revision, error) {
@@ -617,4 +628,58 @@ func (s *Store) Promote(fromScope, fromKey, toScope, toKey, tier, summary, devic
 		return Item{}, err
 	}
 	return ur.Item, nil
+}
+
+// SetEmbedding stores an L2-normalized embedding blob and model tag for memory id.
+func (s *Store) SetEmbedding(id int64, model string, blob []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	db, err := s.dbLocked()
+	if err != nil {
+		return err
+	}
+	if _, err := db.Exec(`UPDATE memories SET embedding = ?, embedding_model = ? WHERE id = ?`, blob, model, id); err != nil {
+		return err
+	}
+	s.invalidateVectorCache()
+	return nil
+}
+
+// ListNeedingEmbedding returns up to limit active memories whose embedding is missing or for a different model.
+func (s *Store) ListNeedingEmbedding(model string, limit int) ([]Item, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	db, err := s.dbLocked()
+	if err != nil {
+		return nil, err
+	}
+	limit = clampLimit(limit, 32)
+	q := `SELECT ` + itemSelectCols + ` FROM memories m
+		WHERE m.status = 'active' AND (m.embedding IS NULL OR m.embedding_model != ?)
+		ORDER BY m.updated_at DESC, m.id DESC LIMIT ?`
+	return queryItems(db, q, []any{model, limit}, false)
+}
+
+// EmbeddingCounts returns (embeddedForModel, pendingForModel, totalActive) across active memories.
+func (s *Store) EmbeddingCounts(model string) (embedded, pending, total int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	db, err := s.dbLocked()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	if err = db.QueryRow(`SELECT COUNT(*) FROM memories WHERE status = 'active'`).Scan(&total); err != nil {
+		return 0, 0, 0, err
+	}
+	if strings.TrimSpace(model) == "" {
+		return 0, total, total, nil
+	}
+	if err = db.QueryRow(
+		`SELECT COUNT(*) FROM memories WHERE status = 'active' AND embedding IS NOT NULL AND embedding_model = ?`,
+		model,
+	).Scan(&embedded); err != nil {
+		return 0, 0, 0, err
+	}
+	pending = max(total-embedded, 0)
+	return embedded, pending, total, nil
 }

@@ -91,12 +91,20 @@ func SanitizeFileName(name string) string {
 }
 
 var extraMIMEByExt = map[string]string{
+	".aac":  "audio/aac",
 	".csv":  "text/csv; charset=utf-8",
 	".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	".flac": "audio/flac",
 	".json": "application/json; charset=utf-8",
+	".m4a":  "audio/mp4",
 	".md":   "text/markdown; charset=utf-8",
+	".mp3":  "audio/mpeg",
+	".ogg":  "audio/ogg",
+	".opus": "audio/opus",
 	".pdf":  "application/pdf",
 	".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	".wav":  "audio/wav",
+	".webm": "audio/webm",
 	".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }
 
