@@ -511,11 +511,21 @@ func TestDiscordGatewaySyncAndTwoWayTurn(t *testing.T) {
 		},
 	})
 	div := waitForPost(t, disc.postCh, 5*time.Second, func(p recordedDiscordPost) bool {
-		c, _ := p.Payload["content"].(string)
-		return strings.Contains(c, "New context started")
+		embeds, _ := p.Payload["embeds"].([]any)
+		if len(embeds) == 0 {
+			return false
+		}
+		emb, _ := embeds[0].(map[string]any)
+		title, _ := emb["title"].(string)
+		return strings.Contains(title, "Context Cleared")
 	})
 	if div.ChannelID != "555555555555555555" {
 		t.Fatalf("unexpected divider channel %s", div.ChannelID)
+	}
+	divEmb := div.Payload["embeds"].([]any)[0].(map[string]any)
+	divDesc, _ := divEmb["description"].(string)
+	if !strings.Contains(divDesc, "Discord") || !strings.Contains(divDesc, "long-term memory") {
+		t.Fatalf("unexpected /new embed description: %q", divDesc)
 	}
 	ch, err := eng.store.GetChannel("general")
 	if err != nil || ch.ContextEpoch < 1 {
@@ -968,5 +978,60 @@ func TestDiscordAutoSyncMultipleGuildsRequiresID(t *testing.T) {
 
 	if _, err := eng.SyncDiscordChannels(context.Background()); err == nil || !strings.Contains(err.Error(), "multiple servers") {
 		t.Fatalf("expected multiple servers error when guild_id is omitted, got %v", err)
+	}
+}
+
+func TestDiscordContextClearedNoteFromWebReset(t *testing.T) {
+	disc := newMockDiscordServer(t)
+	defer disc.Close()
+
+	eng, cfg := setupDiscordTestEngine(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}, disc)
+
+	noMirror := false
+	cfg.Discord.MirrorWebTurns = &noMirror
+	if _, err := eng.UpdateConfig(cfg, false); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := eng.ResetChannel("general", true); err != nil {
+		t.Fatal(err)
+	}
+
+	note := waitForPost(t, disc.postCh, 5*time.Second, func(p recordedDiscordPost) bool {
+		return p.ChannelID == "555555555555555555"
+	})
+	embeds, _ := note.Payload["embeds"].([]any)
+	if len(embeds) != 1 {
+		t.Fatalf("expected 1 embed in context-cleared post, got %+v", note.Payload)
+	}
+	emb, _ := embeds[0].(map[string]any)
+	title, _ := emb["title"].(string)
+	desc, _ := emb["description"].(string)
+	footer, _ := emb["footer"].(map[string]any)
+	footerText, _ := footer["text"].(string)
+	if !strings.Contains(title, "Context Cleared") {
+		t.Fatalf("expected Context Cleared title, got %q", title)
+	}
+	if !strings.Contains(desc, "Fleet Console") || !strings.Contains(desc, "long-term memory") {
+		t.Fatalf("unexpected embed description: %q", desc)
+	}
+	if !strings.Contains(footerText, "#general") || !strings.Contains(footerText, "Context #2") {
+		t.Fatalf("unexpected embed footer: %q", footerText)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var cursor string
+	for time.Now().Before(deadline) {
+		var err error
+		cursor, err = eng.store.GetDiscordCursor("general")
+		if err == nil && cursor != "" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if cursor != "880000000000000001" {
+		t.Fatalf("expected Discord cursor updated to 880000000000000001, got %q", cursor)
 	}
 }

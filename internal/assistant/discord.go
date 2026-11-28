@@ -533,10 +533,10 @@ func (e *Engine) handleDiscordMessageCreate(ctx context.Context, tok string, cfg
 		return
 	}
 	if strings.EqualFold(content, "/new") || strings.EqualFold(content, "/reset") {
-		if _, err := e.resetChannelInternal(ctx, fleetCh, false, "discord"); err == nil {
-			_, _ = e.discordClient().CreateMessage(ctx, tok, msg.ChannelID, map[string]any{
-				"content": "── *New context started (long-term memory preserved)* ──",
-			})
+		if ch, err := e.resetChannelInternal(ctx, fleetCh, false, "discord"); err == nil {
+			if msgID, pErr := e.discordClient().CreateMessage(ctx, tok, msg.ChannelID, buildContextClearedDiscordPayload(ch, "discord", false)); pErr == nil && msgID != "" {
+				_ = e.store.SetDiscordCursor(ch.ID, msg.ChannelID, msgID)
+			}
 		}
 		return
 	}
@@ -830,20 +830,44 @@ func (e *Engine) sendApprovalToDiscord(cfg Config, ch Channel, apr Approval) boo
 	return true
 }
 
-func (e *Engine) postDiscordDivider(ctx context.Context, cfg Config, channelID, text string) {
+func buildContextClearedDiscordPayload(ch Channel, origin string, clearHistory bool) map[string]any {
+	var desc string
+	switch {
+	case origin == "discord":
+		desc = "Conversation context was cleared in **Discord**. Messages above this note are no longer part of active context.\n\n*Discord history and long-term memory are preserved.*"
+	case clearHistory:
+		desc = "Conversation context and Fleet Console thread were cleared in **Fleet Console**. Messages above this note are no longer part of active context.\n\n*Discord history and long-term memory are preserved.*"
+	default:
+		desc = "Conversation context was cleared in **Fleet Console**. Messages above this note are no longer part of active context.\n\n*Discord history and long-term memory are preserved.*"
+	}
+	return map[string]any{
+		"embeds": []map[string]any{{
+			"title":       "🧹 Context Cleared — New Conversation",
+			"description": desc,
+			"color":       0x8b5cf6,
+			"footer":      map[string]string{"text": fmt.Sprintf("Fleet Assistant · #%s · Context #%d", ch.ID, ch.ContextEpoch)},
+			"timestamp":   time.Now().UTC().Format(time.RFC3339),
+		}},
+	}
+}
+
+func (e *Engine) postDiscordContextCleared(ctx context.Context, cfg Config, ch Channel, origin string, clearHistory bool) {
 	if !cfg.Discord.Enabled {
 		return
 	}
-	discChannelID := cfg.Discord.Channels[channelID]
+	discChannelID := cfg.Discord.Channels[ch.ID]
 	if discChannelID == "" {
 		return
 	}
-	tok, err := e.resolveDiscordBotToken(ctx, cfg.Discord)
+	postCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	tok, err := e.resolveDiscordBotToken(postCtx, cfg.Discord)
 	if err != nil {
 		return
 	}
-	if msgID, pErr := e.discordClient().CreateMessage(ctx, tok, discChannelID, map[string]any{"content": text}); pErr == nil && msgID != "" {
-		_ = e.store.SetDiscordCursor(channelID, discChannelID, msgID)
+	payload := buildContextClearedDiscordPayload(ch, origin, clearHistory)
+	if msgID, pErr := e.discordClient().CreateMessage(postCtx, tok, discChannelID, payload); pErr == nil && msgID != "" {
+		_ = e.store.SetDiscordCursor(ch.ID, discChannelID, msgID)
 	}
 }
 

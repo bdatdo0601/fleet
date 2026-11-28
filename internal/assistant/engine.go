@@ -828,7 +828,7 @@ func (e *Engine) resetChannelInternal(ctx context.Context, id string, clearHisto
 	if origin != "discord" {
 		cfg := e.Config()
 		if cfg.Discord.Enabled && cfg.Discord.Channels[ch.ID] != "" {
-			go e.postDiscordDivider(context.WithoutCancel(ctx), cfg, ch.ID, "── *New chat context started in Fleet Console* ──")
+			go e.postDiscordContextCleared(context.WithoutCancel(ctx), cfg, ch, origin, clearHistory)
 		}
 	}
 	return ch, nil
