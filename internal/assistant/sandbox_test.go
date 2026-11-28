@@ -515,3 +515,97 @@ func TestSocketSandboxRunnerBridge(t *testing.T) {
 		t.Fatalf("RunSandboxAgent returned unexpected error on shutdown: %v", aErr)
 	}
 }
+
+func TestAppleContainerRunnerBuildImageDNSRecoveryAndTailError(t *testing.T) {
+	if got := truncateTailText("short text", 20); got != "short text" {
+		t.Fatalf("truncateTailText short = %q", got)
+	}
+	if got := truncateTailText("alpha-beta-gamma-tail", 10); got != "...gamma-tail" {
+		t.Fatalf("truncateTailText long = %q", got)
+	}
+
+	tmp := t.TempDir()
+	logFile := filepath.Join(tmp, "calls.log")
+	stateFile := filepath.Join(tmp, "state")
+	fakeBin := filepath.Join(tmp, "container")
+
+	script := `#!/bin/sh
+echo "$*" >> "` + logFile + `"
+cmd="$1"
+sub="$2"
+if [ "$cmd" = "builder" ] && [ "$sub" = "status" ]; then
+  if [ -f "` + stateFile + `.running" ]; then
+    echo "builder is running"
+    exit 0
+  fi
+  echo "builder is not running"
+  exit 0
+fi
+if [ "$cmd" = "builder" ] && [ "$sub" = "start" ]; then
+  touch "` + stateFile + `.running"
+  exit 0
+fi
+if [ "$cmd" = "builder" ] && [ "$sub" = "delete" ]; then
+  rm -f "` + stateFile + `.running"
+  exit 0
+fi
+if [ "$cmd" = "build" ]; then
+  if [ -f "` + stateFile + `.fail_tail" ]; then
+    python3 -c 'print("PREFIX " + "x"*2000 + " FATAL_END_MARKER")'
+    exit 1
+  fi
+  if [ ! -f "` + stateFile + `.dns_retried" ] && [ -f "` + stateFile + `.fail_dns_once" ]; then
+    touch "` + stateFile + `.dns_retried"
+    echo "Temporary failure resolving 'deb.debian.org'" >&2
+    exit 1
+  fi
+  echo "build ok"
+  exit 0
+fi
+exit 0
+`
+	if err := os.WriteFile(fakeBin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runner := &AppleContainerRunner{bin: fakeBin}
+	cfPath := filepath.Join(tmp, "Containerfile")
+	if err := os.WriteFile(cfPath, []byte("FROM scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Case 1: builder not running initially -> started with explicit --dns before build.
+	if out, err := runner.BuildImage(t.Context(), "test:c1", cfPath, tmp, 4, 4096, false); err != nil || !strings.Contains(out, "build ok") {
+		t.Fatalf("Case 1 BuildImage failed: out=%q err=%v", out, err)
+	}
+	calls1Bytes, _ := os.ReadFile(logFile)
+	calls1 := string(calls1Bytes)
+	startIdx := strings.Index(calls1, "builder start --cpus 4 --memory 4096M --dns 1.1.1.1 --dns 8.8.8.8")
+	buildIdx := strings.Index(calls1, "build -t test:c1")
+	if startIdx == -1 || buildIdx == -1 || startIdx > buildIdx {
+		t.Fatalf("expected builder start with DNS before build, got log:\n%s", calls1)
+	}
+
+	// Case 2: already-running builder hits DNS failure -> deleted, restarted with DNS, retried cleanly.
+	_ = os.WriteFile(logFile, nil, 0o644)
+	_ = os.WriteFile(stateFile+".fail_dns_once", []byte("1"), 0o644)
+	if out, err := runner.BuildImage(t.Context(), "test:c2", cfPath, tmp, 4, 4096, false); err != nil || !strings.Contains(out, "build ok") {
+		t.Fatalf("Case 2 BuildImage DNS recovery failed: out=%q err=%v", out, err)
+	}
+	calls2Bytes, _ := os.ReadFile(logFile)
+	calls2 := string(calls2Bytes)
+	delIdx := strings.Index(calls2, "builder delete --force")
+	restartIdx := strings.Index(calls2, "builder start --cpus 4 --memory 4096M --dns 1.1.1.1 --dns 8.8.8.8")
+	if delIdx == -1 || restartIdx == -1 || delIdx > restartIdx {
+		t.Fatalf("expected builder delete then DNS start, got log:\n%s", calls2)
+	}
+
+	// Case 3: persistent non-DNS failure keeps the tail of build output.
+	_ = os.WriteFile(stateFile+".fail_tail", []byte("1"), 0o644)
+	_, err := runner.BuildImage(t.Context(), "test:c3", cfPath, tmp, 4, 4096, false)
+	if err == nil {
+		t.Fatal("Case 3 expected BuildImage error")
+	}
+	if !strings.Contains(err.Error(), "FATAL_END_MARKER") || strings.Contains(err.Error(), "PREFIX ") {
+		t.Fatalf("expected error to preserve tail and drop prefix, got:\n%s", err.Error())
+	}
+}

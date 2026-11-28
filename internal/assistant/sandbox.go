@@ -316,18 +316,67 @@ func (r *AppleContainerRunner) ImageExists(ctx context.Context, image string) bo
 	return exec.CommandContext(ctx, bin, "image", "inspect", image).Run() == nil
 }
 
+func truncateTailText(s string, maxLen int) string {
+	s = strings.TrimSpace(s)
+	if maxLen <= 0 || len(s) <= maxLen {
+		return s
+	}
+	runes := []rune(s)
+	if len(runes) <= maxLen {
+		return s
+	}
+	return "..." + string(runes[len(runes)-maxLen:])
+}
+
+func (r *AppleContainerRunner) startBuilderWithDNS(ctx context.Context, bin string, cpus, memoryMB int) error {
+	args := []string{
+		"builder", "start",
+		"--cpus", strconv.Itoa(max(cpus, 4)),
+		"--memory", fmt.Sprintf("%dM", max(memoryMB, 4096)),
+		"--dns", "1.1.1.1",
+		"--dns", "8.8.8.8",
+	}
+	out, err := exec.CommandContext(ctx, bin, args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func (r *AppleContainerRunner) ensureBuilderDNS(ctx context.Context, bin string, cpus, memoryMB int) {
+	out, err := exec.CommandContext(ctx, bin, "builder", "status").CombinedOutput()
+	if err == nil && !strings.Contains(strings.ToLower(string(out)), "not running") {
+		return
+	}
+	if startErr := r.startBuilderWithDNS(ctx, bin, cpus, memoryMB); startErr != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "sandbox builder start warning: %v\n", startErr)
+	}
+}
+
+func (r *AppleContainerRunner) runContainerBuild(ctx context.Context, bin string, args []string) (string, error) {
+	cmd := exec.CommandContext(ctx, bin, args...)
+	var outBuf bytes.Buffer
+	mw := io.MultiWriter(os.Stderr, &outBuf)
+	cmd.Stdout = mw
+	cmd.Stderr = mw
+	err := cmd.Run()
+	return outBuf.String(), err
+}
+
 // BuildImage builds an OCI image tag from containerfilePath using `container build` while streaming progress.
 func (r *AppleContainerRunner) BuildImage(ctx context.Context, tag, containerfilePath, contextDir string, cpus, memoryMB int, noCache bool) (string, error) {
 	bin := r.binary()
 	if bin == "" {
 		return "", newErr("Apple `container` CLI not found", http.StatusServiceUnavailable)
 	}
+	buildCPUs := max(cpus, 4)
+	buildMemMB := max(memoryMB, 4096)
 	args := []string{
 		"build",
 		"-t", tag,
 		"-f", containerfilePath,
-		"-c", strconv.Itoa(max(cpus, 4)),
-		"-m", fmt.Sprintf("%dM", max(memoryMB, 4096)),
+		"-c", strconv.Itoa(buildCPUs),
+		"-m", fmt.Sprintf("%dM", buildMemMB),
 		"--progress", "plain",
 	}
 	if noCache {
@@ -335,16 +384,20 @@ func (r *AppleContainerRunner) BuildImage(ctx context.Context, tag, containerfil
 	}
 	args = append(args, contextDir)
 
-	cmd := exec.CommandContext(ctx, bin, args...)
-	var outBuf bytes.Buffer
-	mw := io.MultiWriter(os.Stderr, &outBuf)
-	cmd.Stdout = mw
-	cmd.Stderr = mw
-	if err := cmd.Run(); err != nil {
-		out := outBuf.String()
-		return out, fmt.Errorf("container build %s failed: %w\n%s", tag, err, truncateText(out, 1500))
+	r.ensureBuilderDNS(ctx, bin, buildCPUs, buildMemMB)
+	out, err := r.runContainerBuild(ctx, bin, args)
+	if err != nil && strings.Contains(out, "Temporary failure resolving") {
+		_, _ = fmt.Fprintf(os.Stderr, "sandbox build DNS failure detected; recreating builder with --dns 1.1.1.1 --dns 8.8.8.8...\n")
+		_ = exec.CommandContext(ctx, bin, "builder", "delete", "--force").Run()
+		if startErr := r.startBuilderWithDNS(ctx, bin, buildCPUs, buildMemMB); startErr != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "sandbox builder restart warning: %v\n", startErr)
+		}
+		out, err = r.runContainerBuild(ctx, bin, args)
 	}
-	return outBuf.String(), nil
+	if err != nil {
+		return out, fmt.Errorf("container build %s failed: %w\n%s", tag, err, truncateTailText(out, 1800))
+	}
+	return out, nil
 }
 
 // StartContainer starts a hardened, offline micro-VM container with bounded resources.
