@@ -1069,12 +1069,49 @@ func fileExists(p string) bool {
 	return err == nil
 }
 
+func resolveLighthousePullTarget(repoDir, owner string, gitEnv map[string]string) (string, string) {
+	branchOut, _, err := RunAsOwner(owner, repoDir, gitEnv, 15*time.Second, "git", "-C", repoDir, "symbolic-ref", "--short", "HEAD")
+	branch := strings.TrimSpace(branchOut)
+	if err != nil || branch == "" {
+		return "", ""
+	}
+	remote := "origin"
+	if remoteOut, _, err := RunAsOwner(owner, repoDir, gitEnv, 15*time.Second, "git", "-C", repoDir, "config", "--get", "branch."+branch+".remote"); err == nil {
+		if r := strings.TrimSpace(remoteOut); r != "" {
+			remote = r
+		}
+	}
+	mergeRef := branch
+	if mergeOut, _, err := RunAsOwner(owner, repoDir, gitEnv, 15*time.Second, "git", "-C", repoDir, "config", "--get-all", "branch."+branch+".merge"); err == nil {
+		var unique []string
+		seen := make(map[string]struct{})
+		for line := range strings.SplitSeq(mergeOut, "\n") {
+			ref := strings.TrimSpace(line)
+			if ref == "" {
+				continue
+			}
+			if _, ok := seen[ref]; !ok {
+				seen[ref] = struct{}{}
+				unique = append(unique, ref)
+			}
+		}
+		if len(unique) == 1 {
+			mergeRef = unique[0]
+		}
+	}
+	return remote, mergeRef
+}
+
 func pullLighthouseRepo(repoDir, owner string) string {
 	gitEnv := map[string]string{"GIT_TERMINAL_PROMPT": "0", "GIT_SSH_COMMAND": "ssh -o BatchMode=yes"}
 	if !fileExists(filepath.Join(repoDir, ".git")) {
 		return ""
 	}
-	if _, pullErrOut, err := RunAsOwner(owner, repoDir, gitEnv, 60*time.Second, "git", "-C", repoDir, "pull", "--ff-only", "-q"); err != nil {
+	args := []string{"-C", repoDir, "-c", "pull.rebase=false", "pull", "--no-rebase", "--ff-only", "-q"}
+	if remote, mergeRef := resolveLighthousePullTarget(repoDir, owner, gitEnv); remote != "" && mergeRef != "" {
+		args = append(args, remote, mergeRef)
+	}
+	if _, pullErrOut, err := RunAsOwner(owner, repoDir, gitEnv, 60*time.Second, "git", args...); err != nil {
 		detail := cmp.Or(strings.TrimSpace(pullErrOut), "git pull failed")
 		_, _ = fmt.Fprintf(os.Stderr, "self-update skipped: %s\n", detail)
 	}

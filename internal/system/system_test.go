@@ -268,3 +268,74 @@ func TestBuildAgentPlistWithPathEnvAndShell(t *testing.T) {
 		t.Fatalf("did not expect SHELL key when Shell is empty:\n%s", withoutShell)
 	}
 }
+
+func TestPullLighthouseRepoIgnoresPullRebaseAndMultipleMergeRefs(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	runGit := func(dir string, args ...string) string {
+		t.Helper()
+		cmdArgs := args
+		if dir != "" {
+			cmdArgs = append([]string{"-C", dir}, args...)
+		}
+		out, err := exec.Command("git", cmdArgs...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v failed: %v\n%s", cmdArgs, err, string(out))
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	tmp := t.TempDir()
+	originDir := filepath.Join(tmp, "origin.git")
+	cloneDir := filepath.Join(tmp, "clone")
+	pusherDir := filepath.Join(tmp, "pusher")
+
+	runGit("", "init", "--bare", "-b", "main", originDir)
+	runGit("", "clone", originDir, cloneDir)
+	runGit(cloneDir, "checkout", "-B", "main")
+	runGit(cloneDir, "config", "user.name", "Test")
+	runGit(cloneDir, "config", "user.email", "test@example.com")
+
+	if err := os.WriteFile(filepath.Join(cloneDir, "README.md"), []byte("v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(cloneDir, "add", "README.md")
+	runGit(cloneDir, "commit", "-m", "initial")
+	runGit(cloneDir, "push", "-u", "origin", "main")
+
+	// Create and push a second branch so branch.main.merge can reference two heads.
+	runGit(cloneDir, "checkout", "-b", "other")
+	if err := os.WriteFile(filepath.Join(cloneDir, "OTHER.md"), []byte("other\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(cloneDir, "add", "OTHER.md")
+	runGit(cloneDir, "commit", "-m", "other branch commit")
+	runGit(cloneDir, "push", "origin", "other")
+	runGit(cloneDir, "checkout", "main")
+
+	// Advance origin/main from a separate clone.
+	runGit("", "clone", "-b", "main", originDir, pusherDir)
+	runGit(pusherDir, "config", "user.name", "Pusher")
+	runGit(pusherDir, "config", "user.email", "pusher@example.com")
+	if err := os.WriteFile(filepath.Join(pusherDir, "README.md"), []byte("v2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(pusherDir, "add", "README.md")
+	runGit(pusherDir, "commit", "-m", "update main")
+	runGit(pusherDir, "push", "origin", "main")
+	wantSHA := runGit(pusherDir, "rev-parse", "HEAD")
+
+	// Reproduce the failing config on the local repo: pull.rebase=true + multiple merge refs.
+	runGit(cloneDir, "config", "pull.rebase", "true")
+	runGit(cloneDir, "config", "--add", "branch.main.merge", "refs/heads/other")
+
+	out, err := exec.Command("git", "-C", cloneDir, "pull", "--ff-only", "-q").CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "Cannot rebase onto multiple branches") {
+		t.Fatalf("expected raw git pull to fail with multiple branches error, got err=%v out=%q", err, string(out))
+	}
+
+	if got := pullLighthouseRepo(cloneDir, ""); got != wantSHA {
+		t.Fatalf("pullLighthouseRepo() HEAD = %q, want %q", got, wantSHA)
+	}
+}
