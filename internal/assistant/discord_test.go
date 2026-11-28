@@ -2,6 +2,7 @@ package assistant
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"encoding/base64"
@@ -12,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -20,9 +22,17 @@ import (
 	"time"
 )
 
+type recordedDiscordFile struct {
+	FieldName   string
+	Filename    string
+	ContentType string
+	Data        []byte
+}
+
 type recordedDiscordPost struct {
 	ChannelID string
 	Payload   map[string]any
+	Files     []recordedDiscordFile
 }
 
 type recordedDiscordInteractionResp struct {
@@ -32,23 +42,25 @@ type recordedDiscordInteractionResp struct {
 }
 
 type mockDiscordServer struct {
-	t            *testing.T
-	httpSrv      *httptest.Server
-	mu           sync.Mutex
-	conn         net.Conn
-	bw           *bufio.Writer
-	identified   chan string
-	posts        []recordedDiscordPost
-	postCh       chan recordedDiscordPost
-	interactions []recordedDiscordInteractionResp
-	interCh      chan recordedDiscordInteractionResp
-	meStatus     int
-	meBody       string
-	botUserID    string
-	msgSeq       atomic.Int64
-	guilds       []discordGuild
-	channels     []discordChannel
-	nextChID     atomic.Int64
+	t                   *testing.T
+	httpSrv             *httptest.Server
+	mu                  sync.Mutex
+	conn                net.Conn
+	bw                  *bufio.Writer
+	identified          chan string
+	posts               []recordedDiscordPost
+	postCh              chan recordedDiscordPost
+	interactions        []recordedDiscordInteractionResp
+	interCh             chan recordedDiscordInteractionResp
+	meStatus            int
+	meBody              string
+	botUserID           string
+	msgSeq              atomic.Int64
+	guilds              []discordGuild
+	channels            []discordChannel
+	nextChID            atomic.Int64
+	failMultipartStatus int
+	cdnFiles            map[string][]byte
 }
 
 func newMockDiscordServer(t *testing.T) *mockDiscordServer {
@@ -61,6 +73,7 @@ func newMockDiscordServer(t *testing.T) *mockDiscordServer {
 		meStatus:   http.StatusOK,
 		meBody:     `{"id":"999999999999999999","username":"FleetBot","bot":true}`,
 		botUserID:  "999999999999999999",
+		cdnFiles:   make(map[string][]byte),
 	}
 	m.httpSrv = httptest.NewServer(http.HandlerFunc(m.handleHTTP))
 	return m
@@ -146,9 +159,46 @@ func (m *mockDiscordServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, `[]`)
 	case strings.HasPrefix(path, "/channels/") && strings.HasSuffix(path, "/messages") && r.Method == http.MethodPost:
 		chID := strings.TrimSuffix(strings.TrimPrefix(path, "/channels/"), "/messages")
-		var payload map[string]any
-		_ = json.NewDecoder(r.Body).Decode(&payload)
-		rec := recordedDiscordPost{ChannelID: chID, Payload: payload}
+		rec := recordedDiscordPost{ChannelID: chID}
+		if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
+			m.mu.Lock()
+			failStatus := m.failMultipartStatus
+			m.mu.Unlock()
+			if failStatus >= 400 {
+				w.WriteHeader(failStatus)
+				_, _ = fmt.Fprintf(w, `{"message":"mock multipart failure %d"}`, failStatus)
+				return
+			}
+			mr, mrErr := r.MultipartReader()
+			if mrErr != nil {
+				http.Error(w, mrErr.Error(), http.StatusBadRequest)
+				return
+			}
+			for {
+				part, pErr := mr.NextPart()
+				if pErr == io.EOF {
+					break
+				}
+				if pErr != nil {
+					http.Error(w, pErr.Error(), http.StatusBadRequest)
+					return
+				}
+				data, _ := io.ReadAll(part)
+				if part.FormName() == "payload_json" {
+					_ = json.Unmarshal(data, &rec.Payload)
+				} else {
+					rec.Files = append(rec.Files, recordedDiscordFile{
+						FieldName:   part.FormName(),
+						Filename:    part.FileName(),
+						ContentType: part.Header.Get("Content-Type"),
+						Data:        data,
+					})
+				}
+				_ = part.Close()
+			}
+		} else {
+			_ = json.NewDecoder(r.Body).Decode(&rec.Payload)
+		}
 		m.mu.Lock()
 		m.posts = append(m.posts, rec)
 		m.mu.Unlock()
@@ -159,6 +209,20 @@ func (m *mockDiscordServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		id := fmt.Sprintf("8800000000000000%02d", m.msgSeq.Add(1))
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintf(w, `{"id":%q,"channel_id":%q}`, id, chID)
+	case strings.HasPrefix(path, "/cdn/") && r.Method == http.MethodGet:
+		if r.Header.Get("Authorization") != "" {
+			http.Error(w, "bot authorization must not be sent to CDN", http.StatusBadRequest)
+			return
+		}
+		m.mu.Lock()
+		data, ok := m.cdnFiles[path]
+		m.mu.Unlock()
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+		_, _ = w.Write(data)
 	case strings.HasPrefix(path, "/channels/") && strings.HasSuffix(path, "/typing") && r.Method == http.MethodPost:
 		w.WriteHeader(http.StatusNoContent)
 	case strings.HasPrefix(path, "/interactions/") && strings.HasSuffix(path, "/callback") && r.Method == http.MethodPost:
@@ -1102,5 +1166,322 @@ func TestDiscordOutboxNotifyDelivery(t *testing.T) {
 		if it.ID == unmapped.ID && it.Delivered {
 			t.Fatalf("expected unmapped outbox item to remain undelivered when webhook is disabled")
 		}
+	}
+}
+
+func TestDiscordOutboundFileAttachments(t *testing.T) {
+	disc := newMockDiscordServer(t)
+	defer disc.Close()
+
+	var step atomic.Int32
+	eng, cfg := setupDiscordTestEngine(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			http.NotFound(w, r)
+			return
+		}
+		var req struct {
+			Stream bool `json:"stream"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if !req.Stream {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":""}}]}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		if step.Add(1) == 1 {
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tc_pub\",\"type\":\"function\",\"function\":{\"name\":\"sandbox_publish_file\",\"arguments\":\"{\\\"path\\\":\\\"out/chart.png\\\",\\\"title\\\":\\\"Usage Chart\\\"}\"}}]}}]}\n\n")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Here is your chart.\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}, disc)
+
+	cfg.Sandbox.Enabled = true
+	if _, err := eng.UpdateConfig(cfg, false); err != nil {
+		t.Fatal(err)
+	}
+
+	pngBytes := []byte("\x89PNG\r\n\x1a\nmock-png-payload")
+	workDir, err := eng.sandbox.WorkDir("general")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workDir, "out", "chart.png"), pngBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	eng.Start(t.Context())
+	select {
+	case <-disc.identified:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for Discord Gateway Identify")
+	}
+
+	_ = disc.SendGatewayJSON(map[string]any{
+		"op": 0, "t": "MESSAGE_CREATE", "s": 2,
+		"d": map[string]any{
+			"id": "100000000000000501", "channel_id": "555555555555555555",
+			"content": "make a chart", "author": map[string]any{"id": "222222222222222222", "bot": false},
+		},
+	})
+
+	post := waitForPost(t, disc.postCh, 5*time.Second, func(p recordedDiscordPost) bool {
+		c, _ := p.Payload["content"].(string)
+		return strings.Contains(c, "Here is your chart.")
+	})
+	if len(post.Files) != 1 {
+		t.Fatalf("expected 1 multipart attachment, got %+v", post.Files)
+	}
+	f := post.Files[0]
+	if f.FieldName != "files[0]" || f.Filename != "chart.png" || !strings.HasPrefix(f.ContentType, "image/png") {
+		t.Fatalf("unexpected multipart file metadata: %+v", f)
+	}
+	if !bytes.Equal(f.Data, pngBytes) {
+		t.Fatalf("expected exact png bytes, got %q", f.Data)
+	}
+	ref, _ := post.Payload["message_reference"].(map[string]any)
+	if ref["message_id"] != "100000000000000501" {
+		t.Fatalf("expected message_reference to original discord msg, got %+v", ref)
+	}
+	atts, _ := post.Payload["attachments"].([]any)
+	if len(atts) != 1 {
+		t.Fatalf("expected payload_json attachments metadata, got %+v", post.Payload["attachments"])
+	}
+}
+
+func TestDiscordOutboundFileAttachmentOversizedAndFallback(t *testing.T) {
+	t.Run("oversized_skips_upload_and_links_console", func(t *testing.T) {
+		disc := newMockDiscordServer(t)
+		defer disc.Close()
+
+		var step atomic.Int32
+		eng, cfg := setupDiscordTestEngine(t, func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/chat/completions" {
+				http.NotFound(w, r)
+				return
+			}
+			var req struct {
+				Stream bool `json:"stream"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if !req.Stream {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"choices":[{"message":{"content":""}}]}`)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			if step.Add(1) == 1 {
+				_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tc_big\",\"type\":\"function\",\"function\":{\"name\":\"sandbox_publish_file\",\"arguments\":\"{\\\"path\\\":\\\"out/big.txt\\\"}\"}}]}}]}\n\n")
+				_, _ = io.WriteString(w, "data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n")
+				_, _ = io.WriteString(w, "data: [DONE]\n\n")
+				return
+			}
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Generated big.txt.\"}}]}\n\n")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		}, disc)
+
+		cfg.Sandbox.Enabled = true
+		if _, err := eng.UpdateConfig(cfg, false); err != nil {
+			t.Fatal(err)
+		}
+		eng.discordMaxUploadBytes = 64
+
+		workDir, err := eng.sandbox.WorkDir("general")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(workDir, "out", "big.txt"), bytes.Repeat([]byte("a"), 200), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		eng.Start(t.Context())
+		if _, _, err := eng.EnqueueUserMessage("general", "create big file", ""); err != nil {
+			t.Fatal(err)
+		}
+
+		post := waitForPost(t, disc.postCh, 5*time.Second, func(p recordedDiscordPost) bool {
+			c, _ := p.Payload["content"].(string)
+			return strings.Contains(c, "Generated big.txt.")
+		})
+		if len(post.Files) != 0 {
+			t.Fatalf("expected oversized file not uploaded as multipart, got %d files", len(post.Files))
+		}
+		c, _ := post.Payload["content"].(string)
+		if !strings.Contains(c, "big.txt") || !strings.Contains(c, "http://127.0.0.1:4771/#chat/general") {
+			t.Fatalf("expected fallback Fleet Console link and filename, got %q", c)
+		}
+	})
+
+	t.Run("multipart_failure_falls_back_to_text", func(t *testing.T) {
+		disc := newMockDiscordServer(t)
+		defer disc.Close()
+		disc.failMultipartStatus = http.StatusForbidden
+
+		var step atomic.Int32
+		eng, cfg := setupDiscordTestEngine(t, func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/chat/completions" {
+				http.NotFound(w, r)
+				return
+			}
+			var req struct {
+				Stream bool `json:"stream"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if !req.Stream {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"choices":[{"message":{"content":""}}]}`)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			if step.Add(1) == 1 {
+				_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tc_sm\",\"type\":\"function\",\"function\":{\"name\":\"sandbox_publish_file\",\"arguments\":\"{\\\"path\\\":\\\"out/note.txt\\\"}\"}}]}}]}\n\n")
+				_, _ = io.WriteString(w, "data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n")
+				_, _ = io.WriteString(w, "data: [DONE]\n\n")
+				return
+			}
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Generated note.txt.\"}}]}\n\n")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		}, disc)
+
+		cfg.Sandbox.Enabled = true
+		if _, err := eng.UpdateConfig(cfg, false); err != nil {
+			t.Fatal(err)
+		}
+		eng.discordMaxUploadBytes = 1024 * 1024
+
+		workDir, err := eng.sandbox.WorkDir("general")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(workDir, "out", "note.txt"), []byte("hello"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		eng.Start(t.Context())
+		if _, _, err := eng.EnqueueUserMessage("general", "create note", ""); err != nil {
+			t.Fatal(err)
+		}
+
+		post := waitForPost(t, disc.postCh, 5*time.Second, func(p recordedDiscordPost) bool {
+			c, _ := p.Payload["content"].(string)
+			return strings.Contains(c, "Generated note.txt.")
+		})
+		if len(post.Files) != 0 {
+			t.Fatalf("expected fallback JSON post without files, got %d files", len(post.Files))
+		}
+		c, _ := post.Payload["content"].(string)
+		if !strings.Contains(c, "Could not attach file(s) to Discord") || !strings.Contains(c, "note.txt") || !strings.Contains(c, "http://127.0.0.1:4771/#chat/general") {
+			t.Fatalf("expected attachment error fallback note, got %q", c)
+		}
+	})
+}
+
+func TestDiscordInboundAttachments(t *testing.T) {
+	disc := newMockDiscordServer(t)
+	defer disc.Close()
+	csvData := []byte("name,score\nalice,10\n")
+	disc.mu.Lock()
+	disc.cdnFiles["/cdn/report.csv"] = csvData
+	disc.mu.Unlock()
+
+	var llmCalls atomic.Int32
+	eng, _ := setupDiscordTestEngine(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			http.NotFound(w, r)
+			return
+		}
+		var req struct {
+			Stream bool `json:"stream"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if !req.Stream {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":""}}]}`)
+			return
+		}
+		llmCalls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Inspected report.csv.\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}, disc)
+
+	eng.Start(t.Context())
+	select {
+	case <-disc.identified:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for Discord Gateway Identify")
+	}
+
+	attPayload := map[string]any{
+		"id": "100000000000000601", "channel_id": "555555555555555555",
+		"content": "",
+		"author":  map[string]any{"id": "222222222222222222", "bot": false},
+		"attachments": []map[string]any{{
+			"id":           "att_1",
+			"filename":     "report.csv",
+			"content_type": "text/csv",
+			"size":         len(csvData),
+			"url":          disc.APIURL() + "/cdn/report.csv",
+		}},
+	}
+	_ = disc.SendGatewayJSON(map[string]any{"op": 0, "t": "MESSAGE_CREATE", "s": 2, "d": attPayload})
+
+	reply := waitForPost(t, disc.postCh, 5*time.Second, func(p recordedDiscordPost) bool {
+		c, _ := p.Payload["content"].(string)
+		return strings.Contains(c, "Inspected report.csv.")
+	})
+	if reply.ChannelID != "555555555555555555" {
+		t.Fatalf("unexpected reply channel %s", reply.ChannelID)
+	}
+
+	// Resending same external ID must be deduplicated without creating extra files.
+	_ = disc.SendGatewayJSON(map[string]any{"op": 0, "t": "MESSAGE_CREATE", "s": 3, "d": attPayload})
+	time.Sleep(150 * time.Millisecond)
+	if llmCalls.Load() != 1 {
+		t.Fatalf("expected 1 LLM call across duplicate attachment message, got %d", llmCalls.Load())
+	}
+
+	files, err := eng.store.ListChannelFiles("general", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files[0].Name != "report.csv" || files[0].Direction != "upload" {
+		t.Fatalf("expected exactly 1 saved upload report.csv, got %+v", files)
+	}
+
+	workDir, err := eng.sandbox.WorkDir("general")
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged, err := os.ReadFile(filepath.Join(workDir, "in", "report.csv"))
+	if err != nil || !bytes.Equal(staged, csvData) {
+		t.Fatalf("expected report.csv staged in /work/in/, got %q (%v)", staged, err)
+	}
+
+	msgs, err := eng.store.ListMessages("general", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawUserFileMsg bool
+	for _, m := range msgs {
+		if m.Role == "user" && m.ExternalID == "100000000000000601" {
+			if len(m.Widgets) != 1 || m.Widgets[0].Kind != "files" {
+				t.Fatalf("expected files widget on inbound Discord user message, got %+v", m.Widgets)
+			}
+			if !strings.Contains(m.Content, "attached file") {
+				t.Fatalf("expected default prompt for attachment-only message, got %q", m.Content)
+			}
+			sawUserFileMsg = true
+		}
+	}
+	if !sawUserFileMsg {
+		t.Fatalf("missing user message for Discord attachment")
 	}
 }

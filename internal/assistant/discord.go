@@ -9,7 +9,10 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"mime"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"strings"
 	"sync"
@@ -22,11 +25,16 @@ const (
 	defaultDiscordAPIBase = "https://discord.com/api/v10"
 	// Intents: GUILDS (1<<0) | GUILD_MESSAGES (1<<9) | DIRECT_MESSAGES (1<<12) | MESSAGE_CONTENT (1<<15) = 37377
 	discordGatewayIntents = 37377
+
+	defaultDiscordMaxUploadBytes int64 = 10 * 1024 * 1024
+	discordUploadSafetyMargin    int64 = 256 * 1024
+	discordMaxFilesPerMessage          = 10
 )
 
 type discordAPI struct {
-	baseURL    string
-	httpClient *http.Client
+	baseURL      string
+	httpClient   *http.Client
+	uploadClient *http.Client
 }
 
 type discordUser struct {
@@ -60,11 +68,34 @@ type DiscordSyncResult struct {
 	Channels         map[string]string `json:"channels"`
 }
 
+type discordAttachment struct {
+	ID          string `json:"id"`
+	Filename    string `json:"filename"`
+	ContentType string `json:"content_type,omitempty"`
+	Size        int64  `json:"size,omitempty"`
+	URL         string `json:"url"`
+}
+
+type discordUploadFile struct {
+	ID       string
+	Name     string
+	MimeType string
+	Size     int64
+	Data     []byte
+}
+
+type discordFileRef struct {
+	ID   string
+	Name string
+	Size int64
+}
+
 type discordMessage struct {
-	ID        string      `json:"id"`
-	ChannelID string      `json:"channel_id"`
-	Content   string      `json:"content"`
-	Author    discordUser `json:"author"`
+	ID          string              `json:"id"`
+	ChannelID   string              `json:"channel_id"`
+	Content     string              `json:"content"`
+	Author      discordUser         `json:"author"`
+	Attachments []discordAttachment `json:"attachments,omitempty"`
 }
 
 type discordInteraction struct {
@@ -89,8 +120,9 @@ type gatewayPayload struct {
 
 func newDiscordAPI(baseURL string) *discordAPI {
 	return &discordAPI{
-		baseURL:    strings.TrimRight(cmp.Or(strings.TrimSpace(baseURL), defaultDiscordAPIBase), "/"),
-		httpClient: &http.Client{Timeout: 15 * time.Second},
+		baseURL:      strings.TrimRight(cmp.Or(strings.TrimSpace(baseURL), defaultDiscordAPIBase), "/"),
+		httpClient:   &http.Client{Timeout: 15 * time.Second},
+		uploadClient: &http.Client{Timeout: 60 * time.Second},
 	}
 }
 
@@ -179,6 +211,98 @@ func (d *discordAPI) CreateMessage(ctx context.Context, token, channelID string,
 	}
 	err := d.doJSON(ctx, token, http.MethodPost, "/channels/"+url.PathEscape(channelID)+"/messages", payload, &res)
 	return res.ID, err
+}
+
+func (d *discordAPI) CreateMessageWithFiles(ctx context.Context, token, channelID string, payload map[string]any, files []discordUploadFile) (string, error) {
+	if len(files) == 0 {
+		return d.CreateMessage(ctx, token, channelID, payload)
+	}
+	payloadCopy := maps.Clone(payload)
+	if payloadCopy == nil {
+		payloadCopy = make(map[string]any)
+	}
+	attMeta := make([]map[string]any, 0, len(files))
+	for i, f := range files {
+		attMeta = append(attMeta, map[string]any{
+			"id":       i,
+			"filename": f.Name,
+		})
+	}
+	payloadCopy["attachments"] = attMeta
+	payloadBytes, err := json.Marshal(payloadCopy)
+	if err != nil {
+		return "", err
+	}
+
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+
+	jsonHdr := textproto.MIMEHeader{}
+	jsonHdr.Set("Content-Disposition", `form-data; name="payload_json"`)
+	jsonHdr.Set("Content-Type", "application/json")
+	jsonPart, err := mw.CreatePart(jsonHdr)
+	if err != nil {
+		return "", err
+	}
+	if _, err := jsonPart.Write(payloadBytes); err != nil {
+		return "", err
+	}
+
+	for i, f := range files {
+		fileHdr := textproto.MIMEHeader{}
+		fileHdr.Set("Content-Disposition", mime.FormatMediaType("form-data", map[string]string{
+			"name":     fmt.Sprintf("files[%d]", i),
+			"filename": f.Name,
+		}))
+		fileHdr.Set("Content-Type", cmp.Or(strings.TrimSpace(f.MimeType), "application/octet-stream"))
+		part, pErr := mw.CreatePart(fileHdr)
+		if pErr != nil {
+			return "", pErr
+		}
+		if _, wErr := part.Write(f.Data); wErr != nil {
+			return "", wErr
+		}
+	}
+	if err := mw.Close(); err != nil {
+		return "", err
+	}
+
+	path := "/channels/" + url.PathEscape(channelID) + "/messages"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.baseURL+path, &body)
+	if err != nil {
+		return "", errors.New(scrubSecret(err.Error(), token))
+	}
+	req.Header.Set("User-Agent", "DiscordBot (https://github.com/bdatdo0601/fleet, 1.0)")
+	if token != "" {
+		req.Header.Set("Authorization", "Bot "+token)
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+
+	client := d.uploadClient
+	if client == nil {
+		client = d.httpClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", errors.New(scrubSecret(err.Error(), token))
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	if err != nil {
+		return "", errors.New(scrubSecret(err.Error(), token))
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", errors.New(scrubSecret(fmt.Sprintf("discord API POST %s HTTP %d: %s", path, resp.StatusCode, strings.TrimSpace(string(raw))), token))
+	}
+	var res struct {
+		ID string `json:"id"`
+	}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &res); err != nil {
+			return "", err
+		}
+	}
+	return res.ID, nil
 }
 
 func (d *discordAPI) TriggerTyping(ctx context.Context, token, channelID string) {
@@ -516,6 +640,75 @@ func (e *Engine) catchupDiscordChannels(ctx context.Context, cfg DiscordConfig, 
 	}
 }
 
+func isAllowedDiscordAttachmentURL(rawURL, apiBase string) bool {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u.Hostname() == "" {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if u.Scheme == "https" && (host == "cdn.discordapp.com" || host == "media.discordapp.net" || host == "attachments.discordapp.net") {
+		return true
+	}
+	if trimmedBase := strings.TrimSpace(apiBase); trimmedBase != "" {
+		if base, bErr := url.Parse(trimmedBase); bErr == nil && base.Scheme == u.Scheme && strings.EqualFold(base.Host, u.Host) {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Engine) downloadOneDiscordAttachment(ctx context.Context, client *http.Client, fleetCh, apiBase string, att discordAttachment, maxBytes int64) (string, bool) {
+	if !isAllowedDiscordAttachmentURL(att.URL, apiBase) || att.Size > maxBytes {
+		return "", false
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, att.URL, nil)
+	if err != nil {
+		return "", false
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", false
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 || resp.ContentLength > maxBytes {
+		return "", false
+	}
+	name := cmp.Or(strings.TrimSpace(att.Filename), "attachment.bin")
+	ct := cmp.Or(strings.TrimSpace(att.ContentType), resp.Header.Get("Content-Type"))
+	rec, err := e.SaveUploadedFile(fleetCh, name, ct, io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
+		return "", false
+	}
+	return rec.ID, true
+}
+
+func (e *Engine) downloadDiscordAttachments(ctx context.Context, fleetCh string, atts []discordAttachment) []string {
+	if len(atts) == 0 {
+		return nil
+	}
+	apiBase := e.discordAPIBase
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return errors.New("too many redirects")
+			}
+			if !isAllowedDiscordAttachmentURL(req.URL.String(), apiBase) {
+				return errors.New("disallowed redirect target")
+			}
+			return nil
+		},
+	}
+	maxBytes := e.maxSandboxFileBytes()
+	var ids []string
+	for _, att := range atts {
+		if id, ok := e.downloadOneDiscordAttachment(ctx, client, fleetCh, apiBase, att, maxBytes); ok {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
 func (e *Engine) handleDiscordMessageCreate(ctx context.Context, tok string, cfg DiscordConfig, msg discordMessage) {
 	e.discordMu.RLock()
 	botID := e.discordBotUserID
@@ -529,10 +722,10 @@ func (e *Engine) handleDiscordMessageCreate(ctx context.Context, tok string, cfg
 	}
 	_ = e.store.SetDiscordCursor(fleetCh, msg.ChannelID, msg.ID)
 	content := strings.TrimSpace(msg.Content)
-	if content == "" {
+	if content == "" && len(msg.Attachments) == 0 {
 		return
 	}
-	if strings.EqualFold(content, "/new") || strings.EqualFold(content, "/reset") {
+	if len(msg.Attachments) == 0 && (strings.EqualFold(content, "/new") || strings.EqualFold(content, "/reset")) {
 		if ch, err := e.resetChannelInternal(ctx, fleetCh, false, "discord"); err == nil {
 			if msgID, pErr := e.discordClient().CreateMessage(ctx, tok, msg.ChannelID, buildContextClearedDiscordPayload(ch, "discord", false)); pErr == nil && msgID != "" {
 				_ = e.store.SetDiscordCursor(ch.ID, msg.ChannelID, msgID)
@@ -540,7 +733,17 @@ func (e *Engine) handleDiscordMessageCreate(ctx context.Context, tok string, cfg
 		}
 		return
 	}
-	if _, _, inserted, err := e.EnqueueExternalMessage(fleetCh, content, "discord", msg.ID); err == nil && inserted {
+	if msg.ID != "" && e.store.HasExternalMessage("discord", msg.ID) {
+		return
+	}
+	var fileIDs []string
+	if len(msg.Attachments) > 0 {
+		fileIDs = e.downloadDiscordAttachments(ctx, fleetCh, msg.Attachments)
+	}
+	if content == "" && len(fileIDs) == 0 {
+		return
+	}
+	if _, _, inserted, err := e.EnqueueExternalMessage(fleetCh, content, "discord", msg.ID, fileIDs); err == nil && inserted {
 		go e.discordClient().TriggerTyping(context.WithoutCancel(ctx), tok, msg.ChannelID)
 	}
 }
@@ -757,22 +960,145 @@ func buildDecidedApprovalDiscordPayload(apr Approval, deepLink string) map[strin
 	}
 }
 
-func (e *Engine) mirrorTurnToDiscord(ctx context.Context, cfg Config, ch Channel, opts turnOptions, content string, widgets []WidgetPayload) {
-	if !cfg.Discord.Enabled {
-		return
+func (e *Engine) discordUploadLimit() int64 {
+	if e.discordMaxUploadBytes > 0 {
+		return e.discordMaxUploadBytes
 	}
-	discChannelID := cfg.Discord.Channels[ch.ID]
-	if discChannelID == "" {
-		return
+	return defaultDiscordMaxUploadBytes
+}
+
+func extractWidgetFileRefs(widgets []WidgetPayload) []discordFileRef {
+	seen := make(map[string]struct{})
+	var refs []discordFileRef
+	for _, w := range widgets {
+		if w.Kind != "files" {
+			continue
+		}
+		dataMap, ok := w.Data.(map[string]any)
+		if !ok {
+			continue
+		}
+		rawFiles, ok := dataMap["files"].([]any)
+		if !ok {
+			continue
+		}
+		for _, item := range rawFiles {
+			fm, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			id, _ := fm["id"].(string)
+			id = strings.TrimSpace(id)
+			if id == "" {
+				continue
+			}
+			if _, dup := seen[id]; dup {
+				continue
+			}
+			seen[id] = struct{}{}
+			name, _ := fm["name"].(string)
+			var size int64
+			switch v := fm["size_bytes"].(type) {
+			case float64:
+				size = int64(v)
+			case int64:
+				size = v
+			case int:
+				size = int64(v)
+			}
+			refs = append(refs, discordFileRef{ID: id, Name: name, Size: size})
+		}
 	}
-	isDiscordOrigin := opts.TriggerSource == "discord"
-	if !isDiscordOrigin && cfg.Discord.MirrorWebTurns != nil && !*cfg.Discord.MirrorWebTurns {
-		return
-	}
-	tok, err := e.resolveDiscordBotToken(ctx, cfg.Discord)
+	return refs
+}
+
+func (e *Engine) readDiscordUploadFile(ref discordFileRef, remainingBudget int64) (discordUploadFile, string, bool) {
+	f, fh, err := e.OpenStoredFile(ref.ID)
 	if err != nil {
-		return
+		return discordUploadFile{}, cmp.Or(ref.Name, ref.ID), false
 	}
+	defer func() { _ = fh.Close() }()
+	size := f.SizeBytes
+	if size <= 0 {
+		if st, sErr := fh.Stat(); sErr == nil {
+			size = st.Size()
+		}
+	}
+	label := fmt.Sprintf("%s (%s)", f.Name, formatByteSize(size))
+	if remainingBudget <= 0 || size > remainingBudget {
+		return discordUploadFile{}, label, false
+	}
+	data, err := io.ReadAll(io.LimitReader(fh, remainingBudget+1))
+	if err != nil || int64(len(data)) > remainingBudget {
+		return discordUploadFile{}, label, false
+	}
+	return discordUploadFile{
+		ID:       f.ID,
+		Name:     f.Name,
+		MimeType: f.MimeType,
+		Size:     int64(len(data)),
+		Data:     data,
+	}, "", true
+}
+
+func (e *Engine) collectDiscordFiles(widgets []WidgetPayload) ([]discordUploadFile, []string) {
+	refs := extractWidgetFileRefs(widgets)
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	limit := e.discordUploadLimit()
+	budget := limit
+	if limit > discordUploadSafetyMargin {
+		budget = limit - discordUploadSafetyMargin
+	}
+	var totalBytes int64
+	var uploads []discordUploadFile
+	var skipped []string
+	for _, ref := range refs {
+		if len(uploads) >= discordMaxFilesPerMessage {
+			label := cmp.Or(ref.Name, ref.ID)
+			if ref.Size > 0 {
+				label = fmt.Sprintf("%s (%s)", label, formatByteSize(ref.Size))
+			}
+			skipped = append(skipped, label)
+			continue
+		}
+		uf, skipLabel, ok := e.readDiscordUploadFile(ref, budget-totalBytes)
+		if !ok {
+			skipped = append(skipped, skipLabel)
+			continue
+		}
+		uploads = append(uploads, uf)
+		totalBytes += uf.Size
+	}
+	return uploads, skipped
+}
+
+func buildDiscordAttachmentFallbackPayload(payload map[string]any, files []discordUploadFile, deepLink string) map[string]any {
+	fb := maps.Clone(payload)
+	if fb == nil {
+		fb = make(map[string]any)
+	}
+	delete(fb, "attachments")
+	labels := make([]string, 0, len(files))
+	for _, f := range files {
+		labels = append(labels, fmt.Sprintf("%s (%s)", f.Name, formatByteSize(f.Size)))
+	}
+	note := fmt.Sprintf("\n\n*Could not attach file(s) to Discord (%s) — [Open in Fleet Console](%s)*", strings.Join(labels, ", "), deepLink)
+	base, _ := fb["content"].(string)
+	if maxBase := 2000 - len(note) - 3; maxBase <= 0 {
+		fb["content"] = truncateText(strings.TrimSpace(note), 1995)
+	} else {
+		if len(base) > maxBase {
+			base = truncateText(base, maxBase)
+		}
+		fb["content"] = strings.TrimSpace(base + note)
+	}
+	return fb
+}
+
+func buildMirrorDiscordBody(opts turnOptions, content string, widgets []WidgetPayload) (string, []map[string]any, bool) {
+	isDiscordOrigin := opts.TriggerSource == "discord"
 	var out strings.Builder
 	if !isDiscordOrigin && strings.TrimSpace(opts.TriggerUserText) != "" {
 		label := "You (Fleet Web)"
@@ -783,12 +1109,51 @@ func (e *Engine) mirrorTurnToDiscord(ctx context.Context, cfg Config, ch Channel
 	}
 	out.WriteString(strings.TrimSpace(content))
 	embeds, hasHTML := widgetsToDiscordEmbeds(widgets)
+	return out.String(), embeds, hasHTML
+}
+
+func (e *Engine) sendDiscordMirrorChunk(ctx context.Context, api *discordAPI, tok, discChannelID, deepLink string, payload map[string]any, attachments []discordUploadFile) (string, error) {
+	if len(attachments) == 0 {
+		return api.CreateMessage(ctx, tok, discChannelID, payload)
+	}
+	msgID, err := api.CreateMessageWithFiles(ctx, tok, discChannelID, payload, attachments)
+	if err != nil {
+		return api.CreateMessage(ctx, tok, discChannelID, buildDiscordAttachmentFallbackPayload(payload, attachments, deepLink))
+	}
+	return msgID, nil
+}
+
+func (e *Engine) mirrorTurnToDiscord(ctx context.Context, cfg Config, ch Channel, opts turnOptions, content string, widgets []WidgetPayload) {
+	if !cfg.Discord.Enabled {
+		return
+	}
+	discChannelID := cfg.Discord.Channels[ch.ID]
+	if discChannelID == "" {
+		return
+	}
+	if opts.TriggerSource != "discord" && cfg.Discord.MirrorWebTurns != nil && !*cfg.Discord.MirrorWebTurns {
+		return
+	}
+	tok, err := e.resolveDiscordBotToken(ctx, cfg.Discord)
+	if err != nil {
+		return
+	}
+	bodyText, embeds, hasHTML := buildMirrorDiscordBody(opts, content, widgets)
+	attachments, skippedFiles := e.collectDiscordFiles(widgets)
+	var out strings.Builder
+	out.WriteString(bodyText)
+	deepLink := ""
+	if hasHTML || len(skippedFiles) > 0 || len(attachments) > 0 {
+		deepLink = buildFleetDeepLink(cfg.Discord.FleetBaseURL, ch.ID)
+	}
 	if hasHTML {
-		deepLink := buildFleetDeepLink(cfg.Discord.FleetBaseURL, ch.ID)
 		fmt.Fprintf(&out, "\n\n*Interactive widget attached — [Open in Fleet Console](%s)*", deepLink)
 	}
+	if len(skippedFiles) > 0 {
+		fmt.Fprintf(&out, "\n\n*File(s) available in Fleet Console (%s) — [Open in Fleet Console](%s)*", strings.Join(skippedFiles, ", "), deepLink)
+	}
 	chunks := splitDiscordContent(out.String(), 1900)
-	if len(chunks) == 0 && len(embeds) > 0 {
+	if len(chunks) == 0 && (len(embeds) > 0 || len(attachments) > 0) {
 		chunks = []string{""}
 	}
 	api := e.discordClient()
@@ -797,10 +1162,14 @@ func (e *Engine) mirrorTurnToDiscord(ctx context.Context, cfg Config, ch Channel
 		if i == 0 && opts.ReplyToExternalID != "" {
 			payload["message_reference"] = map[string]string{"message_id": opts.ReplyToExternalID}
 		}
-		if i == len(chunks)-1 && len(embeds) > 0 {
-			payload["embeds"] = embeds
+		var chunkAtts []discordUploadFile
+		if i == len(chunks)-1 {
+			if len(embeds) > 0 {
+				payload["embeds"] = embeds
+			}
+			chunkAtts = attachments
 		}
-		if msgID, pErr := api.CreateMessage(ctx, tok, discChannelID, payload); pErr == nil && msgID != "" {
+		if msgID, pErr := e.sendDiscordMirrorChunk(ctx, api, tok, discChannelID, deepLink, payload, chunkAtts); pErr == nil && msgID != "" {
 			_ = e.store.SetDiscordCursor(ch.ID, discChannelID, msgID)
 		}
 	}

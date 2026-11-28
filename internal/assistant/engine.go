@@ -86,14 +86,15 @@ type Engine struct {
 	hasActiveDelegations bool
 	notifier             Notifier
 
-	discordMu         sync.RWMutex
-	discordSyncMu     sync.Mutex
-	discordConnected  bool
-	discordBotUserID  string
-	discordCategoryID string
-	discordAPIBase    string
-	discordGatewayURL string
-	discordReloadCh   chan struct{}
+	discordMu             sync.RWMutex
+	discordSyncMu         sync.Mutex
+	discordConnected      bool
+	discordBotUserID      string
+	discordCategoryID     string
+	discordAPIBase        string
+	discordGatewayURL     string
+	discordMaxUploadBytes int64
+	discordReloadCh       chan struct{}
 
 	notifyCh chan struct{}
 	cancel   context.CancelFunc
@@ -569,8 +570,8 @@ func (e *Engine) EnqueueUserMessage(channelID, content, modelOverride string) (M
 }
 
 // EnqueueExternalMessage idempotently ingests a user message from an external bridge (e.g. Discord).
-func (e *Engine) EnqueueExternalMessage(channelID, content, source, externalID string) (Message, InboxEvent, bool, error) {
-	return e.enqueueMessageInternal(channelID, content, "", nil, source, externalID)
+func (e *Engine) EnqueueExternalMessage(channelID, content, source, externalID string, fileIDs []string) (Message, InboxEvent, bool, error) {
+	return e.enqueueMessageInternal(channelID, content, "", fileIDs, source, externalID)
 }
 
 // EnqueueUserMessageWithFiles stores a user message with optional uploaded file attachments and wakes the worker.
