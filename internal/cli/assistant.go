@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -251,13 +250,8 @@ func resolveOBBinary(explicit string) (string, error) {
 		}
 		return explicit, nil
 	}
-	if p, err := exec.LookPath("ob"); err == nil {
+	if p := assistant.FindOBBinary(); p != "" {
 		return p, nil
-	}
-	for _, cand := range []string{"/opt/homebrew/bin/ob", "/usr/local/bin/ob"} {
-		if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
-			return cand, nil
-		}
 	}
 	return "", errors.New("`ob` (obsidian-headless) not found; install with `npm install -g obsidian-headless`")
 }

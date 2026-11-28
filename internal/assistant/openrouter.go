@@ -74,10 +74,12 @@ type ChatTurnResult struct {
 
 // DecisionQuestion specifies one typed question for OpenRouter's Decisions API.
 type DecisionQuestion struct {
-	ID      string   `json:"id"`
-	Type    string   `json:"type"` // "noul", "choice", "score"
-	Prompt  string   `json:"prompt"`
-	Options []string `json:"options,omitempty"`
+	ID           string   `json:"id"`
+	Type         string   `json:"type"` // "noul", "choice", "score"
+	Instructions string   `json:"instructions,omitempty"`
+	Prompt       string   `json:"prompt,omitempty"`
+	Criteria     any      `json:"criteria,omitempty"`
+	Options      []string `json:"options,omitempty"`
 }
 
 // DecisionAnswer captures the returned top choice and probabilities.
@@ -357,24 +359,56 @@ func (c *openRouterClient) CompleteText(ctx context.Context, cfg Config, model, 
 	return parsed.Choices[0].Message.Content, nil
 }
 
+func decisionsEndpoint(baseURL string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if base, ok := strings.CutSuffix(trimmed, "/api/v1"); ok {
+		return base + "/api/alpha/decisions"
+	}
+	return trimmed + "/api/alpha/decisions"
+}
+
+func buildDecisionQuestionsMap(questions []DecisionQuestion) map[string]any {
+	qMap := make(map[string]any, len(questions))
+	for _, q := range questions {
+		if q.ID == "" {
+			continue
+		}
+		entry := map[string]any{
+			"type":         cmp.Or(q.Type, "choice"),
+			"instructions": cmp.Or(q.Instructions, q.Prompt),
+		}
+		if q.Criteria != nil {
+			entry["criteria"] = q.Criteria
+		} else if len(q.Options) > 0 {
+			crit := make(map[string]string, len(q.Options))
+			for _, opt := range q.Options {
+				crit[opt] = opt
+			}
+			entry["criteria"] = crit
+		}
+		qMap[q.ID] = entry
+	}
+	return qMap
+}
+
 // Decide evaluates typed System-1 decisions via OpenRouter's Decisions API with a short timeout.
 func (c *openRouterClient) Decide(ctx context.Context, cfg Config, input string, questions []DecisionQuestion) (map[string]DecisionAnswer, error) {
 	if strings.TrimSpace(cfg.APIKey) == "" || strings.TrimSpace(cfg.Models.Decision) == "" {
 		return nil, errors.New("decision model not configured")
 	}
-	dCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	dCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	payload := map[string]any{
 		"model":     cfg.Models.Decision,
-		"input":     input,
-		"questions": questions,
+		"state":     map[string]any{"input": input},
+		"questions": buildDecisionQuestionsMap(questions),
 	}
 	rawBody, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(dCtx, http.MethodPost, cfg.BaseURL+"/decisions", bytes.NewReader(rawBody))
+	req, err := http.NewRequestWithContext(dCtx, http.MethodPost, decisionsEndpoint(cfg.BaseURL), bytes.NewReader(rawBody))
 	if err != nil {
 		return nil, err
 	}
@@ -393,17 +427,43 @@ func (c *openRouterClient) Decide(ctx context.Context, cfg Config, input string,
 		return nil, fmt.Errorf("decisions HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBytes)))
 	}
 	var parsed struct {
-		Answers []DecisionAnswer `json:"answers"`
-		Results []DecisionAnswer `json:"results"`
+		Answers map[string]struct {
+			Type          string   `json:"type"`
+			Choice        string   `json:"choice"`
+			Noul          *float64 `json:"noul"`
+			Value         any      `json:"value"`
+			Confidence    float64  `json:"confidence"`
+			Probabilities []struct {
+				Key         string  `json:"key"`
+				Level       string  `json:"level"`
+				Probability float64 `json:"probability"`
+			} `json:"probabilities"`
+		} `json:"answers"`
 	}
 	if err := json.Unmarshal(respBytes, &parsed); err != nil {
 		return nil, err
 	}
-	out := make(map[string]DecisionAnswer)
-	for _, a := range append(parsed.Answers, parsed.Results...) {
-		if a.ID != "" {
-			out[a.ID] = a
+	out := make(map[string]DecisionAnswer, len(parsed.Answers))
+	for id, a := range parsed.Answers {
+		val := a.Choice
+		if val == "" && a.Noul != nil {
+			if *a.Noul >= 0.5 {
+				val = "true"
+			} else {
+				val = "false"
+			}
 		}
+		if val == "" && a.Value != nil {
+			val = fmt.Sprint(a.Value)
+		}
+		probs := make(map[string]float64, len(a.Probabilities))
+		for _, p := range a.Probabilities {
+			k := cmp.Or(p.Key, p.Level)
+			if k != "" {
+				probs[k] = p.Probability
+			}
+		}
+		out[id] = DecisionAnswer{ID: id, Value: val, Confidence: a.Confidence, Probabilities: probs}
 	}
 	return out, nil
 }

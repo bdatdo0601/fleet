@@ -34,11 +34,13 @@ type Engine struct {
 	opReader    OPReaderFunc
 	Probes      DoctorProbes
 
-	cfgMu     sync.RWMutex
-	cfg       Config
-	cachedKey string
-	cachedRef string
-	cachedAt  time.Time
+	cfgMu      sync.RWMutex
+	cfg        Config
+	cachedKey  string
+	cachedRef  string
+	cachedAt   time.Time
+	opVaults   []OPVaultMeta
+	opVaultsAt time.Time
 
 	subMu       sync.Mutex
 	subscribers map[chan StreamEvent]struct{}
@@ -200,8 +202,33 @@ func (e *Engine) SaveOPServiceAccountToken(token string) error {
 	e.cfgMu.Lock()
 	e.cachedKey = ""
 	e.cachedRef = ""
+	e.opVaults = nil
+	e.opVaultsAt = time.Time{}
 	e.cfgMu.Unlock()
 	return nil
+}
+
+func (e *Engine) listOPVaultsCached(ctx context.Context) ([]OPVaultMeta, error) {
+	e.cfgMu.RLock()
+	cached := e.opVaults
+	at := e.opVaultsAt
+	e.cfgMu.RUnlock()
+	if len(cached) > 0 && time.Since(at) < 5*time.Minute {
+		return cached, nil
+	}
+	lister := e.Probes.ListVaults
+	if lister == nil {
+		lister = ListOPVaults
+	}
+	vaults, err := lister(ctx, e.opTokenPath)
+	if err != nil {
+		return nil, err
+	}
+	e.cfgMu.Lock()
+	e.opVaults = vaults
+	e.opVaultsAt = time.Now()
+	e.cfgMu.Unlock()
+	return vaults, nil
 }
 
 func (e *Engine) resolveRuntimeConfig(ctx context.Context) (Config, error) {
@@ -525,10 +552,14 @@ func (e *Engine) resolveModel(ctx context.Context, cfg Config, ch Channel, sourc
 	}
 	if strings.EqualFold(chosen, "auto") {
 		if ans, err := e.llm.Decide(ctx, cfg, cleanText, []DecisionQuestion{{
-			ID:      "tier",
-			Type:    "choice",
-			Prompt:  "Choose model capability tier needed for this request",
-			Options: []string{"fast", "balanced", "frontier"},
+			ID:           "tier",
+			Type:         "choice",
+			Instructions: "Choose model capability tier needed for this user request.",
+			Criteria: map[string]string{
+				"fast":     "Simple question, greeting, reminder, or single-step status lookup",
+				"balanced": "Normal assistant work, tool orchestration, summarization, or multi-step chat",
+				"frontier": "Complex planning, deep reasoning, architecture design, or subtle analysis",
+			},
 		}}); err == nil {
 			switch ans["tier"].Value {
 			case "fast":
@@ -542,7 +573,7 @@ func (e *Engine) resolveModel(ctx context.Context, cfg Config, ch Channel, sourc
 	return chosen
 }
 
-func (e *Engine) buildPromptMessages(ch Channel, tail []Message, slashAliases map[string]string) []ChatMessage {
+func (e *Engine) buildPromptMessages(ctx context.Context, ch Channel, tail []Message, slashAliases map[string]string) []ChatMessage {
 	v, _ := e.vault()
 	var soul, reflections, observations, fleetCtx string
 	var skills []Skill
@@ -567,6 +598,9 @@ func (e *Engine) buildPromptMessages(ch Channel, tail []Message, slashAliases ma
 	}
 	if fleetCtx != "" {
 		sysStatic.WriteString("\n## Fleet Standing Memory\n" + fleetCtx + "\n")
+	}
+	if opSection := e.buildOPPromptSection(ctx); opSection != "" {
+		sysStatic.WriteString(opSection)
 	}
 
 	var memPrefix strings.Builder
@@ -601,6 +635,28 @@ func (e *Engine) buildPromptMessages(ch Channel, tail []Message, slashAliases ma
 	return out
 }
 
+func (e *Engine) buildOPPromptSection(ctx context.Context) string {
+	hasTok := ResolveOPToken(e.opTokenPath) != ""
+	if !hasTok && e.Probes.ListVaults == nil {
+		return ""
+	}
+	vaults, err := e.listOPVaultsCached(ctx)
+	if (err != nil || len(vaults) == 0) && !hasTok {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\n## 1Password Agent Vault (Zero-Exposure)\n")
+	if len(vaults) > 0 {
+		names := make([]string, 0, len(vaults))
+		for _, v := range vaults {
+			names = append(names, v.Name)
+		}
+		b.WriteString("Accessible vaults: " + strings.Join(names, ", ") + "\n")
+	}
+	b.WriteString("Use `onepassword_list_items`, `onepassword_get_item_meta`, `http_request_with_credential`, and `onepassword_store_item` to inspect item metadata/op:// references and inject credentials at runtime without ever requesting or displaying plaintext secrets.\n")
+	return b.String()
+}
+
 func (e *Engine) runAgentTurn(ctx context.Context, cfg Config, ch Channel, source, userText, explicitModel string) error {
 	v, _ := e.vault()
 	var skills []Skill
@@ -612,7 +668,7 @@ func (e *Engine) runAgentTurn(ctx context.Context, cfg Config, ch Channel, sourc
 	if err != nil {
 		return err
 	}
-	msgs := e.buildPromptMessages(ch, tail, cfg.Models.Aliases)
+	msgs := e.buildPromptMessages(ctx, ch, tail, cfg.Models.Aliases)
 	tools := e.buildToolSpecs(ctx)
 
 	e.publishEvent(StreamEvent{Type: "run_start", ChannelID: ch.ID, Data: map[string]any{"model": model}})

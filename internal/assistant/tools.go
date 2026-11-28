@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -141,10 +142,24 @@ func (e *Engine) buildToolSpecs(ctx context.Context) []ToolSpec {
 			"title": strProp("Widget title"), "html": strProp("Self-contained HTML snippet (inline <style>/<script> allowed; no external URLs)"),
 		}, "title", "html")),
 		makeToolSpec("credential_list_aliases", "List configured 1Password credential aliases and allowlisted hosts (no secrets returned).", schemaObj(map[string]any{})),
-		makeToolSpec("http_request_with_credential", "Perform an HTTP request injecting a 1Password secret into an allowlisted host without exposing the secret.", schemaObj(map[string]any{
-			"alias": strProp("Credential alias"), "method": strProp("HTTP method"), "url": strProp("Target URL"),
+		makeToolSpec("onepassword_list_vaults", "List 1Password vaults accessible to the assistant Service Account.", schemaObj(map[string]any{})),
+		makeToolSpec("onepassword_list_items", "List items in a 1Password vault (titles, categories, URLs, tags — no secrets).", schemaObj(map[string]any{
+			"vault": strProp("Optional vault name or ID"),
+		})),
+		makeToolSpec("onepassword_get_item_meta", "Get field labels, URLs, and op:// references for a 1Password item (zero secrets returned).", schemaObj(map[string]any{
+			"item": strProp("Item title or ID"), "vault": strProp("Optional vault name or ID"),
+		}, "item")),
+		makeToolSpec("onepassword_store_item", "Create a new credential item in a scoped 1Password vault (approval-gated).", schemaObj(map[string]any{
+			"vault": strProp("Target 1Password vault"), "title": strProp("Item title"),
+			"category": strProp("Category (default API Credential)"), "url": strProp("Associated API/website URL"),
+			"fields": map[string]any{"type": "object", "description": "Field label->value pairs"},
+		}, "vault", "title")),
+		makeToolSpec("http_request_with_credential", "Perform an HTTP request injecting a 1Password secret (via configured alias or op_ref+item) into an allowlisted host without exposing the secret.", schemaObj(map[string]any{
+			"alias": strProp("Configured credential alias"), "op_ref": strProp("op://Vault/Item/field reference"),
+			"item": strProp("1Password item name (required with op_ref to enforce URL host allowlist)"), "vault": strProp("Optional 1Password vault"),
+			"method": strProp("HTTP method"), "url": strProp("Target URL"),
 			"body": strProp("Optional request body"),
-		}, "alias", "url")),
+		}, "url")),
 	}
 	if e.mcp != nil {
 		for _, ext := range e.mcp.ListTools(ctx) {
@@ -215,7 +230,7 @@ func (e *Engine) dispatchTool(ctx context.Context, name string, args map[string]
 	if name == "render_card" || name == "render_widget" {
 		return dispatchUITool(name, args, tctx)
 	}
-	if name == "credential_list_aliases" || name == "http_request_with_credential" {
+	if name == "credential_list_aliases" || name == "http_request_with_credential" || strings.HasPrefix(name, "onepassword_") {
 		return e.dispatchCredentialTool(ctx, name, args, rawArgs, tctx)
 	}
 	if strings.HasPrefix(name, "mcp__") && e.mcp != nil {
@@ -382,17 +397,82 @@ func dispatchUITool(name string, args map[string]any, tctx *toolExecContext) (an
 }
 
 func (e *Engine) dispatchCredentialTool(ctx context.Context, name string, args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {
-	if name == "credential_list_aliases" {
+	switch name {
+	case "credential_list_aliases":
 		return tctx.Config.View("").Credentials, nil
+	case "onepassword_list_vaults":
+		return e.listOPVaultsCached(ctx)
+	case "onepassword_list_items":
+		return ListOPItems(ctx, e.opTokenPath, strArg(args, "vault"))
+	case "onepassword_get_item_meta":
+		return GetOPItemMeta(ctx, e.opTokenPath, strArg(args, "item"), strArg(args, "vault"))
+	case "onepassword_store_item":
+		if !tctx.BypassHITL {
+			return nil, &approvalRequiredError{
+				ToolName:  name,
+				Summary:   fmt.Sprintf("Create 1Password item %q in vault %q", strArg(args, "title"), strArg(args, "vault")),
+				RiskLevel: "credential_write",
+				ArgsJSON:  cmp.Or(rawArgs, "{}"),
+			}
+		}
+		fields := map[string]string{}
+		if rawFields, ok := args["fields"].(map[string]any); ok {
+			for k, v := range rawFields {
+				fields[k] = fmt.Sprint(v)
+			}
+		}
+		return StoreOPItem(ctx, e.opTokenPath, strArg(args, "vault"), strArg(args, "title"), strArg(args, "category"), strArg(args, "url"), fields)
+	case "http_request_with_credential":
+		return e.execCredentialHTTPTool(ctx, args, rawArgs, tctx)
+	default:
+		return nil, newErr("unknown credential tool "+name, http.StatusBadRequest)
 	}
+}
+
+func (e *Engine) execCredentialHTTPTool(ctx context.Context, args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {
 	alias := strArg(args, "alias")
+	opRef := strArg(args, "op_ref")
+	if opRef != "" {
+		item := strArg(args, "item")
+		if item == "" {
+			return nil, newErr("item is required when using op_ref", http.StatusBadRequest)
+		}
+		if !tctx.BypassHITL {
+			return nil, &approvalRequiredError{
+				ToolName:  "http_request_with_credential",
+				Summary:   fmt.Sprintf("Authenticated HTTP %s %s (1Password ref %s)", cmp.Or(strArg(args, "method"), "GET"), strArg(args, "url"), opRef),
+				RiskLevel: "credential_http",
+				ArgsJSON:  cmp.Or(rawArgs, "{}"),
+			}
+		}
+		meta, err := GetOPItemMeta(ctx, e.opTokenPath, item, strArg(args, "vault"))
+		if err != nil {
+			return nil, err
+		}
+		var allowed []string
+		for _, rawURL := range meta.URLs {
+			if u, uErr := url.Parse(rawURL); uErr == nil && u.Hostname() != "" {
+				allowed = append(allowed, u.Hostname())
+			}
+		}
+		if len(allowed) == 0 {
+			return nil, newErr(fmt.Sprintf("1Password item %q has no URLs configured for host allowlist", item), http.StatusForbidden)
+		}
+		return ExecuteCredentialHTTP(ctx, tctx.Config, e.opReader, nil, CredentialHTTPRequest{
+			OPRef:        opRef,
+			AllowedHosts: allowed,
+			Method:       strArg(args, "method"),
+			URL:          strArg(args, "url"),
+			Body:         strArg(args, "body"),
+		})
+	}
 	cp, ok := findCredentialPolicy(tctx.Config, alias)
 	if !ok {
 		return nil, newErr(fmt.Sprintf("unknown credential alias %q", alias), http.StatusNotFound)
 	}
 	if cp.RequireApproval && !tctx.BypassHITL {
 		return nil, &approvalRequiredError{
-			ToolName:  name,
+			ToolName:  "http_request_with_credential",
 			Summary:   fmt.Sprintf("Authenticated HTTP %s %s (credential %s)", cmp.Or(strArg(args, "method"), "GET"), strArg(args, "url"), alias),
 			RiskLevel: "credential_http",
 			ArgsJSON:  cmp.Or(rawArgs, "{}"),

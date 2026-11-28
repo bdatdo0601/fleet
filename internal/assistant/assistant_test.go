@@ -288,9 +288,9 @@ func TestEngineStreamingRoutingApprovalsAndObservationalMemory(t *testing.T) {
 
 	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/decisions":
+		case "/api/alpha/decisions":
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"answers":[{"id":"tier","value":"frontier","confidence":0.94}]}`))
+			_, _ = w.Write([]byte(`{"answers":{"tier":{"type":"choice","choice":"frontier","confidence":0.94}}}`))
 		case "/chat/completions":
 			var req struct {
 				Model    string            `json:"model"`
@@ -450,9 +450,19 @@ func TestDoctorAndAPIKeyOPRef(t *testing.T) {
 		case "/chat/completions":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"OK"}}]}`))
-		case "/decisions":
+		case "/api/alpha/decisions":
+			var dReq struct {
+				Model     string                    `json:"model"`
+				State     map[string]any            `json:"state"`
+				Questions map[string]map[string]any `json:"questions"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&dReq)
+			if dReq.State["input"] == "" || dReq.Questions["tier"]["criteria"] == nil {
+				http.Error(w, "invalid decisions payload", http.StatusBadRequest)
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"answers":[{"id":"tier","value":"fast","confidence":0.95}]}`))
+			_, _ = w.Write([]byte(`{"answers":{"tier":{"type":"choice","choice":"fast","confidence":0.95}}}`))
 		}
 	}))
 	defer mockLLM.Close()
@@ -525,5 +535,46 @@ func TestDoctorAndAPIKeyOPRef(t *testing.T) {
 	repFail := eng.Doctor(t.Context())
 	if repFail.OK {
 		t.Fatalf("expected doctor OK=false when op fails for api_key_op_ref")
+	}
+}
+
+func TestOPMetadataRedactionAndPromptAwareness(t *testing.T) {
+	rawItem := []byte(`{
+		"id": "item123",
+		"title": "Linear API",
+		"category": "API_CREDENTIAL",
+		"vault": {"id": "v1", "name": "FleetAgent"},
+		"urls": [{"href": "https://api.linear.app/graphql"}],
+		"tags": ["ops"],
+		"fields": [
+			{"id": "credential", "label": "credential", "type": "CONCEALED", "value": "lin_api_SECRET_VALUE_DO_NOT_LEAK", "reference": "op://FleetAgent/Linear API/credential"}
+		]
+	}`)
+	meta, err := parseOPItemDetailMeta(rawItem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ := json.Marshal(meta)
+	if strings.Contains(string(encoded), "SECRET_VALUE_DO_NOT_LEAK") {
+		t.Fatalf("secret leaked in OPItemDetailMeta: %s", encoded)
+	}
+	if len(meta.Fields) != 1 || meta.Fields[0].Reference != "op://FleetAgent/Linear API/credential" {
+		t.Fatalf("expected op:// reference preserved, got %+v", meta.Fields)
+	}
+
+	tmp := t.TempDir()
+	eng, err := Open(filepath.Join(tmp, "assistant.db"), filepath.Join(tmp, "assistant.json"), filepath.Join(tmp, "vault"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = eng.Close() }()
+
+	eng.Probes.ListVaults = func(context.Context, string) ([]OPVaultMeta, error) {
+		return []OPVaultMeta{{ID: "v1", Name: "FleetAgent"}}, nil
+	}
+	msgs := eng.buildPromptMessages(t.Context(), Channel{ID: "general"}, nil, DefaultAliases())
+	rawPrompt, _ := json.Marshal(msgs[0])
+	if !strings.Contains(string(rawPrompt), "FleetAgent") || !strings.Contains(string(rawPrompt), "onepassword_list_items") {
+		t.Fatalf("expected 1Password Agent Vault section in system prompt, got %s", rawPrompt)
 	}
 }

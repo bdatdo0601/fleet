@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -30,16 +31,45 @@ type DoctorReport struct {
 
 // DoctorProbes allows tests to override local OS/binary checks.
 type DoctorProbes struct {
-	FindOB    func() string
-	OBRunning func() bool
-	CheckOP   func(context.Context, string) (string, bool, string, error)
+	FindOB     func() string
+	OBRunning  func() bool
+	CheckOP    func(context.Context, string) (string, bool, string, error)
+	ListVaults func(context.Context, string) ([]OPVaultMeta, error)
 }
 
-func defaultFindOB() string {
+// FindOBBinary locates `ob` (obsidian-headless) across PATH, Homebrew, npm/nvm/fnm/volta/mise/pnpm, and login shell PATH.
+func FindOBBinary() string {
 	if p, err := exec.LookPath("ob"); err == nil {
 		return p
 	}
-	for _, cand := range []string{"/opt/homebrew/bin/ob", "/usr/local/bin/ob"} {
+	cands := []string{"/opt/homebrew/bin/ob", "/usr/local/bin/ob"}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		cands = append(cands,
+			filepath.Join(home, ".volta", "bin", "ob"),
+			filepath.Join(home, ".local", "share", "mise", "shims", "ob"),
+			filepath.Join(home, ".asdf", "shims", "ob"),
+			filepath.Join(home, "Library", "pnpm", "ob"),
+			filepath.Join(home, ".npm-global", "bin", "ob"),
+			filepath.Join(home, ".local", "bin", "ob"),
+		)
+		for _, glob := range []string{
+			filepath.Join(home, ".nvm", "versions", "node", "*", "bin", "ob"),
+			filepath.Join(home, ".local", "share", "fnm", "node-versions", "*", "installation", "bin", "ob"),
+		} {
+			if matches, gErr := filepath.Glob(glob); gErr == nil && len(matches) > 0 {
+				sort.Strings(matches)
+				cands = append(cands, matches[len(matches)-1])
+			}
+		}
+		if shellPath, pErr := paths.LoginShellPath(context.Background(), "", home, ""); pErr == nil && shellPath != "" {
+			for dir := range strings.SplitSeq(shellPath, string(os.PathListSeparator)) {
+				if dir != "" {
+					cands = append(cands, filepath.Join(dir, "ob"))
+				}
+			}
+		}
+	}
+	for _, cand := range cands {
 		if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
 			return cand
 		}
@@ -51,7 +81,10 @@ func defaultOBRunning() bool {
 	if exec.Command("launchctl", "print", fmt.Sprintf("gui/%d/%s", os.Getuid(), paths.ObsidianSyncLabel)).Run() == nil {
 		return true
 	}
-	return exec.Command("pgrep", "-f", "ob sync").Run() == nil
+	if exec.Command("pgrep", "-f", "ob sync").Run() == nil {
+		return true
+	}
+	return exec.Command("pgrep", "-f", "obsidian-headless").Run() == nil
 }
 
 // Doctor verifies all assistant subsystems on the lighthouse and returns actionable hints.
@@ -140,10 +173,13 @@ func (e *Engine) checkDecisionsDoctor(ctx context.Context, rtCfg Config, rtErr e
 		return DoctorCheck{Name: "decisions", Status: "skip", Detail: "No decision model configured"}
 	}
 	ans, err := e.llm.Decide(ctx, rtCfg, "ping", []DecisionQuestion{{
-		ID:      "tier",
-		Type:    "choice",
-		Prompt:  "Choose tier",
-		Options: []string{"fast", "balanced"},
+		ID:           "tier",
+		Type:         "choice",
+		Instructions: "Choose the model tier needed for this request.",
+		Criteria: map[string]string{
+			"fast":     "Simple ping, greeting, or quick lookup",
+			"balanced": "Standard assistant turn or tool call",
+		},
 	}})
 	if err != nil {
 		return DoctorCheck{
@@ -180,7 +216,7 @@ func (e *Engine) checkVaultDoctor(vaultPath string) DoctorCheck {
 func (e *Engine) checkObsidianSyncDoctor(vaultPath string) DoctorCheck {
 	findOB := e.Probes.FindOB
 	if findOB == nil {
-		findOB = defaultFindOB
+		findOB = FindOBBinary
 	}
 	obRunning := e.Probes.OBRunning
 	if obRunning == nil {
