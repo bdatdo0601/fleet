@@ -6,14 +6,15 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,25 +48,28 @@ func setupWaiterServer(t *testing.T) (*core.Fleet, *httptest.Server, string) {
 	return f, srv, tmp
 }
 
-func TestWaitForInboxCLIAndPIDLockReplacement(t *testing.T) {
+func TestWaitForInboxCLIAndFlockContention(t *testing.T) {
 	f, srv, tmp := setupWaiterServer(t)
 	_, _ = f.Agents.Heartbeat(agents.HeartbeatParams{Device: "mini", Harness: "antigravity", RawID: "agy-wait", Title: new("Deploy Helper"), CWD: "/d"})
 	_, _ = f.Agents.Heartbeat(agents.HeartbeatParams{Device: "mini", Harness: "claude", RawID: "sender-w", Title: new("Coordinator"), CWD: "/c"})
 
 	lockDir := filepath.Join(tmp, "locks")
-	_ = os.MkdirAll(lockDir, 0o755)
-	dummy := exec.Command("sleep", "30")
-	if err := dummy.Start(); err != nil {
+	heldLock, err := acquirePIDLock("mini:antigravity:agy-wait", lockDir)
+	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		if dummy.Process != nil {
-			_ = dummy.Process.Kill()
-			_, _ = dummy.Process.Wait()
-		}
-	})
-	lp := pidLockPath("mini:antigravity:agy-wait", lockDir)
-	_ = os.WriteFile(lp, []byte(fmt.Sprintf("%d\n", dummy.Process.Pid)), 0o600)
+	if _, err := WaitForInboxCLI(WaitCLIOpts{
+		SessionID:   "mini:antigravity:agy-wait",
+		APIURL:      srv.URL,
+		Harness:     "antigravity",
+		MaxWait:     1.0,
+		PollTimeout: 0.5,
+		LockDir:     lockDir,
+	}); err == nil {
+		releasePIDLock(heldLock)
+		t.Fatal("expected WaitForInboxCLI to fail when flock is already held")
+	}
+	releasePIDLock(heldLock)
 
 	go func() {
 		time.Sleep(150 * time.Millisecond)
@@ -86,8 +90,7 @@ func TestWaitForInboxCLIAndPIDLockReplacement(t *testing.T) {
 	if err != nil || rc != 0 {
 		t.Fatalf("WaitForInboxCLI failed: rc=%d err=%v", rc, err)
 	}
-	// Wait for dummy process reaping
-	_ = dummy.Wait()
+	lp := pidLockPath("mini:antigravity:agy-wait", lockDir)
 	if _, err := os.Stat(lp); !os.IsNotExist(err) {
 		t.Fatalf("expected lockfile removed, stat err=%v", err)
 	}
@@ -609,5 +612,99 @@ func TestLivenessSweepRefreshesTranscriptTail(t *testing.T) {
 	}
 	if detail.Title != "Demo Hygiene Report" {
 		t.Fatalf("expected title refreshed from transcript, got %q", detail.Title)
+	}
+}
+
+func TestSessionPushLoopStopRestartCancellationAndAckBackoff(t *testing.T) {
+	// 1. Stop cancels an in-flight /v1/agents/wait immediately, and Start->Stop->Start leaves listener running.
+	waitEntered := make(chan struct{}, 4)
+	var ackStatus atomic.Int32
+	ackStatus.Store(http.StatusOK)
+	var deliverCount atomic.Int32
+	var waitCalls atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		_ = r.Body.Close()
+		switch r.URL.Path {
+		case "/v1/agents/wait":
+			n := waitCalls.Add(1)
+			if n == 1 {
+				select {
+				case waitEntered <- struct{}{}:
+				default:
+				}
+				<-r.Context().Done()
+				return
+			}
+			_ = json.NewEncoder(w).Encode(agents.WaitResult{
+				SessionID: "mini:codex:01a1ece5-f00",
+				FullRawID: "01a1ece5-f00c-7860-a0dc-6c1897e73f30",
+				Messages: []agents.Message{
+					{ID: 42, ThreadID: "t1", FromSession: "mini:claude:peer", Body: "ping"},
+				},
+			})
+		case "/v1/agents/ack":
+			code := int(ackStatus.Load())
+			if code != http.StatusOK {
+				w.WriteHeader(code)
+				_, _ = w.Write([]byte(`{"error":"ack failed"}`))
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	listener := NewCodexQueueListener(CodexListenerOpts{
+		APIURL:      srv.URL,
+		PPID:        9999,
+		CWD:         "/tmp",
+		CodexBin:    "/usr/local/bin/codex",
+		PollTimeout: 30.0,
+		RunQueueFn: func([]string) (int, string) {
+			deliverCount.Add(1)
+			return 0, ""
+		},
+	})
+	t.Cleanup(func() { listener.Stop() })
+
+	listener.Start()
+	select {
+	case <-waitEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first /v1/agents/wait call")
+	}
+
+	stopDone := make(chan ListenerStatus, 1)
+	go func() { stopDone <- listener.Stop() }()
+	select {
+	case st := <-stopDone:
+		if st.Running || st.Enabled {
+			t.Fatalf("expected stopped status after Stop, got %+v", st)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not cancel in-flight wait promptly")
+	}
+
+	// Failed ack must report LastError and back off instead of incrementing DeliveredCount or tight-looping.
+	ackStatus.Store(http.StatusInternalServerError)
+	st := listener.Start()
+	if !st.Running || !st.Enabled {
+		t.Fatalf("expected running after Stop->Start, got %+v", st)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if listener.Status().LastError != nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	stErr := listener.Status()
+	if stErr.LastError == nil || stErr.DeliveredCount != 0 {
+		t.Fatalf("expected LastError set and DeliveredCount=0 when ack fails, got %+v", stErr)
+	}
+	if deliverCount.Load() != 1 {
+		t.Fatalf("expected backoff after failed ack (1 delivery attempt), got %d", deliverCount.Load())
 	}
 }

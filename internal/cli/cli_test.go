@@ -278,3 +278,67 @@ func TestCLIAssistantWorkerCommands(t *testing.T) {
 		t.Fatalf("expected conflicting --use-rex/--use-tmux error on worker-install, got rc=%d out=%q err=%q", rc, out.String(), errBuf.String())
 	}
 }
+
+func TestCLIJoinRejectsTraversalAndHelpPrintsDefaults(t *testing.T) {
+	pendDir := t.TempDir()
+	t.Setenv("FLEET_PENDING_DIR", pendDir)
+	t.Setenv("FLEET_NEBULA_ETC", t.TempDir())
+
+	for _, bad := range []string{"../evil", "bad/name", ".hidden", "UPPER"} {
+		var out, errBuf bytes.Buffer
+		rc := Run([]string{"join", bad}, &IO{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errBuf})
+		if rc == 0 || !strings.Contains(errBuf.String(), "invalid device name") {
+			t.Fatalf("expected invalid device name error for %q, got rc=%d err=%q", bad, rc, errBuf.String())
+		}
+	}
+	entries, err := os.ReadDir(pendDir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("expected empty pending dir after rejected join, got entries=%v err=%v", entries, err)
+	}
+
+	// Subcommand --help prints subcommand flag defaults instead of generic top-level usage.
+	var helpOut, helpErr bytes.Buffer
+	rc := Run([]string{"join", "--help"}, &IO{Stdin: strings.NewReader(""), Stdout: &helpOut, Stderr: &helpErr})
+	if rc != 0 || !strings.Contains(helpOut.String(), "-force") || strings.Contains(helpOut.String(), "approve-mobile") {
+		t.Fatalf("expected subcommand help defaults for join --help, got rc=%d out=%q err=%q", rc, helpOut.String(), helpErr.String())
+	}
+
+	// Zero-positional subcommand rejects unexpected positional args.
+	var posOut, posErr bytes.Buffer
+	rc = Run([]string{"ls", "unexpected"}, &IO{Stdin: strings.NewReader(""), Stdout: &posOut, Stderr: &posErr})
+	if rc == 0 || !strings.Contains(posErr.String(), "unexpected arguments") {
+		t.Fatalf("expected unexpected arguments error on ls, got rc=%d err=%q", rc, posErr.String())
+	}
+}
+
+func TestCLIAssistantSetupPreservesEnableZDRAndRejectsSandboxConflict(t *testing.T) {
+	f, _, _ := setupCLIServer(t)
+
+	var out, errBuf bytes.Buffer
+	rc := Run([]string{"assistant", "setup", "--enable=false", "--zdr=false", "--no-test"}, &IO{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errBuf})
+	if rc != 0 {
+		t.Fatalf("initial setup failed: rc=%d out=%q err=%q", rc, out.String(), errBuf.String())
+	}
+	if f.Assistant.Config().Enabled || f.Assistant.Config().ZDR {
+		t.Fatalf("expected Enabled=false and ZDR=false, got %+v", f.Assistant.Config())
+	}
+
+	// Partial update must not clobber enable or zdr back to true.
+	out.Reset()
+	errBuf.Reset()
+	rc = Run([]string{"assistant", "setup", "--model", "openai/gpt-4o-mini", "--no-test"}, &IO{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errBuf})
+	if rc != 0 {
+		t.Fatalf("partial setup failed: rc=%d out=%q err=%q", rc, out.String(), errBuf.String())
+	}
+	cfg := f.Assistant.Config()
+	if cfg.Enabled || cfg.ZDR || cfg.Models.DefaultChat != "openai/gpt-4o-mini" {
+		t.Fatalf("partial setup clobbered enable/zdr or missed model: %+v", cfg)
+	}
+
+	// Conflicting sandbox flags must fail.
+	errBuf.Reset()
+	rc = Run([]string{"assistant", "setup", "--sandbox-enable", "--sandbox-disable", "--no-test"}, &IO{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errBuf})
+	if rc == 0 || !strings.Contains(errBuf.String(), "cannot be combined") {
+		t.Fatalf("expected sandbox flag conflict error, got rc=%d err=%q", rc, errBuf.String())
+	}
+}

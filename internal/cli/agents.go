@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -59,13 +58,6 @@ Lifecycle & Relay:
   wait     --session SID [--harness H] [--timeout S] [--poll-timeout S]
   relay    [--harness H[,H2...]] [--poll-timeout S] [--agentapi PATH]
 `
-}
-
-func writeJSONOut(w io.Writer, v any) error {
-	enc := json.NewEncoder(w)
-	enc.SetEscapeHTML(false)
-	enc.SetIndent("", "  ")
-	return enc.Encode(v)
 }
 
 func resolveCLICaller(explicitSID string) (sid, harness, cwd string) {
@@ -1225,7 +1217,8 @@ func cmdAgentsPathsAdd(args []string, cio *IO) error {
 	if *jsonOut {
 		return writeJSONOut(cio.Stdout, res)
 	}
-	cio.printf("tracked %s:%s (repo=%s)\n", res["device"], res["path"], cmp.Or(fmt.Sprint(res["repo"]), "-"))
+	repoStr, _ := res["repo"].(string)
+	cio.printf("tracked %s:%s (repo=%s)\n", res["device"], res["path"], cmp.Or(repoStr, "-"))
 	return nil
 }
 

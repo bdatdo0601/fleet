@@ -1,7 +1,11 @@
 package codes
 
 import (
+	"bufio"
+	"bytes"
+	"compress/zlib"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"strings"
 	"testing"
@@ -68,5 +72,35 @@ func TestShortIDFormat(t *testing.T) {
 	parts := strings.Split(id, "-")
 	if len(parts) != 3 || len(id) != 14 {
 		t.Fatalf("unexpected short id: %q", id)
+	}
+}
+
+func TestDecodeRejectsZipBombAndReadBlockCap(t *testing.T) {
+	// Compress > 1 MiB of zeros (highly compressible zip bomb).
+	var comp bytes.Buffer
+	zw := zlib.NewWriter(&comp)
+	zeros := make([]byte, maxDecodedBytes+4096)
+	if _, err := zw.Write(zeros); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	bomb := "-----BEGIN " + Response + "-----\n" +
+		base64.StdEncoding.EncodeToString(comp.Bytes()) +
+		"\n-----END " + Response + "-----"
+
+	var out map[string]any
+	err := Decode(Response, bomb, &out)
+	if err == nil || !strings.Contains(err.Error(), "maximum decoded size") {
+		t.Fatalf("expected zip-bomb rejection, got %v", err)
+	}
+
+	oversized := strings.Repeat("x", maxBlockBytes+64)
+	if _, err := ReadBlock("END FLEET JOIN REQUEST", strings.NewReader(oversized)); err == nil || !strings.Contains(err.Error(), "maximum size") {
+		t.Fatalf("expected ReadBlock unbuffered cap error, got %v", err)
+	}
+	if _, err := ReadBlock("END FLEET JOIN REQUEST", bufio.NewReader(strings.NewReader(oversized))); err == nil || !strings.Contains(err.Error(), "maximum size") {
+		t.Fatalf("expected ReadBlock buffered cap error, got %v", err)
 	}
 }

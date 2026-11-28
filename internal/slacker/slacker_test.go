@@ -2,6 +2,7 @@ package slacker
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/binary"
@@ -22,7 +23,6 @@ import (
 	"time"
 
 	"github.com/bdatdo0601/fleet/internal/agents"
-	"github.com/bdatdo0601/fleet/internal/client"
 	"github.com/bdatdo0601/fleet/internal/paths"
 	"github.com/bdatdo0601/fleet/internal/registry"
 	"github.com/bdatdo0601/fleet/internal/session"
@@ -424,7 +424,7 @@ func TestWorkerCrossDeviceRoutingSleepingMacRecoveryAndCleanup(t *testing.T) {
 		case "/v1/slacker/worker/receipt":
 			var rec Receipt
 			_ = json.NewDecoder(r.Body).Decode(&rec)
-			j, err := store.RecordReceipt(dev, rec)
+			j, err := store.recordReceiptCtx(r.Context(), dev, rec)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusForbidden)
 				return
@@ -615,12 +615,12 @@ while True:
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/slacker/worker/poll":
-			j, _ := store.ClaimNextJob("laptop", 90*time.Second)
+			j, _ := store.claimNextJobCtx(r.Context(), "laptop", 90*time.Second)
 			_ = json.NewEncoder(w).Encode(map[string]any{"job": j, "device": "laptop"})
 		case "/v1/slacker/worker/receipt":
 			var rec Receipt
 			_ = json.NewDecoder(r.Body).Decode(&rec)
-			j, _ := store.RecordReceipt("laptop", rec)
+			j, _ := store.recordReceiptCtx(r.Context(), "laptop", rec)
 			_ = json.NewEncoder(w).Encode(map[string]any{"job": j})
 		}
 	}))
@@ -673,8 +673,6 @@ while True:
 	if _, err := os.Stat(filepath.Join(repoDir, "README.md")); err != nil {
 		t.Fatalf("expected repo preserved: %v", err)
 	}
-	var unusedClient *client.APIError
-	_ = unusedClient
 }
 
 func TestWorkerAgyDefaultAppBackend(t *testing.T) {
@@ -727,12 +725,12 @@ func TestWorkerAgyDefaultAppBackend(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/slacker/worker/poll":
-			j, _ := store.ClaimNextJob("laptop", 90*time.Second)
+			j, _ := store.claimNextJobCtx(r.Context(), "laptop", 90*time.Second)
 			_ = json.NewEncoder(w).Encode(map[string]any{"job": j, "device": "laptop"})
 		case "/v1/slacker/worker/receipt":
 			var rec Receipt
 			_ = json.NewDecoder(r.Body).Decode(&rec)
-			j, _ := store.RecordReceipt("laptop", rec)
+			j, _ := store.recordReceiptCtx(r.Context(), "laptop", rec)
 			_ = json.NewEncoder(w).Encode(map[string]any{"job": j})
 		}
 	}))
@@ -901,7 +899,7 @@ func TestMultiAccountListenerAndReadWriteAPI(t *testing.T) {
 		ts := r.URL.Query().Get("latest")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"ok":       true,
-			"messages": []SlackMessage{{TS: cmpOr(ts, "10.1"), User: "U1", Text: "Message in " + ch}},
+			"messages": []SlackMessage{{TS: cmp.Or(ts, "10.1"), User: "U1", Text: "Message in " + ch}},
 		})
 	})
 	mux.HandleFunc("/conversations.replies", func(w http.ResponseWriter, r *http.Request) {
@@ -1063,13 +1061,6 @@ func TestMultiAccountListenerAndReadWriteAPI(t *testing.T) {
 		t.Fatalf("unexpected post payload: %s", got)
 	}
 	stopListener()
-}
-
-func cmpOr(a, b string) string {
-	if a != "" {
-		return a
-	}
-	return b
 }
 
 func TestWorkspaceDirAndMultiDeviceConfigValidation(t *testing.T) {
@@ -1642,12 +1633,12 @@ func TestWorkerProcessesKillAndKillAllJobs(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/slacker/worker/poll":
-			j, _ := store.ClaimNextJob("laptop", 90*time.Second)
+			j, _ := store.claimNextJobCtx(r.Context(), "laptop", 90*time.Second)
 			_ = json.NewEncoder(w).Encode(map[string]any{"job": j, "device": "laptop"})
 		case "/v1/slacker/worker/receipt":
 			var rec Receipt
 			_ = json.NewDecoder(r.Body).Decode(&rec)
-			j, _ := store.RecordReceipt("laptop", rec)
+			j, _ := store.recordReceiptCtx(r.Context(), "laptop", rec)
 			_ = json.NewEncoder(w).Encode(map[string]any{"job": j})
 		}
 	}))
@@ -1728,12 +1719,12 @@ func TestWorkerRefreshShellPathBeforeLaunch(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/slacker/worker/poll":
-			j, _ := store.ClaimNextJob("laptop", 90*time.Second)
+			j, _ := store.claimNextJobCtx(r.Context(), "laptop", 90*time.Second)
 			_ = json.NewEncoder(w).Encode(map[string]any{"job": j, "device": "laptop"})
 		case "/v1/slacker/worker/receipt":
 			var rec Receipt
 			_ = json.NewDecoder(r.Body).Decode(&rec)
-			j, _ := store.RecordReceipt("laptop", rec)
+			j, _ := store.recordReceiptCtx(r.Context(), "laptop", rec)
 			_ = json.NewEncoder(w).Encode(map[string]any{"job": j})
 		}
 	}))
@@ -1771,5 +1762,175 @@ func TestWorkerRefreshShellPathBeforeLaunch(t *testing.T) {
 	}
 	if brewIdx < 0 || customIdx > brewIdx {
 		t.Fatalf("expected %q (idx %d) ahead of /opt/homebrew/bin (idx %d) in %q", customBin, customIdx, brewIdx, launchedPath)
+	}
+}
+
+func TestWorkerReexecutesAfterRetryJobAndSanitizesReceiptPath(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "slacker.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/slacker/worker/poll":
+			j, _ := store.claimNextJobCtx(r.Context(), "laptop", 90*time.Second)
+			_ = json.NewEncoder(w).Encode(map[string]any{"job": j, "device": "laptop"})
+		case "/v1/slacker/worker/receipt":
+			var rec Receipt
+			_ = json.NewDecoder(r.Body).Decode(&rec)
+			j, _ := store.recordReceiptCtx(r.Context(), "laptop", rec)
+			_ = json.NewEncoder(w).Encode(map[string]any{"job": j})
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	_, job, err := store.EnqueueJob(Job{
+		EventID: "EvRetry", ChannelID: "C1", MessageTS: "99.1", Reaction: "claude", UserID: "U1",
+		TargetDevice: "laptop", RepoPath: tmp, Harness: "claude",
+		SessionName: DeterministicSessionName("C1", "99.1"), Prompt: "retry me",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	workerDir := filepath.Join(tmp, "worker-state")
+	attempts := 0
+	runOnce := func() error {
+		return RunWorker(context.Background(), WorkerOpts{
+			APIURL:        srv.URL,
+			LocalStateDir: workerDir,
+			Once:          true,
+			SessionExists: func(string, string) (bool, string) { return false, "" },
+			LaunchFn: func(Job, bool, io.Writer, io.Writer) (string, error) {
+				attempts++
+				if attempts == 1 {
+					return "", errors.New("transient launch failure")
+				}
+				return "tmux", nil
+			},
+		})
+	}
+
+	// 1st run fails and records failed local receipt for attempt 1.
+	if err := runOnce(); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := store.GetJob(job.ID)
+	if got.Status != "failed" || got.AttemptCount != 1 {
+		t.Fatalf("expected failed attempt 1, got %+v", got)
+	}
+
+	// RetryJob queues it; next ClaimNextJob increments AttemptCount=2, so worker MUST re-execute LaunchFn.
+	if _, err := store.RetryJob(job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := runOnce(); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 {
+		t.Fatalf("expected LaunchFn called twice after RetryJob, got %d", attempts)
+	}
+	got, _ = store.GetJob(job.ID)
+	if got.Status != "launched" || got.AttemptCount != 2 || got.Backend != "tmux" {
+		t.Fatalf("expected launched on attempt 2, got %+v", got)
+	}
+
+	// Receipt path sanitizes traversal characters in jobID.
+	rp := receiptPath(workerDir, "../../evil/job-1")
+	if !strings.HasPrefix(rp, receiptsDir(workerDir)+string(filepath.Separator)) || strings.Contains(rp, "..") {
+		t.Fatalf("unsanitized receipt path: %q", rp)
+	}
+}
+
+func TestApplyUpdateErrorImmutability(t *testing.T) {
+	prev := Config{
+		Accounts: map[string]AccountConfig{
+			"default": {ID: "default", Enabled: true, AppToken: "xapp-1", UserToken: "xoxp-1", AuthorizedUserID: "U1"},
+		},
+		Devices: map[string]DeviceConfig{
+			"mini": {WorkspaceDir: "~/ws"},
+		},
+		DefaultDevices: []string{"mini"},
+		Channels: map[string]ChannelMapping{
+			"C1": {Account: "default", ChannelID: "C1", Devices: []string{"mini"}, Device: "mini", RepoPath: "fleet"},
+		},
+		Emojis: map[string]string{"claude": "claude"},
+	}
+
+	// Trigger validation error on invalid emoji after mutating account/devices/channels in upd.
+	_, err := ApplyUpdate(prev, ConfigUpdate{
+		DeleteAccount: "default",
+		Devices:       map[string]DeviceConfig{"mini": {WorkspaceDir: "/changed"}},
+		Emojis:        map[string]string{"bad": "not-a-harness"},
+	}, map[string]bool{"mini": true})
+	if err == nil {
+		t.Fatal("expected error from invalid emoji mapping")
+	}
+	if _, ok := prev.Accounts["default"]; !ok {
+		t.Fatal("prev.Accounts mutated on ApplyUpdate error")
+	}
+	if prev.Devices["mini"].WorkspaceDir != "~/ws" {
+		t.Fatalf("prev.Devices mutated on ApplyUpdate error: %+v", prev.Devices)
+	}
+	if _, ok := prev.Channels["C1"]; !ok {
+		t.Fatal("prev.Channels mutated on ApplyUpdate error")
+	}
+	if prev.Emojis["claude"] != "claude" {
+		t.Fatalf("prev.Emojis mutated on ApplyUpdate error: %+v", prev.Emojis)
+	}
+}
+
+func TestReadMessagesThreadOldestLatestAndStoreClose(t *testing.T) {
+	var gotOldest, gotLatest string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/conversations.replies":
+			gotOldest = r.URL.Query().Get("oldest")
+			gotLatest = r.URL.Query().Get("latest")
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "messages": []SlackMessage{{TS: "100.1", User: "U1", Text: "hi"}}})
+		case "/conversations.info":
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "channel": map[string]string{"name": "eng"}})
+		case "/users.info":
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "user": map[string]any{"name": "u"}})
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	sc := &SlackClient{BaseURL: srv.URL}
+	if _, err := sc.ReadMessages(context.Background(), "xoxp-1", ReadMessagesOpts{
+		ChannelID: "C1", ThreadTS: "100.0", Oldest: "100.0", Latest: "100.5",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if gotOldest != "100.0" || gotLatest != "100.5" {
+		t.Fatalf("expected oldest/latest passed to conversations.replies, got oldest=%q latest=%q", gotOldest, gotLatest)
+	}
+
+	store, err := Open(filepath.Join(t.TempDir(), "slacker.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitErrCh := make(chan error, 1)
+	go func() {
+		_, wErr := store.WaitForJob(context.Background(), "laptop", 10*time.Second, 90*time.Second)
+		waitErrCh <- wErr
+	}()
+	time.Sleep(40 * time.Millisecond)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case wErr := <-waitErrCh:
+		if wErr == nil {
+			t.Fatal("expected WaitForJob to return error when store closed")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close() did not wake WaitForJob")
+	}
+	if _, err := store.GetJob("x"); err == nil {
+		t.Fatal("expected error rather than panic on post-Close GetJob")
 	}
 }

@@ -94,3 +94,46 @@ func TestNebulaWatchdogLifecycle(t *testing.T) {
 		t.Fatalf("expected new pending request after rotation/cooldown, got %+v err=%v", req2, err)
 	}
 }
+
+func TestNebulaWatchdogCRLFOffsetsAndStop(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "nebula.log")
+
+	wd := &NebulaWatchdog{
+		StateDir:       dir,
+		LogPath:        logPath,
+		PollInterval:   5 * time.Millisecond,
+		BurstWindow:    60 * time.Second,
+		BurstThreshold: 5,
+		Cooldown:       10 * time.Minute,
+	}
+	wd.Init()
+
+	crlfLine := strings.TrimSuffix(sampleRelayErr, "\n") + "\r\n"
+	appendLogLines(t, logPath, crlfLine, 3)
+	if wd.CheckOnce(time.Now()) {
+		t.Fatal("expected 3 errors not to trigger")
+	}
+	info, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wd.mu.Lock()
+	gotOffset := wd.offset
+	wd.mu.Unlock()
+	if gotOffset != info.Size() {
+		t.Fatalf("expected offset %d matching CRLF file size, got %d", info.Size(), gotOffset)
+	}
+	// Re-checking without new writes must not re-count previous CRLF lines.
+	if wd.CheckOnce(time.Now()) {
+		t.Fatal("expected no re-counting on unchanged CRLF file")
+	}
+	if st := wd.State(); st.RecentErrors != 3 {
+		t.Fatalf("expected 3 recent errors, got %d", st.RecentErrors)
+	}
+
+	wd.Start(t.Context())
+	time.Sleep(20 * time.Millisecond)
+	wd.Stop()
+	wd.Stop() // idempotent
+}

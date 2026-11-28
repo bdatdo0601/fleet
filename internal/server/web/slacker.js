@@ -6,9 +6,11 @@ import {
   cell,
   clear,
   confirmDialog,
+  createDevicePoolPicker,
   el,
   fetchPathsCatalog,
   field,
+  isWorkerOnline,
   makeCopyBtn,
   populateDatalist,
   relTime,
@@ -123,9 +125,13 @@ function renderAccountsCard(cfg, runtimes, ctx) {
                   if (!(await confirmDialog("Delete Slack account", `Remove account '${a.id}' and its channel mappings?`, "Delete", true))) {
                     return;
                   }
-                  await api("POST", "/v1/slacker/config", { delete_account: a.id });
-                  toast(`Removed account ${a.id}`, "ok");
-                  ctx.refresh();
+                  try {
+                    await api("POST", "/v1/slacker/config", { delete_account: a.id });
+                    toast(`Removed account ${a.id}`, "ok");
+                    ctx.refresh();
+                  } catch (err) {
+                    toast(err.message, "error");
+                  }
                 },
               }),
             ),
@@ -211,18 +217,6 @@ function renderAccountsCard(cfg, runtimes, ctx) {
     ),
   );
   return card;
-}
-
-function isWorkerOnline(runtimes, dev) {
-  const rt = runtimes.find((r) => r.role === `worker:${dev}`);
-  if (!rt || !rt.connected) {
-    return false;
-  }
-  const ts = Date.parse(rt.last_poll_at || rt.updated_at || "");
-  if (!Number.isFinite(ts)) {
-    return false;
-  }
-  return Date.now() - ts <= 90 * 1000;
 }
 
 function renderMachinesCard(cfg, statusRes, knownDevices, pathsCatalog, ctx) {
@@ -351,7 +345,7 @@ function renderMachinesCard(cfg, statusRes, knownDevices, pathsCatalog, ctx) {
   );
 }
 
-function renderMappingsCard(cfg, cfgRes, statusRes, devices, pathsCatalog, ctx) {
+function renderMappingsCard(cfg, devices, pathsCatalog, ctx) {
   const accountIDs = Object.keys(cfg.accounts || {}).sort();
   if (accountIDs.length === 0) {
     accountIDs.push("default");
@@ -385,10 +379,6 @@ function renderMappingsCard(cfg, cfgRes, statusRes, devices, pathsCatalog, ctx) 
       );
       const idIn = el("input", { type: "text", value: ch.channel_id || "", placeholder: "C0123456789", oninput: (e) => { ch.channel_id = e.target.value; } });
       const chipPool = Array.from(new Set([...devices, ...(ch.devices || [])].filter(Boolean)));
-      const poolHint = el("span", {
-        className: "small muted",
-        text: (ch.devices || []).length === 0 ? `default (${defaultDevices.length > 0 ? defaultDevices.join(", ") : "none"})` : "",
-      });
       const repoListID = `slacker-ch-repo-${i}`;
       const repoDatalist = el("datalist", { id: repoListID });
       const repoIn = el("input", {
@@ -420,28 +410,15 @@ function renderMappingsCard(cfg, cfgRes, statusRes, devices, pathsCatalog, ctx) 
       };
       syncRowRepoChoices();
 
-      const chipButtons = chipPool.map((devName) => {
-        const isSelected = (ch.devices || []).includes(devName);
-        const btn = el("button", {
-          type: "button",
-          className: `chip${isSelected ? " active" : ""}`,
-          text: devName,
-          onclick: () => {
-            const cur = new Set(ch.devices || []);
-            if (cur.has(devName)) {
-              cur.delete(devName);
-            } else {
-              cur.add(devName);
-            }
-            ch.devices = chipPool.filter((d) => cur.has(d));
-            btn.classList.toggle("active", cur.has(devName));
-            poolHint.textContent = ch.devices.length === 0 ? `default (${defaultDevices.length > 0 ? defaultDevices.join(", ") : "none"})` : "";
-            syncRowRepoChoices();
-          },
-        });
-        return btn;
+      const { element: devChipsBox } = createDevicePoolPicker({
+        pool: chipPool,
+        selected: ch.devices || [],
+        defaultDevices,
+        onChange: (next) => {
+          ch.devices = next;
+          syncRowRepoChoices();
+        },
       });
-      const devChipsBox = el("div", { className: "chips-row" }, ...chipButtons, poolHint);
       const stratSel = el(
         "select",
         { onchange: (e) => { ch.strategy = e.target.value; } },
@@ -591,10 +568,38 @@ function renderJobsSection(jobs, ctx) {
   for (const j of jobs) {
     const acts = el("div", { className: "actions-row" });
     if (j.status === "failed" || j.status === "cancelled" || j.status === "claimed") {
-      acts.appendChild(el("button", { type: "button", className: "btn btn-sm", text: "Retry", onclick: async () => { await api("POST", `/v1/slacker/jobs/${encodeURIComponent(j.id)}/retry`, {}); ctx.refresh(); } }));
+      acts.appendChild(
+        el("button", {
+          type: "button",
+          className: "btn btn-sm",
+          text: "Retry",
+          onclick: async () => {
+            try {
+              await api("POST", `/v1/slacker/jobs/${encodeURIComponent(j.id)}/retry`, {});
+              ctx.refresh();
+            } catch (err) {
+              toast(err.message, "error");
+            }
+          },
+        }),
+      );
     }
     if (j.status === "queued" || j.status === "claimed") {
-      acts.appendChild(el("button", { type: "button", className: "btn btn-sm btn-danger", text: "Cancel", onclick: async () => { await api("POST", `/v1/slacker/jobs/${encodeURIComponent(j.id)}/cancel`, {}); ctx.refresh(); } }));
+      acts.appendChild(
+        el("button", {
+          type: "button",
+          className: "btn btn-sm btn-danger",
+          text: "Cancel",
+          onclick: async () => {
+            try {
+              await api("POST", `/v1/slacker/jobs/${encodeURIComponent(j.id)}/cancel`, {});
+              ctx.refresh();
+            } catch (err) {
+              toast(err.message, "error");
+            }
+          },
+        }),
+      );
     }
     const variant = j.status === "launched" ? "ok" : j.status === "failed" ? "danger" : j.status === "queued" || j.status === "claimed" ? "warn" : "neutral";
     const triggerText = j.account === "ui" ? "web-ui" : `:${j.reaction}: #${j.channel_name || j.channel_id}`;
@@ -624,9 +629,13 @@ function renderJobsSection(jobs, ctx) {
           if (!(await confirmDialog("Prune terminal jobs", "Delete launched, failed, and cancelled job records? Active sessions and repos are untouched.", "Prune"))) {
             return;
           }
-          const res = await api("POST", "/v1/slacker/cleanup", { all_terminal: true });
-          toast(`Pruned ${res.pruned_jobs || 0} job(s)`, "ok");
-          ctx.refresh();
+          try {
+            const res = await api("POST", "/v1/slacker/cleanup", { all_terminal: true });
+            toast(`Pruned ${res.pruned_jobs || 0} job(s)`, "ok");
+            ctx.refresh();
+          } catch (err) {
+            toast(err.message, "error");
+          }
         },
       }),
     },
@@ -646,6 +655,7 @@ function renderJobsSection(jobs, ctx) {
 }
 
 export async function renderSlacker(root, ctx, subRoute = "") {
+  const signal = ctx && ctx.signal;
   if (!state.isAdmin) {
     root.appendChild(el("div", { className: "empty-state", text: "Admin privileges required to configure Slacker." }));
     return;
@@ -662,15 +672,21 @@ export async function renderSlacker(root, ctx, subRoute = "") {
   let pathsCatalog;
   try {
     [statusRes, cfgRes, jobsRes, devicesRes, pathsCatalog] = await Promise.all([
-      api("GET", "/v1/slacker/status"),
-      api("GET", "/v1/slacker/config"),
-      api("GET", "/v1/slacker/jobs?limit=50"),
-      api("GET", "/v1/devices"),
-      fetchPathsCatalog(),
+      api("GET", "/v1/slacker/status", undefined, { signal }),
+      api("GET", "/v1/slacker/config", undefined, { signal }),
+      api("GET", "/v1/slacker/jobs?limit=50", undefined, { signal }),
+      api("GET", "/v1/devices", undefined, { signal }),
+      fetchPathsCatalog("", { signal }),
     ]);
   } catch (err) {
+    if ((err && err.name === "AbortError") || (signal && signal.aborted)) {
+      return;
+    }
     clear(root);
     root.appendChild(el("div", { className: "alert-banner alert-danger", text: err.message }));
+    return;
+  }
+  if (signal && signal.aborted) {
     return;
   }
 
@@ -720,7 +736,7 @@ export async function renderSlacker(root, ctx, subRoute = "") {
 
   if (slackerState.tab === "routing") {
     root.appendChild(section("Machines & Defaults", { className: "ui-section" }, renderMachinesCard(cfg, statusRes, devices, pathsCatalog, ctx)));
-    root.appendChild(section("Channel & Emoji Mappings", { className: "ui-section" }, renderMappingsCard(cfg, cfgRes, statusRes, devices, pathsCatalog, ctx)));
+    root.appendChild(section("Channel & Emoji Mappings", { className: "ui-section" }, renderMappingsCard(cfg, devices, pathsCatalog, ctx)));
     root.appendChild(
       section(
         "Known Directories & Repos",

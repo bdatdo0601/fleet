@@ -2,6 +2,7 @@ package assistant
 
 import (
 	"cmp"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,8 +15,21 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 	"unicode/utf8"
 )
+
+var vaultGitLocks sync.Map // map[string]*sync.Mutex
+
+func vaultGitMutex(root string) *sync.Mutex {
+	clean := filepath.Clean(root)
+	if resolved, err := filepath.EvalSymlinks(clean); err == nil {
+		clean = resolved
+	}
+	actual, _ := vaultGitLocks.LoadOrStore(clean, &sync.Mutex{})
+	return actual.(*sync.Mutex)
+}
 
 const skillProvenanceFile = ".fleet-skill.json"
 
@@ -124,18 +138,9 @@ func (v *Vault) ResolveRel(rel string) (string, string, error) {
 	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 		return "", "", newErr("path must stay inside vault", http.StatusBadRequest)
 	}
-	full := filepath.Join(v.Root, clean)
-	rootReal, err := filepath.EvalSymlinks(v.Root)
+	full, err := resolveJailedPath(v.Root, clean, "symlink escapes vault")
 	if err != nil {
-		rootReal = v.Root
-	}
-	for _, candidate := range []string{full, filepath.Dir(full)} {
-		if resolved, rErr := filepath.EvalSymlinks(candidate); rErr == nil {
-			relCheck, relErr := filepath.Rel(rootReal, resolved)
-			if relErr != nil || relCheck == ".." || strings.HasPrefix(relCheck, ".."+string(filepath.Separator)) {
-				return "", "", newErr("symlink escapes vault", http.StatusForbidden)
-			}
-		}
+		return "", "", err
 	}
 	return filepath.ToSlash(clean), full, nil
 }
@@ -777,7 +782,12 @@ func (v *Vault) GitRollback(sha string) (VaultCommit, error) {
 	if _, err := os.Stat(filepath.Join(v.Root, ".git")); err != nil {
 		return VaultCommit{}, newErr("vault is not a git repository", http.StatusBadRequest)
 	}
-	if out, err := exec.Command("git", "-C", v.Root, "checkout", clean, "--", ".").CombinedOutput(); err != nil {
+	mu := vaultGitMutex(v.Root)
+	mu.Lock()
+	defer mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if out, err := exec.CommandContext(ctx, "git", "-C", v.Root, "checkout", clean, "--", ".").CombinedOutput(); err != nil {
 		return VaultCommit{}, newErr(fmt.Sprintf("git checkout %s failed: %s", clean, strings.TrimSpace(string(out))), http.StatusBadRequest)
 	}
 	short := clean
@@ -785,8 +795,8 @@ func (v *Vault) GitRollback(sha string) (VaultCommit, error) {
 		short = short[:7]
 	}
 	msg := "ui: rollback vault to " + short
-	_ = exec.Command("git", "-C", v.Root, "add", "-A").Run()
-	_ = exec.Command("git", "-C", v.Root, "commit", "--allow-empty", "-m", msg, "--quiet").Run()
+	_ = exec.CommandContext(ctx, "git", "-C", v.Root, "add", "-A").Run()
+	_ = exec.CommandContext(ctx, "git", "-C", v.Root, "commit", "--allow-empty", "-m", msg, "--quiet").Run()
 	hist, _ := v.GitHistory(1)
 	if len(hist) > 0 {
 		return hist[0], nil
@@ -796,18 +806,28 @@ func (v *Vault) GitRollback(sha string) (VaultCommit, error) {
 
 // MaybeGitCommit stages and commits changes if the vault is already a git repository.
 func (v *Vault) MaybeGitCommit(enabled bool, msg string) {
+	v.MaybeGitCommitContext(context.Background(), enabled, msg)
+}
+
+// MaybeGitCommitContext stages and commits changes with ctx if the vault is already a git repository.
+func (v *Vault) MaybeGitCommitContext(ctx context.Context, enabled bool, msg string) {
 	if !enabled {
 		return
 	}
 	if _, err := os.Stat(filepath.Join(v.Root, ".git")); err != nil {
 		return
 	}
-	addCmd := exec.Command("git", "-C", v.Root, "add", "-A")
+	mu := vaultGitMutex(v.Root)
+	mu.Lock()
+	defer mu.Unlock()
+	runCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	addCmd := exec.CommandContext(runCtx, "git", "-C", v.Root, "add", "-A")
 	if err := addCmd.Run(); err != nil {
 		return
 	}
 	commitMsg := cmp.Or(strings.TrimSpace(msg), "assistant: update vault")
-	_ = exec.Command("git", "-C", v.Root, "commit", "-m", commitMsg, "--quiet").Run()
+	_ = exec.CommandContext(runCtx, "git", "-C", v.Root, "commit", "-m", commitMsg, "--quiet").Run()
 }
 
 // NonEmptyBody reports whether a markdown file has non-comment, non-heading content.

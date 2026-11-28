@@ -112,12 +112,18 @@ func (a DecisionAnswer) Prob(key string) float64 {
 }
 
 type openRouterClient struct {
-	http *http.Client
+	http       *http.Client
+	streamHTTP *http.Client
 }
 
 func newOpenRouterClient() *openRouterClient {
+	streamTransport := &http.Transport{
+		ResponseHeaderTimeout: 60 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+	}
 	return &openRouterClient{
-		http: &http.Client{Timeout: 120 * time.Second},
+		http:       &http.Client{Timeout: 120 * time.Second},
+		streamHTTP: &http.Client{Transport: streamTransport},
 	}
 }
 
@@ -182,7 +188,11 @@ func (c *openRouterClient) StreamChat(
 	}
 	applyOpenRouterHeaders(req, cfg.APIKey)
 
-	resp, err := c.http.Do(req)
+	httpCli := c.streamHTTP
+	if httpCli == nil {
+		httpCli = c.http
+	}
+	resp, err := httpCli.Do(req)
 	if err != nil {
 		return ChatTurnResult{}, err
 	}
@@ -196,6 +206,10 @@ func (c *openRouterClient) StreamChat(
 }
 
 type streamChunk struct {
+	Error *struct {
+		Message string `json:"message"`
+		Code    any    `json:"code"`
+	} `json:"error"`
 	Choices []struct {
 		FinishReason string `json:"finish_reason"`
 		Delta        struct {
@@ -246,6 +260,16 @@ func readChatSSE(r io.Reader, onDelta func(string)) (ChatTurnResult, error) {
 		var chunk streamChunk
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			continue
+		}
+		if chunk.Error != nil {
+			msg := strings.TrimSpace(chunk.Error.Message)
+			if msg == "" {
+				msg = "upstream stream error"
+			}
+			if chunk.Error.Code != nil {
+				return ChatTurnResult{}, fmt.Errorf("LLM stream error (%v): %s", chunk.Error.Code, msg)
+			}
+			return ChatTurnResult{}, fmt.Errorf("LLM stream error: %s", msg)
 		}
 		if chunk.Usage != nil {
 			usage.PromptTokens = chunk.Usage.PromptTokens
@@ -351,7 +375,11 @@ func (c *openRouterClient) CompleteText(ctx context.Context, cfg Config, model, 
 		return "", err
 	}
 	applyOpenRouterHeaders(req, cfg.APIKey)
-	resp, err := c.http.Do(req)
+	httpCli := c.streamHTTP
+	if httpCli == nil {
+		httpCli = c.http
+	}
+	resp, err := httpCli.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -457,7 +485,11 @@ func (c *openRouterClient) DecideState(ctx context.Context, cfg Config, state ma
 		return nil, err
 	}
 	applyOpenRouterHeaders(req, cfg.APIKey)
-	resp, err := c.http.Do(req)
+	httpCli := c.streamHTTP
+	if httpCli == nil {
+		httpCli = c.http
+	}
+	resp, err := httpCli.Do(req)
 	if err != nil {
 		return nil, err
 	}

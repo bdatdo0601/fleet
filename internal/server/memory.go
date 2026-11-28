@@ -83,7 +83,11 @@ func registerMemoryRoutes(
 		if err := readJSONBody(r, &req); err != nil {
 			return err
 		}
-		req.Device = cmp.Or(req.Device, c.Name)
+		if !core.IsAdmin(c) {
+			req.Device = c.Name
+		} else {
+			req.Device = cmp.Or(req.Device, c.Name)
+		}
 		res, err := fleet.Memory.Upsert(req)
 		if err != nil {
 			return err
@@ -95,35 +99,7 @@ func registerMemoryRoutes(
 		return nil
 	}))
 
-	mux.HandleFunc("DELETE /v1/memory/item", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
-		q := r.URL.Query()
-		scope := q.Get("scope")
-		key := q.Get("key")
-		hard := queryBool(r, "hard")
-		harness := q.Get("harness")
-		sessionID := q.Get("session_id")
-		reason := q.Get("reason")
-		if scope == "" && key == "" && r.ContentLength != 0 {
-			var body struct {
-				Scope     string `json:"scope"`
-				Key       string `json:"key"`
-				Hard      bool   `json:"hard"`
-				Harness   string `json:"harness"`
-				SessionID string `json:"session_id"`
-				Reason    string `json:"reason"`
-			}
-			if err := readJSONBody(r, &body); err != nil {
-				return err
-			}
-			scope, key, hard = body.Scope, body.Key, body.Hard
-			harness, sessionID, reason = body.Harness, body.SessionID, body.Reason
-		}
-		if err := fleet.Memory.Delete(scope, key, hard, c.Name, harness, sessionID, reason); err != nil {
-			return err
-		}
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-		return nil
-	}))
+	mux.HandleFunc("DELETE /v1/memory/item", route(false, handleMemoryDelete(fleet)))
 
 	mux.HandleFunc("POST /v1/memory/sync", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
 		var req struct {
@@ -155,6 +131,38 @@ func registerMemoryRoutes(
 	registerMemoryHistoryRoutes(mux, fleet, route)
 	registerMemoryProposalRoutes(mux, fleet, route)
 	registerMemoryCuratorRoutes(mux, fleet, route)
+}
+
+func handleMemoryDelete(fleet *core.Fleet) func(http.ResponseWriter, *http.Request, *registry.Device) error {
+	return func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
+		q := r.URL.Query()
+		scope := q.Get("scope")
+		key := q.Get("key")
+		hard := queryBool(r, "hard")
+		harness := q.Get("harness")
+		sessionID := q.Get("session_id")
+		reason := q.Get("reason")
+		if scope == "" && key == "" && r.ContentLength != 0 {
+			var body struct {
+				Scope     string `json:"scope"`
+				Key       string `json:"key"`
+				Hard      bool   `json:"hard"`
+				Harness   string `json:"harness"`
+				SessionID string `json:"session_id"`
+				Reason    string `json:"reason"`
+			}
+			if err := readJSONBody(r, &body); err != nil {
+				return err
+			}
+			scope, key, hard = body.Scope, body.Key, body.Hard
+			harness, sessionID, reason = body.Harness, body.SessionID, body.Reason
+		}
+		if err := fleet.Memory.Delete(scope, key, hard, c.Name, harness, sessionID, reason); err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return nil
+	}
 }
 
 func parseProposalDecision(raw string) (bool, error) {
@@ -250,7 +258,7 @@ func registerMemoryProposalRoutes(
 		return nil
 	}))
 
-	mux.HandleFunc("POST /v1/memory/proposals/resolve", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
+	mux.HandleFunc("POST /v1/memory/proposals/resolve", route(true, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
 		var req struct {
 			ID       int64  `json:"id"`
 			Decision string `json:"decision"`
@@ -270,7 +278,7 @@ func registerMemoryProposalRoutes(
 		return nil
 	}))
 
-	mux.HandleFunc("POST /v1/memory/proposals/batch", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
+	mux.HandleFunc("POST /v1/memory/proposals/batch", route(true, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
 		var req struct {
 			IDs        []int64 `json:"ids"`
 			AllPending bool    `json:"all_pending"`
@@ -320,7 +328,11 @@ func registerMemoryCuratorRoutes(
 	route func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc,
 ) {
 	mux.HandleFunc("GET /v1/memory/curator", route(false, func(w http.ResponseWriter, _ *http.Request, _ *registry.Device) error {
-		writeJSON(w, http.StatusOK, fleet.Curator.Status())
+		var st memory.CuratorStatus
+		if fleet.Curator != nil {
+			st = fleet.Curator.Status()
+		}
+		writeJSON(w, http.StatusOK, st)
 		return nil
 	}))
 

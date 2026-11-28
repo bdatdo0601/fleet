@@ -145,6 +145,7 @@ func allowedRequestHost(rawHost string, fleet *core.Fleet) bool {
 		return true
 	}
 	if addr, err := netip.ParseAddr(host); err == nil {
+		addr = addr.Unmap()
 		if addr.IsLoopback() {
 			return true
 		}
@@ -186,25 +187,37 @@ func checkBrowserOrigin(r *http.Request, fleet *core.Fleet) error {
 	return nil
 }
 
-func resolvedPeerIP(r *http.Request, edgeToken string) string {
+func hasEdgeProxyHeaders(r *http.Request) bool {
+	return len(r.Header.Values(tlsdns.HeaderEdgeToken)) > 0 ||
+		len(r.Header.Values(tlsdns.HeaderClientIP)) > 0 ||
+		len(r.Header.Values("X-Forwarded-Proto")) > 0
+}
+
+func resolvePeerIP(r *http.Request, edgeToken string) (string, error) {
 	raw := clientIP(r.RemoteAddr)
-	if edgeToken == "" {
-		return raw
-	}
 	addr, err := netip.ParseAddr(raw)
 	if err != nil || !addr.Unmap().IsLoopback() {
-		return raw
+		if err == nil && addr.IsValid() {
+			return addr.Unmap().String(), nil
+		}
+		return raw, nil
+	}
+	if !hasEdgeProxyHeaders(r) {
+		return addr.Unmap().String(), nil
+	}
+	if edgeToken == "" {
+		return "", &core.FleetError{Msg: "edge proxy token is not configured", Status: http.StatusForbidden}
 	}
 	gotTok := r.Header.Get(tlsdns.HeaderEdgeToken)
 	if len(gotTok) != len(edgeToken) || subtle.ConstantTimeCompare([]byte(gotTok), []byte(edgeToken)) != 1 {
-		return raw
+		return "", &core.FleetError{Msg: "invalid edge proxy token", Status: http.StatusForbidden}
 	}
-	if fwd := strings.TrimSpace(r.Header.Get(tlsdns.HeaderClientIP)); fwd != "" {
-		if fwdAddr, fErr := netip.ParseAddr(fwd); fErr == nil && fwdAddr.IsValid() {
-			return fwdAddr.Unmap().String()
-		}
+	fwd := strings.TrimSpace(r.Header.Get(tlsdns.HeaderClientIP))
+	fwdAddr, fErr := netip.ParseAddr(fwd)
+	if fErr != nil || !fwdAddr.IsValid() {
+		return "", &core.FleetError{Msg: "invalid forwarded client IP", Status: http.StatusForbidden}
 	}
-	return raw
+	return fwdAddr.Unmap().String(), nil
 }
 
 func makeAuthRoute(fleet *core.Fleet, quiet bool) func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc {
@@ -214,7 +227,11 @@ func makeAuthRoute(fleet *core.Fleet, quiet bool) func(bool, func(http.ResponseW
 			w.Header().Set("X-Frame-Options", "DENY")
 			w.Header().Set("Referrer-Policy", "no-referrer")
 
-			peerIP := resolvedPeerIP(r, fleet.EdgeToken)
+			peerIP, err := resolvePeerIP(r, fleet.EdgeToken)
+			if err != nil {
+				handleError(w, r, err, quiet)
+				return
+			}
 			if !quiet {
 				_, _ = fmt.Fprintf(os.Stderr, "%s %s %s\n", peerIP, r.Method, r.URL.RequestURI())
 			}
@@ -549,11 +566,11 @@ func registerAgentMessageRoutes(
 		return nil
 	}))
 	mux.HandleFunc("POST /v1/usage", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
-		return handleUsagePost(w, r, fleet, c.Name)
+		return handleUsagePost(w, r, fleet, c)
 	}))
 }
 
-func handleUsagePost(w http.ResponseWriter, r *http.Request, fleet *core.Fleet, dev string) error {
+func handleUsagePost(w http.ResponseWriter, r *http.Request, fleet *core.Fleet, caller *registry.Device) error {
 	var raw json.RawMessage
 	if err := readJSONBody(r, &raw); err != nil {
 		return err
@@ -575,9 +592,10 @@ func handleUsagePost(w http.ResponseWriter, r *http.Request, fleet *core.Fleet, 
 		}
 		items = []agents.HarnessUsage{single}
 	}
+	isAdmin := core.IsAdmin(caller)
 	for _, u := range items {
-		if u.Device == "" {
-			u.Device = dev
+		if !isAdmin || u.Device == "" {
+			u.Device = caller.Name
 		}
 		if _, err := fleet.Agents.UpsertUsage(u); err != nil {
 			return err
@@ -741,11 +759,11 @@ func Serve(port int, host string) error {
 	}
 	defer func() { _ = fleet.Close() }()
 
-	if tok, tokErr := tlsdns.EnsureEdgeToken(fleet.Root); tokErr != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "tls edge token warning: %v\n", tokErr)
-	} else {
-		fleet.EdgeToken = tok
+	tok, err := tlsdns.EnsureEdgeToken(fleet.Root)
+	if err != nil {
+		return fmt.Errorf("ensure edge token: %w", err)
 	}
+	fleet.EdgeToken = tok
 
 	addr := fmt.Sprintf("%s:%d", host, port)
 	ln, err := net.Listen("tcp", addr)
@@ -765,6 +783,7 @@ func Serve(port int, host string) error {
 	_, _ = fmt.Fprintf(os.Stderr, "fleet serve listening on %s\n", addr)
 
 	watchdog.Start(ctx)
+	defer watchdog.Stop()
 	tlsMgr.Start(ctx)
 	defer tlsMgr.Stop()
 	if fleet.Curator != nil {
@@ -793,7 +812,7 @@ func serveUntilCanceled(ctx context.Context, srv *http.Server, ln net.Listener) 
 
 	select {
 	case <-ctx.Done():
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(shutCtx); err != nil {
 			_ = srv.Close()

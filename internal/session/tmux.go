@@ -2,13 +2,17 @@ package session
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
 	"syscall"
+	"time"
 )
+
+const cmdTimeout = 30 * time.Second
 
 type trackedState struct {
 	ID         string  `json:"id"`
@@ -20,8 +24,19 @@ type trackedState struct {
 }
 
 func runCmdCapture(name string, args ...string) (string, error) {
+	return runCmdCaptureWithEnv(context.Background(), AugmentedPath(os.Getenv("PATH"), os.Getenv("HOME")), name, args...)
+}
+
+func runCmdCaptureWithEnv(parentCtx context.Context, pathEnv, name string, args ...string) (string, error) {
+	bin := name
+	if resolved, err := lookPathWithEnv(name, pathEnv); err == nil && resolved != "" {
+		bin = resolved
+	}
+	ctx, cancel := context.WithTimeout(parentCtx, cmdTimeout)
+	defer cancel()
 	var stdout, stderr bytes.Buffer
-	cmd := exec.Command(name, args...)
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Env = withEnvPath(os.Environ(), pathEnv)
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
@@ -39,8 +54,46 @@ func tmuxCmd(args ...string) (string, error) {
 	return runCmdCapture("tmux", args...)
 }
 
+func tmuxCmdCtx(ctx context.Context, args ...string) (string, error) {
+	return runCmdCaptureWithEnv(ctx, AugmentedPath(os.Getenv("PATH"), os.Getenv("HOME")), "tmux", args...)
+}
+
 func tmuxHasSession(target string) bool {
-	return exec.Command("tmux", "has-session", "-t", target).Run() == nil
+	pathEnv := AugmentedPath(os.Getenv("PATH"), os.Getenv("HOME"))
+	bin := "tmux"
+	if resolved, err := lookPathWithEnv("tmux", pathEnv); err == nil && resolved != "" {
+		bin = resolved
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "has-session", "-t", target)
+	cmd.Env = withEnvPath(os.Environ(), pathEnv)
+	return cmd.Run() == nil
+}
+
+func checkTmuxForHarness(spec Spec, pathEnv string) (bool, error) {
+	_, tmuxErr := lookPathWithEnv("tmux", pathEnv)
+	hasTmux := tmuxErr == nil
+	if spec.Name != HarnessAgy && !hasTmux {
+		return false, ErrTmuxRequired
+	}
+	return hasTmux, nil
+}
+
+func tmuxSessionEnvArgs(spec Spec, name, pathEnv string, pol Policy) []string {
+	args := []string{
+		"-e", "PATH=" + pathEnv,
+		"-e", "FLEET_SESSION_TARGET=tmux",
+		"-e", "FLEET_SESSION_NAME=" + name,
+		"-e", "FLEET_SESSION_POLICY=" + string(pol),
+	}
+	if shellEnv := os.Getenv("SHELL"); shellEnv != "" {
+		args = append(args, "-e", "SHELL="+shellEnv)
+	}
+	if spec.Name == HarnessAgy {
+		args = append(args, "-e", "AGY_SESSION_TARGET=tmux", "-e", "AGY_SESSION_NAME="+name)
+	}
+	return args
 }
 
 func tmuxListSessions() []string {
@@ -107,7 +160,11 @@ func tmuxRunsHarness(spec Spec, session string) bool {
 }
 
 func tmuxDisplay(target, format string) (string, error) {
-	out, err := tmuxCmd("display-message", "-p", "-t", target, format)
+	return tmuxDisplayCtx(context.Background(), target, format)
+}
+
+func tmuxDisplayCtx(ctx context.Context, target, format string) (string, error) {
+	out, err := tmuxCmdCtx(ctx, "display-message", "-p", "-t", target, format)
 	return strings.TrimSpace(out), err
 }
 
@@ -120,7 +177,11 @@ func tmuxShowPaneOption(pane, opt string) string {
 }
 
 func tmuxSetPaneOption(pane, opt, val string) error {
-	_, err := tmuxCmd("set-option", "-p", "-t", pane, opt, val)
+	return tmuxSetPaneOptionCtx(context.Background(), pane, opt, val)
+}
+
+func tmuxSetPaneOptionCtx(ctx context.Context, pane, opt, val string) error {
+	_, err := tmuxCmdCtx(ctx, "set-option", "-p", "-t", pane, opt, val)
 	return err
 }
 
@@ -138,10 +199,11 @@ func tmuxAttachExec(spec Spec, target, pathEnv string) error {
 	_, _ = tmuxCmd("set-option", "-t", target+":", "set-titles-string", title)
 	_, _ = tmuxCmd("set-option", "-t", target+":", "set-titles", "on")
 
+	env := withEnvPath(os.Environ(), pathEnv)
 	if os.Getenv("TMUX") != "" {
-		return syscall.Exec(tmuxBin, []string{"tmux", "switch-client", "-t", target}, os.Environ())
+		return syscall.Exec(tmuxBin, []string{"tmux", "switch-client", "-t", target}, env)
 	}
-	return syscall.Exec(tmuxBin, []string{"tmux", "attach-session", "-t", target}, os.Environ())
+	return syscall.Exec(tmuxBin, []string{"tmux", "attach-session", "-t", target}, env)
 }
 
 func parseTrackedState(raw string) (trackedState, bool) {

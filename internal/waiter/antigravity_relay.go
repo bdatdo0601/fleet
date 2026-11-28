@@ -77,8 +77,7 @@ func relayDeliverBatch(ctx context.Context, api, harness, bin string, batch agen
 	if rc != 0 {
 		return errors.New(cmp.Or(errDetail, fmt.Sprintf("agentapi send-message exited with status %d", rc)))
 	}
-	ackMessages(ctx, api, harness, batch.SessionID, batch.Messages)
-	return nil
+	return ackMessages(ctx, api, harness, batch.SessionID, batch.Messages)
 }
 
 // RunAntigravityRelay runs a device-level relay that long-polls /v1/agents/wait-harness and pushes messages via `agentapi`.

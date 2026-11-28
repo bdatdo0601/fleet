@@ -4,6 +4,7 @@ package mcpinstall
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -22,8 +23,9 @@ const (
 )
 
 var (
-	tomlHeaderRE = regexp.MustCompile(`^\s*\[[^\]]+\]\s*$`)
-	tomlHooksRE  = regexp.MustCompile(`^\s*hooks\s*=`)
+	tomlHeaderRE       = regexp.MustCompile(`^\s*\[[^\]]+\]\s*$`)
+	tomlHooksRE        = regexp.MustCompile(`^\s*hooks\s*=`)
+	dynamicSkillSlugRE = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 )
 
 type hookEventSpec struct {
@@ -365,7 +367,30 @@ func hasAllSkills(skillsDir string) bool {
 }
 
 func codexHooksEnabled(raw string) bool {
-	return tomlHooksRE.MatchString(raw) || strings.Contains(raw, "hooks = true")
+	clean := strings.ReplaceAll(raw, "\r\n", "\n")
+	inFeatures := false
+	for line := range strings.SplitSeq(clean, "\n") {
+		if idx := strings.IndexByte(line, '#'); idx >= 0 {
+			line = line[:idx]
+		}
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if tomlHeaderRE.MatchString(trimmed) {
+			inFeatures = trimmed == "[features]"
+			continue
+		}
+		if !inFeatures {
+			continue
+		}
+		if k, v, ok := strings.Cut(trimmed, "="); ok {
+			if strings.TrimSpace(k) == "hooks" && strings.TrimSpace(v) == "true" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 type jsonEditSpec struct {
@@ -426,7 +451,10 @@ func Install(opts InstallOpts) ([]string, error) {
 	var changed []string
 	if slices.Contains(harnesses, "codex") {
 		codexTOML := filepath.Join(targetHome, ".codex", "config.toml")
-		rawTOML, _ := os.ReadFile(codexTOML)
+		rawTOML, err := os.ReadFile(codexTOML)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
 		wrote, err := writeUserFile(codexTOML, updateCodexTOML(string(rawTOML), false), opts.UID, opts.GID)
 		if err != nil {
 			return nil, err
@@ -710,17 +738,39 @@ func SyncDynamicSkills(owner string, dynamic []skills.Skill) ([]string, error) {
 	return syncDynamicSkillsInHome(home, &uid, &gid, dynamic)
 }
 
+func isValidDynamicSkillSlug(slug string) bool {
+	if slug == "" || slug == "." || slug == ".." || strings.Contains(slug, "..") {
+		return false
+	}
+	if !dynamicSkillSlugRE.MatchString(slug) {
+		return false
+	}
+	return !slices.Contains(skills.Names, slug)
+}
+
+func isStrictlyInside(base, target string) bool {
+	cleanBase := filepath.Clean(base)
+	cleanTarget := filepath.Clean(target)
+	rel, err := filepath.Rel(cleanBase, cleanTarget)
+	if err != nil {
+		return false
+	}
+	return rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
+}
+
 func syncDynamicSkillsInHome(home string, uid, gid *int, dynamic []skills.Skill) ([]string, error) {
 	dirs := skillDirsForHarnesses(home, paths.Harnesses)
 	want := make(map[string][]byte, len(dynamic))
 	var wantNames []string
 	for _, sk := range dynamic {
 		slug := strings.TrimSpace(sk.Name)
-		if slug == "" || slices.Contains(skills.Names, slug) || strings.Contains(slug, "/") || strings.Contains(slug, "..") {
+		if !isValidDynamicSkillSlug(slug) {
 			continue
 		}
+		if _, dup := want[slug]; !dup {
+			wantNames = append(wantNames, slug)
+		}
 		want[slug] = sk.Content
-		wantNames = append(wantNames, slug)
 	}
 	slices.Sort(wantNames)
 
@@ -732,15 +782,23 @@ func syncDynamicSkillsInHome(home string, uid, gid *int, dynamic []skills.Skill)
 			_ = json.Unmarshal(raw, &prev)
 		}
 		for _, oldName := range prev {
-			if _, keep := want[oldName]; !keep && !slices.Contains(skills.Names, oldName) && oldName != "" && !strings.Contains(oldName, "/") {
-				dir := filepath.Join(base, oldName)
-				if pathExists(dir) && os.RemoveAll(dir) == nil {
-					changed = append(changed, dir)
-				}
+			if _, keep := want[oldName]; keep || !isValidDynamicSkillSlug(oldName) {
+				continue
+			}
+			dir := filepath.Join(base, oldName)
+			if !isStrictlyInside(base, dir) {
+				continue
+			}
+			if pathExists(dir) && os.RemoveAll(dir) == nil {
+				changed = append(changed, dir)
 			}
 		}
 		for _, name := range wantNames {
-			p := filepath.Join(base, name, "SKILL.md")
+			skillDir := filepath.Join(base, name)
+			p := filepath.Join(skillDir, "SKILL.md")
+			if !isStrictlyInside(base, skillDir) || !isStrictlyInside(base, p) {
+				continue
+			}
 			wrote, err := paths.WriteFileAtomic(p, want[name], 0o644, uid, gid)
 			if err != nil {
 				return nil, err

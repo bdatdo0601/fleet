@@ -22,7 +22,35 @@ import (
 const (
 	certCheckInterval = 2 * time.Second
 	dnsCacheTTL       = 5 * time.Second
+	dnsMaxBackoff     = 15 * time.Second
 )
+
+type edgeAuthCtxKey struct{}
+
+type edgeAuthInfo struct {
+	peerIP string
+	token  string
+}
+
+func newEdgeTokenLoader(stateDir string) func() string {
+	var mu sync.Mutex
+	var cachedTok string
+	var tokenChecked time.Time
+	return func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		if cachedTok != "" && time.Since(tokenChecked) < certCheckInterval {
+			return cachedTok
+		}
+		tokenChecked = time.Now()
+		if tok, err := ReadEdgeToken(stateDir); err == nil {
+			cachedTok = tok
+		} else {
+			cachedTok = ""
+		}
+		return cachedTok
+	}
+}
 
 type fileStamp struct {
 	modTime time.Time
@@ -101,6 +129,19 @@ func clientIPFromAddr(remoteAddr string) string {
 	return strings.Trim(remoteAddr, "[]")
 }
 
+func peerIPFromAddr(remoteAddr string) (string, netip.Addr, bool) {
+	raw := clientIPFromAddr(remoteAddr)
+	addr, err := netip.ParseAddr(raw)
+	if err != nil {
+		return "", netip.Addr{}, false
+	}
+	addr = addr.Unmap()
+	if !addr.IsValid() {
+		return "", netip.Addr{}, false
+	}
+	return addr.String(), addr, true
+}
+
 // NewHTTPSProxy returns a reverse proxy to upstreamURL that authenticates via stateDir/edge.token
 // and forwards the verified mesh peer IP in X-Fleet-Client-IP.
 func NewHTTPSProxy(upstreamURL, stateDir string) (http.Handler, error) {
@@ -109,21 +150,7 @@ func NewHTTPSProxy(upstreamURL, stateDir string) (http.Handler, error) {
 		return nil, fmt.Errorf("invalid upstream URL %q: %w", upstreamURL, err)
 	}
 
-	var tokenMu sync.Mutex
-	var cachedTok string
-	var tokenChecked time.Time
-	loadToken := func() string {
-		tokenMu.Lock()
-		defer tokenMu.Unlock()
-		if cachedTok != "" && time.Since(tokenChecked) < certCheckInterval {
-			return cachedTok
-		}
-		tokenChecked = time.Now()
-		if tok, rErr := ReadEdgeToken(stateDir); rErr == nil {
-			cachedTok = tok
-		}
-		return cachedTok
-	}
+	loadToken := newEdgeTokenLoader(stateDir)
 
 	proxy := &httputil.ReverseProxy{
 		FlushInterval: -1, // Preserve SSE streaming (/v1/assistant/stream).
@@ -133,37 +160,68 @@ func NewHTTPSProxy(upstreamURL, stateDir string) (http.Handler, error) {
 			pr.Out.Host = pr.In.Host
 			pr.Out.Header.Del(HeaderClientIP)
 			pr.Out.Header.Del(HeaderEdgeToken)
-			if peerIP := clientIPFromAddr(pr.In.RemoteAddr); peerIP != "" {
-				pr.Out.Header.Set(HeaderClientIP, peerIP)
-			}
-			if tok := loadToken(); tok != "" {
-				pr.Out.Header.Set(HeaderEdgeToken, tok)
+			if auth, ok := pr.In.Context().Value(edgeAuthCtxKey{}).(edgeAuthInfo); ok {
+				pr.Out.Header.Set(HeaderClientIP, auth.peerIP)
+				pr.Out.Header.Set(HeaderEdgeToken, auth.token)
 			}
 			pr.Out.Header.Set("X-Forwarded-Proto", "https")
 		},
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		peerIP := clientIPFromAddr(r.RemoteAddr)
-		if addr, pErr := netip.ParseAddr(peerIP); pErr != nil || (!addr.IsLoopback() && !meshPrefix.Contains(addr)) {
+		peerIP, addr, ok := peerIPFromAddr(r.RemoteAddr)
+		if !ok || (!addr.IsLoopback() && !meshPrefix.Contains(addr)) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
-		proxy.ServeHTTP(w, r)
+		tok := loadToken()
+		if tok == "" || peerIP == "" {
+			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		ctx := context.WithValue(r.Context(), edgeAuthCtxKey{}, edgeAuthInfo{
+			peerIP: peerIP,
+			token:  tok,
+		})
+		proxy.ServeHTTP(w, r.WithContext(ctx))
 	}), nil
 }
 
-// NewCachedRecordProvider polls upstreamURL/v1/dns/records with TTL caching and stale fallback.
+func dnsBackoffDuration(failCount int) time.Duration {
+	if failCount <= 1 {
+		return time.Second
+	}
+	shift := min(failCount-1, 4)
+	return min(time.Second<<shift, dnsMaxBackoff)
+}
+
+// NewCachedRecordProvider polls upstreamURL/v1/dns/records with TTL caching, failure backoff, and stale fallback.
 func NewCachedRecordProvider(upstreamURL, stateDir string, httpClient *http.Client) RecordProvider {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 3 * time.Second}
 	}
 	endpoint := strings.TrimRight(upstreamURL, "/") + "/v1/dns/records"
+	loadToken := newEdgeTokenLoader(stateDir)
 
 	var mu sync.Mutex
 	var cached DNSSnapshot
 	var fetchedAt time.Time
 	var hasCached bool
+	var retryAfter time.Time
+	var failCount int
+	var lastErr error
+
+	recordFailure := func(err error) (DNSSnapshot, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		failCount++
+		retryAfter = time.Now().Add(dnsBackoffDuration(failCount))
+		lastErr = err
+		if hasCached {
+			return cached, nil
+		}
+		return DNSSnapshot{}, err
+	}
 
 	return func(ctx context.Context) (DNSSnapshot, error) {
 		mu.Lock()
@@ -172,48 +230,46 @@ func NewCachedRecordProvider(upstreamURL, stateDir string, httpClient *http.Clie
 			mu.Unlock()
 			return snap, nil
 		}
+		if !retryAfter.IsZero() && time.Now().Before(retryAfter) {
+			snap := cached
+			cachedOK := hasCached
+			err := lastErr
+			mu.Unlock()
+			if cachedOK {
+				return snap, nil
+			}
+			return DNSSnapshot{}, err
+		}
 		mu.Unlock()
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			return DNSSnapshot{}, err
 		}
-		if tok, tErr := ReadEdgeToken(stateDir); tErr == nil && tok != "" {
+		if tok := loadToken(); tok != "" {
 			req.Header.Set(HeaderEdgeToken, tok)
 			req.Header.Set(HeaderClientIP, "127.0.0.1")
 		}
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			mu.Lock()
-			defer mu.Unlock()
-			if hasCached {
-				return cached, nil
-			}
-			return DNSSnapshot{}, err
+			return recordFailure(err)
 		}
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusOK {
-			mu.Lock()
-			defer mu.Unlock()
-			if hasCached {
-				return cached, nil
-			}
-			return DNSSnapshot{}, fmt.Errorf("upstream DNS records HTTP %d", resp.StatusCode)
+			return recordFailure(fmt.Errorf("upstream DNS records HTTP %d", resp.StatusCode))
 		}
 		var snap DNSSnapshot
 		if err := json.NewDecoder(resp.Body).Decode(&snap); err != nil {
-			mu.Lock()
-			defer mu.Unlock()
-			if hasCached {
-				return cached, nil
-			}
-			return DNSSnapshot{}, err
+			return recordFailure(err)
 		}
 
 		mu.Lock()
 		cached = snap
 		fetchedAt = time.Now()
 		hasCached = true
+		failCount = 0
+		retryAfter = time.Time{}
+		lastErr = nil
 		mu.Unlock()
 		return snap, nil
 	}
@@ -287,9 +343,11 @@ func RunEdge(ctx context.Context, opts EdgeOpts) error {
 	}()
 
 	var firstErr error
+	remaining := 2
 	select {
 	case <-ctx.Done():
 	case err := <-errCh:
+		remaining = 1
 		if err != nil {
 			firstErr = err
 		}
@@ -300,8 +358,10 @@ func RunEdge(ctx context.Context, opts EdgeOpts) error {
 	if err := srv.Shutdown(shutCtx); err != nil {
 		_ = srv.Close()
 	}
-	if second := <-errCh; second != nil && firstErr == nil && ctx.Err() == nil {
-		firstErr = second
+	for range remaining {
+		if err := <-errCh; err != nil && firstErr == nil && ctx.Err() == nil {
+			firstErr = err
+		}
 	}
 	return firstErr
 }

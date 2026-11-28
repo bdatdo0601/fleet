@@ -241,8 +241,8 @@ func recordPathExecLocked(eq sqlExecQuerier, device, rawPath, repo, source, nowI
 	return err
 }
 
-func loadSessionPathSeeds(db *sql.DB) ([]struct{ device, cwd, repo, startedAt, updatedAt string }, error) {
-	rows, err := db.Query(
+func loadSessionPathSeeds(eq sqlExecQuerier) ([]struct{ device, cwd, repo, startedAt, updatedAt string }, error) {
+	rows, err := eq.Query(
 		`SELECT device, cwd, repo, started_at, updated_at
 		 FROM agent_sessions
 		 WHERE cwd != '' AND cwd != '/'
@@ -265,21 +265,27 @@ func loadSessionPathSeeds(db *sql.DB) ([]struct{ device, cwd, repo, startedAt, u
 }
 
 func backfillPathsFromSessions(db *sql.DB) error {
-	var count int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM agent_paths`).Scan(&count); err != nil || count > 0 {
+	tx, err := db.Begin()
+	if err != nil {
 		return err
 	}
-	seeds, err := loadSessionPathSeeds(db)
+	defer func() { _ = tx.Rollback() }()
+
+	var count int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM agent_paths`).Scan(&count); err != nil || count > 0 {
+		return err
+	}
+	seeds, err := loadSessionPathSeeds(tx)
 	if err != nil {
 		return err
 	}
 	for _, s := range seeds {
 		ts := cmp.Or(s.updatedAt, s.startedAt, registry.NowISO())
-		if err := recordPathExecLocked(db, s.device, s.cwd, s.repo, "heartbeat", ts, true); err != nil {
+		if err := recordPathExecLocked(tx, s.device, s.cwd, s.repo, "heartbeat", ts, true); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 // RecordPath records or updates a tracked directory/repository on device.
@@ -291,7 +297,18 @@ func (h *Hub) RecordPath(device, rawPath, repo, source string, bumpCount bool) e
 	nowISO := registry.NowISO()
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return recordPathExecLocked(h.db, device, norm, repo, source, nowISO, bumpCount)
+	if err := h.checkOpenLocked(); err != nil {
+		return err
+	}
+	tx, err := h.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := recordPathExecLocked(tx, device, norm, repo, source, nowISO, bumpCount); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ListPaths returns tracked directories and repositories ordered by most recently seen.
@@ -318,6 +335,9 @@ func (h *Hub) ListPaths(device, query string) ([]TrackedPath, error) {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if err := h.checkOpenLocked(); err != nil {
+		return nil, err
+	}
 	rows, err := h.db.Query(sqlStr, args...)
 	if err != nil {
 		return nil, err
@@ -346,6 +366,9 @@ func (h *Hub) DeletePath(device, rawPath string) (bool, error) {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if err := h.checkOpenLocked(); err != nil {
+		return false, err
+	}
 	res, err := h.db.Exec(`DELETE FROM agent_paths WHERE device = ? AND path = ?`, dev, norm)
 	if err != nil {
 		return false, err
@@ -374,6 +397,9 @@ func (h *Hub) KnownRepos(device string) ([]string, error) {
 	dev := strings.TrimSpace(device)
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if err := h.checkOpenLocked(); err != nil {
+		return nil, err
+	}
 
 	seen := map[string]bool{}
 	collect := func(q string, args ...any) error {

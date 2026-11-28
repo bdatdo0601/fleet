@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -125,6 +126,18 @@ func TestHelperMCPProcess(t *testing.T) {
 			})
 		case "tools/call":
 			args, _ := req.Params["arguments"].(map[string]any)
+			if mode, _ := args["mode"].(string); mode == "error" {
+				b, _ := json.Marshal(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      req.ID,
+					"error":   map[string]any{"code": -32000, "message": "simulated mcp failure"},
+				})
+				fmt.Println(string(b))
+				continue
+			} else if mode == "hang" {
+				time.Sleep(10 * time.Second)
+				continue
+			}
 			writeHelperJSON(req.ID, map[string]any{
 				"msg":     args["msg"],
 				"has_env": os.Getenv("TEST_MCP_TOKEN") == "injected-secret-99",
@@ -1656,7 +1669,7 @@ func TestDecisionModelZDRMigrationAndDoctorHint(t *testing.T) {
 		t.Fatalf("expected non-ZDR config to preserve explicit decision model, got %q", preserved.Models.Decision)
 	}
 
-	mockDecisions := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mockDecisions := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte(`{"error":{"message":"No endpoints found matching your data policy (Zero data retention).","code":404}}`))
 	}))
@@ -1760,7 +1773,7 @@ func TestAutoApproveBypassAndSlashDirectives(t *testing.T) {
 	}
 
 	// Read-only vault invariant must remain enforced even with BypassHITL=true.
-	if _, roErr := eng.execVaultWriteTool("vault_write", map[string]any{"vault": "ref", "path": "Note.md", "content": "x"}, "{}", &toolExecContext{ChannelID: "general", Source: "chat", Config: cfg, BypassHITL: true}); roErr == nil {
+	if _, roErr := eng.execVaultWriteTool(t.Context(), "vault_write", map[string]any{"vault": "ref", "path": "Note.md", "content": "x"}, "{}", &toolExecContext{ChannelID: "general", Source: "chat", Config: cfg, BypassHITL: true}); roErr == nil {
 		t.Fatalf("expected read-only vault write to stay forbidden even under BypassHITL")
 	}
 
@@ -1962,5 +1975,263 @@ func TestMCPHostPathAndResolveCommand(t *testing.T) {
 	env := setEnvVar([]string{"FOO=1", "PATH=/bin"}, "PATH", pathEnv)
 	if !slices.Contains(env, "PATH="+pathEnv) || !slices.Contains(env, "FOO=1") {
 		t.Fatalf("unexpected setEnvVar result: %+v", env)
+	}
+}
+
+func TestNestedNonExistentSymlinkEscape(t *testing.T) {
+	tmp := t.TempDir()
+	outside := filepath.Join(tmp, "outside")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Vault nested non-existent subpath through symlink + dangling symlink.
+	v, err := OpenVault(filepath.Join(tmp, "vault"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(v.Root, "ext")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "does-not-exist"), filepath.Join(v.Root, "dangling")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := v.ResolveRel("ext/nested/nonexistent/secret.md"); err == nil {
+		t.Fatalf("expected nested non-existent symlink escape in Vault to be rejected")
+	}
+	if _, _, err := v.ResolveRel("dangling/nested/file.md"); err == nil {
+		t.Fatalf("expected dangling symlink escape in Vault to be rejected")
+	}
+	if _, _, err := v.ResolveRel("Notes/newdir/sub/ok.md"); err != nil {
+		t.Fatalf("expected legitimate nested non-existent path in Vault to succeed, got %v", err)
+	}
+
+	// Sandbox nested non-existent subpath through symlink.
+	sb := NewSandboxManager(filepath.Join(tmp, "sandbox"), newMockSandboxRunner())
+	workDir, err := sb.WorkDir("general")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(workDir, "ext")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := sb.ResolveWorkPath("general", "ext/deep/nonexistent/out.txt"); err == nil {
+		t.Fatalf("expected nested non-existent symlink escape in Sandbox to be rejected")
+	}
+	if _, _, err := sb.ResolveWorkPath("general", "out/nested/report.txt"); err != nil {
+		t.Fatalf("expected legitimate nested non-existent path in Sandbox to succeed, got %v", err)
+	}
+}
+
+func TestExecuteCredentialHTTPBlocksRedirects(t *testing.T) {
+	secret := "cred-secret-redirect-999"
+	reader := func(_ context.Context, _ string) (string, error) { return secret, nil }
+
+	var evilSawSecret atomic.Bool
+	evilSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.Header.Get("Authorization"), secret) {
+			evilSawSecret.Store(true)
+		}
+		_, _ = w.Write([]byte("evil"))
+	}))
+	defer evilSrv.Close()
+
+	redirSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/to-evil":
+			http.Redirect(w, r, evilSrv.URL+"/leak", http.StatusFound)
+		case "/to-localhost":
+			u, _ := url.Parse(evilSrv.URL)
+			http.Redirect(w, r, "http://localhost:"+u.Port()+"/leak", http.StatusFound)
+		case "/to-file":
+			http.Redirect(w, r, "file:///etc/passwd", http.StatusFound)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer redirSrv.Close()
+
+	cfg := DefaultConfig()
+	cfg.Credentials = []CredentialPolicy{{
+		Alias:        "demo",
+		OPRef:        "op://Vault/Item/tok",
+		AllowedHosts: []string{"127.0.0.1", "localhost"},
+	}}
+
+	// Redirect to cross-domain host (localhost vs 127.0.0.1) must be blocked.
+	if _, err := ExecuteCredentialHTTP(t.Context(), cfg, reader, redirSrv.Client(), CredentialHTTPRequest{
+		Alias: "demo",
+		URL:   redirSrv.URL + "/to-localhost",
+	}); err == nil {
+		t.Fatalf("expected cross-host redirect to be blocked")
+	}
+	// Redirect to non-HTTP(S) scheme must be blocked.
+	if _, err := ExecuteCredentialHTTP(t.Context(), cfg, reader, redirSrv.Client(), CredentialHTTPRequest{
+		Alias: "demo",
+		URL:   redirSrv.URL + "/to-file",
+	}); err == nil {
+		t.Fatalf("expected non-http/https redirect to be blocked")
+	}
+	// Redirect to unallowlisted host must be blocked.
+	cfgStrict := DefaultConfig()
+	cfgStrict.Credentials = []CredentialPolicy{{
+		Alias:        "strict",
+		OPRef:        "op://Vault/Item/tok",
+		AllowedHosts: []string{"127.0.0.1"},
+	}}
+	if _, err := ExecuteCredentialHTTP(t.Context(), cfgStrict, reader, redirSrv.Client(), CredentialHTTPRequest{
+		OPRef:        "op://Vault/Item/tok",
+		AllowedHosts: []string{"127.0.0.1"},
+		URL:          redirSrv.URL + "/to-localhost",
+	}); err == nil {
+		t.Fatalf("expected redirect to non-allowlisted host to be blocked")
+	}
+	if evilSawSecret.Load() {
+		t.Fatalf("credential secret leaked across redirect")
+	}
+}
+
+func TestOPCLIValidationAndStdinTemplate(t *testing.T) {
+	if _, err := NewOPReader("")(t.Context(), "--help"); err == nil {
+		t.Fatalf("expected NewOPReader to reject '-' prefixed ref")
+	}
+	if _, err := GetOPItemMeta(t.Context(), "", "--vault=all", ""); err == nil {
+		t.Fatalf("expected GetOPItemMeta to reject '-' prefixed item")
+	}
+	if _, err := StoreOPItem(t.Context(), "", "Vault", "Title", "", "", map[string]string{"--flag": "val"}); err == nil {
+		t.Fatalf("expected StoreOPItem to reject '-' prefixed field key")
+	}
+
+	// Verify StoreOPItem sends fields in stdin JSON rather than CLI arguments.
+	binDir := t.TempDir()
+	argsLog := filepath.Join(binDir, "args.txt")
+	stdinLog := filepath.Join(binDir, "stdin.json")
+	fakeOP := filepath.Join(binDir, "op")
+	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$@\" > %q\ncat > %q\nprintf '{\"id\":\"it1\",\"title\":\"MyAPI\",\"category\":\"API_CREDENTIAL\"}'\n", argsLog, stdinLog)
+	if err := os.WriteFile(fakeOP, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	meta, err := StoreOPItem(t.Context(), "", "AgentVault", "MyAPI", "API Credential", "https://api.example.com", map[string]string{
+		"credential": "super-secret-value-xyz",
+	})
+	if err != nil {
+		t.Fatalf("StoreOPItem failed: %v", err)
+	}
+	if meta.Title != "MyAPI" {
+		t.Fatalf("unexpected StoreOPItem meta: %+v", meta)
+	}
+	rawArgs, _ := os.ReadFile(argsLog)
+	if strings.Contains(string(rawArgs), "super-secret-value-xyz") {
+		t.Fatalf("secret leaked in CLI arguments: %s", string(rawArgs))
+	}
+	rawStdin, _ := os.ReadFile(stdinLog)
+	if !strings.Contains(string(rawStdin), "super-secret-value-xyz") {
+		t.Fatalf("expected secret passed via stdin JSON template, got: %s", string(rawStdin))
+	}
+}
+
+func TestMCPStdioErrorAndContextCancel(t *testing.T) {
+	t.Setenv("GO_WANT_MCP_HELPER", "1")
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr := NewMCPManager([]MCPServerConfig{{
+		Name:    "helper",
+		Command: exe,
+		Args:    []string{"-test.run=^TestHelperMCPProcess$"},
+		EnvRefs: map[string]string{"TEST_MCP_TOKEN": "op://Fleet-Agent/Helper/token"},
+		Enabled: true,
+	}}, func(_ context.Context, _ string) (string, error) {
+		return "injected-secret-99", nil
+	})
+	defer mgr.Close()
+
+	// 1. JSON-RPC error response must return immediately instead of hanging.
+	ctxErr, cancelErr := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancelErr()
+	if _, err := mgr.CallTool(ctxErr, "mcp__helper__echo_secret", map[string]any{"mode": "error"}); err == nil || !strings.Contains(err.Error(), "simulated mcp failure") {
+		t.Fatalf("expected JSON-RPC error returned immediately, got %v", err)
+	}
+
+	// 2. Context cancellation during blocked stdio read must return promptly and tear down subprocess.
+	ctxHang, cancelHang := context.WithTimeout(t.Context(), 150*time.Millisecond)
+	defer cancelHang()
+	start := time.Now()
+	if _, err := mgr.CallTool(ctxHang, "mcp__helper__echo_secret", map[string]any{"mode": "hang"}); err == nil {
+		t.Fatalf("expected canceled stdio call to return error")
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("stdio cancel took too long: %v", time.Since(start))
+	}
+
+	// 3. Subsequent call cleanly restarts subprocess because c.started was reset.
+	ctxOK, cancelOK := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancelOK()
+	res, err := mgr.CallTool(ctxOK, "mcp__helper__echo_secret", map[string]any{"msg": "recovered"})
+	if err != nil {
+		t.Fatalf("expected stdio MCP to recover after cancel, got %v", err)
+	}
+	if m, _ := res.(map[string]any); m["msg"] != "recovered" {
+		t.Fatalf("unexpected recovered result: %+v", res)
+	}
+}
+
+func TestStoreRecoveryPermissionsAndPostClose(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "assistant.db")
+	st, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("expected 0600 permissions on assistant.db, got %o", fi.Mode().Perm())
+	}
+
+	ev, inserted, err := st.EnqueueInbox("general", "chat", "rec-1", map[string]any{"content": "hello"}, "")
+	if err != nil || !inserted {
+		t.Fatalf("EnqueueInbox failed: inserted=%v err=%v", inserted, err)
+	}
+	claimed, err := st.ClaimNextInbox()
+	if err != nil || claimed == nil || claimed.ID != ev.ID || claimed.Status != "running" {
+		t.Fatalf("ClaimNextInbox failed: %+v err=%v", claimed, err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Post-Close calls must return error safely without nil-pointer panic.
+	if _, err := st.ListChannels(); err == nil {
+		t.Fatalf("expected error on ListChannels after Close")
+	}
+	_ = st.Summary()
+	if err := st.Close(); err != nil {
+		t.Fatalf("expected idempotent Close, got %v", err)
+	}
+
+	// Reopening must recover stale 'running' inbox rows back to 'queued'.
+	st2, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st2.Close() }()
+	recovered, err := st2.ClaimNextInbox()
+	if err != nil || recovered == nil || recovered.ID != ev.ID {
+		t.Fatalf("expected stale running row recovered and claimable, got %+v err=%v", recovered, err)
+	}
+}
+
+func TestOpenRouterMidStreamError(t *testing.T) {
+	sse := "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n" +
+		"data: {\"error\":{\"code\":502,\"message\":\"upstream provider reset\"}}\n\n"
+	_, err := readChatSSE(strings.NewReader(sse), nil)
+	if err == nil || !strings.Contains(err.Error(), "upstream provider reset") {
+		t.Fatalf("expected mid-stream SSE error to fail, got %v", err)
 	}
 }

@@ -46,13 +46,18 @@ type KillAgentResult struct {
 	WorkerOnline bool        `json:"worker_online"`
 }
 
+// InternalAdminCaller returns the trusted in-process admin device identity for internal callers such as the assistant.
+func InternalAdminCaller() *registry.Device {
+	return &registry.Device{Name: "admin", Grp: "admin"}
+}
+
 func randomHex(nBytes int) string {
 	b := make([]byte, nBytes)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
 }
 
-func (f *Fleet) resolveSpawnDevices(caller *registry.Device, req SpawnAgentRequest, cfg slacker.Config) ([]string, error) {
+func dedupDevices(req SpawnAgentRequest) []string {
 	var rawDevs []string
 	if len(req.Devices) > 0 {
 		rawDevs = req.Devices
@@ -69,6 +74,14 @@ func (f *Fleet) resolveSpawnDevices(caller *registry.Device, req SpawnAgentReque
 		seen[d] = true
 		devs = append(devs, d)
 	}
+	return devs
+}
+
+func (f *Fleet) resolveSpawnDevices(caller *registry.Device, req SpawnAgentRequest, cfg slacker.Config) ([]string, error) {
+	if caller == nil {
+		return nil, newFleetErr("caller authentication required", http.StatusUnauthorized)
+	}
+	devs := dedupDevices(req)
 	if len(devs) > 0 {
 		activeDevs, err := f.ActiveDeviceNames()
 		if err != nil {
@@ -78,39 +91,94 @@ func (f *Fleet) resolveSpawnDevices(caller *registry.Device, req SpawnAgentReque
 			if !activeDevs[d] {
 				return nil, newFleetErr(fmt.Sprintf("unknown or revoked device %q", d), http.StatusBadRequest)
 			}
-			if !IsAdmin(caller) && caller != nil && d != caller.Name {
+			if !IsAdmin(caller) && d != caller.Name {
 				return nil, newFleetErr(fmt.Sprintf("%s cannot spawn agents on %s", caller.Name, d), http.StatusForbidden)
 			}
 		}
 		return devs, nil
 	}
-	if (!IsAdmin(caller) || len(cfg.DefaultDevices) == 0) && caller != nil && caller.Name != "" {
+	if (!IsAdmin(caller) || len(cfg.DefaultDevices) == 0) && caller.Name != "" {
 		return []string{caller.Name}, nil
 	}
 	return nil, nil
 }
 
-// SpawnAgent queues a Slacker spawn job on the selected Mac device and records tracked paths.
-func (f *Fleet) SpawnAgent(ctx context.Context, caller *registry.Device, req SpawnAgentRequest) (SpawnAgentResult, error) {
-	if strings.TrimSpace(req.Harness) == "" && f.Registry != nil {
-		if lh, lErr := f.Registry.Lighthouse(); lErr == nil && lh != nil && lh.Name != "" {
-			dev := strings.TrimSpace(req.Device)
-			if strings.EqualFold(dev, lh.Name) || (len(req.Devices) == 1 && strings.EqualFold(strings.TrimSpace(req.Devices[0]), lh.Name)) {
-				req.Harness = session.HarnessAgy
+func (f *Fleet) buildSpawnChannel(devs []string, strat, pol, repoPath string, useTmux bool, cfg slacker.Config) slacker.ChannelMapping {
+	singleDev := ""
+	if len(devs) == 1 {
+		singleDev = devs[0]
+	}
+	ch := slacker.ChannelMapping{
+		ChannelID: strings.Join(devs, ","),
+		Device:    singleDev,
+		Devices:   devs,
+		Strategy:  strat,
+		Policy:    pol,
+		RepoPath:  strings.TrimSpace(repoPath),
+		UseTmux:   useTmux,
+	}
+	if len(devs) == 1 {
+		if lh, lErr := f.Registry.Lighthouse(); lErr == nil && lh != nil && devs[0] == lh.Name && ch.RepoPath == "" && strings.TrimSpace(cfg.Devices[lh.Name].WorkspaceDir) == "" {
+			ch.RepoPath = "~"
+		}
+	}
+	return ch
+}
+
+func (f *Fleet) sessionDeviceCounts(context.Context) (map[string]int, error) {
+	counts := map[string]int{}
+	if f.Agents == nil {
+		return counts, nil
+	}
+	if sessions, err := f.Agents.ListSessions("", "", "", "", false); err == nil {
+		for _, s := range sessions {
+			if s.Device != "" {
+				counts[s.Device]++
 			}
 		}
 	}
+	return counts, nil
+}
+
+func resolveSpawnSessionName(harness, rawName string) (string, error) {
+	sessName := strings.TrimSpace(rawName)
+	if sessName == "" {
+		return "ui-" + harness + "-" + randomHex(4), nil
+	}
+	if err := session.ValidateName(sessName); err != nil {
+		return "", newFleetErr(err.Error(), http.StatusBadRequest)
+	}
+	return sessName, nil
+}
+
+func (f *Fleet) defaultSpawnHarness(req SpawnAgentRequest) string {
+	if strings.TrimSpace(req.Harness) != "" || f.Registry == nil {
+		return req.Harness
+	}
+	lh, lErr := f.Registry.Lighthouse()
+	if lErr != nil || lh == nil || lh.Name == "" {
+		return req.Harness
+	}
+	dev := strings.TrimSpace(req.Device)
+	if strings.EqualFold(dev, lh.Name) || (len(req.Devices) == 1 && strings.EqualFold(strings.TrimSpace(req.Devices[0]), lh.Name)) {
+		return session.HarnessAgy
+	}
+	return req.Harness
+}
+
+// SpawnAgent queues a Slacker spawn job on the selected Mac device and records tracked paths.
+func (f *Fleet) SpawnAgent(ctx context.Context, caller *registry.Device, req SpawnAgentRequest) (SpawnAgentResult, error) {
+	if caller == nil {
+		return SpawnAgentResult{}, newFleetErr("caller authentication required", http.StatusUnauthorized)
+	}
+	req.Harness = f.defaultSpawnHarness(req)
 	harness, ok := session.NormalizeHarness(req.Harness)
 	if !ok {
 		return SpawnAgentResult{}, newFleetErr(fmt.Sprintf("unknown harness %q (expected claude, agy, or codex)", req.Harness), http.StatusBadRequest)
 	}
-	sessName := strings.TrimSpace(req.Name)
-	if sessName != "" {
-		if err := session.ValidateName(sessName); err != nil {
-			return SpawnAgentResult{}, newFleetErr(err.Error(), http.StatusBadRequest)
-		}
-	} else {
-		sessName = "ui-" + harness + "-" + randomHex(4)
+	sessName, err := resolveSpawnSessionName(harness, req.Name)
+	if err != nil {
+		return SpawnAgentResult{}, err
 	}
 	strat, err := slacker.NormalizeStrategy(req.Strategy)
 	if err != nil {
@@ -128,54 +196,21 @@ func (f *Fleet) SpawnAgent(ctx context.Context, caller *registry.Device, req Spa
 	if err != nil {
 		return SpawnAgentResult{}, err
 	}
-	singleDev := ""
-	if len(devs) == 1 {
-		singleDev = devs[0]
-	}
-	ch := slacker.ChannelMapping{
-		ChannelID: strings.Join(devs, ","),
-		Device:    singleDev,
-		Devices:   devs,
-		Strategy:  strat,
-		Policy:    pol,
-		RepoPath:  strings.TrimSpace(req.RepoPath),
-		UseTmux:   req.UseTmux,
-	}
-	if len(devs) == 1 {
-		if lh, lErr := f.Registry.Lighthouse(); lErr == nil && lh != nil && devs[0] == lh.Name && ch.RepoPath == "" && strings.TrimSpace(cfg.Devices[lh.Name].WorkspaceDir) == "" {
-			ch.RepoPath = "~"
-		}
-	}
-	loadFn := func(context.Context) (map[string]int, error) {
-		counts := map[string]int{}
-		if f.Agents != nil {
-			if sessions, lErr := f.Agents.ListSessions("", "", "", "", false); lErr == nil {
-				for _, s := range sessions {
-					if s.Device != "" {
-						counts[s.Device]++
-					}
-				}
-			}
-		}
-		return counts, nil
-	}
+	ch := f.buildSpawnChannel(devs, strat, pol, req.RepoPath, req.UseTmux, cfg)
 
 	f.spawnMu.Lock()
 	defer f.spawnMu.Unlock()
 
 	now := time.Now()
-	targetDevice, resolvedRepo, scope, err := slacker.SelectTarget(ctx, cfg, "ui", ch, f.Slacker, loadFn, now)
+	targetDevice, resolvedRepo, scope, err := slacker.SelectTarget(ctx, cfg, "ui", ch, f.Slacker, f.sessionDeviceCounts, now)
 	if err != nil {
 		return SpawnAgentResult{}, err
 	}
 	onlineWorkers, _ := f.Slacker.OnlineWorkers(now, slacker.WorkerOnlineWindow)
 	workerOnline := onlineWorkers[targetDevice]
 
-	callerName := "admin"
-	if caller != nil && caller.Name != "" {
-		callerName = caller.Name
-	}
-	inserted, job, err := f.Slacker.EnqueueJob(slacker.Job{
+	callerName := cmp.Or(caller.Name, "admin")
+	inserted, job, err := f.Slacker.EnqueueJobContext(ctx, slacker.Job{
 		Account:      "ui",
 		EventID:      "ui-" + randomHex(8),
 		ChannelName:  "web-ui",
@@ -204,6 +239,14 @@ func (f *Fleet) SpawnAgent(ctx context.Context, caller *registry.Device, req Spa
 
 // KillAgent queues a Slacker kill job for target sessionID and deregisters it immediately.
 func (f *Fleet) KillAgent(caller *registry.Device, sessionID string) (KillAgentResult, error) {
+	return f.KillAgentContext(context.Background(), caller, sessionID)
+}
+
+// KillAgentContext queues a Slacker kill job for target sessionID using ctx and deregisters it immediately.
+func (f *Fleet) KillAgentContext(ctx context.Context, caller *registry.Device, sessionID string) (KillAgentResult, error) {
+	if caller == nil {
+		return KillAgentResult{}, newFleetErr("caller authentication required", http.StatusUnauthorized)
+	}
 	if strings.TrimSpace(sessionID) == "" {
 		return KillAgentResult{}, newFleetErr("session_id is required", http.StatusBadRequest)
 	}
@@ -211,7 +254,7 @@ func (f *Fleet) KillAgent(caller *registry.Device, sessionID string) (KillAgentR
 	if err != nil {
 		return KillAgentResult{}, err
 	}
-	if !IsAdmin(caller) && caller != nil && detail.Device != caller.Name {
+	if !IsAdmin(caller) && detail.Device != caller.Name {
 		return KillAgentResult{}, newFleetErr(fmt.Sprintf("%s cannot kill session on %s", caller.Name, detail.Device), http.StatusForbidden)
 	}
 	sessHarness, ok := session.NormalizeHarness(detail.Harness)
@@ -226,11 +269,8 @@ func (f *Fleet) KillAgent(caller *registry.Device, sessionID string) (KillAgentR
 		PID:       detail.PID,
 	})
 	onlineWorkers, _ := f.Slacker.OnlineWorkers(time.Now(), slacker.WorkerOnlineWindow)
-	callerName := "admin"
-	if caller != nil && caller.Name != "" {
-		callerName = caller.Name
-	}
-	_, job, err := f.Slacker.EnqueueJob(slacker.Job{
+	callerName := cmp.Or(caller.Name, "admin")
+	_, job, err := f.Slacker.EnqueueJobContext(ctx, slacker.Job{
 		Account:      "ui",
 		EventID:      "ui-kill-" + randomHex(8),
 		ChannelName:  "web-ui",

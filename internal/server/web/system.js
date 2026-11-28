@@ -459,15 +459,22 @@ function renderTLSCard(tlsData, ov) {
   return card;
 }
 
-async function renderLogsCard(container) {
-  clear(container);
+async function renderLogsCard(container, signal) {
   let logRes;
   try {
-    logRes = await api("GET", `/v1/logs?name=${encodeURIComponent(sysState.logName)}&lines=${sysState.logLines}`);
+    logRes = await api("GET", `/v1/logs?name=${encodeURIComponent(sysState.logName)}&lines=${sysState.logLines}`, undefined, { signal });
   } catch (err) {
+    if ((err && err.name === "AbortError") || (signal && signal.aborted)) {
+      return;
+    }
+    clear(container);
     container.appendChild(el("div", { className: "alert-banner alert-danger", text: err.message }));
     return;
   }
+  if (signal && signal.aborted) {
+    return;
+  }
+  clear(container);
 
   const tabs = ["serve", "edge", "ddns", "slacker", "sync", "nebula"].map((name) =>
     el("button", {
@@ -476,7 +483,7 @@ async function renderLogsCard(container) {
       text: name,
       onclick: () => {
         sysState.logName = name;
-        renderLogsCard(container);
+        renderLogsCard(container, signal);
       },
     }),
   );
@@ -487,7 +494,7 @@ async function renderLogsCard(container) {
       "aria-label": "Log lines count",
       onchange: (ev) => {
         sysState.logLines = Number.parseInt(ev.target.value, 10) || 150;
-        renderLogsCard(container);
+        renderLogsCard(container, signal);
       },
     },
     ...[100, 150, 300, 500].map((n) => el("option", { value: String(n), text: `${n} lines`, selected: sysState.logLines === n })),
@@ -532,7 +539,7 @@ async function renderLogsCard(container) {
         el("div", { className: "chips-row" }, tabs),
         linesSel,
         filterIn,
-        el("button", { type: "button", className: "btn btn-sm", text: "Refresh Log", onclick: () => renderLogsCard(container) }),
+        el("button", { type: "button", className: "btn btn-sm", text: "Refresh Log", onclick: () => renderLogsCard(container, signal) }),
         makeCopyBtn((logRes.lines || []).join("\n"), "Copy"),
       ),
       logRes.error ? el("div", { className: "alert-banner alert-warn mb-2", text: logRes.error }) : null,
@@ -542,7 +549,8 @@ async function renderLogsCard(container) {
   updateFiltered();
 }
 
-export async function renderSystem(root) {
+export async function renderSystem(root, ctx) {
+  const signal = ctx && ctx.signal;
   if (!state.isAdmin) {
     root.appendChild(el("div", { className: "empty-state", text: "Admin privileges required to inspect lighthouse system internals." }));
     return;
@@ -553,13 +561,19 @@ export async function renderSystem(root) {
   let nebStatus = null;
   try {
     [ddnsData, tlsData, nebStatus] = await Promise.all([
-      api("GET", "/v1/ddns"),
-      api("GET", "/v1/tls"),
-      api("GET", "/v1/nebula/status"),
+      api("GET", "/v1/ddns", undefined, { signal }),
+      api("GET", "/v1/tls", undefined, { signal }),
+      api("GET", "/v1/nebula/status", undefined, { signal }),
     ]);
   } catch (err) {
+    if ((err && err.name === "AbortError") || (signal && signal.aborted)) {
+      return;
+    }
     clear(root);
     root.appendChild(el("div", { className: "alert-banner alert-danger", text: err.message }));
+    return;
+  }
+  if (signal && signal.aborted) {
     return;
   }
 
@@ -607,5 +621,5 @@ export async function renderSystem(root) {
 
   const logsContainer = el("div");
   root.appendChild(section("Lighthouse Logs", { className: "ui-section" }, logsContainer));
-  await renderLogsCard(logsContainer);
+  await renderLogsCard(logsContainer, signal);
 }

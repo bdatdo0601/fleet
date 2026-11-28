@@ -71,6 +71,7 @@ type mcpClientConn struct {
 	cfg        MCPServerConfig
 	cmd        *exec.Cmd
 	stdin      io.WriteCloser
+	stdout     io.ReadCloser
 	reader     *bufio.Reader
 	httpClient *http.Client
 	oauth      *MCPOAuthManager
@@ -110,6 +111,13 @@ func (m *MCPManager) SetOAuthStore(store MCPOAuthTokenStore) {
 	if m.oauth != nil {
 		m.oauth.SetStore(store)
 	}
+}
+
+// SetOPReader updates the 1Password secret reader used when resolving MCP env_refs and header_refs.
+func (m *MCPManager) SetOPReader(fn OPReaderFunc) {
+	m.mu.Lock()
+	m.reader = fn
+	m.mu.Unlock()
 }
 
 // SetHTTPClient sets the HTTP client used for HTTP MCP calls and OAuth exchanges.
@@ -157,8 +165,6 @@ func mcpConfigEqual(a, b MCPServerConfig) bool {
 
 // Reload updates configured servers and closes any disabled, removed, or modified connections.
 func (m *MCPManager) Reload(servers []MCPServerConfig) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	next := make(map[string]MCPServerConfig, len(servers))
 	for _, raw := range servers {
 		srv := NormalizeMCPServerConfig(raw)
@@ -167,23 +173,33 @@ func (m *MCPManager) Reload(servers []MCPServerConfig) {
 		}
 		next[srv.Name] = srv
 	}
+	var toClose []*mcpClientConn
+	m.mu.Lock()
 	for name, conn := range m.conns {
 		cfg, keep := next[name]
 		if !keep || !mcpConfigEqual(conn.cfg, cfg) {
-			conn.close()
+			toClose = append(toClose, conn)
 			delete(m.conns, name)
 		}
 	}
 	m.configs = next
+	m.mu.Unlock()
+	for _, conn := range toClose {
+		conn.close()
+	}
 }
 
 // Close terminates all running stdio MCP server subprocesses.
 func (m *MCPManager) Close() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	toClose := make([]*mcpClientConn, 0, len(m.conns))
 	for name, conn := range m.conns {
-		conn.close()
+		toClose = append(toClose, conn)
 		delete(m.conns, name)
+	}
+	m.mu.Unlock()
+	for _, conn := range toClose {
+		conn.close()
 	}
 }
 
@@ -224,7 +240,7 @@ func (m *MCPManager) TestServer(ctx context.Context, srv MCPServerConfig) ([]Ext
 	if err := conn.ensureStarted(ctx, reader); err != nil {
 		return nil, err
 	}
-	return append([]ExternalTool(nil), conn.tools...), nil
+	return conn.snapshotTools(), nil
 }
 
 // ListServerStatuses inspects each configured server and returns status + discovered tool names.
@@ -257,8 +273,9 @@ func (m *MCPManager) ListServerStatuses(ctx context.Context, servers []MCPServer
 			out = append(out, st)
 			continue
 		}
-		st.ToolCount = len(conn.tools)
-		for _, t := range conn.tools {
+		tools := conn.snapshotTools()
+		st.ToolCount = len(tools)
+		for _, t := range tools {
 			st.Tools = append(st.Tools, t.RemoteName)
 		}
 		out = append(out, st)
@@ -282,7 +299,7 @@ func (m *MCPManager) ListTools(ctx context.Context) []ExternalTool {
 		if err != nil {
 			continue
 		}
-		out = append(out, conn.tools...)
+		out = append(out, conn.snapshotTools()...)
 	}
 	return out
 }
@@ -313,20 +330,47 @@ func (m *MCPManager) CallTool(ctx context.Context, fullName string, args map[str
 	return conn.callTool(ctx, reader, tool.RemoteName, args)
 }
 
+func (c *mcpClientConn) snapshotTools() []ExternalTool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]ExternalTool(nil), c.tools...)
+}
+
 func (c *mcpClientConn) close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.resetStdioLocked()
+}
+
+func (c *mcpClientConn) terminateStdioHandlesLocked() {
 	if c.stdin != nil {
 		_ = c.stdin.Close()
 		c.stdin = nil
 	}
 	if c.cmd != nil && c.cmd.Process != nil {
 		_ = c.cmd.Process.Kill()
-		_ = c.cmd.Wait()
+	}
+	if c.stdout != nil {
+		_ = c.stdout.Close()
+		c.stdout = nil
+	}
+}
+
+func (c *mcpClientConn) finishStdioWaitLocked() {
+	if c.cmd != nil {
+		if c.cmd.Process != nil {
+			_ = c.cmd.Wait()
+		}
 		c.cmd = nil
 	}
+	c.reader = nil
 	c.sessionID = ""
 	c.started = false
+}
+
+func (c *mcpClientConn) resetStdioLocked() {
+	c.terminateStdioHandlesLocked()
+	c.finishStdioWaitLocked()
 }
 
 func (c *mcpClientConn) ensureStarted(ctx context.Context, opReader OPReaderFunc) error {
@@ -357,14 +401,7 @@ func (c *mcpClientConn) ensureStarted(ctx context.Context, opReader OPReaderFunc
 		return err
 	}
 	if err := c.handshakeLocked(ctx, opReader); err != nil {
-		c.started = false
-		_ = c.stdin.Close()
-		c.stdin = nil
-		if c.cmd != nil && c.cmd.Process != nil {
-			_ = c.cmd.Process.Kill()
-			_ = c.cmd.Wait()
-		}
-		c.cmd = nil
+		c.resetStdioLocked()
 		return err
 	}
 	return nil
@@ -454,18 +491,23 @@ func (c *mcpClientConn) startStdioLocked(ctx context.Context, opReader OPReaderF
 	if err != nil {
 		return err
 	}
-	stdout, err := cmd.StdoutPipe()
+	rPipe, wPipe, err := os.Pipe()
 	if err != nil {
 		_ = stdin.Close()
 		return err
 	}
+	cmd.Stdout = wPipe
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
+		_ = rPipe.Close()
+		_ = wPipe.Close()
 		return err
 	}
+	_ = wPipe.Close()
 	c.cmd = cmd
 	c.stdin = stdin
-	c.reader = bufio.NewReader(stdout)
+	c.stdout = rPipe
+	c.reader = bufio.NewReader(rPipe)
 	c.started = true
 	return nil
 }
@@ -584,6 +626,41 @@ func (c *mcpClientConn) notifyLocked(ctx context.Context, opReader OPReaderFunc,
 	return c.writeFrameLocked(msg)
 }
 
+type stdioReadResult struct {
+	line []byte
+	err  error
+}
+
+func (c *mcpClientConn) readStdioLineLocked(ctx context.Context) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		c.resetStdioLocked()
+		return nil, err
+	}
+	reader := c.reader
+	if reader == nil {
+		c.resetStdioLocked()
+		return nil, errors.New("MCP stdio reader closed")
+	}
+	ch := make(chan stdioReadResult, 1)
+	go func() {
+		line, err := reader.ReadBytes('\n')
+		ch <- stdioReadResult{line: line, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		c.terminateStdioHandlesLocked()
+		<-ch
+		c.finishStdioWaitLocked()
+		return nil, ctx.Err()
+	case res := <-ch:
+		if res.err != nil {
+			c.resetStdioLocked()
+			return nil, res.err
+		}
+		return res.line, nil
+	}
+}
+
 func (c *mcpClientConn) rpcCallLocked(ctx context.Context, opReader OPReaderFunc, method string, params any) (json.RawMessage, error) {
 	id := c.nextID.Add(1)
 	reqBody := map[string]any{
@@ -596,10 +673,11 @@ func (c *mcpClientConn) rpcCallLocked(ctx context.Context, opReader OPReaderFunc
 		return c.httpCallLocked(ctx, opReader, method, reqBody, id)
 	}
 	if err := c.writeFrameLocked(reqBody); err != nil {
+		c.resetStdioLocked()
 		return nil, err
 	}
 	for {
-		line, err := c.reader.ReadBytes('\n')
+		line, err := c.readStdioLineLocked(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -743,7 +821,7 @@ func (c *mcpClientConn) httpCallLocked(ctx context.Context, opReader OPReaderFun
 
 func extractSSEJSONRPC(body []byte, wantID int64) ([]byte, error) {
 	sc := bufio.NewScanner(bytes.NewReader(body))
-	sc.Buffer(make([]byte, 0, 64*1024), mcpMaxHTTPResponseBytes)
+	sc.Buffer(make([]byte, 0, 64*1024), max(2*1024*1024, mcpMaxHTTPResponseBytes))
 	var dataLines []string
 	checkBlock := func() ([]byte, bool) {
 		if len(dataLines) == 0 {

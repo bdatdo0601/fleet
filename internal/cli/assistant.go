@@ -98,7 +98,9 @@ type assistantSetupFlags struct {
 	decisionModel         string
 	observerModel         string
 	zdr                   bool
+	zdrSet                bool
 	enable                bool
+	enableSet             bool
 	autoApprove           bool
 	autoApproveSet        bool
 	noAutoApprove         bool
@@ -167,8 +169,15 @@ func applyDiscordSetupFlags(cfg *assistant.Config, opts assistantSetupFlags) err
 }
 
 func applyAssistantSetupFlags(cfg *assistant.Config, opts assistantSetupFlags, cio *IO) error {
-	cfg.Enabled = opts.enable
-	cfg.ZDR = opts.zdr
+	if opts.enableSet {
+		cfg.Enabled = opts.enable
+	}
+	if opts.zdrSet {
+		cfg.ZDR = opts.zdr
+	}
+	if opts.sandboxEnable && opts.sandboxDisable {
+		return errors.New("--sandbox-enable and --sandbox-disable cannot be combined")
+	}
 	if err := applyAutoApproveSetupFlags(cfg, opts); err != nil {
 		return err
 	}
@@ -269,11 +278,19 @@ func cmdAssistantSetup(args []string, cio *IO) error {
 	})
 	fs.BoolVar(&opts.sandboxEnable, "sandbox-enable", false, "enable the sandboxed computer runtime")
 	fs.BoolVar(&opts.sandboxDisable, "sandbox-disable", false, "disable the sandboxed computer runtime")
-	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
 		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(pos, " "))
 	}
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
+		case "enable":
+			opts.enableSet = true
+		case "zdr":
+			opts.zdrSet = true
 		case "auto-approve":
 			opts.autoApproveSet = true
 		case "discord-auto-approve":
@@ -343,8 +360,12 @@ func cmdAssistantSetup(args []string, cio *IO) error {
 func cmdAssistantDoctor(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("assistant doctor", flag.ContinueOnError)
 	jsonOut := fs.Bool("json", false, "output JSON")
-	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
 		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(pos, " "))
 	}
 	api, err := client.ResolveAPI("")
 	if err != nil {
@@ -374,8 +395,12 @@ func cmdAssistantOPSetup(args []string, cio *IO) error {
 	opRef := fs.String("op-ref", "", "read service account token from a 1Password op:// reference")
 	fromStdin := fs.Bool("token-stdin", false, "read service account token from stdin")
 	clearTok := fs.Bool("clear", false, "remove stored service account token from lighthouse")
-	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
 		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(pos, " "))
 	}
 	var token string
 	switch {
@@ -445,8 +470,12 @@ func cmdAssistantSyncInstall(args []string, cio *IO) error {
 	mountName := fs.String("name", "", "mounted vault name (omit for primary agent vault; e.g. personal)")
 	vaultPath := fs.String("vault", "", "local vault directory (defaults to configured vault path)")
 	obBinFlag := fs.String("ob-bin", "", "path to `ob` binary")
-	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
 		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(pos, " "))
 	}
 	cleanName := strings.ToLower(strings.TrimSpace(*mountName))
 	if cleanName != "" && cleanName != assistant.PrimaryVaultName && !assistant.IsValidVaultName(cleanName) {
@@ -508,8 +537,12 @@ func cmdAssistantSyncInstall(args []string, cio *IO) error {
 func cmdAssistantSyncUninstall(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("assistant sync-uninstall", flag.ContinueOnError)
 	mountName := fs.String("name", "", "mounted vault name (omit for primary agent vault)")
-	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
 		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(pos, " "))
 	}
 	cleanName := strings.ToLower(strings.TrimSpace(*mountName))
 	if cleanName != "" && cleanName != assistant.PrimaryVaultName && !assistant.IsValidVaultName(cleanName) {
@@ -526,8 +559,12 @@ func cmdAssistantSyncUninstall(args []string, cio *IO) error {
 func cmdAssistantStatus(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("assistant status", flag.ContinueOnError)
 	jsonOut := fs.Bool("json", false, "output JSON")
-	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
 		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(pos, " "))
 	}
 	api, err := client.ResolveAPI("")
 	if err != nil {
@@ -596,8 +633,12 @@ func cmdAssistantAsk(args []string, cio *IO) error {
 func cmdAssistantApprovals(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("assistant approvals", flag.ContinueOnError)
 	status := fs.String("status", "pending", "filter status")
-	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
 		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(pos, " "))
 	}
 	api, err := client.ResolveAPI("")
 	if err != nil {
@@ -627,8 +668,8 @@ func cmdAssistantDecide(args []string, approve bool, cio *IO) error {
 	if err != nil {
 		return err
 	}
-	if len(pos) == 0 {
-		return fmt.Errorf("approval id is required")
+	if len(pos) != 1 {
+		return fmt.Errorf("usage: fleet assistant approve|deny [--note NOTE] [--scope once|topic] ID")
 	}
 	api, err := client.ResolveAPI("")
 	if err != nil {
@@ -653,8 +694,7 @@ func cmdAssistantDecide(args []string, approve bool, cio *IO) error {
 }
 
 func cmdAssistantTimers(args []string, cio *IO) error {
-	fs := flag.NewFlagSet("assistant timers", flag.ContinueOnError)
-	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+	if err := parseFlagsNoPositional("assistant timers", args); err != nil {
 		return err
 	}
 	api, err := client.ResolveAPI("")
@@ -678,8 +718,7 @@ func cmdAssistantTimers(args []string, cio *IO) error {
 }
 
 func cmdAssistantNotifyTest(args []string, cio *IO) error {
-	fs := flag.NewFlagSet("assistant notify-test", flag.ContinueOnError)
-	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+	if err := parseFlagsNoPositional("assistant notify-test", args); err != nil {
 		return err
 	}
 	api, err := client.ResolveAPI("")
@@ -694,8 +733,7 @@ func cmdAssistantNotifyTest(args []string, cio *IO) error {
 }
 
 func cmdAssistantDiscordSync(args []string, cio *IO) error {
-	fs := flag.NewFlagSet("assistant discord-sync", flag.ContinueOnError)
-	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+	if err := parseFlagsNoPositional("assistant discord-sync", args); err != nil {
 		return err
 	}
 	api, err := client.ResolveAPI("")
@@ -717,8 +755,12 @@ func cmdAssistantDiscordSync(args []string, cio *IO) error {
 func cmdAssistantSandboxBuild(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("assistant sandbox-build", flag.ContinueOnError)
 	rebuildBase := fs.Bool("rebuild-base", false, "rebuild the base image from scratch")
-	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
 		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(pos, " "))
 	}
 	api, err := client.ResolveAPI("")
 	if err != nil {
@@ -738,8 +780,12 @@ func cmdAssistantSandboxReset(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("assistant sandbox-reset", flag.ContinueOnError)
 	ch := fs.String("channel", "general", "target channel")
 	clearOut := fs.Bool("clear-output", false, "also clear /work/out")
-	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
 		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(pos, " "))
 	}
 	api, err := client.ResolveAPI("")
 	if err != nil {
@@ -756,8 +802,7 @@ func cmdAssistantSandboxReset(args []string, cio *IO) error {
 }
 
 func cmdAssistantSandboxInstall(args []string, cio *IO) error {
-	fs := flag.NewFlagSet("assistant sandbox-install", flag.ContinueOnError)
-	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+	if err := parseFlagsNoPositional("assistant sandbox-install", args); err != nil {
 		return err
 	}
 	fleetBin := paths.InstalledBinaryPath()
@@ -793,8 +838,7 @@ func cmdAssistantSandboxInstall(args []string, cio *IO) error {
 }
 
 func cmdAssistantSandboxUninstall(args []string, cio *IO) error {
-	fs := flag.NewFlagSet("assistant sandbox-uninstall", flag.ContinueOnError)
-	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+	if err := parseFlagsNoPositional("assistant sandbox-uninstall", args); err != nil {
 		return err
 	}
 	if err := system.UninstallUserAgent(paths.SandboxAgentLabel); err != nil {
@@ -808,8 +852,12 @@ func cmdAssistantSandboxUninstall(args []string, cio *IO) error {
 func cmdAssistantSandboxAgent(args []string, _ *IO) error {
 	fs := flag.NewFlagSet("assistant sandbox-agent", flag.ContinueOnError)
 	sock := fs.String("socket", paths.SandboxSocketPath(paths.StateDir()), "Unix socket path")
-	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
 		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(pos, " "))
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -846,6 +894,69 @@ func detectLighthouseDeviceName(api string) string {
 	return ""
 }
 
+func waitForWorkerOnline(api, lhName string) (connected, inDefault bool) {
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		var stRes struct {
+			Config   slacker.ConfigView      `json:"config"`
+			Runtimes []slacker.RuntimeStatus `json:"runtimes"`
+		}
+		if callErr := client.Call(api, http.MethodGet, "/v1/slacker/status", nil, 3*time.Second, nil, &stRes); callErr == nil {
+			if lhName != "" {
+				inDefault = slices.Contains(stRes.Config.DefaultDevices, lhName)
+			}
+			for _, rt := range stRes.Runtimes {
+				if (lhName != "" && rt.Role == "worker:"+lhName && rt.Connected) ||
+					(lhName == "" && strings.HasPrefix(rt.Role, "worker:") && rt.Connected) {
+					return true, inDefault
+				}
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return false, inDefault
+}
+
+func reportWorkerReadiness(cio *IO, backend, pathEnv string) {
+	var harnesses []string
+	for _, h := range []string{"agy", "claude", "codex"} {
+		if binExistsInPathEnv(h, pathEnv) {
+			harnesses = append(harnesses, h)
+		}
+	}
+	harnessSummary := "none found in PATH"
+	if len(harnesses) > 0 {
+		harnessSummary = strings.Join(harnesses, ", ")
+	}
+	cio.info(fmt.Sprintf("readiness: backend=%s · harnesses=%s", backend, harnessSummary))
+}
+
+func buildWorkerInstallArgs(instBin, pathEnv string, useRex, useTmux bool, pol session.Policy) ([]string, string) {
+	workerArgs := []string{instBin, "slacker", "worker"}
+	if useTmux {
+		workerArgs = append(workerArgs, "--use-tmux")
+	} else if useRex {
+		workerArgs = append(workerArgs, "--use-rex")
+	}
+	var backend string
+	switch {
+	case useTmux:
+		backend = "tmux (forced)"
+	case useRex:
+		backend = "rex (forced)"
+	case binExistsInPathEnv("rex", pathEnv):
+		backend = "auto (agy=app, claude/codex=rex)"
+	case binExistsInPathEnv("tmux", pathEnv):
+		backend = "auto (agy=app, claude/codex=tmux)"
+	default:
+		backend = "auto (agy=app; install rex or tmux for claude/codex)"
+	}
+	if pol != "" {
+		workerArgs = append(workerArgs, "--policy", string(pol))
+	}
+	return workerArgs, backend
+}
+
 func cmdAssistantWorkerInstall(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("assistant worker-install", flag.ContinueOnError)
 	useRex := fs.Bool("use-rex", false, "force Rex for spawned sessions (runs agy CLI in Rex instead of Antigravity app)")
@@ -877,28 +988,7 @@ func cmdAssistantWorkerInstall(args []string, cio *IO) error {
 	}
 	home, _ := os.UserHomeDir()
 	pathEnv := session.AugmentedPath(os.Getenv("PATH"), home)
-	workerArgs := []string{instBin, "slacker", "worker"}
-	if *useTmux {
-		workerArgs = append(workerArgs, "--use-tmux")
-	} else if *useRex {
-		workerArgs = append(workerArgs, "--use-rex")
-	}
-	var backend string
-	switch {
-	case *useTmux:
-		backend = "tmux (forced)"
-	case *useRex:
-		backend = "rex (forced)"
-	case binExistsInPathEnv("rex", pathEnv):
-		backend = "auto (agy=app, claude/codex=rex)"
-	case binExistsInPathEnv("tmux", pathEnv):
-		backend = "auto (agy=app, claude/codex=tmux)"
-	default:
-		backend = "auto (agy=app; install rex or tmux for claude/codex)"
-	}
-	if pol != "" {
-		workerArgs = append(workerArgs, "--policy", string(pol))
-	}
+	workerArgs, backend := buildWorkerInstallArgs(instBin, pathEnv, *useRex, *useTmux, pol)
 	if err := system.InstallUserAgent(system.AgentOpts{
 		Label:     paths.SlackerWorkerLabel,
 		Args:      workerArgs,
@@ -912,31 +1002,7 @@ func cmdAssistantWorkerInstall(args []string, cio *IO) error {
 
 	if api, aErr := client.ResolveAPI(""); aErr == nil {
 		lhName := detectLighthouseDeviceName(api)
-		var connected bool
-		var inDefault bool
-		deadline := time.Now().Add(4 * time.Second)
-		for time.Now().Before(deadline) {
-			var stRes struct {
-				Config   slacker.ConfigView      `json:"config"`
-				Runtimes []slacker.RuntimeStatus `json:"runtimes"`
-			}
-			if callErr := client.Call(api, http.MethodGet, "/v1/slacker/status", nil, 3*time.Second, nil, &stRes); callErr == nil {
-				if lhName != "" {
-					inDefault = slices.Contains(stRes.Config.DefaultDevices, lhName)
-				}
-				for _, rt := range stRes.Runtimes {
-					if (lhName != "" && rt.Role == "worker:"+lhName && rt.Connected) ||
-						(lhName == "" && strings.HasPrefix(rt.Role, "worker:") && rt.Connected) {
-						connected = true
-						break
-					}
-				}
-				if connected {
-					break
-				}
-			}
-			time.Sleep(250 * time.Millisecond)
-		}
+		connected, inDefault := waitForWorkerOnline(api, lhName)
 		if connected {
 			cio.info(fmt.Sprintf("lighthouse worker online (%s)", cmp.Or(lhName, "lighthouse")))
 		} else {
@@ -948,18 +1014,7 @@ func cmdAssistantWorkerInstall(args []string, cio *IO) error {
 			cio.info("isolated from slacker default_devices (only explicit lighthouse spawns run here)")
 		}
 	}
-
-	var harnesses []string
-	for _, h := range []string{"agy", "claude", "codex"} {
-		if binExistsInPathEnv(h, pathEnv) {
-			harnesses = append(harnesses, h)
-		}
-	}
-	harnessSummary := "none found in PATH"
-	if len(harnesses) > 0 {
-		harnessSummary = strings.Join(harnesses, ", ")
-	}
-	cio.info(fmt.Sprintf("readiness: backend=%s · harnesses=%s", backend, harnessSummary))
+	reportWorkerReadiness(cio, backend, pathEnv)
 	return nil
 }
 

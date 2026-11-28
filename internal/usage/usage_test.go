@@ -52,7 +52,7 @@ for line in sys.stdin:
 		t.Fatal(err)
 	}
 
-	got := CollectCodex(context.Background(), fakeCodex)
+	got := CollectCodex(context.Background(), fakeCodex, "")
 	if got.Status != "ok" || got.Harness != "codex" || got.Plan != "pro" || got.Source != "codex-app-server" {
 		t.Fatalf("unexpected codex usage: %+v", got)
 	}
@@ -61,6 +61,67 @@ for line in sys.stdin:
 	}
 	if got.Metrics["lifetime_tokens"] != int64(987654) || got.Metrics["credits_balance"] != "15.50" || got.Metrics["current_streak_days"] != int64(7) {
 		t.Fatalf("unexpected codex metrics: %+v", got.Metrics)
+	}
+}
+
+func TestCollectCodexOutOfOrderRPCAndPipeCloseUnderRace(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("skipped when running as root")
+	}
+	dir := t.TempDir()
+	fakeBinDir := filepath.Join(dir, ".local", "bin")
+	if err := os.MkdirAll(fakeBinDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeCodex := filepath.Join(fakeBinDir, "codex")
+	script := `#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    m = msg.get("method")
+    if m == "initialize":
+        print(json.dumps({"id": mid, "result": {"userAgent": "codex-fake"}}), flush=True)
+    elif m == "account/usage/read":
+        # Respond to id 3 before id 2 has been emitted (out-of-order)
+        print(json.dumps({"id": 3, "result": {
+            "summary": {"lifetimeTokens": 42, "peakDailyTokens": 10, "currentStreakDays": 2}
+        }}), flush=True)
+        print(json.dumps({"id": 2, "result": {
+            "ordinaryUsageAllowed": True,
+            "rateLimits": {
+                "planType": "plus",
+                "primary": {"usedPercent": 25, "windowDurationMins": 300, "resetsAt": 1796000000}
+            }
+        }}), flush=True)
+`
+	if err := os.WriteFile(fakeCodex, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Ensure PATH does not shadow home/.local/bin/codex with a system codex binary.
+	t.Setenv("PATH", "/usr/bin:/bin")
+	// Verify CollectCodex discovers codex via passed home and handles out-of-order id=3 before id=2.
+	got := CollectCodex(context.Background(), "", dir)
+	if got.Status != "ok" || got.Plan != "plus" || len(got.Windows) != 1 || got.Windows[0].UsedPercent != 25 {
+		t.Fatalf("unexpected out-of-order codex usage: %+v", got)
+	}
+	if got.Metrics["lifetime_tokens"] != int64(42) || got.Metrics["peak_daily_tokens"] != int64(10) {
+		t.Fatalf("expected buffered out-of-order token usage, got %+v", got.Metrics)
+	}
+
+	// Verify early pipe close with stderr output does not race under -race.
+	failingCodex := filepath.Join(dir, "codex-fail")
+	failScript := "#!/bin/sh\necho 'boom stderr' >&2\nexit 1\n"
+	if err := os.WriteFile(failingCodex, []byte(failScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	failRes := CollectCodex(context.Background(), failingCodex, dir)
+	if failRes.Status != "error" || !strings.Contains(failRes.Detail, "boom stderr") {
+		t.Fatalf("expected stderr detail on closed pipe, got %+v", failRes)
 	}
 }
 

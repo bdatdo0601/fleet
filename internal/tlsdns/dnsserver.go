@@ -22,6 +22,7 @@ const (
 	dnsSOATTL        = 60
 	maxUDPPacketSize = 1232
 	maxTCPMsgSize    = 65535
+	maxDNSTCPConns   = 64
 )
 
 var meshPrefix = netip.MustParsePrefix(paths.MeshCIDR)
@@ -338,7 +339,11 @@ func serveDNSPacketConn(ctx context.Context, pc net.PacketConn, provider RecordP
 }
 
 func handleDNSTCPConn(ctx context.Context, conn net.Conn, provider RecordProvider) {
-	defer func() { _ = conn.Close() }()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer func() {
+		stop()
+		_ = conn.Close()
+	}()
 	if !IsAllowedDNSPeer(conn.RemoteAddr()) {
 		return
 	}
@@ -381,7 +386,12 @@ func serveDNSListeners(
 		serveDNSPacketConn(ctx, pc, provider)
 	}()
 	go func() {
-		defer wg.Done()
+		var connWg sync.WaitGroup
+		sem := make(chan struct{}, maxDNSTCPConns)
+		defer func() {
+			connWg.Wait()
+			wg.Done()
+		}()
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
@@ -390,7 +400,15 @@ func serveDNSListeners(
 				}
 				continue
 			}
-			go handleDNSTCPConn(ctx, conn, provider)
+			select {
+			case sem <- struct{}{}:
+				connWg.Go(func() {
+					defer func() { <-sem }()
+					handleDNSTCPConn(ctx, conn, provider)
+				})
+			default:
+				_ = conn.Close()
+			}
 		}
 	}()
 }

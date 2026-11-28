@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"io"
 	"math/big"
 	"net"
@@ -741,5 +742,127 @@ func TestServeDNSBindsLoopbackNotWildcard(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("ServeDNS did not shut down promptly after cancel")
+	}
+}
+
+func TestEdgeHTTPSProxyFailClosedAndUnmap(t *testing.T) {
+	// Missing edge.token -> 503 Service Unavailable, upstream never hit.
+	emptyDir := t.TempDir()
+	upstreamHits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	proxyNoTok, err := NewHTTPSProxy(upstream.URL, emptyDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "https://fleet.example.com/v1/overview", nil)
+	req.RemoteAddr = "10.213.0.4:54321"
+	rec := httptest.NewRecorder()
+	proxyNoTok.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable || upstreamHits != 0 {
+		t.Fatalf("expected 503 without upstream hit when edge.token missing, got code=%d hits=%d", rec.Code, upstreamHits)
+	}
+
+	// Valid edge.token + IPv4-mapped IPv6 mesh RemoteAddr -> unmapped and forwarded; mapped public IP -> 403.
+	tokDir := t.TempDir()
+	tok, err := EnsureEdgeToken(tokDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotClientIP, gotTok string
+	upstream2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotClientIP = r.Header.Get(HeaderClientIP)
+		gotTok = r.Header.Get(HeaderEdgeToken)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream2.Close()
+
+	proxyWithTok, err := NewHTTPSProxy(upstream2.URL, tokDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req6 := httptest.NewRequest(http.MethodGet, "https://fleet.example.com/v1/overview", nil)
+	req6.RemoteAddr = "[::ffff:10.213.0.4]:54321"
+	rec6 := httptest.NewRecorder()
+	proxyWithTok.ServeHTTP(rec6, req6)
+	if rec6.Code != http.StatusOK || gotClientIP != "10.213.0.4" || gotTok != tok {
+		t.Fatalf("expected 200 with unmapped 10.213.0.4, got code=%d ip=%q tok=%q", rec6.Code, gotClientIP, gotTok)
+	}
+
+	badReq6 := httptest.NewRequest(http.MethodGet, "https://fleet.example.com/v1/overview", nil)
+	badReq6.RemoteAddr = "[::ffff:203.0.113.10]:1234"
+	badRec6 := httptest.NewRecorder()
+	proxyWithTok.ServeHTTP(badRec6, badReq6)
+	if badRec6.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for mapped public IP, got %d", badRec6.Code)
+	}
+}
+
+func TestWaitChangeInSyncFailFastAndRenewNowTryLockAndProviderBackoff(t *testing.T) {
+	// WaitChangeInSync fails fast after 5 consecutive errors.
+	calls := 0
+	err := WaitChangeInSync(
+		t.Context(),
+		"prof",
+		"/change/C1",
+		"/usr/bin/aws",
+		func(string, ...string) (string, string, error) {
+			calls++
+			return "", "AccessDenied", errors.New("exit 255")
+		},
+		time.Millisecond,
+	)
+	if err == nil || !strings.Contains(err.Error(), "AccessDenied") || calls != maxRoute53PollErrors {
+		t.Fatalf("expected fail-fast after %d calls with AccessDenied, got calls=%d err=%v", maxRoute53PollErrors, calls, err)
+	}
+
+	// RenewNow uses TryLock and returns ErrRenewalInProgress if already running.
+	started := make(chan struct{})
+	release := make(chan struct{})
+	stateDir := t.TempDir()
+	mgr := NewManager(stateDir, func() (*Config, error) {
+		close(started)
+		<-release
+		return nil, nil
+	}, ACMEDeps{})
+	done1 := make(chan error, 1)
+	go func() {
+		_, rErr := mgr.RenewNow(t.Context(), false)
+		done1 <- rErr
+	}()
+	<-started
+	_, err2 := mgr.RenewNow(t.Context(), false)
+	if !errors.Is(err2, ErrRenewalInProgress) {
+		t.Fatalf("expected ErrRenewalInProgress, got %v", err2)
+	}
+	close(release)
+	<-done1
+
+	// NewCachedRecordProvider applies failure backoff instead of hammering upstream.
+	hits := 0
+	failSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer failSrv.Close()
+	prov := NewCachedRecordProvider(failSrv.URL, t.TempDir(), failSrv.Client())
+	if _, err := prov(t.Context()); err == nil {
+		t.Fatal("expected initial error")
+	}
+	if _, err := prov(t.Context()); err == nil {
+		t.Fatal("expected cached backoff error")
+	}
+	if hits != 1 {
+		t.Fatalf("expected 1 upstream hit during failure backoff, got %d", hits)
+	}
+
+	// CertPathsForDir constructs paths directly inside tlsDir.
+	cp := CertPathsForDir("/tmp/custom-tls")
+	if cp.Fullchain != "/tmp/custom-tls/fullchain.pem" || cp.Privkey != "/tmp/custom-tls/privkey.pem" {
+		t.Fatalf("unexpected CertPathsForDir: %+v", cp)
 	}
 }

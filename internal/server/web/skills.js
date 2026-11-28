@@ -175,12 +175,18 @@ function openSkillRegistryModal(onInstalled) {
   );
 }
 
-async function renderVaultFileEditor(container, relPath, title, hint, extraActions = null) {
+async function renderVaultFileEditor(container, relPath, title, hint, extraActions = null, signal = null) {
   let content = "";
   try {
-    const res = await api("GET", `/v1/assistant/vault/file?path=${encodeURIComponent(relPath)}`);
+    const res = await api("GET", `/v1/assistant/vault/file?path=${encodeURIComponent(relPath)}`, undefined, { signal });
+    if (signal && signal.aborted) {
+      return;
+    }
     content = res.content || "";
   } catch (err) {
+    if ((err && err.name === "AbortError") || (signal && signal.aborted)) {
+      return;
+    }
     container.appendChild(el("div", { className: "alert-banner alert-danger", text: err.message }));
     return;
   }
@@ -215,16 +221,31 @@ async function renderVaultFileEditor(container, relPath, title, hint, extraActio
 }
 
 export async function renderSkills(main, ctx, sub) {
+  const signal = ctx && ctx.signal;
+  if (signal && signal.aborted) {
+    return;
+  }
   clear(main);
   const tab = (sub || "").trim() || "library";
+  const tabDefs = [
+    ["library", "Skills Library", "#skills/library"],
+    ["agent", "SOUL & Heartbeat", "#skills/agent"],
+    ["memory", "Observational Memory", "#skills/memory"],
+    ["vault", "Vault Search", "#skills/vault"],
+    ["history", "History", "#skills/history"],
+  ];
   const tabs = el(
     "div",
-    { className: "subtabs" },
-    el("a", { href: "#skills/library", className: `subtab${tab === "library" ? " active" : ""}`, text: "Skills Library" }),
-    el("a", { href: "#skills/agent", className: `subtab${tab === "agent" ? " active" : ""}`, text: "SOUL & Heartbeat" }),
-    el("a", { href: "#skills/memory", className: `subtab${tab === "memory" ? " active" : ""}`, text: "Observational Memory" }),
-    el("a", { href: "#skills/vault", className: `subtab${tab === "vault" ? " active" : ""}`, text: "Vault Search" }),
-    el("a", { href: "#skills/history", className: `subtab${tab === "history" ? " active" : ""}`, text: "History" }),
+    { className: "sub-tabs", role: "tablist", "aria-label": "Skills views" },
+    ...tabDefs.map(([id, label, hash]) =>
+      el("a", {
+        href: hash,
+        role: "tab",
+        "aria-selected": tab === id ? "true" : "false",
+        className: `sub-tab${tab === id ? " active" : ""}`,
+        text: label,
+      }),
+    ),
   );
 
   const actions = el(
@@ -248,8 +269,11 @@ export async function renderSkills(main, ctx, sub) {
   main.appendChild(section("Skills & Second Brain", { subtitle: "Obsidian-backed SKILL.md library, agent directives, and Observational Memory", actions }, tabs, body));
 
   if (tab === "agent") {
-    await renderVaultFileEditor(body, "_agent/SOUL.md", "SOUL.md", "Static system directives cached at the top of every run.");
-    await renderVaultFileEditor(body, "_agent/HEARTBEAT.md", "HEARTBEAT.md", "Periodic autonomous checklist evaluated on the heartbeat timer.");
+    await renderVaultFileEditor(body, "_agent/SOUL.md", "SOUL.md", "Static system directives cached at the top of every run.", null, signal);
+    if (signal && signal.aborted) {
+      return;
+    }
+    await renderVaultFileEditor(body, "_agent/HEARTBEAT.md", "HEARTBEAT.md", "Periodic autonomous checklist evaluated on the heartbeat timer.", null, signal);
     return;
   }
 
@@ -286,18 +310,27 @@ export async function renderSkills(main, ctx, sub) {
         },
       }),
     );
-    await renderVaultFileEditor(body, "_agent/memory/REFLECTIONS.md", "REFLECTIONS.md", "Condensed long-term context kept in the cached prompt prefix.", observeActions);
-    await renderVaultFileEditor(body, "_agent/memory/OBSERVATIONS.md", "OBSERVATIONS.md", "Append-only dated observations distilled by the background Observer.");
+    await renderVaultFileEditor(body, "_agent/memory/REFLECTIONS.md", "REFLECTIONS.md", "Condensed long-term context kept in the cached prompt prefix.", observeActions, signal);
+    if (signal && signal.aborted) {
+      return;
+    }
+    await renderVaultFileEditor(body, "_agent/memory/OBSERVATIONS.md", "OBSERVATIONS.md", "Append-only dated observations distilled by the background Observer.", null, signal);
     return;
   }
 
   if (tab === "vault") {
     let extraVaults = [];
     try {
-      const cfgRes = await api("GET", "/v1/assistant/config");
+      const cfgRes = await api("GET", "/v1/assistant/config", undefined, { signal });
       extraVaults = (cfgRes.config && cfgRes.config.extra_vaults) || [];
-    } catch {
+    } catch (err) {
+      if ((err && err.name === "AbortError") || (signal && signal.aborted)) {
+        return;
+      }
       // fall back to primary vault if config lookup fails
+    }
+    if (signal && signal.aborted) {
+      return;
     }
     const vaultSel = el(
       "select",
@@ -313,7 +346,12 @@ export async function renderSkills(main, ctx, sub) {
         const res = await api(
           "GET",
           `/v1/assistant/vault/search?vault=${encodeURIComponent(vaultSel.value)}&q=${encodeURIComponent(qIn.value.trim())}&limit=25`,
+          undefined,
+          { signal },
         );
+        if (signal && signal.aborted) {
+          return;
+        }
         clear(hitsBox);
         const hits = res.hits || [];
         if (hits.length === 0) {
@@ -338,17 +376,24 @@ export async function renderSkills(main, ctx, sub) {
                 className: "btn btn-sm",
                 text: "Open Note",
                 onclick: async () => {
-                  const file = await api(
-                    "GET",
-                    `/v1/assistant/vault/file?vault=${encodeURIComponent(hitVault)}&path=${encodeURIComponent(h.path)}`,
-                  );
-                  openModal(`${hitVault}:${h.path}`, el("pre", { className: "code-block" }, el("code", { text: file.content || "" })));
+                  try {
+                    const file = await api(
+                      "GET",
+                      `/v1/assistant/vault/file?vault=${encodeURIComponent(hitVault)}&path=${encodeURIComponent(h.path)}`,
+                    );
+                    openModal(`${hitVault}:${h.path}`, el("pre", { className: "code-block" }, el("code", { text: file.content || "" })));
+                  } catch (err) {
+                    toast(err.message, "error");
+                  }
                 },
               }),
             ),
           );
         }
       } catch (err) {
+        if ((err && err.name === "AbortError") || (signal && signal.aborted)) {
+          return;
+        }
         toast(err.message, "error");
       }
     };
@@ -375,9 +420,15 @@ export async function renderSkills(main, ctx, sub) {
   if (tab === "history") {
     let commits = [];
     try {
-      const res = await api("GET", "/v1/assistant/vault/history?vault=agent&limit=25");
+      const res = await api("GET", "/v1/assistant/vault/history?vault=agent&limit=25", undefined, { signal });
+      if (signal && signal.aborted) {
+        return;
+      }
       commits = res.commits || [];
     } catch (err) {
+      if ((err && err.name === "AbortError") || (signal && signal.aborted)) {
+        return;
+      }
       body.appendChild(el("div", { className: "alert-banner alert-danger", text: err.message }));
       return;
     }
@@ -439,9 +490,15 @@ export async function renderSkills(main, ctx, sub) {
 
   let skills = [];
   try {
-    const res = await api("GET", "/v1/assistant/skills");
+    const res = await api("GET", "/v1/assistant/skills", undefined, { signal });
+    if (signal && signal.aborted) {
+      return;
+    }
     skills = res.skills || [];
   } catch (err) {
+    if ((err && err.name === "AbortError") || (signal && signal.aborted)) {
+      return;
+    }
     body.appendChild(el("div", { className: "alert-banner alert-danger", text: err.message }));
     return;
   }
@@ -493,6 +550,10 @@ export async function renderSkills(main, ctx, sub) {
             className: "btn btn-sm btn-danger",
             text: "Delete",
             onclick: async () => {
+              const ok = await confirmDialog("Delete Skill?", `Delete skill "${sk.name}" from _skills/?`, "Delete", true);
+              if (!ok) {
+                return;
+              }
               try {
                 await api("DELETE", `/v1/assistant/skills/${encodeURIComponent(sk.name)}`);
                 toast(`Deleted ${sk.name}`, "ok");

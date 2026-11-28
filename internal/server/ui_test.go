@@ -778,13 +778,13 @@ func TestTLSDNSAndEdgeProxyAuth(t *testing.T) {
 		t.Fatalf("expected managed device forwarded via edge token to get 403 on /v1/tls, got %d", st)
 	}
 
-	// Invalid edge token is ignored (falls back to loopback = mini admin).
+	// Invalid edge token on a proxied loopback request fails closed (403 Forbidden).
 	st, _, _ = doRawReq(t, srv.URL+"/v1/tls", http.MethodGet, "", map[string]string{
 		tlsdns.HeaderEdgeToken: "wrong-token",
 		tlsdns.HeaderClientIP:  office.IP,
 	}, "fleet.example.com")
-	if st != http.StatusOK {
-		t.Fatalf("expected wrong edge token to ignore X-Fleet-Client-IP and use loopback mini, got %d", st)
+	if st != http.StatusForbidden {
+		t.Fatalf("expected wrong edge token to fail closed with 403, got %d", st)
 	}
 
 	// GET /v1/dns/records returns active devices mapped under fleet.example.com.

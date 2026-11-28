@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,6 +50,10 @@ CREATE TABLE IF NOT EXISTS assistant_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_assistant_messages_channel
   ON assistant_messages(channel_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_assistant_messages_unobserved
+  ON assistant_messages(channel_id, context_epoch, observed, id DESC);
+CREATE INDEX IF NOT EXISTS idx_assistant_messages_created
+  ON assistant_messages(created_at);
 
 CREATE TABLE IF NOT EXISTS assistant_inbox (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -369,7 +374,17 @@ func OpenStore(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	if path != "" && path != ":memory:" && !strings.HasPrefix(path, "file:") {
+		if err := os.Chmod(path, 0o600); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+	}
 	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_messages_external ON assistant_messages(source, external_id) WHERE external_id != ''`); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if _, err := db.Exec(`UPDATE assistant_inbox SET status = 'queued', updated_at = ? WHERE status = 'running'`, registry.NowISO()); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -388,9 +403,7 @@ func (s *Store) Close() error {
 	if s.db == nil {
 		return nil
 	}
-	err := s.db.Close()
-	s.db = nil
-	return err
+	return s.db.Close()
 }
 
 func (s *Store) seedDefaultChannels() error {
@@ -499,7 +512,13 @@ func (s *Store) ResetChannelContext(id string, clearHistory bool) (Channel, erro
 	defer s.mu.Unlock()
 	cleanID := strings.TrimSpace(id)
 	now := registry.NowISO()
-	res, err := s.db.Exec(
+	tx, err := s.db.Begin()
+	if err != nil {
+		return Channel{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.Exec(
 		`UPDATE assistant_channels SET context_epoch = context_epoch + 1, updated_at = ? WHERE id = ?`,
 		now, cleanID,
 	)
@@ -509,14 +528,14 @@ func (s *Store) ResetChannelContext(id string, clearHistory bool) (Channel, erro
 	if n, _ := res.RowsAffected(); n == 0 {
 		return Channel{}, newErr(fmt.Sprintf("channel %q not found", id), http.StatusNotFound)
 	}
-	if _, err := s.db.Exec(`DELETE FROM assistant_frontier_grants WHERE channel_id = ?`, cleanID); err != nil {
+	if _, err := tx.Exec(`DELETE FROM assistant_frontier_grants WHERE channel_id = ?`, cleanID); err != nil {
 		return Channel{}, err
 	}
 	if clearHistory {
-		if _, err := s.db.Exec(`DELETE FROM assistant_messages WHERE channel_id = ?`, cleanID); err != nil {
+		if _, err := tx.Exec(`DELETE FROM assistant_messages WHERE channel_id = ?`, cleanID); err != nil {
 			return Channel{}, err
 		}
-		if _, err := s.db.Exec(
+		if _, err := tx.Exec(
 			`UPDATE assistant_approvals SET status = 'cancelled', decided_at = ? WHERE channel_id = ? AND status = 'pending'`,
 			now, cleanID,
 		); err != nil {
@@ -524,9 +543,12 @@ func (s *Store) ResetChannelContext(id string, clearHistory bool) (Channel, erro
 		}
 	}
 	var ch Channel
-	if err := s.db.QueryRow(
+	if err := tx.QueryRow(
 		`SELECT id, title, description, model, context_epoch, created_at, updated_at FROM assistant_channels WHERE id = ?`, cleanID,
 	).Scan(&ch.ID, &ch.Title, &ch.Description, &ch.Model, &ch.ContextEpoch, &ch.CreatedAt, &ch.UpdatedAt); err != nil {
+		return Channel{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return Channel{}, err
 	}
 	return ch, nil
@@ -881,8 +903,6 @@ func NextCronRun(expr string, after time.Time) (time.Time, error) {
 
 // UpsertTimer creates or updates a scheduled timer.
 func (s *Store) UpsertTimer(t Timer) (Timer, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	now := registry.NowISO()
 	if t.ID == "" {
 		t.ID = randomHexID("tmr")
@@ -911,6 +931,9 @@ func (s *Store) UpsertTimer(t Timer) (Timer, error) {
 	}
 	t.CreatedAt = cmp.Or(t.CreatedAt, now)
 	t.UpdatedAt = now
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, err := s.db.Exec(
 		`INSERT INTO assistant_timers(
 			id, channel_id, name, prompt, model, schedule_kind, fire_at,
@@ -997,8 +1020,6 @@ func (s *Store) DueTimers(nowISO string) ([]Timer, error) {
 
 // MarkTimerRun updates last_run_at and next_run_at (or disables one-shot timers).
 func (s *Store) MarkTimerRun(t Timer, now time.Time) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	nowISO := now.UTC().Truncate(time.Second).Format("2006-01-02T15:04:05+00:00")
 	enabled := 1
 	nextRun := ""
@@ -1015,6 +1036,8 @@ func (s *Store) MarkTimerRun(t Timer, now time.Time) error {
 	default:
 		nextRun = now.UTC().Add(time.Duration(t.IntervalSeconds) * time.Second).Truncate(time.Second).Format("2006-01-02T15:04:05+00:00")
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	_, err := s.db.Exec(
 		`UPDATE assistant_timers SET enabled = ?, last_run_at = ?, next_run_at = ?, updated_at = ? WHERE id = ?`,
 		enabled, nowISO, nextRun, nowISO, t.ID,
@@ -1597,19 +1620,24 @@ func (s *Store) AttachFilesToMessage(channelID string, msgID int64, fileIDs []st
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cleanCh := cmp.Or(strings.TrimSpace(channelID), "general")
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
 	for _, id := range fileIDs {
 		cleanID := strings.TrimSpace(id)
 		if cleanID == "" {
 			continue
 		}
-		if _, err := s.db.Exec(
+		if _, err := tx.Exec(
 			`UPDATE assistant_files SET message_id = ? WHERE id = ? AND channel_id = ? AND message_id = 0`,
 			msgID, cleanID, cleanCh,
 		); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 // GetMCPOAuthToken loads the stored OAuth token record for serverName.

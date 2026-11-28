@@ -199,6 +199,7 @@ type SandboxRunner interface {
 
 // AppleContainerRunner executes Apple's `container` CLI (macOS 26+).
 type AppleContainerRunner struct {
+	mu  sync.Mutex
 	bin string
 }
 
@@ -208,14 +209,22 @@ func NewAppleContainerRunner() *AppleContainerRunner {
 }
 
 func (r *AppleContainerRunner) binary() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.bin != "" {
 		return r.bin
 	}
-	return r.FindBinary()
+	return r.findBinaryLocked()
 }
 
 // FindBinary locates Apple's `container` CLI in PATH or standard Homebrew locations.
 func (r *AppleContainerRunner) FindBinary() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.findBinaryLocked()
+}
+
+func (r *AppleContainerRunner) findBinaryLocked() string {
 	if p, err := exec.LookPath("container"); err == nil {
 		r.bin = p
 		return p
@@ -510,6 +519,7 @@ type activeSandbox struct {
 	network       string
 	gatewayIP     string
 	lastUsed      time.Time
+	inFlight      int
 }
 
 // SandboxManager manages scale-to-zero per-channel sandbox micro-VMs and workspace staging.
@@ -569,18 +579,9 @@ func (m *SandboxManager) ResolveWorkPath(channelID, rawPath string) (abs, cleanR
 	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 		return "", "", newErr("sandbox path traversal rejected", http.StatusBadRequest)
 	}
-	full := filepath.Join(workDir, clean)
-	rootReal, err := filepath.EvalSymlinks(workDir)
+	full, err := resolveJailedPath(workDir, clean, "symlink escapes sandbox /work")
 	if err != nil {
-		rootReal = workDir
-	}
-	for _, cand := range []string{full, filepath.Dir(full)} {
-		if resolved, rErr := filepath.EvalSymlinks(cand); rErr == nil {
-			relCheck, relErr := filepath.Rel(rootReal, resolved)
-			if relErr != nil || relCheck == ".." || strings.HasPrefix(relCheck, ".."+string(filepath.Separator)) {
-				return "", "", newErr("symlink escapes sandbox /work", http.StatusForbidden)
-			}
-		}
+		return "", "", err
 	}
 	return full, filepath.ToSlash(clean), nil
 }
@@ -644,7 +645,12 @@ func (m *SandboxManager) ReadTextFile(channelID, relPath string, maxBytes int) (
 	if info.IsDir() {
 		return "", 0, false, newErr(fmt.Sprintf("%q is a directory", relPath), http.StatusBadRequest)
 	}
-	data, err := os.ReadFile(abs)
+	f, err := os.Open(abs)
+	if err != nil {
+		return "", 0, false, err
+	}
+	defer func() { _ = f.Close() }()
+	data, err := io.ReadAll(io.LimitReader(f, int64(maxBytes)+1))
 	if err != nil {
 		return "", 0, false, err
 	}
@@ -676,6 +682,9 @@ func (m *SandboxManager) WriteTextFile(channelID, relPath, content string) (stri
 func (m *SandboxManager) ensureActiveLocked(ctx context.Context, cfg SandboxConfig, channelID string) (*activeSandbox, error) {
 	norm := normalizeSandboxConfig(cfg)
 	if m.active != nil && (m.active.channelID != channelID || m.active.image != norm.Image || m.active.network != norm.Network) {
+		if m.active.inFlight > 0 {
+			return nil, newErr("sandbox container is currently busy executing another command", http.StatusConflict)
+		}
 		_ = m.runner.StopRemoveContainer(ctx, m.active.containerName)
 		m.active = nil
 	}
@@ -757,9 +766,16 @@ func (m *SandboxManager) Exec(ctx context.Context, cfg SandboxConfig, channelID 
 		m.mu.Unlock()
 		return SandboxExecResult{}, err
 	}
+	act.inFlight++
 	containerName := act.containerName
 	gatewayIP := cmp.Or(act.gatewayIP, "192.168.127.1")
 	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		act.inFlight--
+		act.lastUsed = time.Now()
+		m.mu.Unlock()
+	}()
 
 	workDir, err := m.WorkDir(channelID)
 	if err != nil {
@@ -817,11 +833,6 @@ func (m *SandboxManager) Exec(ctx context.Context, cfg SandboxConfig, channelID 
 		Command: cmdArgs,
 		Env:     envVars,
 	})
-	m.mu.Lock()
-	if m.active != nil && m.active.containerName == containerName {
-		m.active.lastUsed = time.Now()
-	}
-	m.mu.Unlock()
 	if execErr != nil {
 		return SandboxExecResult{}, execErr
 	}
@@ -957,7 +968,7 @@ func (m *SandboxManager) ReapIdle(ctx context.Context, idleMinutes int) {
 	}
 	m.mu.Lock()
 	act := m.active
-	if act == nil || time.Since(act.lastUsed) < time.Duration(idleMinutes)*time.Minute {
+	if act == nil || act.inFlight > 0 || time.Since(act.lastUsed) < time.Duration(idleMinutes)*time.Minute {
 		m.mu.Unlock()
 		return
 	}

@@ -13,9 +13,56 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
+
+func isUpgradeLockActive(lockDir string) bool {
+	info, err := os.Stat(lockDir)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	pidBytes, err := os.ReadFile(filepath.Join(lockDir, "pid"))
+	if err != nil {
+		if time.Since(info.ModTime()) > 5*time.Second {
+			_ = os.RemoveAll(lockDir)
+			return false
+		}
+		return true
+	}
+	pid, pErr := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
+	if pErr != nil || pid <= 0 {
+		_ = os.RemoveAll(lockDir)
+		return false
+	}
+	if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+		_ = os.RemoveAll(lockDir)
+		return false
+	}
+	return true
+}
+
+func acquireUpgradeLock(lockDir string) (func(), error) {
+	_ = isUpgradeLockActive(lockDir)
+	if err := os.Mkdir(lockDir, 0o755); err != nil {
+		return nil, fmt.Errorf("another upgrade is running. If it was interrupted without cleanup, remove %s", lockDir)
+	}
+	_ = os.WriteFile(filepath.Join(lockDir, "pid"), fmt.Appendf(nil, "%d\n", os.Getpid()), 0o644)
+	var removed atomic.Bool
+	return func() {
+		if removed.CompareAndSwap(false, true) {
+			_ = os.RemoveAll(lockDir)
+		}
+	}, nil
+}
+
+func loadAtomicSignal(p *atomic.Pointer[os.Signal]) os.Signal {
+	if sp := p.Load(); sp != nil {
+		return *sp
+	}
+	return nil
+}
 
 type tmuxUpgradeTarget struct {
 	pane       string
@@ -36,14 +83,15 @@ type rexUpgradeTarget struct {
 
 // Upgrade stops all tracked sessions for harness, upgrades the harness CLI, and resumes every session in place.
 func Upgrade(harness, selfBin string, stdout, stderr io.Writer) error {
+	stdout = cmp.Or(stdout, io.Discard)
+	stderr = cmp.Or(stderr, io.Discard)
 	spec, err := GetSpec(harness)
 	if err != nil {
 		return err
 	}
 	pathEnv := AugmentedPath(os.Getenv("PATH"), os.Getenv("HOME"))
-	_ = os.Setenv("PATH", pathEnv)
 	if _, err := lookPathWithEnv("tmux", pathEnv); err != nil {
-		return errors.New("tmux is required (macOS: brew install tmux)")
+		return ErrTmuxRequired
 	}
 	if spec.Name == HarnessClaude {
 		if _, err := lookPathWithEnv("brew", pathEnv); err != nil {
@@ -59,16 +107,9 @@ func Upgrade(harness, selfBin string, stdout, stderr io.Writer) error {
 	if err := os.MkdirAll(stateRoot, 0o755); err != nil {
 		return err
 	}
-	lockDir := upgradeLockPath(spec.Name)
-	if err := os.Mkdir(lockDir, 0o755); err != nil {
-		return fmt.Errorf("another upgrade is running. If it was interrupted without cleanup, remove %s", lockDir)
-	}
-	lockRemoved := false
-	removeLock := func() {
-		if !lockRemoved {
-			_ = os.Remove(lockDir)
-			lockRemoved = true
-		}
+	removeLock, err := acquireUpgradeLock(upgradeLockPath(spec.Name))
+	if err != nil {
+		return err
 	}
 	defer removeLock()
 
@@ -95,11 +136,11 @@ func Upgrade(harness, selfBin string, stdout, stderr io.Writer) error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	var interruptedSig os.Signal
+	var interruptedSig atomic.Pointer[os.Signal]
 	go func() {
 		select {
 		case s := <-sigCh:
-			interruptedSig = s
+			interruptedSig.Store(&s)
 			cancel()
 		case <-ctx.Done():
 		}
@@ -115,12 +156,12 @@ func Upgrade(harness, selfBin string, stdout, stderr io.Writer) error {
 		return upgradeErr
 	}
 	if ctx.Err() != nil {
-		upgradeErr = signalErr(interruptedSig)
+		upgradeErr = signalErr(loadAtomicSignal(&interruptedSig))
 		return upgradeErr
 	}
 	if err := runHarnessUpgradeCmd(ctx, spec, harnessBin, pathEnv, stdout, stderr); err != nil {
-		if interruptedSig != nil {
-			upgradeErr = signalErr(interruptedSig)
+		if sig := loadAtomicSignal(&interruptedSig); sig != nil {
+			upgradeErr = signalErr(sig)
 		} else {
 			upgradeErr = err
 		}
@@ -257,11 +298,11 @@ func collectRexUpgradeTargets(spec Spec) ([]*rexUpgradeTarget, error) {
 
 func stopTargetsForUpgrade(ctx context.Context, spec Spec, tmuxTargets []*tmuxUpgradeTarget, rexTargets []*rexUpgradeTarget, stdout io.Writer) error {
 	for _, t := range tmuxTargets {
-		_ = tmuxSetPaneOption(t.pane, spec.ExitOption, t.exitOption)
-		_ = tmuxSetPaneOption(t.pane, "remain-on-exit", "on")
+		_ = tmuxSetPaneOptionCtx(ctx, t.pane, spec.ExitOption, t.exitOption)
+		_ = tmuxSetPaneOptionCtx(ctx, t.pane, "remain-on-exit", "on")
 	}
 	for _, t := range tmuxTargets {
-		dead, _ := tmuxDisplay(t.pane, "#{pane_dead}")
+		dead, _ := tmuxDisplayCtx(ctx, t.pane, "#{pane_dead}")
 		if dead == "0" && t.pid > 0 {
 			_, _ = fmt.Fprintf(stdout, "Stopping %s\n", t.name)
 			t.stopping = true
@@ -282,7 +323,7 @@ func stopTargetsForUpgrade(ctx context.Context, spec Spec, tmuxTargets []*tmuxUp
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			if dead, _ := tmuxDisplay(t.pane, "#{pane_dead}"); dead == "1" {
+			if dead, _ := tmuxDisplayCtx(ctx, t.pane, "#{pane_dead}"); dead == "1" {
 				break
 			}
 			if time.Now().After(deadline) {
@@ -305,11 +346,12 @@ func stopTargetsForUpgrade(ctx context.Context, spec Spec, tmuxTargets []*tmuxUp
 	return nil
 }
 
-func useBrewCask(binPath, caskName, pathEnv string) bool {
-	if _, err := lookPathWithEnv("brew", pathEnv); err != nil {
+func useBrewCask(ctx context.Context, binPath, caskName, pathEnv string) bool {
+	brewBin, err := lookPathWithEnv("brew", pathEnv)
+	if err != nil {
 		return false
 	}
-	out, err := runCmdCapture("brew", "--prefix")
+	out, err := runCmdCaptureWithEnv(ctx, pathEnv, "brew", "--prefix")
 	if err != nil {
 		return false
 	}
@@ -317,34 +359,42 @@ func useBrewCask(binPath, caskName, pathEnv string) bool {
 	if prefix == "" || !strings.HasPrefix(binPath, strings.TrimRight(prefix, "/")+"/") {
 		return false
 	}
-	return exec.Command("brew", "list", "--cask", caskName).Run() == nil
+	cmdCtx, cancel := context.WithTimeout(ctx, cmdTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(cmdCtx, brewBin, "list", "--cask", caskName)
+	cmd.Env = withEnvPath(os.Environ(), pathEnv)
+	return cmd.Run() == nil
 }
 
 func runHarnessUpgradeCmd(ctx context.Context, spec Spec, harnessBin, pathEnv string, stdout, stderr io.Writer) error {
+	brewBin, _ := lookPathWithEnv("brew", pathEnv)
+	brewBin = cmp.Or(brewBin, "brew")
 	var cmd *exec.Cmd
 	switch spec.Name {
 	case HarnessClaude:
 		_, _ = fmt.Fprintln(stdout, "Running: brew upgrade claude-code@latest")
-		cmd = exec.CommandContext(ctx, "brew", "upgrade", "claude-code@latest")
+		cmd = exec.CommandContext(ctx, brewBin, "upgrade", "claude-code@latest")
 	case HarnessAgy:
-		if useBrewCask(harnessBin, "antigravity-cli", pathEnv) {
+		if useBrewCask(ctx, harnessBin, "antigravity-cli", pathEnv) {
 			_, _ = fmt.Fprintln(stdout, "Running: brew upgrade --cask antigravity-cli")
-			cmd = exec.CommandContext(ctx, "brew", "upgrade", "--cask", "antigravity-cli")
+			cmd = exec.CommandContext(ctx, brewBin, "upgrade", "--cask", "antigravity-cli")
 		} else {
 			_, _ = fmt.Fprintf(stdout, "Running: %s update\n", harnessBin)
 			cmd = exec.CommandContext(ctx, harnessBin, "update")
 		}
 	case HarnessCodex:
-		if useBrewCask(harnessBin, "codex", pathEnv) {
+		if useBrewCask(ctx, harnessBin, "codex", pathEnv) {
 			_, _ = fmt.Fprintln(stdout, "Running: brew upgrade --cask codex")
-			cmd = exec.CommandContext(ctx, "brew", "upgrade", "--cask", "codex")
+			cmd = exec.CommandContext(ctx, brewBin, "upgrade", "--cask", "codex")
 		} else {
 			_, _ = fmt.Fprintf(stdout, "Running: %s update\n", harnessBin)
 			cmd = exec.CommandContext(ctx, harnessBin, "update")
 		}
 	}
+	cmd.Env = withEnvPath(os.Environ(), pathEnv)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
+	cmd.WaitDelay = 2 * time.Second
 	return cmd.Run()
 }
 
@@ -408,19 +458,8 @@ func restoreOneTmuxTarget(spec Spec, self, pathEnv string, t *tmuxUpgradeTarget,
 		if aErr != nil {
 			return aErr
 		}
-		respawnArgs := []string{
-			"respawn-pane", "-t", t.pane, "-c", t.directory,
-			"-e", "PATH=" + pathEnv,
-			"-e", "FLEET_SESSION_TARGET=tmux",
-			"-e", "FLEET_SESSION_NAME=" + t.name,
-			"-e", "FLEET_SESSION_POLICY=" + string(t.policy),
-		}
-		if shellEnv := os.Getenv("SHELL"); shellEnv != "" {
-			respawnArgs = append(respawnArgs, "-e", "SHELL="+shellEnv)
-		}
-		if spec.Name == HarnessAgy {
-			respawnArgs = append(respawnArgs, "-e", "AGY_SESSION_TARGET=tmux", "-e", "AGY_SESSION_NAME="+t.name)
-		}
+		respawnArgs := []string{"respawn-pane", "-t", t.pane, "-c", t.directory}
+		respawnArgs = append(respawnArgs, tmuxSessionEnvArgs(spec, t.name, pathEnv, t.policy)...)
 		respawnArgs = append(respawnArgs, bin)
 		respawnArgs = append(respawnArgs, args...)
 		if _, rErr := tmuxCmd(respawnArgs...); rErr != nil {

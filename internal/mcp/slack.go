@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -11,20 +12,20 @@ import (
 
 const slackToolTimeout = 15 * time.Second
 
-func callSlackTool(name string, rawArgs json.RawMessage, api string) (any, error) {
+func callSlackTool(ctx context.Context, name string, rawArgs json.RawMessage, api string) (any, error) {
 	switch name {
 	case "fleet_slack_channels":
-		return callSlackChannels(api, rawArgs)
+		return callSlackChannels(ctx, api, rawArgs)
 	case "fleet_slack_read":
-		return callSlackRead(api, rawArgs)
+		return callSlackRead(ctx, api, rawArgs)
 	case "fleet_slack_send":
-		return callSlackSend(api, rawArgs)
+		return callSlackSend(ctx, api, rawArgs)
 	default:
 		return nil, fmt.Errorf("unknown slack tool %q", name)
 	}
 }
 
-func callSlackChannels(api string, rawArgs json.RawMessage) (any, error) {
+func callSlackChannels(ctx context.Context, api string, rawArgs json.RawMessage) (any, error) {
 	a, err := decodeArgs[struct {
 		Account    string `json:"account"`
 		IncludeAll bool   `json:"include_all"`
@@ -47,10 +48,10 @@ func callSlackChannels(api string, rawArgs json.RawMessage) (any, error) {
 	if enc := q.Encode(); enc != "" {
 		qs = "?" + enc
 	}
-	return callJSON(api, "GET", "/v1/slacker/channels"+qs, nil, slackToolTimeout)
+	return callJSON(ctx, api, "GET", "/v1/slacker/channels"+qs, nil, slackToolTimeout)
 }
 
-func callSlackRead(api string, rawArgs json.RawMessage) (any, error) {
+func callSlackRead(ctx context.Context, api string, rawArgs json.RawMessage) (any, error) {
 	a, err := decodeArgs[struct {
 		Account  string `json:"account"`
 		Channel  string `json:"channel"`
@@ -88,10 +89,10 @@ func callSlackRead(api string, rawArgs json.RawMessage) (any, error) {
 	if a.Limit != nil && *a.Limit > 0 {
 		q.Set("limit", strconv.Itoa(*a.Limit))
 	}
-	return callJSON(api, "GET", "/v1/slacker/messages?"+q.Encode(), nil, slackToolTimeout)
+	return callJSON(ctx, api, "GET", "/v1/slacker/messages?"+q.Encode(), nil, slackToolTimeout)
 }
 
-func callSlackSend(api string, rawArgs json.RawMessage) (any, error) {
+func callSlackSend(ctx context.Context, api string, rawArgs json.RawMessage) (any, error) {
 	a, err := decodeArgs[struct {
 		Account  string `json:"account"`
 		Channel  string `json:"channel"`
@@ -114,5 +115,5 @@ func callSlackSend(api string, rawArgs json.RawMessage) (any, error) {
 	if ts := strings.TrimSpace(a.ThreadTS); ts != "" {
 		body["thread_ts"] = ts
 	}
-	return callJSON(api, "POST", "/v1/slacker/send", body, slackToolTimeout)
+	return callJSON(ctx, api, "POST", "/v1/slacker/send", body, slackToolTimeout)
 }

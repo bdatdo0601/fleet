@@ -1156,7 +1156,7 @@ func TestDiscordOutboxNotifyDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	eng.dispatchOutboxNotification(unmapped)
+	eng.dispatchOutboxNotification(t.Context(), unmapped)
 
 	items, err := eng.store.ListOutbox(10, false)
 	if err != nil {

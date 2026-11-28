@@ -188,30 +188,89 @@ func TestSelfUpdateLighthouseRollbackAndManifestPublish(t *testing.T) {
 	if _, err := exec.LookPath("go"); err != nil {
 		t.Skip("go toolchain not installed")
 	}
-	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
-	if err != nil {
+
+	tmp := t.TempDir()
+	repoDir := filepath.Join(tmp, "repo")
+	if err := os.MkdirAll(filepath.Join(repoDir, "cmd", "fleet"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(repoRoot, "go.mod")); err != nil {
-		t.Skip("go.mod not found at repoRoot")
+	if err := os.WriteFile(filepath.Join(repoDir, "go.mod"), []byte("module example.com/fleettest\n\ngo 1.26.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mainSrc := `package main
+
+import "fmt"
+
+func main() {
+	fmt.Println("fleet 0.1.0 (test-v2)")
+}
+`
+	if err := os.WriteFile(filepath.Join(repoDir, "cmd", "fleet", "main.go"), []byte(mainSrc), 0o644); err != nil {
+		t.Fatal(err)
 	}
 
-	// Verify manifest.json structure helper when reading back
-	tmp := t.TempDir()
 	stateDir := filepath.Join(tmp, "state")
 	binDir := filepath.Join(stateDir, "bin")
-	_ = os.MkdirAll(binDir, 0o755)
-	m := core.BinaryManifest{
-		Version:  "0.1.0",
-		Commit:   "abc",
-		Binaries: map[string]core.BinaryEntry{"darwin/arm64": {File: "fleet-darwin-arm64", SHA256: "deadbeef", Size: 4}},
-	}
-	mb, _ := json.Marshal(m)
-	if err := writeOwnerFile(filepath.Join(binDir, "manifest.json"), mb, 0o644, ""); err != nil {
+	targetBin := filepath.Join(tmp, "libexec", "fleet")
+	symlinkPath := filepath.Join(tmp, "bin", "fleet")
+	v1Src := filepath.Join(tmp, "v1-fleet")
+	if err := os.WriteFile(v1Src, []byte("#!/bin/sh\necho 'fleet 0.1.0 (v1)'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(binDir, "manifest.json")); err != nil {
+	if _, err := InstallBinaryAtomic(v1Src, targetBin, symlinkPath); err != nil {
+		t.Fatalf("install v1 failed: %v", err)
+	}
+
+	// Failing healthcheck must trigger rollback to v1 and skip manifest.json publication.
+	updated, err := SelfUpdateLighthouse(LighthouseUpdateOpts{
+		RepoDir:            repoDir,
+		StateDir:           stateDir,
+		TargetBin:          targetBin,
+		SymlinkPath:        symlinkPath,
+		Rebuild:            true,
+		HealthcheckTimeout: 50 * time.Millisecond,
+		SkipDaemonControl:  true,
+		HealthcheckFn:      func(string) bool { return false },
+	})
+	if err == nil || updated {
+		t.Fatalf("expected rollback error on failing healthcheck, got updated=%v err=%v", updated, err)
+	}
+	out, _ := exec.Command(targetBin, "version").CombinedOutput()
+	if !strings.Contains(string(out), "(v1)") {
+		t.Fatalf("expected targetBin rolled back to v1, got %q", string(out))
+	}
+	if _, statErr := os.Stat(filepath.Join(binDir, "manifest.json")); !os.IsNotExist(statErr) {
+		t.Fatalf("expected manifest.json not published on failed healthcheck, got err=%v", statErr)
+	}
+
+	// Healthy update must install v2 and publish manifest.json.
+	updated, err = SelfUpdateLighthouse(LighthouseUpdateOpts{
+		RepoDir:            repoDir,
+		StateDir:           stateDir,
+		TargetBin:          targetBin,
+		SymlinkPath:        symlinkPath,
+		Rebuild:            true,
+		HealthcheckTimeout: 50 * time.Millisecond,
+		SkipDaemonControl:  true,
+		HealthcheckFn:      func(string) bool { return true },
+	})
+	if err != nil || !updated {
+		t.Fatalf("expected healthy SelfUpdateLighthouse to succeed, got updated=%v err=%v", updated, err)
+	}
+	out2, _ := exec.Command(targetBin, "version").CombinedOutput()
+	if !strings.Contains(string(out2), "(test-v2)") {
+		t.Fatalf("expected v2 installed, got %q", string(out2))
+	}
+	rawManifest, err := os.ReadFile(filepath.Join(binDir, "manifest.json"))
+	if err != nil {
+		t.Fatalf("expected manifest.json published: %v", err)
+	}
+	var manifest core.BinaryManifest
+	if err := json.Unmarshal(rawManifest, &manifest); err != nil {
 		t.Fatal(err)
+	}
+	if len(manifest.Binaries["darwin/arm64"].SHA256) == 0 || len(manifest.Binaries["darwin/amd64"].SHA256) == 0 {
+		t.Fatalf("expected darwin/arm64 and darwin/amd64 entries in manifest, got %+v", manifest.Binaries)
 	}
 }
 
@@ -365,8 +424,8 @@ func TestPullLighthouseRepoIgnoresPullRebaseAndMultipleMergeRefs(t *testing.T) {
 		t.Fatalf("expected raw git pull to fail with multiple branches error, got err=%v out=%q", err, string(out))
 	}
 
-	if got := pullLighthouseRepo(cloneDir, ""); got != wantSHA {
-		t.Fatalf("pullLighthouseRepo() HEAD = %q, want %q", got, wantSHA)
+	if got, err := pullLighthouseRepo(cloneDir, ""); err != nil || got != wantSHA {
+		t.Fatalf("pullLighthouseRepo() HEAD = %q err=%v, want %q", got, err, wantSHA)
 	}
 }
 

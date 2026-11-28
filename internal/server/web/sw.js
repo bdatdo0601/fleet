@@ -1,4 +1,4 @@
-const CACHE_NAME = "fleet-console-v13";
+const CACHE_NAME = "fleet-console-v14";
 const APP_SHELL = [
   "/",
   "/manifest.webmanifest",
@@ -15,6 +15,9 @@ const APP_SHELL = [
   "/assets/system.js",
   "/assets/usage.js",
   "/assets/chat.js",
+  "/assets/chat_markdown.js",
+  "/assets/chat_oauth.js",
+  "/assets/chat_settings.js",
   "/assets/skills.js",
   "/assets/favicon.svg",
   "/assets/icon-192.png",
@@ -73,7 +76,9 @@ self.addEventListener("fetch", (event) => {
       .then((resp) => {
         if (resp && resp.ok) {
           const copy = resp.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(req, copy)).catch(() => {});
+          event.waitUntil(
+            caches.open(CACHE_NAME).then((cache) => cache.put(req, copy)).catch(() => {}),
+          );
         }
         return resp;
       })

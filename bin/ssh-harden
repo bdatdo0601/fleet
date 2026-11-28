@@ -5,10 +5,15 @@
 #   bin/ssh-harden [USER]      (default: you)
 set -euo pipefail
 user="${1:-$(id -un)}"
+if [[ ! "$user" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+  echo "error: invalid username: $user" >&2
+  exit 1
+fi
 mesh="10.213.0.0/16"
 conf=/etc/ssh/sshd_config.d/200-fleet.conf
 
 tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
 cat >"$tmp" <<EOF
 # Managed by fleet/bin/ssh-harden. Key-only SSH, reachable only over the Nebula mesh.
 PasswordAuthentication no
@@ -17,7 +22,6 @@ PermitRootLogin no
 AllowUsers ${user}@${mesh}
 EOF
 sudo install -m 644 "$tmp" "$conf"
-rm -f "$tmp"
 if ! sudo /usr/sbin/sshd -t; then
   sudo rm -f "$conf"
   echo "error: sshd rejected the config; removed $conf" >&2

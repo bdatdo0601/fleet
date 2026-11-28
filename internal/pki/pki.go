@@ -19,6 +19,9 @@ import (
 	"github.com/bdatdo0601/fleet/internal/paths"
 )
 
+// ErrInvalidPassphrase is returned when the supplied Nebula CA passphrase fails decryption.
+var ErrInvalidPassphrase = errors.New("invalid passphrase")
+
 var pubkeyPEMRE = regexp.MustCompile(
 	`-----BEGIN NEBULA X25519 PUBLIC KEY-----\s*([A-Za-z0-9+/=\s]+?)\s*-----END NEBULA X25519 PUBLIC KEY-----`,
 )
@@ -83,6 +86,9 @@ func Run(passphrase *string, args ...string) (string, error) {
 		if msg == "" && len(args) > 0 {
 			msg = fmt.Sprintf("nebula-cert %s failed", args[0])
 		}
+		if strings.Contains(strings.ToLower(msg), "invalid passphrase") {
+			return "", fmt.Errorf("%w: %s", ErrInvalidPassphrase, msg)
+		}
 		return "", errors.New(msg)
 	}
 	return stdout.String(), nil
@@ -111,31 +117,34 @@ func Keygen(keyPath, pubPath string) error {
 	return err
 }
 
-// NormalizePubkey extracts and validates a canonical Nebula X25519 public key PEM block.
-func NormalizePubkey(text string) (string, error) {
+func decodePubkeyPEM(text string) (string, []byte, error) {
 	m := pubkeyPEMRE.FindStringSubmatch(text)
 	if len(m) < 2 {
-		return "", errors.New("not a Nebula public key (expected a NEBULA X25519 PUBLIC KEY block)")
+		return "", nil, errors.New("not a Nebula public key (expected a NEBULA X25519 PUBLIC KEY block)")
 	}
 	body := strings.Join(strings.Fields(m[1]), "")
 	raw, err := base64.StdEncoding.DecodeString(body)
 	if err != nil {
-		return "", fmt.Errorf("invalid Nebula public key base64: %w", err)
+		return "", nil, fmt.Errorf("invalid Nebula public key base64: %w", err)
 	}
 	if len(raw) != 32 {
-		return "", errors.New("public key has the wrong length")
+		return "", nil, errors.New("public key has the wrong length")
+	}
+	return body, raw, nil
+}
+
+// NormalizePubkey extracts and validates a canonical Nebula X25519 public key PEM block.
+func NormalizePubkey(text string) (string, error) {
+	body, _, err := decodePubkeyPEM(text)
+	if err != nil {
+		return "", err
 	}
 	return "-----BEGIN NEBULA X25519 PUBLIC KEY-----\n" + body + "\n-----END NEBULA X25519 PUBLIC KEY-----\n", nil
 }
 
 // PubkeyHex returns the lowercase hex representation of the 32-byte public key inside pem.
 func PubkeyHex(pem string) (string, error) {
-	m := pubkeyPEMRE.FindStringSubmatch(pem)
-	if len(m) < 2 {
-		return "", errors.New("not a Nebula public key")
-	}
-	body := strings.Join(strings.Fields(m[1]), "")
-	raw, err := base64.StdEncoding.DecodeString(body)
+	_, raw, err := decodePubkeyPEM(pem)
 	if err != nil {
 		return "", err
 	}

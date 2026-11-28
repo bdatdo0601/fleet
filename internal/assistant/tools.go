@@ -365,10 +365,10 @@ func (e *Engine) dispatchTool(ctx context.Context, name string, args map[string]
 		return e.dispatchSkillTool(ctx, name, args, rawArgs, tctx)
 	}
 	if strings.HasPrefix(name, "vault_") {
-		return e.dispatchVaultTool(name, args, rawArgs, tctx)
+		return e.dispatchVaultTool(ctx, name, args, rawArgs, tctx)
 	}
 	if strings.HasPrefix(name, "timer_") || name == "outbox_notify" {
-		return e.dispatchAutomationTool(name, args, tctx)
+		return e.dispatchAutomationTool(ctx, name, args, tctx)
 	}
 	if name == "render_card" || name == "render_widget" {
 		return dispatchUITool(name, args, tctx)
@@ -493,7 +493,7 @@ func (e *Engine) dispatchSkillTool(ctx context.Context, name string, args map[st
 		if err != nil {
 			return nil, err
 		}
-		v.MaybeGitCommit(tctx.Config.GitAutoCommit, "assistant: update skill "+sk.Name)
+		v.MaybeGitCommitContext(ctx, tctx.Config.GitAutoCommit, "assistant: update skill "+sk.Name)
 		return sk, nil
 	case "skill_search":
 		q := strArg(args, "query")
@@ -507,7 +507,7 @@ func (e *Engine) dispatchSkillTool(ctx context.Context, name string, args map[st
 	case "skill_install":
 		return e.execSkillInstallTool(ctx, args, tctx)
 	case "skill_remove":
-		return e.execSkillRemoveTool(args, rawArgs, tctx)
+		return e.execSkillRemoveTool(ctx, args, rawArgs, tctx)
 	default:
 		return nil, newErr("unknown skill tool "+name, http.StatusBadRequest)
 	}
@@ -538,7 +538,7 @@ func (e *Engine) execSkillFetchTool(ctx context.Context, args map[string]any) (a
 	}, nil
 }
 
-func (e *Engine) dispatchVaultTool(name string, args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {
+func (e *Engine) dispatchVaultTool(ctx context.Context, name string, args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {
 	switch name {
 	case "vault_search":
 		return e.SearchVaults(strArg(args, "vault"), strArg(args, "query"), intArg(args, "limit", 15))
@@ -554,13 +554,13 @@ func (e *Engine) dispatchVaultTool(name string, args map[string]any, rawArgs str
 		}
 		return map[string]string{"vault": mount.Name, "path": rel, "content": content}, nil
 	case "vault_append", "vault_write":
-		return e.execVaultWriteTool(name, args, rawArgs, tctx)
+		return e.execVaultWriteTool(ctx, name, args, rawArgs, tctx)
 	default:
 		return nil, newErr("unknown vault tool "+name, http.StatusBadRequest)
 	}
 }
 
-func (e *Engine) execVaultWriteTool(name string, args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {
+func (e *Engine) execVaultWriteTool(ctx context.Context, name string, args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {
 	v, mount, err := e.ResolveVault(strArg(args, "vault"))
 	if err != nil {
 		return nil, err
@@ -587,11 +587,11 @@ func (e *Engine) execVaultWriteTool(name string, args map[string]any, rawArgs st
 	if wErr != nil {
 		return nil, wErr
 	}
-	v.MaybeGitCommit(tctx.Config.GitAutoCommit, "assistant: update "+norm)
+	v.MaybeGitCommitContext(ctx, tctx.Config.GitAutoCommit, "assistant: update "+norm)
 	return map[string]string{"vault": mount.Name, "path": norm, "status": "saved"}, nil
 }
 
-func (e *Engine) dispatchAutomationTool(name string, args map[string]any, tctx *toolExecContext) (any, error) {
+func (e *Engine) dispatchAutomationTool(ctx context.Context, name string, args map[string]any, tctx *toolExecContext) (any, error) {
 	switch name {
 	case "timer_schedule":
 		return e.store.UpsertTimer(Timer{
@@ -619,7 +619,9 @@ func (e *Engine) dispatchAutomationTool(name string, args map[string]any, tctx *
 		}
 		e.publishEvent(StreamEvent{Type: "outbox", ChannelID: tctx.ChannelID, Data: item})
 		if (tctx.Config.Discord.Enabled || tctx.Config.Notifications.Enabled) && priorityMeetsMin(item.Priority, tctx.Config.Notifications.MinPriority) {
-			go e.dispatchOutboxNotification(item)
+			e.spawnBG(ctx, 10*time.Second, func(nCtx context.Context) {
+				e.dispatchOutboxNotification(nCtx, item)
+			})
 		}
 		return item, nil
 	default:
@@ -757,7 +759,7 @@ func (e *Engine) execCredentialHTTPTool(ctx context.Context, args map[string]any
 		if len(allowed) == 0 {
 			return nil, newErr(fmt.Sprintf("1Password item %q has no URLs configured for host allowlist", item), http.StatusForbidden)
 		}
-		return ExecuteCredentialHTTP(ctx, tctx.Config, e.opReader, nil, CredentialHTTPRequest{
+		return ExecuteCredentialHTTP(ctx, tctx.Config, e.getOPReader(), nil, CredentialHTTPRequest{
 			OPRef:        opRef,
 			AllowedHosts: allowed,
 			Method:       strArg(args, "method"),
@@ -777,7 +779,7 @@ func (e *Engine) execCredentialHTTPTool(ctx context.Context, args map[string]any
 			ArgsJSON:  cmp.Or(rawArgs, "{}"),
 		}
 	}
-	return ExecuteCredentialHTTP(ctx, tctx.Config, e.opReader, nil, CredentialHTTPRequest{
+	return ExecuteCredentialHTTP(ctx, tctx.Config, e.getOPReader(), nil, CredentialHTTPRequest{
 		Alias:  alias,
 		Method: strArg(args, "method"),
 		URL:    strArg(args, "url"),
@@ -1063,6 +1065,8 @@ func (e *Engine) execMCPConfigureTool(ctx context.Context, args map[string]any, 
 			ArgsJSON:   cmp.Or(rawArgs, "{}"),
 		}
 	}
+	e.configWriteMu.Lock()
+	cur = e.Config()
 	nextServers := make([]MCPServerConfig, 0, len(cur.MCPServers)+1)
 	replaced := false
 	for _, s := range cur.MCPServers {
@@ -1077,7 +1081,9 @@ func (e *Engine) execMCPConfigureTool(ctx context.Context, args map[string]any, 
 		nextServers = append(nextServers, srv)
 	}
 	cur.MCPServers = nextServers
-	if _, err := e.UpdateConfig(cur, false); err != nil {
+	_, err := e.updateConfigLocked(cur, false)
+	e.configWriteMu.Unlock()
+	if err != nil {
 		return nil, err
 	}
 	tctx.Config = e.Config()
@@ -1129,13 +1135,17 @@ func (e *Engine) execMCPRemoveTool(args map[string]any, rawArgs string, tctx *to
 			ArgsJSON:   cmp.Or(rawArgs, "{}"),
 		}
 	}
+	e.configWriteMu.Lock()
 	cur := e.Config()
 	idx := slices.IndexFunc(cur.MCPServers, func(s MCPServerConfig) bool { return s.Name == name })
 	if idx < 0 {
+		e.configWriteMu.Unlock()
 		return nil, newErr(fmt.Sprintf("MCP server %q not found", name), http.StatusNotFound)
 	}
 	cur.MCPServers = slices.Delete(cur.MCPServers, idx, idx+1)
-	if _, err := e.UpdateConfig(cur, false); err != nil {
+	_, err := e.updateConfigLocked(cur, false)
+	e.configWriteMu.Unlock()
+	if err != nil {
 		return nil, err
 	}
 	_ = e.RevokeMCPOAuth(name)
@@ -1210,7 +1220,7 @@ func (e *Engine) execSkillInstallTool(ctx context.Context, args map[string]any, 
 	if err != nil {
 		return nil, err
 	}
-	v.MaybeGitCommit(tctx.Config.GitAutoCommit, "assistant: install skill "+sk.Name)
+	v.MaybeGitCommitContext(ctx, tctx.Config.GitAutoCommit, "assistant: install skill "+sk.Name)
 	return map[string]any{
 		"status":                 "installed",
 		"skill":                  sk,
@@ -1221,7 +1231,7 @@ func (e *Engine) execSkillInstallTool(ctx context.Context, args map[string]any, 
 	}, nil
 }
 
-func (e *Engine) execSkillRemoveTool(args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {
+func (e *Engine) execSkillRemoveTool(ctx context.Context, args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {
 	if tctx.Source != "chat" && tctx.Source != "approval" && !tctx.BypassHITL {
 		return nil, newErr("skill_remove is only allowed during direct user chat", http.StatusForbidden)
 	}
@@ -1248,6 +1258,6 @@ func (e *Engine) execSkillRemoveTool(args map[string]any, rawArgs string, tctx *
 	if err := v.DeleteSkill(name); err != nil {
 		return nil, err
 	}
-	v.MaybeGitCommit(tctx.Config.GitAutoCommit, "assistant: remove skill "+name)
+	v.MaybeGitCommitContext(ctx, tctx.Config.GitAutoCommit, "assistant: remove skill "+name)
 	return map[string]any{"status": "removed", "name": name}, nil
 }

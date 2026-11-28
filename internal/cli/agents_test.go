@@ -197,6 +197,11 @@ func TestCLIAgentsPaths(t *testing.T) {
 		t.Fatalf("agents paths add failed: rc=%d out=%q err=%q", rc, out, errStr)
 	}
 
+	rc, out, errStr = runAgentCLI("agents", "paths", "add", "~", "--device", "mini")
+	if rc != 0 || !strings.Contains(out, "(repo=-)") || strings.Contains(out, "<nil>") {
+		t.Fatalf("agents paths add without repo failed: rc=%d out=%q err=%q", rc, out, errStr)
+	}
+
 	rc, out, errStr = runAgentCLI("agents", "paths", "rm", "~/workspace/other", "--device", "mini", "--json")
 	if rc != 0 || !strings.Contains(out, `"deleted": true`) {
 		t.Fatalf("agents paths rm failed: rc=%d out=%q err=%q", rc, out, errStr)

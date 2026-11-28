@@ -12,12 +12,15 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/bdatdo0601/fleet/internal/paths"
 	"github.com/bdatdo0601/fleet/internal/version"
 )
+
+const maxCallResponseBytes = 16 << 20 // 16 MiB
 
 // NodeConfig mirrors /opt/homebrew/etc/nebula/fleet.json.
 type NodeConfig struct {
@@ -129,9 +132,15 @@ func CallContext(ctx context.Context, api, method, path string, body any, timeou
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBytes, err := io.ReadAll(resp.Body)
+	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxCallResponseBytes+1))
 	if err != nil {
 		return &APIError{Msg: fmt.Sprintf("can't reach the lighthouse at %s: %v", api, err)}
+	}
+	if len(respBytes) > maxCallResponseBytes {
+		return &APIError{
+			Msg:        fmt.Sprintf("response from %s exceeds %d bytes", api, maxCallResponseBytes),
+			StatusCode: resp.StatusCode,
+		}
 	}
 	if resp.StatusCode >= 400 {
 		return &APIError{
@@ -149,13 +158,19 @@ func CallContext(ctx context.Context, api, method, path string, body any, timeou
 
 // Download streams a binary response from api+path to dstPath, computing and checking SHA-256.
 func Download(api, path, dstPath string, timeout time.Duration) (string, int64, error) {
+	return DownloadContext(context.Background(), api, path, dstPath, timeout)
+}
+
+// DownloadContext streams a binary response with parent ctx from api+path to dstPath atomically,
+// verifying SHA-256 before replacing dstPath and cleaning up temporary files on error.
+func DownloadContext(ctx context.Context, api, path, dstPath string, timeout time.Duration) (string, int64, error) {
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	url := strings.TrimRight(api, "/") + path
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", 0, &APIError{Msg: fmt.Sprintf("can't reach the lighthouse at %s: %v", api, err)}
 	}
@@ -174,13 +189,25 @@ func Download(api, path, dstPath string, timeout time.Duration) (string, int64, 
 		}
 	}
 
-	f, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+	dir := filepath.Dir(dstPath)
+	tmp, err := os.CreateTemp(dir, ".tmp-fleet-dl-*")
 	if err != nil {
 		return "", 0, err
 	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err := tmp.Chmod(0o755); err != nil {
+		_ = tmp.Close()
+		return "", 0, err
+	}
 	h := sha256.New()
-	n, copyErr := io.Copy(io.MultiWriter(f, h), resp.Body)
-	closeErr := f.Close()
+	n, copyErr := io.Copy(io.MultiWriter(tmp, h), resp.Body)
+	closeErr := tmp.Close()
 	if copyErr != nil {
 		return "", 0, copyErr
 	}
@@ -191,5 +218,9 @@ func Download(api, path, dstPath string, timeout time.Duration) (string, int64, 
 	if expected := strings.TrimSpace(resp.Header.Get("X-Fleet-SHA256")); expected != "" && !strings.EqualFold(expected, shaHex) {
 		return "", 0, fmt.Errorf("downloaded binary SHA-256 mismatch: expected %s, got %s", expected, shaHex)
 	}
+	if err := os.Rename(tmpName, dstPath); err != nil {
+		return "", 0, err
+	}
+	cleanup = false
 	return shaHex, n, nil
 }

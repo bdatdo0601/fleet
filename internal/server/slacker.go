@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bdatdo0601/fleet/internal/agents"
@@ -150,6 +151,8 @@ func registerSlackerAdminRoutes(
 	fleet *core.Fleet,
 	route func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc,
 ) {
+	var cfgMu sync.Mutex
+
 	mux.HandleFunc("GET /v1/slacker/status", route(true, func(w http.ResponseWriter, _ *http.Request, _ *registry.Device) error {
 		cfg, err := slacker.LoadConfig(fleet.SlackerConfigPath)
 		if err != nil {
@@ -201,6 +204,8 @@ func registerSlackerAdminRoutes(
 		if err := readJSONBody(r, &upd); err != nil {
 			return err
 		}
+		cfgMu.Lock()
+		defer cfgMu.Unlock()
 		prev, err := slacker.LoadConfig(fleet.SlackerConfigPath)
 		if err != nil {
 			return err

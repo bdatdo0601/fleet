@@ -57,14 +57,15 @@ func ensureClaudeTrusted(dir string) error {
 	cfgPath := claudeConfigFilePath()
 	var root map[string]any
 	raw, err := os.ReadFile(cfgPath)
-	if err != nil {
+	switch {
+	case err != nil:
 		if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 		root = map[string]any{}
-	} else if len(bytes.TrimSpace(raw)) == 0 {
+	case len(bytes.TrimSpace(raw)) == 0:
 		root = map[string]any{}
-	} else {
+	default:
 		if err := json.Unmarshal(raw, &root); err != nil {
 			return fmt.Errorf("parse %s: %w", cfgPath, err)
 		}
@@ -194,14 +195,15 @@ func ensureAgyTrusted(dir string) error {
 	cfgPath := agyCLISettingsFilePath()
 	var root map[string]any
 	raw, err := os.ReadFile(cfgPath)
-	if err != nil {
+	switch {
+	case err != nil:
 		if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 		root = map[string]any{}
-	} else if len(bytes.TrimSpace(raw)) == 0 {
+	case len(bytes.TrimSpace(raw)) == 0:
 		root = map[string]any{}
-	} else {
+	default:
 		if err := json.Unmarshal(raw, &root); err != nil {
 			return fmt.Errorf("parse %s: %w", cfgPath, err)
 		}

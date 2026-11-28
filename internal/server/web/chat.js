@@ -1,4 +1,7 @@
-import { api, badge, clear, closeModal, el, field, openModal, section, state, toast } from "./lib.js";
+import { api, badge, clear, closeModal, confirmDialog, el, field, formatBytes, openModal, state, toast } from "./lib.js";
+import { renderMarkdownDOM } from "./chat_markdown.js";
+import { renderMCPOAuthCard, subscribeMCPOAuthDone } from "./chat_oauth.js";
+import { openAssistantSettingsModal } from "./chat_settings.js";
 
 const MODEL_CHOICES = [
   { value: "", label: "Channel / Default" },
@@ -19,6 +22,34 @@ const MODEL_CHOICES = [
   { value: "openai/gpt-6.2-astra", label: "GPT-6.2 Astra (Peak)" },
 ];
 
+const PRIVILEGED_WIDGET_DIRECTIVES = new Set(["auto-approve", "yolo"]);
+
+/**
+ * Classify an action string sent from an interactive widget iframe.
+ * Privileged directives like /auto-approve or /yolo are blocked; other leading slash commands require confirmation.
+ */
+export function classifyWidgetAction(action) {
+  const trimmed = String(action || "").trim();
+  if (!trimmed) {
+    return { kind: "empty" };
+  }
+  const tokens = trimmed.split(/\s+/);
+  for (let i = 0; i < Math.min(2, tokens.length); i++) {
+    const tok = tokens[i];
+    if (!tok.startsWith("/")) {
+      break;
+    }
+    const key = tok.slice(1).toLowerCase();
+    if (PRIVILEGED_WIDGET_DIRECTIVES.has(key)) {
+      return { kind: "block", directive: `/${key}` };
+    }
+  }
+  if (trimmed.startsWith("/")) {
+    return { kind: "confirm", action: trimmed };
+  }
+  return { kind: "allow", action: trimmed };
+}
+
 function shortModelName(slug) {
   const s = String(slug || "").trim();
   const idx = s.indexOf("/");
@@ -33,83 +64,20 @@ function currentTheme() {
   return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
-function renderInlineDOM(text) {
-  const frag = document.createDocumentFragment();
-  const re = /(`[^`]+`|\*\*[^*]+\*\*|\[[^\]]+\]\((https?:\/\/[^)\s]+|#[^)\s]*)\))/g;
-  let last = 0;
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    if (m.index > last) {
-      frag.appendChild(document.createTextNode(text.slice(last, m.index)));
-    }
-    const tok = m[0];
-    if (tok.startsWith("`") && tok.endsWith("`")) {
-      frag.appendChild(el("code", { className: "inline-code", text: tok.slice(1, -1) }));
-    } else if (tok.startsWith("**") && tok.endsWith("**")) {
-      frag.appendChild(el("strong", { text: tok.slice(2, -2) }));
-    } else {
-      const linkMatch = /^\[([^\]]+)\]\(([^)]+)\)$/.exec(tok);
-      if (linkMatch) {
-        const href = linkMatch[2];
-        const props = href.startsWith("#") ? { href, text: linkMatch[1] } : { href, target: "_blank", rel: "noopener noreferrer", text: linkMatch[1] };
-        frag.appendChild(el("a", props));
-      } else {
-        frag.appendChild(document.createTextNode(tok));
-      }
-    }
-    last = re.lastIndex;
-  }
-  if (last < text.length) {
-    frag.appendChild(document.createTextNode(text.slice(last)));
-  }
-  return frag;
+function isNearBottom(listEl, threshold = 96) {
+  return listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight < threshold;
 }
 
-function renderMarkdownDOM(raw) {
-  const wrap = el("div", { className: "chat-md" });
-  const text = String(raw || "");
-  if (!text) {
-    return wrap;
+function findActiveWidgetFrame(msgListEl, source) {
+  if (!source) {
+    return null;
   }
-  const parts = text.split(/```/);
-  for (let i = 0; i < parts.length; i++) {
-    if (i % 2 === 1) {
-      const lines = parts[i].split("\n");
-      const codeBody = lines.length > 1 ? lines.slice(1).join("\n") : parts[i];
-      wrap.appendChild(el("pre", { className: "code-block" }, el("code", { text: codeBody.replace(/\n$/, "") })));
-      continue;
-    }
-    const blocks = parts[i].split(/\n{2,}/);
-    for (const blk of blocks) {
-      const trimmed = blk.trim();
-      if (!trimmed) {
-        continue;
-      }
-      const lines = trimmed.split("\n");
-      if (lines.length === 1 && /^#{1,3}\s+/.test(lines[0])) {
-        wrap.appendChild(el("h4", { className: "chat-h" }, renderInlineDOM(lines[0].replace(/^#{1,3}\s+/, ""))));
-        continue;
-      }
-      const allBullets = lines.every((l) => /^\s*[-*]\s+/.test(l));
-      if (allBullets) {
-        const ul = el("ul", { className: "chat-list" });
-        for (const l of lines) {
-          ul.appendChild(el("li", null, renderInlineDOM(l.replace(/^\s*[-*]\s+/, ""))));
-        }
-        wrap.appendChild(ul);
-      } else {
-        const p = el("p", { className: "chat-p" });
-        lines.forEach((l, idx) => {
-          if (idx > 0) {
-            p.appendChild(el("br"));
-          }
-          p.appendChild(renderInlineDOM(l));
-        });
-        wrap.appendChild(p);
-      }
+  for (const fr of msgListEl.querySelectorAll("iframe.gen-widget-frame")) {
+    if (fr.isConnected && fr.contentWindow === source) {
+      return fr;
     }
   }
-  return wrap;
+  return null;
 }
 
 function renderWidgetNode(w, sendPromptFn, onRetryFrontier, msgID) {
@@ -272,11 +240,6 @@ function renderWidgetNode(w, sendPromptFn, onRetryFrontier, msgID) {
       if (!f || !f.url) {
         continue;
       }
-      const sizeKB = f.size_bytes >= 1024 * 1024
-        ? `${(f.size_bytes / (1024 * 1024)).toFixed(1)} MB`
-        : f.size_bytes >= 1024
-          ? `${(f.size_bytes / 1024).toFixed(1)} KB`
-          : `${f.size_bytes || 0} B`;
       const row = el(
         "div",
         { className: "file-card-row" },
@@ -287,7 +250,7 @@ function renderWidgetNode(w, sendPromptFn, onRetryFrontier, msgID) {
           "div",
           { className: "file-card-meta" },
           el("div", { className: "mono small", text: f.name || "file" }),
-          el("div", { className: "small muted", text: `${sizeKB} · ${f.mime_type || "file"}` }),
+          el("div", { className: "small muted", text: `${formatBytes(f.size_bytes)} · ${f.mime_type || "file"}` }),
         ),
         el("a", { className: "btn btn-sm", href: f.url, download: f.name || "file", text: "Download" }),
       );
@@ -300,211 +263,6 @@ function renderWidgetNode(w, sendPromptFn, onRetryFrontier, msgID) {
     return renderMCPOAuthCard(card, data, sendPromptFn);
   }
   card.appendChild(el("pre", { className: "code-block" }, el("code", { text: JSON.stringify(data, null, 2) })));
-  return card;
-}
-
-function parseMCPOAuthPaste(raw) {
-  const txt = String(raw || "").trim();
-  if (!txt) {
-    return { code: "" };
-  }
-  try {
-    const u = new URL(txt);
-    const err = (u.searchParams.get("error") || "").trim();
-    const errDesc = (u.searchParams.get("error_description") || "").trim();
-    if (err) {
-      return { error: errDesc || err };
-    }
-    const code = (u.searchParams.get("code") || "").trim();
-    const state = (u.searchParams.get("state") || "").trim();
-    if (code) {
-      return { code, state };
-    }
-  } catch {
-    // Raw authorization code entered directly.
-  }
-  return { code: txt };
-}
-
-function renderMCPOAuthCard(card, data, sendPromptFn) {
-  const server = String(data.server || "").trim();
-  const provider = String(data.provider || "").toLowerCase();
-  const scopes = Array.isArray(data.scopes) ? data.scopes : [];
-  const cliCmd = data.cli_command || (server ? `fleet assistant mcp-auth ${server}` : "");
-  let authorized = Boolean(data.authorized);
-  let activeState = "";
-
-  card.dataset.mcpOauthServer = server;
-  const statusBadge = badge(authorized ? "Authorized" : "Not connected", authorized ? "ok" : "warn");
-  const providerBadge = badge(provider === "google" ? "Google OAuth" : "OAuth 2.0", "info");
-  const header = el(
-    "div",
-    { className: "gen-mini-row" },
-    el("span", { className: "mono", text: server || "mcp" }),
-    providerBadge,
-    statusBadge,
-  );
-  card.appendChild(header);
-  if (data.url) {
-    card.appendChild(el("div", { className: "small muted mono", text: data.url }));
-  }
-  if (scopes.length > 0) {
-    card.appendChild(el("div", { className: "small muted", text: `Scopes: ${scopes.join(", ")}` }));
-  }
-
-  const detailLine = el("div", { className: "small muted" });
-  if (data.expires_at) {
-    detailLine.textContent = `Expires: ${data.expires_at}`;
-  }
-  card.appendChild(detailLine);
-
-  const linkRow = el("div", { className: "actions-row mt-1", style: "display:none" });
-  const openLink = el("a", { className: "btn btn-sm", target: "_blank", rel: "noopener noreferrer", text: "Open Sign-In Tab ↗" });
-  linkRow.appendChild(openLink);
-
-  const manualBox = el("div", { className: "stack-sm mt-1", style: "display:none" });
-  const pasteIn = el("input", { type: "text", placeholder: "Paste redirected URL (http://127.0.0.1:.../oauth2callback?code=...) or code" });
-  const completeBtn = el("button", { type: "button", className: "btn btn-sm btn-primary", text: "Complete Sign-In" });
-  manualBox.append(pasteIn, el("div", { className: "actions-row" }, completeBtn));
-
-  const connectBtn = el("button", { type: "button", className: "btn btn-sm btn-primary" });
-  const pasteToggleBtn = el("button", {
-    type: "button",
-    className: "btn btn-sm",
-    text: "Paste callback / code",
-    onclick: () => {
-      manualBox.style.display = manualBox.style.display === "none" ? "" : "none";
-    },
-  });
-  const verifyBtn = el("button", {
-    type: "button",
-    className: "btn btn-sm btn-primary",
-    text: "Verify & Continue",
-    onclick: () => {
-      if (sendPromptFn && server) {
-        sendPromptFn(`I've completed OAuth sign-in for MCP server ${server}. Please verify with mcp_test and continue.`);
-      }
-    },
-  });
-  const disconnectBtn = el("button", { type: "button", className: "btn btn-sm", text: "Disconnect" });
-
-  const syncButtons = () => {
-    connectBtn.textContent = authorized ? "Reconnect" : provider === "google" ? "Connect with Google" : "Connect OAuth";
-    statusBadge.textContent = authorized ? "Authorized" : "Not connected";
-    statusBadge.className = `badge badge-${authorized ? "ok" : "warn"}`;
-    verifyBtn.style.display = authorized ? "" : "none";
-    disconnectBtn.style.display = authorized ? "" : "none";
-  };
-  syncButtons();
-
-  connectBtn.onclick = async () => {
-    if (!server) {
-      toast("MCP server name is missing", "error");
-      return;
-    }
-    const isHTTPS = window.location.protocol === "https:";
-    const isLocal = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1";
-    const redir = data.redirect_uri || (isHTTPS || isLocal ? `${window.location.origin}/v1/assistant/mcp/oauth/callback` : "http://127.0.0.1:8765/oauth2callback");
-    const popup = window.open("", "_blank");
-    connectBtn.disabled = true;
-    try {
-      const startRes = await api("POST", `/v1/assistant/mcp/${encodeURIComponent(server)}/oauth/start`, { redirect_uri: redir });
-      activeState = startRes.state || "";
-      openLink.href = startRes.authorize_url;
-      linkRow.style.display = "";
-      if (popup) {
-        popup.location.href = startRes.authorize_url;
-      }
-      if (!isHTTPS && !isLocal && !data.redirect_uri) {
-        manualBox.style.display = "";
-        detailLine.textContent = `Opened sign-in with Desktop loopback redirect. After signing in, paste the redirected URL (or code) below — or run: ${cliCmd}`;
-      } else {
-        detailLine.textContent = "Complete sign-in in the opened browser tab; status will update automatically.";
-      }
-    } catch (err) {
-      if (popup) {
-        popup.close();
-      }
-      toast(err.message, "error");
-    } finally {
-      connectBtn.disabled = false;
-    }
-  };
-
-  completeBtn.onclick = async () => {
-    const parsed = parseMCPOAuthPaste(pasteIn.value);
-    if (parsed.error) {
-      toast(parsed.error, "error");
-      return;
-    }
-    if (!parsed.code) {
-      toast("Paste the redirected URL or authorization code", "error");
-      return;
-    }
-    const stateToUse = parsed.state || activeState;
-    if (!stateToUse) {
-      toast("Click Connect first to initialize an OAuth state", "error");
-      return;
-    }
-    completeBtn.disabled = true;
-    try {
-      const res = await api("POST", `/v1/assistant/mcp/${encodeURIComponent(server)}/oauth/exchange`, {
-        state: stateToUse,
-        code: parsed.code,
-      });
-      authorized = Boolean(res.authorized);
-      manualBox.style.display = "none";
-      linkRow.style.display = "none";
-      detailLine.textContent = res.test_error
-        ? `Authorized, but handshake test failed: ${res.test_error}`
-        : `Authorized · ${res.tool_count || 0} tool(s) ready`;
-      syncButtons();
-      toast(`Connected OAuth for ${server} (${res.tool_count || 0} tools)`, "ok");
-    } catch (err) {
-      toast(err.message, "error");
-    } finally {
-      completeBtn.disabled = false;
-    }
-  };
-
-  disconnectBtn.onclick = async () => {
-    disconnectBtn.disabled = true;
-    try {
-      await api("DELETE", `/v1/assistant/mcp/${encodeURIComponent(server)}/oauth`);
-      authorized = false;
-      detailLine.textContent = "Disconnected.";
-      syncButtons();
-      toast(`Disconnected OAuth for ${server}`, "ok");
-    } catch (err) {
-      toast(err.message, "error");
-    } finally {
-      disconnectBtn.disabled = false;
-    }
-  };
-
-  card._onMCPOAuthDone = (payload) => {
-    if (!payload) {
-      return;
-    }
-    if (payload.ok) {
-      authorized = true;
-      manualBox.style.display = "none";
-      linkRow.style.display = "none";
-      detailLine.textContent = payload.test_error
-        ? `Authorized, but handshake test failed: ${payload.test_error}`
-        : `Authorized · ${payload.tool_count || 0} tool(s) ready`;
-      syncButtons();
-    } else if (payload.error) {
-      detailLine.textContent = `Authorization failed: ${payload.error}`;
-    }
-  };
-
-  card.append(
-    el("div", { className: "actions-row mt-1" }, connectBtn, pasteToggleBtn, verifyBtn, disconnectBtn),
-    linkRow,
-    manualBox,
-    cliCmd ? el("div", { className: "small muted mono mt-1", text: `CLI alternative: ${cliCmd}` }) : null,
-  );
   return card;
 }
 
@@ -645,605 +403,29 @@ function formatMessageFooter(m) {
   return parts.join(" · ");
 }
 
-async function openAssistantSettingsModal(onSaved, onNavigate) {
-  let cfgData;
-  let timersData;
-  try {
-    [cfgData, timersData] = await Promise.all([api("GET", "/v1/assistant/config"), api("GET", "/v1/assistant/timers")]);
-  } catch (err) {
-    toast(err.message, "error");
-    return;
-  }
-  const cfg = cfgData.config || {};
-  const models = cfg.models || {};
-  const routing = cfg.routing || {};
-  const enabledChk = el("input", { type: "checkbox", checked: Boolean(cfg.enabled) });
-  const zdrChk = el("input", { type: "checkbox", checked: cfg.zdr !== false });
-  const autoApproveChk = el("input", { type: "checkbox", checked: Boolean(cfg.auto_approve) });
-  const apiKeyIn = el("input", { type: "password", placeholder: cfg.api_key_hint ? `Current: ${cfg.api_key_hint}` : "sk-or-v1-..." });
-  const vaultIn = el("input", { type: "text", value: cfg.vault_path || "", placeholder: cfg.effective_vault_path || "" });
-  const defaultChatIn = el("input", { type: "text", value: models.default_chat || "" });
-  const fastIn = el("input", { type: "text", value: models.fast || "" });
-  const frontierIn = el("input", { type: "text", value: models.frontier || "" });
-  const decisionIn = el("input", { type: "text", value: models.decision || "" });
-  const observerIn = el("input", { type: "text", value: models.observer || "" });
-  const hbIn = el("input", { type: "number", value: String(cfg.heartbeat_interval_minutes ?? 30), min: "0" });
-  const routingModeSel = el(
-    "select",
-    null,
-    ...[
-      { value: "hybrid", label: "Hybrid (Auto + 1-tap Retry + HITL)" },
-      { value: "gate", label: "HITL Gate Only (Complex asks first)" },
-      { value: "auto", label: "Unattended Auto (No HITL)" },
-      { value: "off", label: "Off (Always Default Chat Model)" },
-    ].map((opt) => el("option", { value: opt.value, text: opt.label, selected: (routing.mode || "hybrid") === opt.value })),
-  );
-  const grantTurnsIn = el("input", { type: "number", value: String(routing.grant_max_turns ?? 5), min: "1", max: "50" });
-  const grantCostIn = el("input", { type: "number", step: "0.05", min: "0.05", value: String(routing.grant_max_cost_usd ?? 0.25) });
-  const grantIdleIn = el("input", { type: "number", value: String(routing.grant_idle_minutes ?? 25), min: "1", max: "240" });
-  const dailyCapIn = el("input", { type: "number", step: "0.25", min: "0", value: String(routing.daily_soft_cap_usd ?? 0) });
-  const extraVaultsIn = el("textarea", {
-    rows: "4",
-    className: "mono",
-    value: JSON.stringify(cfg.extra_vaults || [], null, 2),
-    placeholder: `[{"name":"personal","path":"~/personal-vault","read_only":false,"auto_write_dirs":["Inbox"]}]`,
-  });
-  const mcpIn = el("textarea", { rows: "5", className: "mono", value: JSON.stringify(cfg.mcp_servers || [], null, 2) });
-  const mcpStatusBox = el("div", { className: "stack-sm" });
-  const loadMCPStatus = async () => {
-    clear(mcpStatusBox);
-    try {
-      const res = await api("GET", "/v1/assistant/mcp");
-      const servers = res.servers || [];
-      const byName = new Map((res.statuses || []).map((st) => [st.name, st]));
-      if (servers.length === 0) {
-        return;
-      }
-      for (const srv of servers) {
-        const st = byName.get(srv.name) || {};
-        const oauthOn = Boolean(srv.oauth && srv.oauth.enabled);
-        const actions = [];
-        if (oauthOn) {
-          actions.push(
-            el("button", {
-              type: "button",
-              className: "btn btn-sm",
-              text: st.oauth_authorized ? "Reconnect OAuth" : "Connect OAuth",
-              onclick: async () => {
-                const isHTTPS = window.location.protocol === "https:";
-                const isLocal = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1";
-                const redir = (srv.oauth && srv.oauth.redirect_uri) || `${window.location.origin}/v1/assistant/mcp/oauth/callback`;
-                if (!isHTTPS && !isLocal && !(srv.oauth && srv.oauth.redirect_uri)) {
-                  toast(`Google Web OAuth requires an HTTPS fleet tls domain, or run: fleet assistant mcp-auth ${srv.name}`, "warn");
-                }
-                try {
-                  const startRes = await api("POST", `/v1/assistant/mcp/${encodeURIComponent(srv.name)}/oauth/start`, { redirect_uri: redir });
-                  window.open(startRes.authorize_url, "_blank");
-                } catch (err) {
-                  toast(err.message, "error");
-                }
-              },
-            }),
-          );
-          if (st.oauth_authorized) {
-            actions.push(
-              el("button", {
-                type: "button",
-                className: "btn btn-sm",
-                text: "Disconnect",
-                onclick: async () => {
-                  try {
-                    await api("DELETE", `/v1/assistant/mcp/${encodeURIComponent(srv.name)}/oauth`);
-                    toast(`Disconnected OAuth for ${srv.name}`, "ok");
-                    await loadMCPStatus();
-                  } catch (err) {
-                    toast(err.message, "error");
-                  }
-                },
-              }),
-            );
-          }
-        }
-        const detail = st.error
-          ? st.error
-          : srv.enabled
-            ? `${st.tool_count || 0} tool(s) ready`
-            : "Disabled";
-        mcpStatusBox.appendChild(
-          el(
-            "div",
-            { className: "gen-native-card" },
-            el(
-              "div",
-              { className: "gen-mini-row" },
-              el("strong", { text: srv.name }),
-              badge(srv.transport || "stdio", "neutral"),
-              oauthOn ? badge(st.oauth_authorized ? "OAuth: Authorized" : "OAuth: Not connected", st.oauth_authorized ? "ok" : "warn") : null,
-            ),
-            el("div", { className: "small muted", text: detail }),
-            actions.length > 0 ? el("div", { className: "actions-row mt-1" }, ...actions) : null,
-          ),
-        );
-      }
-    } catch (err) {
-      mcpStatusBox.appendChild(el("div", { className: "small muted", text: `Failed to load MCP status: ${err.message}` }));
-    }
-  };
-  void loadMCPStatus();
-  const onMCPOAuthMessage = (ev) => {
-    if (ev.origin !== window.location.origin || !ev.data || ev.data.type !== "fleet-mcp-oauth-done") {
-      return;
-    }
-    if (ev.data.ok) {
-      toast(`Connected OAuth for ${ev.data.server || "MCP"} (${ev.data.tool_count || 0} tools)`, "ok");
-    } else {
-      toast(ev.data.error || "MCP OAuth failed", "error");
-    }
-    void loadMCPStatus();
-  };
-  window.addEventListener("message", onMCPOAuthMessage);
-  const credsIn = el("textarea", {
-    rows: "4",
-    className: "mono",
-    placeholder: `[{"alias":"linear","op_ref":"op://Fleet-Agent/Linear/token","allowed_hosts":["api.linear.app"],"require_approval":true}]`,
-  });
-  const notifCfg = cfg.notifications || {};
-  const notifEnabledChk = el("input", { type: "checkbox", checked: Boolean(notifCfg.enabled) });
-  const notifApprovalsChk = el("input", { type: "checkbox", checked: notifCfg.notify_approvals !== false });
-  const notifBaseURLIn = el("input", { type: "text", value: notifCfg.fleet_base_url || "", placeholder: "https://fleet.example.com" });
-  const notifWebhookRefIn = el("input", { type: "text", value: notifCfg.discord_webhook_op_ref || "", placeholder: "op://Fleet-Agent/Discord/webhook" });
-  const notifMinPrioSel = el(
-    "select",
-    null,
-    ...["low", "normal", "urgent"].map((p) => el("option", { value: p, text: p, selected: (notifCfg.min_priority || "normal") === p })),
-  );
-  const notifChannelRefsIn = el("textarea", {
-    rows: "3",
-    className: "mono",
-    value: JSON.stringify(notifCfg.discord_channel_op_refs || {}, null, 2),
-    placeholder: `{"approvals":"op://Fleet-Agent/Discord-Approvals/webhook"}`,
-  });
-  const discCfg = cfg.discord || {};
-  const discEnabledChk = el("input", { type: "checkbox", checked: Boolean(discCfg.enabled) });
-  const discAutoSyncChk = el("input", { type: "checkbox", checked: discCfg.auto_sync_channels !== false });
-  const discAllowApprovalsChk = el("input", { type: "checkbox", checked: discCfg.allow_approvals !== false });
-  const discAutoApproveChk = el("input", { type: "checkbox", checked: Boolean(discCfg.auto_approve) });
-  const discMirrorWebChk = el("input", { type: "checkbox", checked: discCfg.mirror_web_turns !== false });
-  const discTokenRefIn = el("input", { type: "text", value: discCfg.bot_token_op_ref || "", placeholder: "op://Fleet-Agent/Discord/bot_token" });
-  const discUserIDIn = el("input", { type: "text", value: discCfg.authorized_user_id || "", placeholder: "18-digit Discord User ID" });
-  const discGuildIDIn = el("input", { type: "text", value: discCfg.guild_id || "", placeholder: "Auto-detected if in 1 server" });
-  const discCategoryIn = el("input", { type: "text", value: discCfg.category_name || "Fleet Assistant", placeholder: "Fleet Assistant" });
-  const discBaseURLIn = el("input", { type: "text", value: discCfg.fleet_base_url || "", placeholder: "https://fleet.example.com" });
-  const discChannelsIn = el("textarea", {
-    rows: "4",
-    className: "mono",
-    value: JSON.stringify(discCfg.channels || {}, null, 2),
-    placeholder: `{"general":"123456789012345678","fleet-ops":"234567890123456789","briefing":"345678901234567890"}`,
-  });
-  const sbCfg = cfg.sandbox || {};
-  const sbEnabledChk = el("input", { type: "checkbox", checked: Boolean(sbCfg.enabled) });
-  const sbCPUsIn = el("input", { type: "number", min: "1", max: "4", value: String(sbCfg.cpus ?? 2) });
-  const sbMemIn = el("input", { type: "number", min: "256", max: "8192", step: "128", value: String(sbCfg.memory_mb ?? 2048) });
-  const sbIdleIn = el("input", { type: "number", min: "1", max: "120", value: String(sbCfg.idle_minutes ?? 10) });
-  const sbMaxFileIn = el("input", { type: "number", min: "1", max: "100", value: String(sbCfg.max_file_mb ?? 25) });
-  const extraPkgsSummary = [
-    ...(sbCfg.extra_apt_packages || []).map((p) => `apt:${p}`),
-    ...(sbCfg.extra_pip_packages || []).map((p) => `pip:${p}`),
-  ];
-  const doctorBox = el("div", { className: "stack-sm mt-2" });
-
-  const renderDoctorResults = (rep) => {
-    clear(doctorBox);
-    for (const c of rep.checks || []) {
-      const variant = c.status === "ok" ? "ok" : c.status === "fail" ? "danger" : c.status === "warn" ? "warn" : "neutral";
-      doctorBox.appendChild(
-        el(
-          "div",
-          { className: "gen-native-card" },
-          el("div", { className: "gen-mini-row" }, el("strong", { text: c.name }), badge(c.status, variant)),
-          el("div", { className: "small", text: c.detail || "" }),
-          c.hint ? el("div", { className: "small muted mono mt-1", text: c.hint }) : null,
-        ),
-      );
-    }
-  };
-
-  const body = el(
-    "div",
-    { className: "stack" },
-    el("label", { className: "check-row" }, enabledChk, el("span", { text: "Enable always-on scheduler & heartbeat" })),
-    el("label", { className: "check-row" }, zdrChk, el("span", { text: "Enforce OpenRouter Zero Data Retention (ZDR)" })),
-    el("label", { className: "check-row" }, autoApproveChk, el("span", { text: "Auto-approve all tool calls & frontier escalations (bypass HITL)" })),
-    field("OpenRouter API Key (leave blank to keep current)", apiKeyIn),
-    field("Obsidian Vault Path on Lighthouse", vaultIn, el("div", { className: "small muted", text: `Active: ${cfg.effective_vault_path || ""}` })),
-    field(
-      "Mounted Extra Vaults (JSON)",
-      extraVaultsIn,
-      el("div", { className: "small muted", text: "Extra vaults are never scaffolded; writes outside auto_write_dirs require approval." }),
-    ),
-    el(
-      "div",
-      { className: "grid-2" },
-      field("Default Chat Model", defaultChatIn),
-      field("Fast / Heartbeat Model", fastIn),
-      field("Frontier Model", frontierIn),
-      field("Decision Model", decisionIn),
-      field("Observer / Reflector Model", observerIn),
-      field("Heartbeat Interval (mins, 0=off)", hbIn),
-    ),
-    el("h4", { className: "mt-2", text: "Frontier Auto-Routing & Topic Grants" }),
-    el(
-      "div",
-      { className: "grid-2" },
-      field("Routing Mode", routingModeSel),
-      field("Topic Grant Max Turns", grantTurnsIn),
-      field("Topic Grant Budget ($)", grantCostIn),
-      field("Topic Grant Idle Timeout (mins)", grantIdleIn),
-      field("Daily Spend Soft Cap ($, 0=off)", dailyCapIn),
-    ),
-    field("External stdio / HTTP MCP Servers (JSON)", mcpIn),
-    mcpStatusBox,
-    field("Replace 1Password Credential Aliases (optional JSON)", credsIn),
-    el("h4", { className: "mt-2", text: "Outbound Discord Notifications (Read-Only Alerts)" }),
-    el("div", { className: "small muted", text: "Optional if Two-Way Discord Bot is enabled below (bot already delivers interactive approvals & outbox alerts to mapped channels)." }),
-    el("label", { className: "check-row" }, notifEnabledChk, el("span", { text: "Enable outbound Discord webhook alerts" })),
-    el("label", { className: "check-row" }, notifApprovalsChk, el("span", { text: "Notify immediately on pending HITL approvals" })),
-    el(
-      "div",
-      { className: "grid-2" },
-      field("Discord Webhook 1Password Ref", notifWebhookRefIn),
-      field("Fleet Console Base URL (deep links)", notifBaseURLIn),
-      field("Minimum Outbox Priority", notifMinPrioSel),
-    ),
-    field("Per-Category / Channel Webhook Refs (optional JSON)", notifChannelRefsIn),
-    el("h4", { className: "mt-2", text: "Discord Bot (Two-Way 1-to-1 Sync & Approvals)" }),
-    el("label", { className: "check-row" }, discEnabledChk, el("span", { text: "Enable outbound Discord Gateway bot (two-way chat)" })),
-    el("label", { className: "check-row" }, discAutoSyncChk, el("span", { text: "Auto-manage Discord channels under category (requires Manage Channels)" })),
-    el("label", { className: "check-row" }, discAllowApprovalsChk, el("span", { text: "Allow interactive Approve / Deny buttons in Discord" })),
-    el("label", { className: "check-row" }, discAutoApproveChk, el("span", { text: "Auto-approve Discord turns (bypass HITL for Discord messages)" })),
-    el("label", { className: "check-row" }, discMirrorWebChk, el("span", { text: "Mirror Fleet Console & timer turns to Discord (non-spoofed blockquote)" })),
-    el(
-      "div",
-      { className: "grid-2" },
-      field("Bot Token 1Password Ref", discTokenRefIn),
-      field("Authorized Discord User ID", discUserIDIn),
-      field("Discord Server ID (optional if 1 server)", discGuildIDIn),
-      field("Category Name", discCategoryIn),
-      field("Fleet Console Base URL (deep links)", discBaseURLIn),
-    ),
-    field("1-to-1 Channel Map (auto-populated or JSON override)", discChannelsIn),
-    el(
-      "div",
-      { className: "actions-row" },
-      el("button", {
-        type: "button",
-        className: "btn",
-        text: "Sync Discord Channels",
-        onclick: async (ev) => {
-          const btn = ev.currentTarget;
-          btn.disabled = true;
-          btn.textContent = "Syncing…";
-          try {
-            const res = await api("POST", "/v1/assistant/discord/sync");
-            const s = res.sync || {};
-            if (s.guild_id) {
-              discGuildIDIn.value = s.guild_id;
-            }
-            if (s.channels) {
-              discChannelsIn.value = JSON.stringify(s.channels, null, 2);
-            }
-            toast(
-              `Synced ${Object.keys(s.channels || {}).length} Discord channel(s) (created: ${(s.created_in_discord || []).length}, adopted: ${(s.adopted_in_discord || []).length})`,
-              "ok",
-            );
-          } catch (err) {
-            toast(err.message, "error");
-          } finally {
-            btn.disabled = false;
-            btn.textContent = "Sync Discord Channels";
-          }
-        },
-      }),
-    ),
-    el("h4", { className: "mt-2", text: "Sandboxed Computer (Apple Container)" }),
-    el("label", { className: "check-row" }, sbEnabledChk, el("span", { text: "Enable isolated micro-VM sandbox for file reading & generation" })),
-    el(
-      "div",
-      { className: "grid-2" },
-      field("CPUs (1-4)", sbCPUsIn),
-      field("Memory MB (256-8192)", sbMemIn),
-      field("Idle Auto-Stop (mins)", sbIdleIn),
-      field("Max File Size (MB)", sbMaxFileIn),
-    ),
-    extraPkgsSummary.length > 0
-      ? el("div", { className: "small muted mono", text: `Custom packages: ${extraPkgsSummary.join(", ")}` })
-      : el("div", { className: "small muted", text: "Pre-baked offline PDF/Office/CSV/chart toolkit; extra packages are approval-gated." }),
-    el(
-      "div",
-      { className: "actions-row" },
-      el("button", {
-        type: "button",
-        className: "btn",
-        text: "Build Sandbox Image",
-        onclick: async (ev) => {
-          const btn = ev.currentTarget;
-          btn.disabled = true;
-          btn.textContent = "Building…";
-          try {
-            const res = await api("POST", "/v1/assistant/sandbox/build", { rebuild_base: false });
-            toast(`Sandbox image ready: ${res.image}`, "ok");
-          } catch (err) {
-            toast(err.message, "error");
-          } finally {
-            btn.disabled = false;
-            btn.textContent = "Build Sandbox Image";
-          }
-        },
-      }),
-      el("button", {
-        type: "button",
-        className: "btn",
-        text: "Reset Sandbox",
-        onclick: async () => {
-          try {
-            await api("POST", "/v1/assistant/sandbox/reset", { channel: localStorage.getItem("fleet_chat_channel") || "general", clear_output: true });
-            toast("Sandbox reset", "ok");
-          } catch (err) {
-            toast(err.message, "error");
-          }
-        },
-      }),
-    ),
-    el(
-      "div",
-      { className: "actions-row" },
-      el("button", {
-        type: "button",
-        className: "btn btn-primary",
-        text: "Save & Test",
-        onclick: async () => {
-          let mcpServers = cfg.mcp_servers || [];
-          try {
-            mcpServers = JSON.parse(mcpIn.value || "[]");
-          } catch {
-            toast("Invalid MCP servers JSON", "error");
-            return;
-          }
-          let extraVaults = cfg.extra_vaults || [];
-          try {
-            extraVaults = JSON.parse(extraVaultsIn.value || "[]");
-            if (!Array.isArray(extraVaults)) {
-              throw new Error("extra_vaults must be a JSON array");
-            }
-          } catch {
-            toast("Invalid extra vaults JSON", "error");
-            return;
-          }
-          let discordChannelOPRefs = {};
-          if (notifChannelRefsIn.value.trim()) {
-            try {
-              discordChannelOPRefs = JSON.parse(notifChannelRefsIn.value);
-            } catch {
-              toast("Invalid Discord channel refs JSON", "error");
-              return;
-            }
-          }
-          let discordChannels = {};
-          if (discChannelsIn.value.trim()) {
-            try {
-              discordChannels = JSON.parse(discChannelsIn.value);
-            } catch {
-              toast("Invalid Discord channel map JSON", "error");
-              return;
-            }
-          }
-          const payload = {
-            enabled: enabledChk.checked,
-            zdr: zdrChk.checked,
-            auto_approve: autoApproveChk.checked,
-            base_url: cfg.base_url,
-            data_collection: cfg.data_collection,
-            vault_path: vaultIn.value.trim(),
-            auto_write_dirs: cfg.auto_write_dirs,
-            extra_vaults: extraVaults,
-            git_auto_commit: cfg.git_auto_commit !== false,
-            heartbeat_interval_minutes: Number.parseInt(hbIn.value || "0", 10) || 0,
-            models: {
-              ...models,
-              default_chat: defaultChatIn.value.trim(),
-              fast: fastIn.value.trim(),
-              heartbeat: fastIn.value.trim(),
-              frontier: frontierIn.value.trim(),
-              decision: decisionIn.value.trim(),
-              observer: observerIn.value.trim(),
-              reflector: observerIn.value.trim(),
-            },
-            routing: {
-              ...routing,
-              mode: routingModeSel.value,
-              grant_max_turns: Number.parseInt(grantTurnsIn.value || "5", 10) || 5,
-              grant_max_cost_usd: Number.parseFloat(grantCostIn.value || "0.25") || 0.25,
-              grant_idle_minutes: Number.parseInt(grantIdleIn.value || "25", 10) || 25,
-              daily_soft_cap_usd: Math.max(0, Number.parseFloat(dailyCapIn.value || "0") || 0),
-            },
-            mcp_servers: mcpServers,
-            notifications: {
-              enabled: notifEnabledChk.checked,
-              fleet_base_url: notifBaseURLIn.value.trim(),
-              discord_webhook_op_ref: notifWebhookRefIn.value.trim(),
-              discord_channel_op_refs: discordChannelOPRefs,
-              notify_approvals: notifApprovalsChk.checked,
-              min_priority: notifMinPrioSel.value,
-            },
-            discord: {
-              enabled: discEnabledChk.checked,
-              bot_token_op_ref: discTokenRefIn.value.trim(),
-              authorized_user_id: discUserIDIn.value.trim(),
-              guild_id: discGuildIDIn.value.trim(),
-              category_name: discCategoryIn.value.trim(),
-              auto_sync_channels: discAutoSyncChk.checked,
-              channels: discordChannels,
-              allow_approvals: discAllowApprovalsChk.checked,
-              auto_approve: discAutoApproveChk.checked,
-              mirror_web_turns: discMirrorWebChk.checked,
-              fleet_base_url: discBaseURLIn.value.trim(),
-            },
-            sandbox: {
-              ...sbCfg,
-              enabled: sbEnabledChk.checked,
-              cpus: Number.parseInt(sbCPUsIn.value || "2", 10) || 2,
-              memory_mb: Number.parseInt(sbMemIn.value || "2048", 10) || 2048,
-              idle_minutes: Number.parseInt(sbIdleIn.value || "10", 10) || 10,
-              max_file_mb: Number.parseInt(sbMaxFileIn.value || "25", 10) || 25,
-            },
-            test: Boolean(apiKeyIn.value.trim()),
-          };
-          if (apiKeyIn.value.trim()) {
-            payload.api_key = apiKeyIn.value.trim();
-          }
-          if (credsIn.value.trim()) {
-            try {
-              payload.credentials = JSON.parse(credsIn.value);
-            } catch {
-              toast("Invalid credentials JSON", "error");
-              return;
-            }
-          }
-          try {
-            await api("POST", "/v1/assistant/config", payload);
-            toast("Assistant configuration saved", "ok");
-            closeModal();
-            if (onSaved) {
-              await onSaved();
-            }
-          } catch (err) {
-            toast(err.message, "error");
-          }
-        },
-      }),
-      el("button", {
-        type: "button",
-        className: "btn",
-        text: "Test Connection",
-        onclick: async () => {
-          try {
-            await api("POST", "/v1/assistant/test");
-            toast("OpenRouter connection OK", "ok");
-          } catch (err) {
-            toast(err.message, "error");
-          }
-        },
-      }),
-      el("button", {
-        type: "button",
-        className: "btn",
-        text: "Run Doctor",
-        onclick: async () => {
-          try {
-            const rep = await api("GET", "/v1/assistant/doctor");
-            renderDoctorResults(rep);
-          } catch (err) {
-            toast(err.message, "error");
-          }
-        },
-      }),
-      el("button", {
-        type: "button",
-        className: "btn",
-        text: "Test Discord Alert",
-        onclick: async () => {
-          try {
-            await api("POST", "/v1/assistant/notifications/test");
-            toast("Test Discord alert sent", "ok");
-          } catch (err) {
-            toast(err.message, "error");
-          }
-        },
-      }),
-      el("button", {
-        type: "button",
-        className: "btn",
-        text: "Long-Term Memory",
-        onclick: () => {
-          closeModal();
-          if (onNavigate) {
-            onNavigate("#skills/memory");
-          } else {
-            window.location.hash = "#skills/memory";
-          }
-        },
-      }),
-    ),
-    doctorBox,
-    el(
-      "div",
-      { className: "gen-mini-row mt-3" },
-      el("h4", { className: "m-0", text: `Timers (${(timersData.timers || []).length})` }),
-      el("button", {
-        type: "button",
-        className: "btn btn-sm",
-        text: "+ Weekday Morning Briefing (8am)",
-        onclick: async () => {
-          try {
-            await api("POST", "/v1/assistant/timers", {
-              channel_id: "briefing",
-              name: "morning-briefing",
-              schedule_kind: "cron",
-              cron_expr: "0 8 * * 1-5",
-              prompt: "Morning briefing: check waiting Fleet agents, unread Slack channels, and today's calendar/vault tasks, then send a concise summary.",
-            });
-            toast("Added 8:00 AM weekday briefing timer", "ok");
-            closeModal();
-            openAssistantSettingsModal(onSaved, onNavigate);
-          } catch (err) {
-            toast(err.message, "error");
-          }
-        },
-      }),
-    ),
-    (timersData.timers || []).length === 0
-      ? el("div", { className: "small muted", text: "No timers scheduled yet." })
-      : el(
-          "div",
-          { className: "stack-sm" },
-          ...(timersData.timers || []).map((t) =>
-            el(
-              "div",
-              { className: "gen-mini-row" },
-              el("span", { className: "small", text: `${t.name} (#${t.channel_id}) · next ${t.next_run_at || "-"}` }),
-              el("button", {
-                type: "button",
-                className: "btn btn-sm btn-danger",
-                text: "Delete",
-                onclick: async () => {
-                  try {
-                    await api("DELETE", `/v1/assistant/timers/${encodeURIComponent(t.id)}`);
-                    closeModal();
-                    openAssistantSettingsModal(onSaved);
-                  } catch (err) {
-                    toast(err.message, "error");
-                  }
-                },
-              }),
-            ),
-          ),
-        ),
-  );
-  openModal("Assistant Settings", body, {
-    onClose: () => window.removeEventListener("message", onMCPOAuthMessage),
-  });
-}
-
 export async function renderChat(main, ctx, sub) {
+  const signal = ctx && ctx.signal;
   clear(main);
   let channels = [];
   let cfgView = {};
   try {
-    const [chRes, stRes] = await Promise.all([api("GET", "/v1/assistant/channels"), api("GET", "/v1/assistant/status")]);
+    const [chRes, stRes] = await Promise.all([
+      api("GET", "/v1/assistant/channels", undefined, { signal }),
+      api("GET", "/v1/assistant/status", undefined, { signal }),
+    ]);
+    if (signal && signal.aborted) {
+      return;
+    }
     channels = chRes.channels || [];
     cfgView = (stRes && stRes.config) || {};
   } catch (err) {
+    if ((err && err.name === "AbortError") || (signal && signal.aborted)) {
+      return;
+    }
     main.appendChild(el("div", { className: "alert-banner alert-danger", text: `Unable to load assistant: ${err.message}` }));
+    return;
+  }
+  if (signal && signal.aborted) {
     return;
   }
 
@@ -1388,7 +570,7 @@ export async function renderChat(main, ctx, sub) {
         const fd = new FormData();
         fd.append("channel", activeChannel);
         fd.append("file", file);
-        const resp = await fetch("/v1/assistant/files", { method: "POST", body: fd, credentials: "same-origin" });
+        const resp = await fetch("/v1/assistant/files", { method: "POST", body: fd, credentials: "same-origin", signal });
         const data = await resp.json().catch(() => null);
         if (!resp.ok) {
           throw new Error((data && data.error) || `${resp.status} ${resp.statusText}`);
@@ -1399,6 +581,9 @@ export async function renderChat(main, ctx, sub) {
       }
       renderPendingFiles();
     } catch (err) {
+      if (err && err.name === "AbortError") {
+        return;
+      }
       toast(err.message, "error");
     } finally {
       attachBtn.disabled = false;
@@ -1427,6 +612,7 @@ export async function renderChat(main, ctx, sub) {
   };
 
   let pendingApprovals = [];
+  let channelLoadSeq = 0;
   const updateGrantPill = (grant) => {
     if (!grant) {
       grantPill.classList.add("hidden");
@@ -1438,13 +624,26 @@ export async function renderChat(main, ctx, sub) {
     grantPill.classList.remove("hidden");
   };
   const loadChannelData = async () => {
-    const [msgRes, aprRes] = await Promise.all([
-      api("GET", `/v1/assistant/messages?channel=${encodeURIComponent(activeChannel)}&limit=100`),
-      api("GET", "/v1/assistant/approvals?status=pending&limit=20"),
-    ]);
-    pendingApprovals = (aprRes.approvals || []).filter((a) => a.channel_id === activeChannel);
-    updateGrantPill(msgRes.grant || null);
-    renderMessages(msgRes.messages || []);
+    const seq = ++channelLoadSeq;
+    try {
+      const [msgRes, aprRes] = await Promise.all([
+        api("GET", `/v1/assistant/messages?channel=${encodeURIComponent(activeChannel)}&limit=100`, undefined, { signal }),
+        api("GET", "/v1/assistant/approvals?status=pending&limit=20", undefined, { signal }),
+      ]);
+      if (seq !== channelLoadSeq || (signal && signal.aborted)) {
+        return;
+      }
+      pendingApprovals = (aprRes.approvals || []).filter((a) => a.channel_id === activeChannel);
+      updateGrantPill(msgRes.grant || null);
+      renderMessages(msgRes.messages || []);
+    } catch (err) {
+      if ((err && err.name === "AbortError") || (signal && signal.aborted)) {
+        return;
+      }
+      if (seq === channelLoadSeq) {
+        toast(`Failed loading channel messages: ${err.message}`, "error");
+      }
+    }
   };
   grantPill.addEventListener("click", async () => {
     try {
@@ -1471,12 +670,15 @@ export async function renderChat(main, ctx, sub) {
   };
 
   const sendMessage = async (overrideText = null) => {
-    const text = (overrideText !== null ? String(overrideText) : inputEl.value).trim();
-    const fileIDs = overrideText === null ? pendingFiles.map((f) => f.id) : [];
+    const isComposer = overrideText === null;
+    const prevRaw = isComposer ? inputEl.value : "";
+    const prevFiles = isComposer ? pendingFiles.slice() : [];
+    const text = (isComposer ? prevRaw : String(overrideText)).trim();
+    const fileIDs = isComposer ? prevFiles.map((f) => f.id) : [];
     if (!text && fileIDs.length === 0) {
       return;
     }
-    if (overrideText === null) {
+    if (isComposer) {
       inputEl.value = "";
       pendingFiles = [];
       renderPendingFiles();
@@ -1490,6 +692,22 @@ export async function renderChat(main, ctx, sub) {
         file_ids: fileIDs,
       });
     } catch (err) {
+      if (isComposer) {
+        if (!inputEl.value) {
+          inputEl.value = prevRaw;
+        }
+        const seen = new Set(pendingFiles.map((f) => f.id));
+        const restored = [];
+        for (const f of prevFiles) {
+          if (!seen.has(f.id)) {
+            seen.add(f.id);
+            restored.push(f);
+          }
+        }
+        pendingFiles = [...restored, ...pendingFiles];
+        renderPendingFiles();
+        resizeComposer();
+      }
       toast(err.message, "error");
     }
   };
@@ -1527,6 +745,7 @@ export async function renderChat(main, ctx, sub) {
     ]);
 
   const renderMessages = (messages) => {
+    const shouldScroll = renderedMsgs.size === 0 || isNearBottom(msgListEl);
     const isEmpty = messages.length === 0 && pendingApprovals.length === 0;
     emptyBox.classList.toggle("hidden", !isEmpty);
     msgItemsEl.classList.toggle("hidden", messages.length === 0);
@@ -1561,7 +780,9 @@ export async function renderChat(main, ctx, sub) {
     for (const apr of pendingApprovals) {
       approvalsBox.appendChild(renderApprovalCard(apr, loadChannelData));
     }
-    scrollMessagesToBottom();
+    if (shouldScroll) {
+      scrollMessagesToBottom();
+    }
   };
 
   sendBtn.addEventListener("click", () => sendMessage(null));
@@ -1571,6 +792,24 @@ export async function renderChat(main, ctx, sub) {
       sendMessage(null);
     }
   });
+
+  let streamText = "";
+  let deltaRAF = 0;
+  const cancelDeltaRAF = () => {
+    if (deltaRAF) {
+      cancelAnimationFrame(deltaRAF);
+      deltaRAF = 0;
+    }
+  };
+  const flushDeltaRender = () => {
+    deltaRAF = 0;
+    const nearBottom = isNearBottom(msgListEl);
+    clear(streamBody);
+    streamBody.appendChild(renderMarkdownDOM(streamText));
+    if (nearBottom) {
+      scrollMessagesToBottom();
+    }
+  };
 
   const topbar = el(
     "header",
@@ -1601,6 +840,7 @@ export async function renderChat(main, ctx, sub) {
         onclick: async () => {
           try {
             await api("POST", `/v1/assistant/channels/${encodeURIComponent(activeChannel)}/reset`, { clear_history: true });
+            cancelDeltaRAF();
             streamBox.classList.add("hidden");
             streamText = "";
             await loadChannelData();
@@ -1658,6 +898,9 @@ export async function renderChat(main, ctx, sub) {
   main.appendChild(shell);
 
   await loadChannelData();
+  if (signal && signal.aborted) {
+    return;
+  }
 
   const kbTimers = new Set();
   const syncViewport = () => {
@@ -1665,7 +908,7 @@ export async function renderChat(main, ctx, sub) {
     const vh = vv ? vv.height : window.innerHeight;
     const vt = vv ? vv.offsetTop : 0;
     const kbOpen = vv ? window.innerHeight - vv.height > 110 : false;
-    const nearBottom = msgListEl.scrollHeight - msgListEl.scrollTop - msgListEl.clientHeight < 96;
+    const nearBottom = isNearBottom(msgListEl);
     document.documentElement.style.setProperty("--vvh", `${Math.round(vh)}px`);
     document.documentElement.style.setProperty("--vvt", `${Math.round(vt)}px`);
     document.documentElement.classList.toggle("kb-open", kbOpen);
@@ -1695,7 +938,6 @@ export async function renderChat(main, ctx, sub) {
     window.visualViewport.addEventListener("scroll", syncViewport);
   }
 
-  let streamText = "";
   const setStatus = (txt, variant) => {
     statusPill.textContent = txt;
     statusPill.className = `badge badge-${variant}`;
@@ -1721,12 +963,15 @@ export async function renderChat(main, ctx, sub) {
       if (d.channel_id !== activeChannel) {
         return;
       }
+      cancelDeltaRAF();
       streamText = "";
       const gt = d.data && d.data.grant_turn ? ` · topic ${d.data.grant_turn}/${d.data.grant_max_turns || 5}` : "";
       streamMeta.textContent = `Running (${(d.data && d.data.model) || ""}${gt})…`;
       clear(streamBody);
       streamBox.classList.remove("hidden");
-      scrollMessagesToBottom();
+      if (isNearBottom(msgListEl)) {
+        scrollMessagesToBottom();
+      }
       return;
     }
     if (type === "tool_start") {
@@ -1740,9 +985,9 @@ export async function renderChat(main, ctx, sub) {
         return;
       }
       streamText += (d.data && d.data.delta) || "";
-      clear(streamBody);
-      streamBody.appendChild(renderMarkdownDOM(streamText));
-      scrollMessagesToBottom();
+      if (!deltaRAF) {
+        deltaRAF = requestAnimationFrame(flushDeltaRender);
+      }
       return;
     }
     if (type === "config_updated") {
@@ -1751,8 +996,11 @@ export async function renderChat(main, ctx, sub) {
       return;
     }
     if (type === "channels_updated") {
-      api("GET", "/v1/assistant/channels")
+      api("GET", "/v1/assistant/channels", undefined, { signal })
         .then((res) => {
+          if (signal && signal.aborted) {
+            return;
+          }
           const list = res.channels || [];
           clear(channelSelect);
           for (const ch of list) {
@@ -1766,6 +1014,7 @@ export async function renderChat(main, ctx, sub) {
     }
     if (type === "message_created" || type === "message_done" || type === "approval" || type === "approval_decided" || type === "channel_reset" || type === "grant_updated") {
       if (d.channel_id === activeChannel) {
+        cancelDeltaRAF();
         streamBox.classList.add("hidden");
         streamText = "";
         loadChannelData();
@@ -1773,55 +1022,72 @@ export async function renderChat(main, ctx, sub) {
       return;
     }
     if (type === "error" && d.channel_id === activeChannel && d.data && d.data.error) {
+      cancelDeltaRAF();
       streamBox.classList.add("hidden");
       toast(d.data.error, "error");
     }
   };
   window.addEventListener("fleet-sse", onFleetSSE);
 
+  const handleWidgetAction = async (rawAction) => {
+    const verdict = classifyWidgetAction(rawAction);
+    if (verdict.kind === "empty") {
+      return;
+    }
+    if (verdict.kind === "block") {
+      toast(`Blocked privileged widget directive (${verdict.directive})`, "warn");
+      return;
+    }
+    if (verdict.kind === "confirm") {
+      const ok = await confirmDialog(
+        "Confirm Widget Command",
+        `A widget requested sending a slash command:\n\n${verdict.action}`,
+        "Send Command",
+        true,
+      );
+      if (!ok) {
+        return;
+      }
+    }
+    await sendMessage(verdict.action);
+  };
+
   const onWindowMsg = (ev) => {
     if (!ev.data || typeof ev.data !== "object") {
       return;
     }
+    const frame = findActiveWidgetFrame(msgListEl, ev.source);
+    if (!frame) {
+      return;
+    }
     if (ev.data.type === "fleet-widget-ready") {
-      for (const fr of msgListEl.querySelectorAll("iframe.gen-widget-frame")) {
-        if (fr.contentWindow === ev.source && typeof fr._fleetRender === "function") {
-          fr._fleetRender();
-        }
+      if (typeof frame._fleetRender === "function") {
+        frame._fleetRender();
       }
     } else if (ev.data.type === "fleet-widget-rendered") {
-      for (const fr of msgListEl.querySelectorAll("iframe.gen-widget-frame")) {
-        if (fr.contentWindow === ev.source && typeof fr._fleetAck === "function") {
-          fr._fleetAck();
-        }
+      if (typeof frame._fleetAck === "function") {
+        frame._fleetAck();
       }
     } else if (ev.data.type === "fleet-widget-resize" && typeof ev.data.height === "number") {
-      const nearBottom = msgListEl.scrollHeight - msgListEl.scrollTop - msgListEl.clientHeight < 120;
-      for (const fr of msgListEl.querySelectorAll("iframe.gen-widget-frame")) {
-        if (fr.contentWindow === ev.source) {
-          fr.style.height = `${Math.min(Math.max(ev.data.height, 48), 640)}px`;
-        }
-      }
+      const nearBottom = isNearBottom(msgListEl, 120);
+      frame.style.height = `${Math.min(Math.max(ev.data.height, 48), 640)}px`;
       if (nearBottom) {
         scrollMessagesToBottom();
       }
     } else if (ev.data.type === "fleet-widget-action" && ev.data.action) {
-      sendMessage(String(ev.data.action));
-    } else if (ev.data.type === "fleet-mcp-oauth-done" && ev.origin === window.location.origin) {
-      const targetSrv = String(ev.data.server || "");
-      for (const card of msgListEl.querySelectorAll("[data-mcp-oauth-server]")) {
-        if ((!targetSrv || card.dataset.mcpOauthServer === targetSrv) && typeof card._onMCPOAuthDone === "function") {
-          card._onMCPOAuthDone(ev.data);
-        }
-      }
-      if (ev.data.ok) {
-        toast(`Connected OAuth for ${targetSrv || "MCP"} (${ev.data.tool_count || 0} tools)`, "ok");
-      } else if (ev.data.error) {
-        toast(ev.data.error, "error");
-      }
+      void handleWidgetAction(ev.data.action);
     }
   };
   window.addEventListener("message", onWindowMsg);
+
+  const unsubOAuth = subscribeMCPOAuthDone((payload) => {
+    const targetSrv = String(payload.server || "");
+    for (const card of msgListEl.querySelectorAll("[data-mcp-oauth-server]")) {
+      if ((!targetSrv || card.dataset.mcpOauthServer === targetSrv) && typeof card._onMCPOAuthDone === "function") {
+        card._onMCPOAuthDone(payload);
+      }
+    }
+  });
 
   const syncWidgetThemes = () => {
     const theme = currentTheme();
@@ -1832,18 +1098,13 @@ export async function renderChat(main, ctx, sub) {
     }
   };
   window.addEventListener("fleet-theme-change", syncWidgetThemes);
-  const darkMedia = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
-  if (darkMedia && typeof darkMedia.addEventListener === "function") {
-    darkMedia.addEventListener("change", syncWidgetThemes);
-  }
 
   state.routeCleanup = () => {
+    cancelDeltaRAF();
+    unsubOAuth();
     window.removeEventListener("fleet-sse", onFleetSSE);
     window.removeEventListener("message", onWindowMsg);
     window.removeEventListener("fleet-theme-change", syncWidgetThemes);
-    if (darkMedia && typeof darkMedia.removeEventListener === "function") {
-      darkMedia.removeEventListener("change", syncWidgetThemes);
-    }
     window.removeEventListener("resize", syncViewport);
     inputEl.removeEventListener("focus", onFocusInput);
     if (window.visualViewport) {

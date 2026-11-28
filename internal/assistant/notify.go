@@ -80,6 +80,16 @@ func (d *DiscordWebhookNotifier) resolveOPRef(n Notification) string {
 		if ref, ok := d.cfg.DiscordChannelOPRefs[cat]; ok && strings.TrimSpace(ref) != "" {
 			return strings.TrimSpace(ref)
 		}
+		switch cat {
+		case "approval":
+			if ref, ok := d.cfg.DiscordChannelOPRefs["approvals"]; ok && strings.TrimSpace(ref) != "" {
+				return strings.TrimSpace(ref)
+			}
+		case "approvals":
+			if ref, ok := d.cfg.DiscordChannelOPRefs["approval"]; ok && strings.TrimSpace(ref) != "" {
+				return strings.TrimSpace(ref)
+			}
+		}
 	}
 	if ch := strings.ToLower(strings.TrimSpace(n.ChannelID)); ch != "" {
 		if ref, ok := d.cfg.DiscordChannelOPRefs[ch]; ok && strings.TrimSpace(ref) != "" {
@@ -105,7 +115,7 @@ func validateDiscordWebhookURL(raw string, allowInsecureTest bool) error {
 }
 
 func discordEmbedColor(n Notification) int {
-	if strings.EqualFold(n.Priority, "urgent") || strings.EqualFold(n.Category, "approval") {
+	if strings.EqualFold(n.Priority, "urgent") || strings.EqualFold(n.Category, "approval") || strings.EqualFold(n.Category, "approvals") {
 		return 0xef4444
 	}
 	if strings.EqualFold(n.Category, "delegation") {

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"errors"
@@ -43,6 +44,8 @@ type NebulaWatchdog struct {
 	recent      []time.Time
 	lastTrigger time.Time
 	lastError   string
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
 }
 
 // NewNebulaWatchdog returns a NebulaWatchdog with production defaults for stateDir.
@@ -112,21 +115,48 @@ func (w *NebulaWatchdog) Init() {
 	w.inode = fileInode(info)
 }
 
-// Start initializes the log cursor and polls the Nebula log until ctx is canceled.
+// Start initializes the log cursor and polls the Nebula log until ctx is canceled or Stop is called.
 func (w *NebulaWatchdog) Start(ctx context.Context) {
+	if w == nil {
+		return
+	}
 	w.Init()
-	go func() {
+	w.mu.Lock()
+	if w.cancel != nil {
+		w.mu.Unlock()
+		return
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	w.cancel = cancel
+	w.mu.Unlock()
+
+	w.wg.Go(func() {
 		ticker := time.NewTicker(w.pollInterval())
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-runCtx.Done():
 				return
 			case now := <-ticker.C:
 				w.CheckOnce(now)
 			}
 		}
-	}()
+	})
+}
+
+// Stop cancels the watchdog loop and waits for its goroutine to exit.
+func (w *NebulaWatchdog) Stop() {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	cancel := w.cancel
+	w.cancel = nil
+	w.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	w.wg.Wait()
 }
 
 // State returns a snapshot of the watchdog's configuration and runtime counters.
@@ -211,13 +241,13 @@ func (w *NebulaWatchdog) readNewLines() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	text := strings.ReplaceAll(string(buf), "\r\n", "\n")
-	lastNL := strings.LastIndexByte(text, '\n')
+	lastNL := bytes.LastIndexByte(buf, '\n')
 	if lastNL < 0 {
 		return nil, nil
 	}
 	w.offset = start + int64(lastNL+1)
-	text = text[:lastNL]
+	text := strings.ReplaceAll(string(buf[:lastNL+1]), "\r\n", "\n")
+	text = strings.TrimSuffix(text, "\n")
 	if skipPartialFirst {
 		if _, after, ok := strings.Cut(text, "\n"); ok {
 			text = after

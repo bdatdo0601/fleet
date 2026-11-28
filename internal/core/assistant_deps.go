@@ -46,7 +46,7 @@ func (d *assistantDeps) ListPaths(device, query string, limit int) (any, error) 
 }
 
 func (d *assistantDeps) SpawnAgent(ctx context.Context, req assistant.SpawnAgentRequest) (assistant.SpawnAgentResult, error) {
-	res, err := d.fleet.SpawnAgent(ctx, nil, SpawnAgentRequest{
+	res, err := d.fleet.SpawnAgent(ctx, InternalAdminCaller(), SpawnAgentRequest{
 		Harness:  req.Harness,
 		Name:     req.Name,
 		Device:   req.Device,
@@ -70,8 +70,8 @@ func (d *assistantDeps) SpawnAgent(ctx context.Context, req assistant.SpawnAgent
 	}, nil
 }
 
-func (d *assistantDeps) KillAgent(_ context.Context, sessionID string) (any, error) {
-	return d.fleet.KillAgent(nil, sessionID)
+func (d *assistantDeps) KillAgent(ctx context.Context, sessionID string) (any, error) {
+	return d.fleet.KillAgentContext(ctx, InternalAdminCaller(), sessionID)
 }
 
 func (d *assistantDeps) LighthouseWorkerStatus() assistant.LighthouseWorkerStatus {

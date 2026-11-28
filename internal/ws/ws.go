@@ -21,8 +21,9 @@ import (
 )
 
 const (
-	wsMagicGUID     = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-	wsMaxFrameBytes = 4 * 1024 * 1024
+	wsMagicGUID      = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	wsMaxFrameBytes  = 4 * 1024 * 1024
+	handshakeTimeout = 15 * time.Second
 )
 
 // WSConn is a minimal RFC 6455 WebSocket client built on Go stdlib networking.
@@ -34,47 +35,34 @@ type WSConn struct {
 	closed  bool
 }
 
-// DialWS connects to a ws:// or wss:// endpoint using ctx for dial timeout/cancellation.
-func DialWS(ctx context.Context, rawURL string, tlsCfg *tls.Config) (*WSConn, error) {
-	u, err := url.Parse(rawURL)
+func wsDialTarget(rawURL string) (u *url.URL, host, hostname string, err error) {
+	u, err = url.Parse(rawURL)
 	if err != nil {
-		return nil, err
+		return nil, "", "", err
 	}
-	host := u.Host
+	hostname = u.Hostname()
+	if hostname == "" {
+		return nil, "", "", fmt.Errorf("missing host in websocket URL %q", rawURL)
+	}
+	port := u.Port()
 	switch u.Scheme {
 	case "ws":
-		if !strings.Contains(host, ":") {
-			host += ":80"
+		if port == "" {
+			port = "80"
 		}
 	case "wss":
-		if !strings.Contains(host, ":") {
-			host += ":443"
+		if port == "" {
+			port = "443"
 		}
 	default:
-		return nil, fmt.Errorf("unsupported websocket scheme %q", u.Scheme)
+		return nil, "", "", fmt.Errorf("unsupported websocket scheme %q", u.Scheme)
 	}
+	return u, net.JoinHostPort(hostname, port), hostname, nil
+}
 
-	dialer := &net.Dialer{Timeout: 15 * time.Second}
-	var conn net.Conn
-	if u.Scheme == "wss" {
-		cfg := &tls.Config{ServerName: u.Hostname(), MinVersion: tls.VersionTLS12}
-		if tlsCfg != nil {
-			cfg = tlsCfg.Clone()
-			if cfg.ServerName == "" {
-				cfg.ServerName = u.Hostname()
-			}
-		}
-		conn, err = (&tls.Dialer{NetDialer: dialer, Config: cfg}).DialContext(ctx, "tcp", host)
-	} else {
-		conn, err = dialer.DialContext(ctx, "tcp", host)
-	}
-	if err != nil {
-		return nil, err
-	}
-
+func performHandshake(ctx context.Context, conn net.Conn, u *url.URL) (*bufio.Reader, error) {
 	var keyRaw [16]byte
 	if _, err := rand.Read(keyRaw[:]); err != nil {
-		_ = conn.Close()
 		return nil, err
 	}
 	wsKey := base64.StdEncoding.EncodeToString(keyRaw[:])
@@ -87,30 +75,74 @@ func DialWS(ctx context.Context, rawURL string, tlsCfg *tls.Config) (*WSConn, er
 		"GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n",
 		path, u.Host, wsKey,
 	)
-	if dl, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(dl)
+	hsDeadline := time.Now().Add(handshakeTimeout)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(hsDeadline) {
+		hsDeadline = dl
 	}
+	_ = conn.SetDeadline(hsDeadline)
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+	})
+	defer stopCancel()
+
 	if _, err := io.WriteString(conn, reqStr); err != nil {
-		_ = conn.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, err
 	}
 	br := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodGet})
 	if err != nil {
-		_ = conn.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, err
 	}
 	_ = resp.Body.Close()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
 	if resp.StatusCode != http.StatusSwitchingProtocols {
-		_ = conn.Close()
 		return nil, fmt.Errorf("websocket handshake failed: HTTP %d", resp.StatusCode)
 	}
-	expected := AcceptHash(wsKey)
-	if strings.TrimSpace(resp.Header.Get("Sec-WebSocket-Accept")) != expected {
-		_ = conn.Close()
+	if strings.TrimSpace(resp.Header.Get("Sec-WebSocket-Accept")) != AcceptHash(wsKey) {
 		return nil, errors.New("websocket handshake failed: invalid Sec-WebSocket-Accept")
 	}
 	_ = conn.SetDeadline(time.Time{})
+	return br, nil
+}
+
+// DialWS connects to a ws:// or wss:// endpoint using ctx for dial timeout/cancellation.
+func DialWS(ctx context.Context, rawURL string, tlsCfg *tls.Config) (*WSConn, error) {
+	u, host, hostname, err := wsDialTarget(rawURL)
+	if err != nil {
+		return nil, err
+	}
+
+	dialer := &net.Dialer{Timeout: handshakeTimeout}
+	var conn net.Conn
+	if u.Scheme == "wss" {
+		cfg := &tls.Config{ServerName: hostname, MinVersion: tls.VersionTLS12}
+		if tlsCfg != nil {
+			cfg = tlsCfg.Clone()
+			if cfg.ServerName == "" {
+				cfg.ServerName = hostname
+			}
+		}
+		conn, err = (&tls.Dialer{NetDialer: dialer, Config: cfg}).DialContext(ctx, "tcp", host)
+	} else {
+		conn, err = dialer.DialContext(ctx, "tcp", host)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	br, err := performHandshake(ctx, conn, u)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 	return &WSConn{conn: conn, br: br}, nil
 }
 
@@ -170,21 +202,31 @@ func (c *WSConn) writeFrame(opcode byte, payload []byte) error {
 
 // ReadText reads the next complete text message, answering pings transparently.
 func (c *WSConn) ReadText(ctx context.Context) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if dl, ok := ctx.Deadline(); ok {
+		_ = c.conn.SetReadDeadline(dl)
+	} else {
+		_ = c.conn.SetReadDeadline(time.Time{})
+	}
+	stop := context.AfterFunc(ctx, func() {
+		_ = c.conn.SetReadDeadline(time.Now())
+	})
+	defer func() {
+		stop()
+		_ = c.conn.SetReadDeadline(time.Time{})
+	}()
+
 	var msgBuf []byte
 	for {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		if dl, ok := ctx.Deadline(); ok {
-			_ = c.conn.SetReadDeadline(dl)
-		} else {
-			_ = c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
 		fin, opcode, payload, err := c.readFrame()
 		if err != nil {
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() && ctx.Err() == nil {
-				continue
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
 			}
 			return nil, err
 		}

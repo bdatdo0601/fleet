@@ -112,8 +112,7 @@ func deliverClaudeBatch(ctx context.Context, api string, batch agents.SessionMes
 	if err := sendFn(info.Socket, info.Token, text); err != nil {
 		return err
 	}
-	ackMessages(ctx, api, "claude", batch.SessionID, batch.Messages)
-	return nil
+	return ackMessages(ctx, api, "claude", batch.SessionID, batch.Messages)
 }
 
 func deliverCodexBatch(ctx context.Context, api, codexBin string, batch agents.SessionMessages, runFn RunQueueFn) error {
@@ -136,8 +135,7 @@ func deliverCodexBatch(ctx context.Context, api, codexBin string, batch agents.S
 	if rc != 0 {
 		return errors.New(cmp.Or(errDetail, fmt.Sprintf("codex queue exited with status %d", rc)))
 	}
-	ackMessages(ctx, api, "codex", batch.SessionID, batch.Messages)
-	return nil
+	return ackMessages(ctx, api, "codex", batch.SessionID, batch.Messages)
 }
 
 func deliverRelayBatch(ctx context.Context, api, harness, agentAPIBin, codexBin string, batch agents.SessionMessages, opts MultiRelayOpts) error {
@@ -280,6 +278,17 @@ func runLivenessLoop(ctx context.Context, api, localDevice string, managed map[s
 	}
 }
 
+type syncWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
+}
+
 // RunRelay runs device-level long-poll relays for the requested harnesses plus a local PID liveness sweep for claude/codex.
 func RunRelay(ctx context.Context, opts MultiRelayOpts) (int, error) {
 	harnesses, err := normalizeRelayHarnesses(opts.Harnesses)
@@ -290,9 +299,11 @@ func RunRelay(ctx context.Context, opts MultiRelayOpts) (int, error) {
 	if err != nil {
 		return 1, err
 	}
-	if opts.Stderr == nil {
-		opts.Stderr = os.Stderr
+	stderr := opts.Stderr
+	if stderr == nil {
+		stderr = os.Stderr
 	}
+	opts.Stderr = &syncWriter{w: stderr}
 	errorBackoff := opts.ErrorBackoff
 	if errorBackoff <= 0 {
 		errorBackoff = 60 * time.Second
@@ -310,11 +321,11 @@ func RunRelay(ctx context.Context, opts MultiRelayOpts) (int, error) {
 		codexBin = resolveRelayCodexBin(opts)
 	}
 
-	lockPath, err := acquirePIDLock("relay-"+strings.Join(harnesses, "-"), opts.LockDir)
+	lockFile, err := acquirePIDLock("relay-"+strings.Join(harnesses, "-"), opts.LockDir)
 	if err != nil {
 		return 1, err
 	}
-	defer releasePIDLock(lockPath)
+	defer releasePIDLock(lockFile)
 
 	if opts.RunSendFn == nil && opts.SendClaudeFn == nil && os.Getenv("FLEET_DISABLE_USAGE_REPORTER") != "1" {
 		usage.StartPeriodicReporter(ctx, 10*time.Minute, api)

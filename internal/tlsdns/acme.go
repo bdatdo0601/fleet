@@ -34,7 +34,11 @@ const (
 
 	renewCheckInterval = 12 * time.Hour
 	startupCheckDelay  = 2 * time.Second
+	acmeAttemptTimeout = 5 * time.Minute
 )
+
+// ErrRenewalInProgress is returned by RenewNow when another renewal is already running.
+var ErrRenewalInProgress = errors.New("TLS renewal already in progress")
 
 // CertStatus describes the on-disk TLS certificate state for the configured domain.
 type CertStatus struct {
@@ -87,11 +91,7 @@ func (d ACMEDeps) logf(format string, args ...any) {
 // InspectCert reads and validates fullchain.pem + privkey.pem against expectedDomain.
 func InspectCert(tlsDir, expectedDomain string, now time.Time) CertStatus {
 	st := CertStatus{NeedsRenewal: true}
-	p := Paths{
-		Dir:       tlsDir,
-		Fullchain: tlsDir + "/fullchain.pem",
-		Privkey:   tlsDir + "/privkey.pem",
-	}
+	p := CertPathsForDir(tlsDir)
 	certPEM, err := os.ReadFile(p.Fullchain)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
@@ -237,12 +237,14 @@ func solveDNS01Authz(
 		return fmt.Errorf("compute dns-01 record: %w", err)
 	}
 	recordFQDN := "_acme-challenge." + cfg.Domain
-	changeID, err := ChangeTXT(cfg, recordFQDN, "UPSERT", val, deps.AWSBin, deps.RunCmd)
+	changeID, err := ChangeTXTContext(ctx, cfg, recordFQDN, "UPSERT", val, deps.AWSBin, deps.RunCmd)
 	if err != nil {
 		return err
 	}
 	defer func() {
-		if _, dErr := ChangeTXT(cfg, recordFQDN, "DELETE", val, deps.AWSBin, deps.RunCmd); dErr != nil {
+		cleanCtx, cleanCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		defer cleanCancel()
+		if _, dErr := ChangeTXTContext(cleanCtx, cfg, recordFQDN, "DELETE", val, deps.AWSBin, deps.RunCmd); dErr != nil {
 			deps.logf("tls: warning cleaning up %s TXT: %v", recordFQDN, dErr)
 		}
 	}()
@@ -269,6 +271,9 @@ func EnsureCert(ctx context.Context, tlsDir string, cfg Config, force bool, deps
 	}
 	cfg.Domain = domain
 
+	ctx, cancel := context.WithTimeout(ctx, acmeAttemptTimeout)
+	defer cancel()
+
 	cur := InspectCert(tlsDir, domain, deps.now())
 	if !force && cur.Exists && !cur.NeedsRenewal {
 		return false, cur, nil
@@ -276,11 +281,8 @@ func EnsureCert(ctx context.Context, tlsDir string, cfg Config, force bool, deps
 	if err := os.MkdirAll(tlsDir, 0o700); err != nil {
 		return false, cur, err
 	}
-	accountKeyPath := (Paths{
-		Dir:               tlsDir,
-		ProdAccountKey:    tlsDir + "/account.key",
-		StagingAccountKey: tlsDir + "/account-staging.key",
-	}).AccountKey(cfg.Staging)
+	certPaths := CertPathsForDir(tlsDir)
+	accountKeyPath := certPaths.AccountKey(cfg.Staging)
 	acctKey, err := loadOrCreateAccountKey(accountKeyPath)
 	if err != nil {
 		return false, cur, err
@@ -329,10 +331,10 @@ func EnsureCert(ctx context.Context, tlsDir string, cfg Config, force bool, deps
 	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
 		return false, cur, fmt.Errorf("verify issued certificate: %w", err)
 	}
-	if err := writeAtomicFile(tlsDir+"/privkey.pem", keyPEM, 0o600); err != nil {
+	if err := writeAtomicFile(certPaths.Privkey, keyPEM, 0o600); err != nil {
 		return false, cur, err
 	}
-	if err := writeAtomicFile(tlsDir+"/fullchain.pem", certPEM, 0o644); err != nil {
+	if err := writeAtomicFile(certPaths.Fullchain, certPEM, 0o644); err != nil {
 		return false, cur, err
 	}
 	return true, InspectCert(tlsDir, domain, deps.now()), nil
@@ -448,8 +450,16 @@ func (m *Manager) State() ManagerState {
 
 // RenewNow checks and renews the certificate (and ensures PublicA if configured).
 func (m *Manager) RenewNow(ctx context.Context, force bool) (RenewResult, error) {
-	m.opMu.Lock()
+	if !m.opMu.TryLock() {
+		return RenewResult{
+			Checked:  m.deps.now().UTC().Format(time.RFC3339),
+			ErrorMsg: ErrRenewalInProgress.Error(),
+		}, ErrRenewalInProgress
+	}
 	defer m.opMu.Unlock()
+
+	attemptCtx, cancel := context.WithTimeout(ctx, acmeAttemptTimeout)
+	defer cancel()
 
 	cfg, err := m.loadCfg()
 	if err != nil {
@@ -474,7 +484,7 @@ func (m *Manager) RenewNow(ctx context.Context, force bool) (RenewResult, error)
 	if cfg.PublicA {
 		rec, rErr := CheckStaticA(*cfg, m.deps.Dig)
 		if rErr != nil || rec == nil || *rec != paths.LighthouseIP {
-			if _, uErr := UpsertStaticA(*cfg, paths.LighthouseIP, m.deps.AWSBin, m.deps.RunCmd); uErr != nil {
+			if _, uErr := UpsertStaticAContext(attemptCtx, *cfg, paths.LighthouseIP, m.deps.AWSBin, m.deps.RunCmd); uErr != nil {
 				m.deps.logf("tls: warning ensuring Route 53 A record for %s: %v", cfg.Domain, uErr)
 			} else {
 				publicAStr = paths.LighthouseIP
@@ -484,7 +494,7 @@ func (m *Manager) RenewNow(ctx context.Context, force bool) (RenewResult, error)
 		}
 	}
 
-	renewed, status, err := EnsureCert(ctx, paths.TLSDir(m.stateDir), *cfg, force, m.deps)
+	renewed, status, err := EnsureCert(attemptCtx, paths.TLSDir(m.stateDir), *cfg, force, m.deps)
 	m.stateMu.Lock()
 	if err != nil {
 		m.state.LastError = err.Error()

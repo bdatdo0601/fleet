@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -1180,5 +1181,60 @@ trust_level = "trusted"
 	}
 	if corrupt, _ := os.ReadFile(filepath.Join(customAgyDir, "settings.json")); string(corrupt) != "{bad-json" {
 		t.Fatalf("malformed agy settings.json should not be overwritten, got %q", string(corrupt))
+	}
+}
+
+func TestUpgradeSignalInterruptionAndStaleLock(t *testing.T) {
+	se := newSessionEnv(t)
+
+	// 1. Stale PID lock in upgrade.lock is cleaned up automatically.
+	lockDir := upgradeLockPath(HarnessClaude)
+	if err := os.MkdirAll(lockDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(lockDir, "pid"), []byte("999999\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if isUpgradeLockActive(lockDir) {
+		t.Fatal("expected dead PID upgrade.lock to be treated as stale")
+	}
+	if _, err := os.Stat(lockDir); !os.IsNotExist(err) {
+		t.Fatalf("expected stale upgrade.lock to be removed, stat err=%v", err)
+	}
+
+	// 2. Signal interruption during Upgrade returns signal error and cleans up lock.
+	startedFile := filepath.Join(se.base, "brew-started")
+	se.writeExec("brew", fmt.Sprintf(`#!/bin/sh
+touch %q
+exec sleep 10
+`, startedFile))
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Upgrade("claude", "", nil, nil)
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(startedFile); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := os.Stat(startedFile); err != nil {
+		t.Fatalf("brew upgrade command did not start: %v", err)
+	}
+	_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+
+	select {
+	case err := <-errCh:
+		if err == nil || !strings.Contains(err.Error(), "interrupted") {
+			t.Fatalf("expected upgrade interrupted error, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Upgrade did not exit promptly after SIGTERM")
+	}
+	if _, err := os.Stat(lockDir); !os.IsNotExist(err) {
+		t.Fatalf("expected upgrade.lock cleaned up after signal, stat err=%v", err)
 	}
 }

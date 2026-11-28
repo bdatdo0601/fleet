@@ -98,16 +98,79 @@ func Open(path string) (*Store, error) {
 	}, nil
 }
 
-// Close closes the underlying SQLite connection.
+// Close closes the underlying SQLite connection and wakes all waiting workers.
 func (s *Store) Close() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.db == nil {
+		s.mu.Unlock()
 		return nil
 	}
 	err := s.db.Close()
 	s.db = nil
+	s.mu.Unlock()
+	s.NotifyAll()
 	return err
+}
+
+var errStoreClosed = errors.New("slacker store closed")
+
+func (s *Store) dbLocked() (*sql.DB, error) {
+	if s.db == nil {
+		return nil, errStoreClosed
+	}
+	return s.db, nil
+}
+
+type immediateTx struct {
+	ctx  context.Context
+	conn *sql.Conn
+	done bool
+}
+
+func (s *Store) beginImmediateLocked(ctx context.Context) (*immediateTx, error) {
+	db, err := s.dbLocked()
+	if err != nil {
+		return nil, err
+	}
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return &immediateTx{ctx: ctx, conn: conn}, nil
+}
+
+func (t *immediateTx) QueryRow(q string, args ...any) *sql.Row {
+	return t.conn.QueryRowContext(t.ctx, q, args...)
+}
+
+func (t *immediateTx) Exec(q string, args ...any) (sql.Result, error) {
+	return t.conn.ExecContext(t.ctx, q, args...)
+}
+
+func (t *immediateTx) Commit() error {
+	if t.done {
+		return nil
+	}
+	t.done = true
+	_, err := t.conn.ExecContext(t.ctx, "COMMIT")
+	cErr := t.conn.Close()
+	if err != nil {
+		return err
+	}
+	return cErr
+}
+
+func (t *immediateTx) Rollback(ctx context.Context) {
+	if t.done {
+		return
+	}
+	t.done = true
+	_, _ = t.conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
+	_ = t.conn.Close()
 }
 
 func newJobID() string {
@@ -174,8 +237,12 @@ func (s *Store) HasEvent(eventID string) (bool, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	db, err := s.dbLocked()
+	if err != nil {
+		return false, err
+	}
 	var n int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM slacker_jobs WHERE event_id = ?`, eventID).Scan(&n)
+	err = db.QueryRow(`SELECT COUNT(*) FROM slacker_jobs WHERE event_id = ?`, eventID).Scan(&n)
 	return n > 0, err
 }
 
@@ -187,8 +254,12 @@ func (s *Store) HasMessageJob(account, channelID, messageTS string) (bool, error
 	acct := cmp.Or(account, DefaultAccountID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	db, err := s.dbLocked()
+	if err != nil {
+		return false, err
+	}
 	var n int
-	err := s.db.QueryRow(
+	err = db.QueryRow(
 		`SELECT COUNT(*) FROM slacker_jobs
 		 WHERE account = ? AND channel_id = ? AND message_ts = ?
 		   AND status IN ('queued', 'claimed', 'launched')`,
@@ -217,6 +288,11 @@ func scanJobRow(sc interface{ Scan(...any) error }) (Job, error) {
 // EnqueueJob inserts a job deduplicated by event_id and active/launched message key (account, channel_id, message_ts).
 // Returns (true, insertedJob, nil) on insert, or (false, existingJob, nil) when a matching job already exists.
 func (s *Store) EnqueueJob(job Job) (bool, Job, error) {
+	return s.EnqueueJobContext(context.Background(), job)
+}
+
+// EnqueueJobContext is the context-aware variant of EnqueueJob.
+func (s *Store) EnqueueJobContext(ctx context.Context, job Job) (bool, Job, error) {
 	if job.EventID == "" {
 		return false, Job{}, newSlackerErr("event_id is required", 400)
 	}
@@ -231,7 +307,7 @@ func (s *Store) EnqueueJob(job Job) (bool, Job, error) {
 		useTmuxInt = 1
 	}
 
-	inserted, resJob, err := s.enqueueJobTx(job, useTmuxInt)
+	inserted, resJob, err := s.enqueueJobTx(ctx, job, useTmuxInt)
 	if err != nil || !inserted {
 		return false, resJob, err
 	}
@@ -239,15 +315,15 @@ func (s *Store) EnqueueJob(job Job) (bool, Job, error) {
 	return true, resJob, nil
 }
 
-func (s *Store) enqueueJobTx(job Job, useTmuxInt int) (bool, Job, error) {
+func (s *Store) enqueueJobTx(ctx context.Context, job Job, useTmuxInt int) (bool, Job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	tx, err := s.db.Begin()
+	tx, err := s.beginImmediateLocked(ctx)
 	if err != nil {
 		return false, Job{}, err
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer tx.Rollback(ctx)
 
 	existing, err := scanJobRow(tx.QueryRow(`SELECT `+jobSelectCols+` FROM slacker_jobs WHERE event_id = ?`, job.EventID))
 	if err == nil {
@@ -293,6 +369,10 @@ func (s *Store) enqueueJobTx(job Job, useTmuxInt int) (bool, Job, error) {
 
 // ClaimNextJob atomically claims the oldest queued or lease-expired job targeted at device.
 func (s *Store) ClaimNextJob(device string, lease time.Duration) (*Job, error) {
+	return s.claimNextJobCtx(context.Background(), device, lease)
+}
+
+func (s *Store) claimNextJobCtx(ctx context.Context, device string, lease time.Duration) (*Job, error) {
 	if lease <= 0 {
 		lease = 90 * time.Second
 	}
@@ -302,11 +382,11 @@ func (s *Store) ClaimNextJob(device string, lease time.Duration) (*Job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	tx, err := s.db.Begin()
+	tx, err := s.beginImmediateLocked(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer tx.Rollback(ctx)
 
 	row := tx.QueryRow(
 		`SELECT `+jobSelectCols+` FROM slacker_jobs
@@ -365,13 +445,8 @@ func (s *Store) WaitForJob(ctx context.Context, device string, timeout, lease ti
 	defer ticker.Stop()
 
 	for {
-		job, err := s.ClaimNextJob(device, lease)
-		if err != nil || job != nil {
-			return job, err
-		}
 		ch := s.registerWaiter(device)
-		// Re-check after registering to avoid missing a concurrent insert.
-		job, err = s.ClaimNextJob(device, lease)
+		job, err := s.claimNextJobCtx(ctx, device, lease)
 		if err != nil || job != nil {
 			s.unregisterWaiter(device, ch)
 			return job, err
@@ -393,6 +468,10 @@ func (s *Store) WaitForJob(ctx context.Context, device string, timeout, lease ti
 
 // RecordReceipt persists a target Mac worker's execution/reconciliation receipt for a job.
 func (s *Store) RecordReceipt(device string, r Receipt) (Job, error) {
+	return s.recordReceiptCtx(context.Background(), device, r)
+}
+
+func (s *Store) recordReceiptCtx(ctx context.Context, device string, r Receipt) (Job, error) {
 	if r.JobID == "" {
 		return Job{}, newSlackerErr("job_id is required", 400)
 	}
@@ -404,7 +483,13 @@ func (s *Store) RecordReceipt(device string, r Receipt) (Job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	j, err := scanJobRow(s.db.QueryRow(`SELECT `+jobSelectCols+` FROM slacker_jobs WHERE id = ?`, r.JobID))
+	tx, err := s.beginImmediateLocked(ctx)
+	if err != nil {
+		return Job{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	j, err := scanJobRow(tx.QueryRow(`SELECT `+jobSelectCols+` FROM slacker_jobs WHERE id = ?`, r.JobID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Job{}, newSlackerErr("job not found", 404)
 	}
@@ -418,12 +503,15 @@ func (s *Store) RecordReceipt(device string, r Receipt) (Job, error) {
 		return j, nil
 	}
 
-	if _, err := s.db.Exec(
+	if _, err := tx.Exec(
 		`UPDATE slacker_jobs
 		 SET status = ?, receipt_id = ?, backend = ?, error = ?, lease_expires_at = '', updated_at = ?
 		 WHERE id = ?`,
 		r.Status, r.ReceiptID, r.Backend, r.Error, now, r.JobID,
 	); err != nil {
+		return Job{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return Job{}, err
 	}
 	j.Status = r.Status
@@ -439,7 +527,11 @@ func (s *Store) RecordReceipt(device string, r Receipt) (Job, error) {
 func (s *Store) GetJob(id string) (*Job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	j, err := scanJobRow(s.db.QueryRow(`SELECT `+jobSelectCols+` FROM slacker_jobs WHERE id = ?`, id))
+	db, err := s.dbLocked()
+	if err != nil {
+		return nil, err
+	}
+	j, err := scanJobRow(db.QueryRow(`SELECT `+jobSelectCols+` FROM slacker_jobs WHERE id = ?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -474,7 +566,11 @@ func (s *Store) ListJobs(device, status string, limit int) ([]Job, error) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows, err := s.db.Query(q, args...)
+	db, err := s.dbLocked()
+	if err != nil {
+		return nil, err
+	}
+	rows, err := db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -499,7 +595,13 @@ func (s *Store) RetryJob(id string) (Job, error) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 
-		cur, err := scanJobRow(s.db.QueryRow(`SELECT `+jobSelectCols+` FROM slacker_jobs WHERE id = ?`, id))
+		tx, err := s.beginImmediateLocked(context.Background())
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(context.Background())
+
+		cur, err := scanJobRow(tx.QueryRow(`SELECT `+jobSelectCols+` FROM slacker_jobs WHERE id = ?`, id))
 		if errors.Is(err, sql.ErrNoRows) {
 			return newSlackerErr("job not found", 404)
 		}
@@ -511,7 +613,7 @@ func (s *Store) RetryJob(id string) (Job, error) {
 		}
 		if cur.ChannelID != "" && cur.MessageTS != "" {
 			var otherID string
-			oErr := s.db.QueryRow(
+			oErr := tx.QueryRow(
 				`SELECT id FROM slacker_jobs
 				 WHERE id != ? AND account = ? AND channel_id = ? AND message_ts = ?
 				   AND status IN ('queued', 'claimed', 'launched')
@@ -526,7 +628,7 @@ func (s *Store) RetryJob(id string) (Job, error) {
 			}
 		}
 
-		res, err := s.db.Exec(
+		res, err := tx.Exec(
 			`UPDATE slacker_jobs
 			 SET status = 'queued', claimed_by = '', claimed_at = '', lease_expires_at = '', error = '', updated_at = ?
 			 WHERE id = ? AND status IN ('failed', 'cancelled', 'claimed')`,
@@ -539,9 +641,12 @@ func (s *Store) RetryJob(id string) (Job, error) {
 		if n == 0 {
 			return newSlackerErr(fmt.Sprintf("job %s is %s and cannot be retried", id, cur.Status), 409)
 		}
-		j, gErr := scanJobRow(s.db.QueryRow(`SELECT `+jobSelectCols+` FROM slacker_jobs WHERE id = ?`, id))
+		j, gErr := scanJobRow(tx.QueryRow(`SELECT `+jobSelectCols+` FROM slacker_jobs WHERE id = ?`, id))
 		if gErr != nil {
 			return gErr
+		}
+		if err := tx.Commit(); err != nil {
+			return err
 		}
 		retried = j
 		return nil
@@ -557,19 +662,25 @@ func (s *Store) RetryJob(id string) (Job, error) {
 func (s *Store) CancelJob(id string) (Job, error) {
 	now := registry.NowISO()
 	s.mu.Lock()
-	res, err := s.db.Exec(
+	defer s.mu.Unlock()
+
+	tx, err := s.beginImmediateLocked(context.Background())
+	if err != nil {
+		return Job{}, err
+	}
+	defer tx.Rollback(context.Background())
+
+	res, err := tx.Exec(
 		`UPDATE slacker_jobs
 		 SET status = 'cancelled', lease_expires_at = '', updated_at = ?
 		 WHERE id = ? AND status IN ('queued', 'claimed')`,
 		now, id,
 	)
 	if err != nil {
-		s.mu.Unlock()
 		return Job{}, err
 	}
 	n, _ := res.RowsAffected()
-	j, gErr := scanJobRow(s.db.QueryRow(`SELECT `+jobSelectCols+` FROM slacker_jobs WHERE id = ?`, id))
-	s.mu.Unlock()
+	j, gErr := scanJobRow(tx.QueryRow(`SELECT `+jobSelectCols+` FROM slacker_jobs WHERE id = ?`, id))
 	if errors.Is(gErr, sql.ErrNoRows) {
 		return Job{}, newSlackerErr("job not found", 404)
 	}
@@ -578,6 +689,9 @@ func (s *Store) CancelJob(id string) (Job, error) {
 	}
 	if n == 0 {
 		return Job{}, newSlackerErr(fmt.Sprintf("job %s is %s and cannot be cancelled", id, j.Status), 409)
+	}
+	if err := tx.Commit(); err != nil {
+		return Job{}, err
 	}
 	return j, nil
 }
@@ -638,7 +752,11 @@ func (s *Store) UpsertWorkerRuntime(device string, pid int, connected bool, last
 func (s *Store) ListRuntimes() ([]RuntimeStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows, err := s.db.Query(
+	db, err := s.dbLocked()
+	if err != nil {
+		return nil, err
+	}
+	rows, err := db.Query(
 		`SELECT role, pid, connected, last_poll_at, last_event_at, last_error, updated_at
 		 FROM slacker_runtime ORDER BY role ASC`,
 	)
@@ -671,7 +789,11 @@ func (s *Store) JobCounts() (map[string]int, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows, err := s.db.Query(`SELECT status, COUNT(*) FROM slacker_jobs GROUP BY status`)
+	db, err := s.dbLocked()
+	if err != nil {
+		return nil, err
+	}
+	rows, err := db.Query(`SELECT status, COUNT(*) FROM slacker_jobs GROUP BY status`)
 	if err != nil {
 		return nil, err
 	}
@@ -693,14 +815,17 @@ func (s *Store) JobCounts() (map[string]int, error) {
 func (s *Store) Cleanup(olderThan time.Duration, allTerminal bool) (int64, int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	db, err := s.dbLocked()
+	if err != nil {
+		return 0, 0, err
+	}
 
 	var jobRes sql.Result
-	var err error
 	if allTerminal || olderThan <= 0 {
-		jobRes, err = s.db.Exec(`DELETE FROM slacker_jobs WHERE status IN ('launched', 'failed', 'cancelled')`)
+		jobRes, err = db.Exec(`DELETE FROM slacker_jobs WHERE status IN ('launched', 'failed', 'cancelled')`)
 	} else {
 		cutoff := time.Now().UTC().Add(-olderThan).Truncate(time.Second).Format("2006-01-02T15:04:05+00:00")
-		jobRes, err = s.db.Exec(
+		jobRes, err = db.Exec(
 			`DELETE FROM slacker_jobs WHERE status IN ('launched', 'failed', 'cancelled') AND updated_at <= ?`,
 			cutoff,
 		)
@@ -713,7 +838,7 @@ func (s *Store) Cleanup(olderThan time.Duration, allTerminal bool) (int64, int64
 	var prunedWorkers int64
 	if olderThan > 0 {
 		cutoff := time.Now().UTC().Add(-olderThan).Truncate(time.Second).Format("2006-01-02T15:04:05+00:00")
-		wRes, wErr := s.db.Exec(`DELETE FROM slacker_runtime WHERE role LIKE 'worker:%' AND updated_at <= ?`, cutoff)
+		wRes, wErr := db.Exec(`DELETE FROM slacker_runtime WHERE role LIKE 'worker:%' AND updated_at <= ?`, cutoff)
 		if wErr != nil {
 			return prunedJobs, 0, wErr
 		}
@@ -727,7 +852,11 @@ func (s *Store) PendingJobCounts() (map[string]int, error) {
 	counts := map[string]int{}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows, err := s.db.Query(
+	db, err := s.dbLocked()
+	if err != nil {
+		return nil, err
+	}
+	rows, err := db.Query(
 		`SELECT target_device, COUNT(*) FROM slacker_jobs WHERE status IN ('queued', 'claimed') GROUP BY target_device`,
 	)
 	if err != nil {
@@ -750,7 +879,11 @@ func (s *Store) OnlineWorkers(now time.Time, window time.Duration) (map[string]b
 	online := map[string]bool{}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows, err := s.db.Query(
+	db, err := s.dbLocked()
+	if err != nil {
+		return nil, err
+	}
+	rows, err := db.Query(
 		`SELECT role, last_poll_at, updated_at FROM slacker_runtime WHERE role LIKE 'worker:%' AND connected = 1`,
 	)
 	if err != nil {
@@ -781,8 +914,12 @@ func (s *Store) OnlineWorkers(now time.Time, window time.Duration) (map[string]b
 func (s *Store) GetLastDevice(scope string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	db, err := s.dbLocked()
+	if err != nil {
+		return "", err
+	}
 	var dev string
-	err := s.db.QueryRow(`SELECT last_device FROM slacker_dispatch_state WHERE scope = ?`, scope).Scan(&dev)
+	err = db.QueryRow(`SELECT last_device FROM slacker_dispatch_state WHERE scope = ?`, scope).Scan(&dev)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
@@ -794,7 +931,11 @@ func (s *Store) SetLastDevice(scope, device string) error {
 	now := registry.NowISO()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(
+	db, err := s.dbLocked()
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(
 		`INSERT INTO slacker_dispatch_state(scope, last_device, updated_at)
 		 VALUES(?, ?, ?)
 		 ON CONFLICT(scope) DO UPDATE SET

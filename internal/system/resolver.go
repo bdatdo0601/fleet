@@ -103,6 +103,13 @@ func SyncMacResolver(resolverDir, domain, nameserver string) (bool, string, erro
 		return false, "", err
 	}
 	target := filepath.Join(resolverDir, norm)
+	if _, statErr := os.Stat(target); statErr == nil {
+		if !isFleetManagedResolver(target) {
+			return false, "", fmt.Errorf("refusing to overwrite non-fleet resolver %s", target)
+		}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return false, "", statErr
+	}
 	content := fmt.Sprintf("%snameserver %s\n", fleetResolverHeader, strings.TrimSpace(nameserver))
 	var wrote bool
 	if IsRoot() || resolverDir == paths.ResolverDir {

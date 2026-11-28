@@ -2,12 +2,12 @@ package paths
 
 import (
 	"bytes"
-	"fmt"
 	"os"
 	"os/user"
 	"path/filepath"
 	"slices"
 	"strconv"
+	"syscall"
 )
 
 // LookupUIDGID returns numeric uid/gid for username.
@@ -55,30 +55,78 @@ func EnsureDir(dir string, mode os.FileMode, uid, gid *int) error {
 	return nil
 }
 
+func ensureFilePerms(path string, mode os.FileMode, uid, gid *int) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if fi.Mode().Perm() != mode.Perm() {
+		if err := os.Chmod(path, mode); err != nil {
+			return err
+		}
+	}
+	if os.Geteuid() == 0 && uid != nil && gid != nil {
+		st, ok := fi.Sys().(*syscall.Stat_t)
+		if !ok || int(st.Uid) != *uid || int(st.Gid) != *gid {
+			if err := os.Chown(path, *uid, *gid); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // WriteFileAtomic atomically writes data to path with mode and optional uid/gid ownership.
-// Returns (false, nil) if path already has identical content.
+// Returns (false, nil) if path already has identical content (still verifying/repairing mode and ownership).
 func WriteFileAtomic(path string, data []byte, mode os.FileMode, uid, gid *int) (bool, error) {
 	if mode == 0 {
 		mode = 0o644
 	}
 	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, data) {
+		if err := ensureFilePerms(path, mode, uid, gid); err != nil {
+			return false, err
+		}
 		return false, nil
 	}
 	dir := filepath.Dir(path)
 	if err := EnsureDir(dir, 0o755, uid, gid); err != nil {
 		return false, err
 	}
-	tmp := filepath.Join(dir, fmt.Sprintf(".%s.%d.tmp", filepath.Base(path), os.Getpid()))
-	if err := os.WriteFile(tmp, data, mode); err != nil {
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
+	if err != nil {
 		return false, err
 	}
-	_ = os.Chmod(tmp, mode)
+	tmp := f.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return false, err
+	}
+	if err := f.Chmod(mode); err != nil {
+		_ = f.Close()
+		return false, err
+	}
 	if os.Geteuid() == 0 && uid != nil && gid != nil {
-		_ = os.Chown(tmp, *uid, *gid)
+		if err := f.Chown(*uid, *gid); err != nil {
+			_ = f.Close()
+			return false, err
+		}
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return false, err
+	}
+	if err := f.Close(); err != nil {
+		return false, err
 	}
 	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
 		return false, err
 	}
+	cleanup = false
 	return true, nil
 }

@@ -283,23 +283,37 @@ func Initialize(opts InitOpts) (*Fleet, error) {
 	}
 	caKey := filepath.Join(root, "ca.key")
 	caCrt := filepath.Join(root, "ca.crt")
+	cleanupFiles := func() {
+		for _, base := range []string{"ca.key", "ca.crt", "fleet.db", "agents.db", "memory.db", "slacker.db", "assistant.db"} {
+			p := filepath.Join(root, base)
+			_ = os.Remove(p)
+			if strings.HasSuffix(base, ".db") {
+				_ = os.Remove(p + "-wal")
+				_ = os.Remove(p + "-shm")
+			}
+		}
+		_ = os.RemoveAll(filepath.Join(root, "assistant-vault"))
+	}
 	if err := pki.CreateCA(caKey, caCrt, opts.Passphrase, "fleet"); err != nil {
+		cleanupFiles()
 		return nil, err
 	}
 	if err := os.Chmod(caKey, 0o600); err != nil {
+		cleanupFiles()
 		return nil, err
 	}
 	f, err := Open(root)
 	if err != nil {
-		return nil, err
-	}
-	if err := os.Chmod(dbPath, 0o600); err != nil {
-		_ = f.Close()
+		cleanupFiles()
 		return nil, err
 	}
 	cleanup := func(err error) (*Fleet, error) {
 		_ = f.Close()
+		cleanupFiles()
 		return nil, err
+	}
+	if err := os.Chmod(dbPath, 0o600); err != nil {
+		return cleanup(err)
 	}
 	if err := f.Registry.SetSetting("lighthouse_host", opts.Host); err != nil {
 		return cleanup(err)
@@ -440,40 +454,30 @@ func (f *Fleet) TLSConfig() (*tlsdns.Config, error) {
 
 // SetTLS persists TLS + private mesh DNS settings in fleet.db.
 func (f *Fleet) SetTLS(cfg tlsdns.Config) error {
-	for _, kv := range [][2]string{
-		{"tls_domain", cfg.Domain},
-		{"tls_zone_id", cfg.ZoneID},
-		{"tls_profile", cfg.Profile},
-		{"tls_email", cfg.Email},
-		{"tls_nameservers", strings.Join(cfg.Nameservers, ",")},
-		{"tls_public_a", strconv.FormatBool(cfg.PublicA)},
-		{"tls_private_dns", strconv.FormatBool(cfg.PrivateDNS)},
-		{"tls_staging", strconv.FormatBool(cfg.Staging)},
-	} {
-		if err := f.Registry.SetSetting(kv[0], kv[1]); err != nil {
-			return err
-		}
-	}
-	return nil
+	return f.Registry.SetSettings(map[string]string{
+		"tls_domain":      cfg.Domain,
+		"tls_zone_id":     cfg.ZoneID,
+		"tls_profile":     cfg.Profile,
+		"tls_email":       cfg.Email,
+		"tls_nameservers": strings.Join(cfg.Nameservers, ","),
+		"tls_public_a":    strconv.FormatBool(cfg.PublicA),
+		"tls_private_dns": strconv.FormatBool(cfg.PrivateDNS),
+		"tls_staging":     strconv.FormatBool(cfg.Staging),
+	})
 }
 
 // ClearTLS disables TLS + private mesh DNS configuration in fleet.db.
 func (f *Fleet) ClearTLS() error {
-	for _, k := range []string{
-		"tls_domain",
-		"tls_zone_id",
-		"tls_profile",
-		"tls_email",
-		"tls_nameservers",
-		"tls_public_a",
-		"tls_private_dns",
-		"tls_staging",
-	} {
-		if err := f.Registry.SetSetting(k, ""); err != nil {
-			return err
-		}
-	}
-	return nil
+	return f.Registry.SetSettings(map[string]string{
+		"tls_domain":      "",
+		"tls_zone_id":     "",
+		"tls_profile":     "",
+		"tls_email":       "",
+		"tls_nameservers": "",
+		"tls_public_a":    "",
+		"tls_private_dns": "",
+		"tls_staging":     "",
+	})
 }
 
 // DNSRecords builds the authoritative private mesh DNS snapshot from active devices in fleet.db.
@@ -543,17 +547,12 @@ func (f *Fleet) DDNSConfig() (*ddns.Route53, error) {
 
 // SetDDNS stores Route 53 DDNS configuration in fleet.db.
 func (f *Fleet) SetDDNS(cfg ddns.Route53) error {
-	for _, kv := range [][2]string{
-		{"ddns_name", cfg.Name},
-		{"ddns_zone_id", cfg.ZoneID},
-		{"ddns_profile", cfg.Profile},
-		{"ddns_nameservers", strings.Join(cfg.Nameservers, ",")},
-	} {
-		if err := f.Registry.SetSetting(kv[0], kv[1]); err != nil {
-			return err
-		}
-	}
-	return nil
+	return f.Registry.SetSettings(map[string]string{
+		"ddns_name":        cfg.Name,
+		"ddns_zone_id":     cfg.ZoneID,
+		"ddns_profile":     cfg.Profile,
+		"ddns_nameservers": strings.Join(cfg.Nameservers, ","),
+	})
 }
 
 // CAPem reads the CA certificate PEM from disk.
@@ -626,7 +625,7 @@ func (f *Fleet) sign(pubkey, name, ip, group, passphrase string, hours int) (str
 		Hours:      hours,
 	})
 	if err != nil {
-		if strings.Contains(err.Error(), "invalid passphrase") {
+		if errors.Is(err, pki.ErrInvalidPassphrase) {
 			return "", newFleetErr(WrongPassphraseMsg, 401)
 		}
 		return "", newFleetErr("signing failed: "+err.Error(), 400)
@@ -657,6 +656,7 @@ func (f *Fleet) Identify(peerIP string) (*registry.Device, error) {
 	}
 	addr, err := netip.ParseAddr(peerIP)
 	if err == nil {
+		addr = addr.Unmap()
 		if addr.IsLoopback() {
 			return f.Registry.Lighthouse()
 		}

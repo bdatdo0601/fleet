@@ -1,15 +1,18 @@
 package mcp
 
 import (
-	"bytes"
+	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -42,6 +45,59 @@ func setupMCPServer(t *testing.T) (*core.Fleet, *httptest.Server) {
 	return f, srv
 }
 
+func runMCPSequential(t *testing.T, opts ServeOpts, reqs []string) []string {
+	t.Helper()
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	opts.Stdin = inR
+	opts.Stdout = outW
+
+	type serveRes struct {
+		rc  int
+		err error
+	}
+	doneCh := make(chan serveRes, 1)
+	go func() {
+		rc, err := ServeStdio(opts)
+		_ = outW.Close()
+		doneCh <- serveRes{rc: rc, err: err}
+	}()
+
+	br := bufio.NewReader(outR)
+	var lines []string
+	for _, raw := range reqs {
+		var meta struct {
+			ID any `json:"id"`
+		}
+		_ = json.Unmarshal([]byte(raw), &meta)
+		if _, err := io.WriteString(inW, raw+"\n"); err != nil {
+			t.Fatalf("write req %s: %v", raw, err)
+		}
+		if meta.ID != nil {
+			ln, err := br.ReadString('\n')
+			if err != nil {
+				t.Fatalf("read response for %s: %v", raw, err)
+			}
+			lines = append(lines, strings.TrimSpace(ln))
+		}
+	}
+	_ = inW.Close()
+	for {
+		ln, err := br.ReadString('\n')
+		if strings.TrimSpace(ln) != "" {
+			lines = append(lines, strings.TrimSpace(ln))
+		}
+		if err != nil {
+			break
+		}
+	}
+	res := <-doneCh
+	if res.err != nil || res.rc != 0 {
+		t.Fatalf("ServeStdio failed: rc=%d err=%v", res.rc, res.err)
+	}
+	return lines
+}
+
 func TestMCPStdioRoundtripAndDeregisterOnEOF(t *testing.T) {
 	f, srv := setupMCPServer(t)
 
@@ -57,8 +113,19 @@ func TestMCPStdioRoundtripAndDeregisterOnEOF(t *testing.T) {
 	})
 	_, _ = f.Agents.SendMessageWithReport("mini", "mini:antigravity:conv-9999", fmt.Sprintf("mini:claude:pid-%d", ppid), "see line 12", nil, nil, nil)
 
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+	var bgWG sync.WaitGroup
+	bgWG.Add(1)
+	defer func() {
+		bgCancel()
+		bgWG.Wait()
+	}()
 	go func() {
+		defer bgWG.Done()
 		for range 60 {
+			if bgCtx.Err() != nil {
+				return
+			}
 			msgs, _ := f.Agents.FetchInbox("mini", "mini:antigravity:conv-9999", true, true, 50)
 			for _, m := range msgs {
 				if m.Body == "which port?" {
@@ -66,7 +133,11 @@ func TestMCPStdioRoundtripAndDeregisterOnEOF(t *testing.T) {
 					return
 				}
 			}
-			time.Sleep(20 * time.Millisecond)
+			select {
+			case <-bgCtx.Done():
+				return
+			case <-time.After(20 * time.Millisecond):
+			}
 		}
 	}()
 
@@ -80,20 +151,14 @@ func TestMCPStdioRoundtripAndDeregisterOnEOF(t *testing.T) {
 		`{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"fleet_send_message","arguments":{"to":"conv-9999","message":"got it"}}}`,
 		`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"fleet_ask_agent","arguments":{"to":"conv-9999","question":"which port?","timeout_seconds":3}}}`,
 	}
-	var out bytes.Buffer
-	rc, err := ServeStdio(ServeOpts{
+	lines := runMCPSequential(t, ServeOpts{
 		Harness:           "claude",
-		Stdin:             strings.NewReader(strings.Join(reqs, "\n") + "\n"),
-		Stdout:            &out,
 		APIURL:            srv.URL,
 		HeartbeatInterval: 60.0,
-	})
-	if err != nil || rc != 0 {
-		t.Fatalf("ServeStdio failed: rc=%d err=%v", rc, err)
-	}
+	}, reqs)
 
 	var resps []map[string]any
-	for ln := range strings.SplitSeq(strings.TrimSpace(out.String()), "\n") {
+	for _, ln := range lines {
 		var r map[string]any
 		if err := json.Unmarshal([]byte(ln), &r); err != nil {
 			t.Fatalf("bad response %q: %v", ln, err)
@@ -132,20 +197,13 @@ func TestMCPCodexAutoListenAndSetName(t *testing.T) {
 		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"fleet_listen","arguments":{"action":"start"}}}`,
 	}
 	auto := true
-	var out bytes.Buffer
-	rc, err := ServeStdio(ServeOpts{
+	lines := runMCPSequential(t, ServeOpts{
 		Harness:           "codex",
-		Stdin:             strings.NewReader(strings.Join(reqs, "\n") + "\n"),
-		Stdout:            &out,
 		APIURL:            srv.URL,
 		HeartbeatInterval: 60.0,
 		AutoListen:        &auto,
 		CodexRunQueueFn:   func([]string) (int, string) { return 0, "" },
-	})
-	if err != nil || rc != 0 {
-		t.Fatalf("codex ServeStdio failed: rc=%d err=%v", rc, err)
-	}
-	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	}, reqs)
 	if len(lines) != 4 {
 		t.Fatalf("expected 4 responses, got %d", len(lines))
 	}
@@ -176,20 +234,13 @@ func TestMCPMemoryToolsRoundtrip(t *testing.T) {
 		`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"fleet_memory_search","arguments":{"query":"focused changes","scope":"global"}}}`,
 	}
 
-	var out bytes.Buffer
-	rc, err := ServeStdio(ServeOpts{
+	lines := runMCPSequential(t, ServeOpts{
 		Harness:           "antigravity",
-		Stdin:             strings.NewReader(strings.Join(reqs, "\n") + "\n"),
-		Stdout:            &out,
 		APIURL:            srv.URL,
 		HeartbeatInterval: 60.0,
-	})
-	if err != nil || rc != 0 {
-		t.Fatalf("ServeStdio memory roundtrip failed: rc=%d err=%v", rc, err)
-	}
-	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	}, reqs)
 	if len(lines) != 7 {
-		t.Fatalf("expected 7 responses, got %d (%s)", len(lines), out.String())
+		t.Fatalf("expected 7 responses, got %d (%v)", len(lines), lines)
 	}
 
 	parseToolJSON := func(idx int) map[string]any {
@@ -274,21 +325,14 @@ func TestMCPMemoryToolsResolveSessionRepoFromRootCWD(t *testing.T) {
 		`{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"fleet_memory_search","arguments":{}}}`,
 	}
 
-	var out bytes.Buffer
-	rc, err := ServeStdio(ServeOpts{
+	lines := runMCPSequential(t, ServeOpts{
 		Harness:           "antigravity",
-		Stdin:             strings.NewReader(strings.Join(reqs, "\n") + "\n"),
-		Stdout:            &out,
 		APIURL:            srv.URL,
 		CWD:               "/",
 		HeartbeatInterval: 60.0,
-	})
-	if err != nil || rc != 0 {
-		t.Fatalf("ServeStdio failed: rc=%d err=%v", rc, err)
-	}
-	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	}, reqs)
 	if len(lines) != 6 {
-		t.Fatalf("expected 6 responses, got %d (%s)", len(lines), out.String())
+		t.Fatalf("expected 6 responses, got %d (%v)", len(lines), lines)
 	}
 
 	parseToolJSON := func(idx int) map[string]any {
@@ -357,11 +401,8 @@ func TestMCPClaudeAutoListenAndAntigravitySidecarStatus(t *testing.T) {
 		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"fleet_listen","arguments":{"action":"start"}}}`,
 	}
 	auto := true
-	var out bytes.Buffer
-	rc, err := ServeStdio(ServeOpts{
+	lines := runMCPSequential(t, ServeOpts{
 		Harness:           "claude",
-		Stdin:             strings.NewReader(strings.Join(reqs, "\n") + "\n"),
-		Stdout:            &out,
 		APIURL:            srv.URL,
 		HeartbeatInterval: 60.0,
 		AutoListen:        &auto,
@@ -369,11 +410,7 @@ func TestMCPClaudeAutoListenAndAntigravitySidecarStatus(t *testing.T) {
 		ClaudeSocketToken: "tok",
 		ClaudeCacheDir:    t.TempDir(),
 		ClaudeSendFn:      func(string, string, string) error { return nil },
-	})
-	if err != nil || rc != 0 {
-		t.Fatalf("claude ServeStdio failed: rc=%d err=%v", rc, err)
-	}
-	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	}, reqs)
 	if len(lines) != 4 {
 		t.Fatalf("expected 4 responses, got %d", len(lines))
 	}
@@ -398,17 +435,10 @@ func TestMCPClaudeAutoListenAndAntigravitySidecarStatus(t *testing.T) {
 		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}`,
 		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fleet_listen","arguments":{"session_id":"mini:antigravity:agy-sidecar-1"}}}`,
 	}
-	var agyOut bytes.Buffer
-	rc, err = ServeStdio(ServeOpts{
+	agyLines := runMCPSequential(t, ServeOpts{
 		Harness: "antigravity",
-		Stdin:   strings.NewReader(strings.Join(agyReqs, "\n") + "\n"),
-		Stdout:  &agyOut,
 		APIURL:  srv.URL,
-	})
-	if err != nil || rc != 0 {
-		t.Fatalf("antigravity ServeStdio failed: rc=%d err=%v", rc, err)
-	}
-	agyLines := strings.Split(strings.TrimSpace(agyOut.String()), "\n")
+	}, agyReqs)
 	var agyR map[string]any
 	_ = json.Unmarshal([]byte(agyLines[1]), &agyR)
 	agyTxt := agyR["result"].(map[string]any)["content"].([]any)[0].(map[string]any)["text"].(string)
@@ -459,20 +489,13 @@ func TestMCPSlackTools(t *testing.T) {
 		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"fleet_slack_read","arguments":{"account":"work","query":"latency"}}}`,
 		`{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"fleet_slack_send","arguments":{"channel":"CWORK","thread_ts":"100.0","text":"Fixed in commit abc"}}}`,
 	}
-	var out bytes.Buffer
-	rc, err := ServeStdio(ServeOpts{
+	lines := runMCPSequential(t, ServeOpts{
 		Harness:           "claude",
-		Stdin:             strings.NewReader(strings.Join(reqs, "\n") + "\n"),
-		Stdout:            &out,
 		APIURL:            srv.URL,
 		HeartbeatInterval: 60.0,
-	})
-	if err != nil || rc != 0 {
-		t.Fatalf("ServeStdio failed: rc=%d err=%v", rc, err)
-	}
-	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	}, reqs)
 	if len(lines) != 5 {
-		t.Fatalf("expected 5 responses, got %d: %s", len(lines), out.String())
+		t.Fatalf("expected 5 responses, got %d: %v", len(lines), lines)
 	}
 	parseTool := func(idx int) map[string]any {
 		var r map[string]any
@@ -497,5 +520,105 @@ func TestMCPSlackTools(t *testing.T) {
 	sendData := parseTool(4)
 	if sendData["ts"] != "100.5" || postedText != "Fixed in commit abc" {
 		t.Fatalf("unexpected send output: %+v posted=%q", sendData, postedText)
+	}
+}
+
+func TestMCPConcurrentToolsCallEOFCancelAndMalformedParams(t *testing.T) {
+	slowStarted := make(chan struct{})
+	slowCanceled := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/agents/ask":
+			_, _ = io.Copy(io.Discard, r.Body)
+			close(slowStarted)
+			select {
+			case <-r.Context().Done():
+				close(slowCanceled)
+			case <-time.After(5 * time.Second):
+			}
+		case "/v1/agents":
+			_, _ = w.Write([]byte(`{"agents":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	doneCh := make(chan error, 1)
+	auto := false
+	go func() {
+		_, err := ServeStdio(ServeOpts{
+			Harness:    "antigravity",
+			Stdin:      inR,
+			Stdout:     outW,
+			APIURL:     srv.URL,
+			AutoListen: &auto,
+		})
+		_ = outW.Close()
+		doneCh <- err
+	}()
+
+	br := bufio.NewReader(outR)
+
+	// 1. Malformed params returns JSON-RPC -32602.
+	_, _ = io.WriteString(inW, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":"not-an-object"}`+"\n")
+	ln, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	var badResp map[string]any
+	_ = json.Unmarshal([]byte(ln), &badResp)
+	if badResp["error"].(map[string]any)["code"] != float64(-32602) {
+		t.Fatalf("expected -32602 on malformed params, got %s", ln)
+	}
+
+	// 2. Oversized line returns -32700 without killing server.
+	_, _ = io.WriteString(inW, strings.Repeat("x", maxMCPRequestBytes+64)+"\n")
+	ln, err = br.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bigResp map[string]any
+	_ = json.Unmarshal([]byte(ln), &bigResp)
+	if bigResp["error"].(map[string]any)["code"] != float64(-32700) {
+		t.Fatalf("expected -32700 on oversized line, got %s", ln)
+	}
+
+	// 3. Slow tools/call does not block concurrent tools/call, and stdin EOF cancels slow call.
+	_, _ = io.WriteString(inW, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fleet_ask_agent","arguments":{"to":"x","question":"hi","timeout_seconds":5}}}`+"\n")
+	<-slowStarted
+	_, _ = io.WriteString(inW, `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fleet_list_agents","arguments":{}}}`+"\n")
+	fastLn, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fastResp map[string]any
+	_ = json.Unmarshal([]byte(fastLn), &fastResp)
+	if fastResp["id"] != float64(3) {
+		t.Fatalf("expected concurrent fast tools/call id=3 first, got %s", fastLn)
+	}
+
+	// Closing stdin cancels the in-flight slow call promptly.
+	_ = inW.Close()
+	select {
+	case <-slowCanceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected slow tools/call HTTP request to be cancelled on stdin EOF")
+	}
+	// Drain remaining output (cancelled id=2 response) and wait for ServeStdio exit.
+	for {
+		if _, rErr := br.ReadString('\n'); rErr != nil {
+			break
+		}
+	}
+	select {
+	case err := <-doneCh:
+		if err != nil {
+			t.Fatalf("ServeStdio returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ServeStdio did not exit after stdin EOF")
 	}
 }

@@ -473,3 +473,92 @@ func TestKeepalivePreservesStateAgeSeconds(t *testing.T) {
 		t.Fatalf("expected StateAgeSeconds preserved >= 175s, got %d", detail.StateAgeSeconds)
 	}
 }
+
+func TestHubPostCloseSafetyAndPromotionCycleGuard(t *testing.T) {
+	hub := openTestHub(t)
+
+	// Seed a session with 2 tail items to verify ListSessions SQL TurnCount matches Tail length.
+	if _, err := hub.Heartbeat(HeartbeatParams{
+		Device:  "laptop",
+		Harness: "claude",
+		RawID:   "turn-check-1",
+		CWD:     "/tmp/proj",
+		Tail: []TailItem{
+			{Role: "user", Text: "hi"},
+			{Role: "assistant", Text: "hello"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	list, err := hub.ListSessions("laptop", "", "", "", true)
+	if err != nil || len(list) != 1 || list[0].TurnCount != 2 {
+		t.Fatalf("expected ListSessions TurnCount=2 via SQL, got %+v err=%v", list, err)
+	}
+
+	// Cycle guard in resolvePromotedLocked must terminate without looping forever.
+	hub.mu.Lock()
+	hub.promotedTo["a"] = "b"
+	hub.promotedTo["b"] = "a"
+	resolved := hub.resolvePromotedLocked("a")
+	hub.mu.Unlock()
+	if resolved != "a" && resolved != "b" {
+		t.Fatalf("unexpected cycle resolution: %q", resolved)
+	}
+
+	// Post-Close calls must return ErrHubClosed without nil-DB panics.
+	if err := hub.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := hub.Close(); err != nil {
+		t.Fatalf("idempotent Close failed: %v", err)
+	}
+
+	if _, err := hub.Heartbeat(HeartbeatParams{Device: "laptop", Harness: "claude", RawID: "after-close"}); !errors.Is(err, ErrHubClosed) {
+		t.Fatalf("expected ErrHubClosed from Heartbeat, got %v", err)
+	}
+	if _, err := hub.ListSessions("", "", "", "", true); !errors.Is(err, ErrHubClosed) {
+		t.Fatalf("expected ErrHubClosed from ListSessions, got %v", err)
+	}
+	if _, err := hub.GetSession("laptop:claude:turn-check-1"); !errors.Is(err, ErrHubClosed) {
+		t.Fatalf("expected ErrHubClosed from GetSession, got %v", err)
+	}
+	if _, err := hub.SendMessageWithReport("laptop", "laptop:claude:turn-check-1", "*", "hi", nil, nil, nil); !errors.Is(err, ErrHubClosed) {
+		t.Fatalf("expected ErrHubClosed from SendMessageWithReport, got %v", err)
+	}
+	if _, err := hub.FetchInbox("laptop", "laptop:claude:turn-check-1", true, false, 10); !errors.Is(err, ErrHubClosed) {
+		t.Fatalf("expected ErrHubClosed from FetchInbox, got %v", err)
+	}
+	if _, err := hub.ListMessages("", "", "", 10); !errors.Is(err, ErrHubClosed) {
+		t.Fatalf("expected ErrHubClosed from ListMessages, got %v", err)
+	}
+	if _, err := hub.AckMessages("laptop", "laptop:claude:turn-check-1", []int64{1}); !errors.Is(err, ErrHubClosed) {
+		t.Fatalf("expected ErrHubClosed from AckMessages, got %v", err)
+	}
+	if _, err := hub.RenameSession("laptop", "laptop:claude:turn-check-1", "new-name"); !errors.Is(err, ErrHubClosed) {
+		t.Fatalf("expected ErrHubClosed from RenameSession, got %v", err)
+	}
+	if err := hub.DeregisterAny("laptop:claude:turn-check-1"); !errors.Is(err, ErrHubClosed) {
+		t.Fatalf("expected ErrHubClosed from DeregisterAny, got %v", err)
+	}
+	if err := hub.RecordPath("laptop", "/tmp/proj", "proj", "manual", true); !errors.Is(err, ErrHubClosed) {
+		t.Fatalf("expected ErrHubClosed from RecordPath, got %v", err)
+	}
+	if _, err := hub.ListPaths("laptop", ""); !errors.Is(err, ErrHubClosed) {
+		t.Fatalf("expected ErrHubClosed from ListPaths, got %v", err)
+	}
+	if _, err := hub.DeletePath("laptop", "/tmp/proj"); !errors.Is(err, ErrHubClosed) {
+		t.Fatalf("expected ErrHubClosed from DeletePath, got %v", err)
+	}
+	if _, err := hub.KnownRepos("laptop"); !errors.Is(err, ErrHubClosed) {
+		t.Fatalf("expected ErrHubClosed from KnownRepos, got %v", err)
+	}
+	if _, err := hub.UpsertUsage(HarnessUsage{Harness: "claude"}); !errors.Is(err, ErrHubClosed) {
+		t.Fatalf("expected ErrHubClosed from UpsertUsage, got %v", err)
+	}
+	if _, err := hub.ListUsage(); !errors.Is(err, ErrHubClosed) {
+		t.Fatalf("expected ErrHubClosed from ListUsage, got %v", err)
+	}
+	if res, err := hub.WaitForMessages(context.Background(), WaitParams{Device: "laptop", SessionID: "laptop:claude:turn-check-1"}); err != nil || !res.TimedOut {
+		t.Fatalf("expected clean timeout on WaitForMessages after Close, got res=%+v err=%v", res, err)
+	}
+}

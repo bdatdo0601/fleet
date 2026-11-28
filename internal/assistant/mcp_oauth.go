@@ -10,7 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"slices"
 	"strings"
@@ -26,6 +28,7 @@ const (
 
 	mcpOAuthStateTTL    = 10 * time.Minute
 	mcpOAuthRefreshSkew = 60 * time.Second
+	maxPendingMCPOAuth  = 256
 )
 
 // MCPOAuthTokenStore persists OAuth access and refresh tokens per MCP server.
@@ -74,12 +77,14 @@ type pendingMCPOAuth struct {
 
 // MCPOAuthManager handles OAuth 2.0/2.1 discovery, PKCE authorization, token exchange, and refresh.
 type MCPOAuthManager struct {
-	mu          sync.Mutex
-	store       MCPOAuthTokenStore
-	httpClient  *http.Client
-	now         func() time.Time
-	pending     map[string]pendingMCPOAuth
-	serverLocks map[string]*sync.Mutex
+	mu            sync.Mutex
+	store         MCPOAuthTokenStore
+	httpClient    *http.Client
+	now           func() time.Time
+	lookupIP      func(context.Context, string) ([]netip.Addr, error)
+	allowLoopback bool
+	pending       map[string]pendingMCPOAuth
+	serverLocks   map[string]*sync.Mutex
 }
 
 // NewMCPOAuthManager constructs an MCPOAuthManager backed by store and httpClient.
@@ -162,13 +167,150 @@ func isGoogleMCPOAuth(srv MCPServerConfig) bool {
 	return isGoogleAPIHost(srv.URL)
 }
 
-func (m *MCPOAuthManager) fetchJSON(ctx context.Context, targetURL string, dst any) error {
+func isLoopbackHost(host string) bool {
+	clean := strings.ToLower(strings.Trim(strings.TrimSpace(host), "[]"))
+	if clean == "localhost" || strings.HasSuffix(clean, ".localhost") {
+		return true
+	}
+	if ip, err := netip.ParseAddr(clean); err == nil {
+		return ip.Unmap().IsLoopback()
+	}
+	return false
+}
+
+func isLoopbackURL(rawURL string) bool {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return false
+	}
+	return isLoopbackHost(u.Hostname())
+}
+
+func (m *MCPOAuthManager) resolveOAuthHostIPs(ctx context.Context, host string) ([]netip.Addr, error) {
+	if m.lookupIP != nil {
+		return m.lookupIP(ctx, host)
+	}
+	return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+}
+
+func (m *MCPOAuthManager) validateOAuthURL(ctx context.Context, rawURL string, allowLoopback bool) error {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u.Hostname() == "" {
+		return fmt.Errorf("invalid OAuth URL %q", rawURL)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	cleanHost := strings.Trim(strings.TrimSpace(u.Hostname()), "[]")
+	switch scheme {
+	case "https":
+	case "http":
+		if !allowLoopback || !isLoopbackHost(cleanHost) {
+			return fmt.Errorf("OAuth URL %q must use https://", rawURL)
+		}
+	default:
+		return fmt.Errorf("OAuth URL %q must use https://", rawURL)
+	}
+	if ip, parseErr := netip.ParseAddr(cleanHost); parseErr == nil {
+		if allowLoopback && ip.Unmap().IsLoopback() {
+			return nil
+		}
+		if IsBlockedEgressAddr(ip) {
+			return fmt.Errorf("OAuth URL %q (%s) blocked: private/internal/mesh IP", rawURL, ip)
+		}
+		return nil
+	}
+	if isLoopbackHost(cleanHost) {
+		if !allowLoopback {
+			return fmt.Errorf("OAuth URL %q blocked: loopback host not allowed", rawURL)
+		}
+		return nil
+	}
+	ips, lookupErr := m.resolveOAuthHostIPs(ctx, cleanHost)
+	if lookupErr != nil {
+		if m.lookupIP != nil {
+			return fmt.Errorf("OAuth DNS lookup failed for %q: %w", cleanHost, lookupErr)
+		}
+		return nil
+	}
+	for _, ip := range ips {
+		if allowLoopback && ip.Unmap().IsLoopback() {
+			continue
+		}
+		if IsBlockedEgressAddr(ip) {
+			return fmt.Errorf("OAuth URL %q resolved to blocked IP %s", rawURL, ip)
+		}
+	}
+	return nil
+}
+
+func (m *MCPOAuthManager) dialOAuthTCP(allowLoopback bool) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid OAuth address %q", addr)
+		}
+		cleanHost := strings.Trim(strings.TrimSpace(host), "[]")
+		var ips []netip.Addr
+		if literal, parseErr := netip.ParseAddr(cleanHost); parseErr == nil {
+			ips = []netip.Addr{literal}
+		} else {
+			ips, err = m.resolveOAuthHostIPs(ctx, cleanHost)
+			if err != nil {
+				return nil, fmt.Errorf("OAuth DNS lookup failed for %q: %w", cleanHost, err)
+			}
+		}
+		if len(ips) == 0 {
+			return nil, fmt.Errorf("no IP addresses resolved for %q", cleanHost)
+		}
+		for _, ip := range ips {
+			if allowLoopback && ip.Unmap().IsLoopback() {
+				continue
+			}
+			if IsBlockedEgressAddr(ip) {
+				return nil, fmt.Errorf("OAuth egress to %q (%s) blocked: private/internal/mesh IP", cleanHost, ip)
+			}
+		}
+		dialer := &net.Dialer{Timeout: 15 * time.Second}
+		return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].Unmap().String(), port))
+	}
+}
+
+func (m *MCPOAuthManager) oauthHTTPClient(allowLoopback bool) *http.Client {
+	base := m.client()
+	cli := *base
+	if cli.Transport == nil {
+		cli.Transport = &http.Transport{
+			DialContext:           m.dialOAuthTCP(allowLoopback),
+			ForceAttemptHTTP2:     true,
+			ResponseHeaderTimeout: 15 * time.Second,
+			IdleConnTimeout:       15 * time.Second,
+		}
+	}
+	prevRedirect := cli.CheckRedirect
+	cli.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 5 {
+			return errors.New("too many redirects")
+		}
+		if err := m.validateOAuthURL(req.Context(), req.URL.String(), allowLoopback); err != nil {
+			return err
+		}
+		if prevRedirect != nil {
+			return prevRedirect(req, via)
+		}
+		return nil
+	}
+	return &cli
+}
+
+func (m *MCPOAuthManager) fetchJSON(ctx context.Context, targetURL string, allowLoopback bool, dst any) error {
+	if err := m.validateOAuthURL(ctx, targetURL, allowLoopback); err != nil {
+		return err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Accept", "application/json")
-	resp, err := m.client().Do(req)
+	resp, err := m.oauthHTTPClient(allowLoopback).Do(req)
 	if err != nil {
 		return err
 	}
@@ -188,14 +330,18 @@ func (m *MCPOAuthManager) discoverEndpoints(ctx context.Context, serverURL strin
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return "", "", fmt.Errorf("invalid MCP server URL %q for OAuth discovery", serverURL)
 	}
+	allowLoopback := m.allowLoopback || isLoopbackURL(serverURL)
 	origin := u.Scheme + "://" + u.Host
 	authServerBase := origin
 
 	var prm struct {
 		AuthorizationServers []string `json:"authorization_servers"`
 	}
-	if m.fetchJSON(ctx, origin+"/.well-known/oauth-protected-resource", &prm) == nil && len(prm.AuthorizationServers) > 0 {
+	if m.fetchJSON(ctx, origin+"/.well-known/oauth-protected-resource", allowLoopback, &prm) == nil && len(prm.AuthorizationServers) > 0 {
 		if cand := strings.TrimRight(strings.TrimSpace(prm.AuthorizationServers[0]), "/"); cand != "" {
+			if vErr := m.validateOAuthURL(ctx, cand, allowLoopback); vErr != nil {
+				return "", "", fmt.Errorf("OAuth discovery rejected authorization_server %q: %w", cand, vErr)
+			}
 			authServerBase = cand
 		}
 	}
@@ -205,13 +351,19 @@ func (m *MCPOAuthManager) discoverEndpoints(ctx context.Context, serverURL strin
 		TokenEndpoint         string `json:"token_endpoint"`
 	}
 	metaURL := authServerBase + "/.well-known/oauth-authorization-server"
-	if dErr := m.fetchJSON(ctx, metaURL, &meta); dErr != nil {
+	if dErr := m.fetchJSON(ctx, metaURL, allowLoopback, &meta); dErr != nil {
 		return "", "", fmt.Errorf("OAuth discovery failed at %s: %w", metaURL, dErr)
 	}
 	authURL = strings.TrimSpace(meta.AuthorizationEndpoint)
 	tokenURL = strings.TrimSpace(meta.TokenEndpoint)
 	if authURL == "" || tokenURL == "" {
 		return "", "", fmt.Errorf("OAuth metadata at %s missing authorization_endpoint or token_endpoint", metaURL)
+	}
+	if err := m.validateOAuthURL(ctx, authURL, allowLoopback); err != nil {
+		return "", "", fmt.Errorf("OAuth discovery rejected authorization_endpoint %q: %w", authURL, err)
+	}
+	if err := m.validateOAuthURL(ctx, tokenURL, allowLoopback); err != nil {
+		return "", "", fmt.Errorf("OAuth discovery rejected token_endpoint %q: %w", tokenURL, err)
 	}
 	return authURL, tokenURL, nil
 }
@@ -220,19 +372,42 @@ func (m *MCPOAuthManager) resolveEndpoints(ctx context.Context, srv MCPServerCon
 	if srv.OAuth == nil {
 		return "", "", errors.New("oauth config is nil")
 	}
+	allowLoopback := m.allowLoopback || isLoopbackURL(srv.URL)
 	authURL = strings.TrimSpace(srv.OAuth.AuthURL)
 	tokenURL = strings.TrimSpace(srv.OAuth.TokenURL)
 	if authURL != "" && tokenURL != "" {
+		if err := m.validateOAuthURL(ctx, authURL, allowLoopback); err != nil {
+			return "", "", err
+		}
+		if err := m.validateOAuthURL(ctx, tokenURL, allowLoopback); err != nil {
+			return "", "", err
+		}
 		return authURL, tokenURL, nil
 	}
 	if isGoogleMCPOAuth(srv) {
-		return cmp.Or(authURL, GoogleOAuthAuthURL), cmp.Or(tokenURL, GoogleOAuthTokenURL), nil
+		resolvedAuth := cmp.Or(authURL, GoogleOAuthAuthURL)
+		resolvedTok := cmp.Or(tokenURL, GoogleOAuthTokenURL)
+		if err := m.validateOAuthURL(ctx, resolvedAuth, allowLoopback); err != nil {
+			return "", "", err
+		}
+		if err := m.validateOAuthURL(ctx, resolvedTok, allowLoopback); err != nil {
+			return "", "", err
+		}
+		return resolvedAuth, resolvedTok, nil
 	}
 	dAuth, dTok, dErr := m.discoverEndpoints(ctx, srv.URL)
 	if dErr != nil {
 		return "", "", dErr
 	}
-	return cmp.Or(authURL, dAuth), cmp.Or(tokenURL, dTok), nil
+	resolvedAuth := cmp.Or(authURL, dAuth)
+	resolvedTok := cmp.Or(tokenURL, dTok)
+	if err := m.validateOAuthURL(ctx, resolvedAuth, allowLoopback); err != nil {
+		return "", "", err
+	}
+	if err := m.validateOAuthURL(ctx, resolvedTok, allowLoopback); err != nil {
+		return "", "", err
+	}
+	return resolvedAuth, resolvedTok, nil
 }
 
 func (m *MCPOAuthManager) resolveClientCreds(ctx context.Context, srv MCPServerConfig, opReader OPReaderFunc) (clientID, clientSecret string, secrets []string, err error) {
@@ -272,6 +447,24 @@ func (m *MCPOAuthManager) pruneExpiredLocked(now time.Time) {
 		if now.After(p.ExpiresAt) {
 			delete(m.pending, st)
 		}
+	}
+}
+
+func (m *MCPOAuthManager) evictPendingCapLocked(now time.Time) {
+	m.pruneExpiredLocked(now)
+	for len(m.pending) >= maxPendingMCPOAuth {
+		var oldestKey string
+		var oldestExp time.Time
+		for st, p := range m.pending {
+			if oldestKey == "" || p.ExpiresAt.Before(oldestExp) {
+				oldestKey = st
+				oldestExp = p.ExpiresAt
+			}
+		}
+		if oldestKey == "" {
+			break
+		}
+		delete(m.pending, oldestKey)
 	}
 }
 
@@ -338,7 +531,7 @@ func (m *MCPOAuthManager) StartAuth(ctx context.Context, srv MCPServerConfig, op
 	now := m.now().UTC()
 	exp := now.Add(mcpOAuthStateTTL)
 	m.mu.Lock()
-	m.pruneExpiredLocked(now)
+	m.evictPendingCapLocked(now)
 	m.pending[state] = pendingMCPOAuth{
 		ServerName:   srv.Name,
 		RedirectURI:  redir,
@@ -402,14 +595,17 @@ type oauthTokenResponse struct {
 	ErrorDesc    string `json:"error_description"`
 }
 
-func (m *MCPOAuthManager) postTokenForm(ctx context.Context, tokenURL string, form url.Values, secrets []string) (oauthTokenResponse, error) {
+func (m *MCPOAuthManager) postTokenForm(ctx context.Context, tokenURL string, allowLoopback bool, form url.Values, secrets []string) (oauthTokenResponse, error) {
+	if err := m.validateOAuthURL(ctx, tokenURL, allowLoopback); err != nil {
+		return oauthTokenResponse{}, errors.New(scrubAllSecrets(err.Error(), secrets))
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return oauthTokenResponse{}, errors.New(scrubAllSecrets(err.Error(), secrets))
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
-	resp, err := m.client().Do(req)
+	resp, err := m.oauthHTTPClient(allowLoopback).Do(req)
 	if err != nil {
 		return oauthTokenResponse{}, errors.New(scrubAllSecrets(err.Error(), secrets))
 	}
@@ -457,7 +653,8 @@ func (m *MCPOAuthManager) ExchangeCode(ctx context.Context, srv MCPServerConfig,
 	if clientSecret != "" {
 		form.Set("client_secret", clientSecret)
 	}
-	tr, err := m.postTokenForm(ctx, pending.TokenURL, form, secrets)
+	allowLoopback := m.allowLoopback || isLoopbackURL(srv.URL)
+	tr, err := m.postTokenForm(ctx, pending.TokenURL, allowLoopback, form, secrets)
 	if err != nil {
 		return MCPOAuthToken{}, err
 	}
@@ -563,7 +760,8 @@ func (m *MCPOAuthManager) GetAccessToken(ctx context.Context, srv MCPServerConfi
 	if clientSecret != "" {
 		form.Set("client_secret", clientSecret)
 	}
-	tr, err := m.postTokenForm(ctx, tokenURL, form, secrets)
+	allowLoopback := m.allowLoopback || isLoopbackURL(srv.URL)
+	tr, err := m.postTokenForm(ctx, tokenURL, allowLoopback, form, secrets)
 	if err != nil {
 		return "", secrets, err
 	}
@@ -595,6 +793,7 @@ func (m *MCPOAuthManager) Revoke(serverName string) error {
 			delete(m.pending, st)
 		}
 	}
+	delete(m.serverLocks, clean)
 	st := m.store
 	m.mu.Unlock()
 	if st == nil {

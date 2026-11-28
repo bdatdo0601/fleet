@@ -340,7 +340,7 @@ func (e *Engine) resolveDiscordBotToken(ctx context.Context, cfg DiscordConfig) 
 	if !strings.HasPrefix(strings.TrimSpace(cfg.BotTokenOPRef), "op://") {
 		return "", newErr("discord.bot_token_op_ref must be an op:// reference", http.StatusBadRequest)
 	}
-	reader := e.opReader
+	reader := e.getOPReader()
 	if reader == nil {
 		reader = defaultOPReader
 	}
@@ -433,14 +433,19 @@ func (e *Engine) runDiscordSession(ctx context.Context, cfg DiscordConfig) error
 	defer func() { _ = conn.Close() }()
 
 	sessCtx, cancelSess := context.WithCancel(ctx)
-	defer cancelSess()
-	go func() {
+	var sessWg sync.WaitGroup
+	sessWg.Go(func() {
 		select {
 		case <-sessCtx.Done():
 			_ = conn.Close()
 		case <-e.discordReloadCh:
 			_ = conn.Close()
 		}
+	})
+	defer func() {
+		cancelSess()
+		_ = conn.Close()
+		sessWg.Wait()
 	}()
 
 	var seqMu sync.Mutex
@@ -499,7 +504,9 @@ func (e *Engine) handleGatewayOp(
 		}
 		hbCtx, cancel := context.WithCancel(ctx)
 		*hbCancel = cancel
-		go runDiscordHeartbeat(hbCtx, conn, interval, seqMu, lastSeq)
+		e.trackWG(func() {
+			runDiscordHeartbeat(hbCtx, conn, interval, seqMu, lastSeq)
+		})
 		return false, sendDiscordIdentify(conn, tok)
 	case 1: // Heartbeat request
 		seqMu.Lock()
@@ -562,7 +569,9 @@ func (e *Engine) handleDiscordDispatch(ctx context.Context, tok string, _ Discor
 		}
 		if json.Unmarshal(raw, &ready) == nil {
 			e.setDiscordState(true, ready.User.ID)
-			go e.handleDiscordReady(ctx, liveCfg, tok)
+			e.trackWG(func() {
+				e.handleDiscordReady(ctx, liveCfg, tok)
+			})
 		}
 	case "CHANNEL_CREATE":
 		var dc discordChannel
@@ -607,11 +616,9 @@ func (e *Engine) handleDiscordChannelCreate(ctx context.Context, cfg DiscordConf
 	if catID != "" && dc.ParentID != catID {
 		return
 	}
-	syncCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-	go func() {
-		defer cancel()
+	e.spawnBG(ctx, 15*time.Second, func(syncCtx context.Context) {
 		_, _ = e.SyncDiscordChannels(syncCtx)
-	}()
+	})
 }
 
 func findFleetChannelForDiscord(cfg DiscordConfig, discordChannelID string) (string, bool) {
@@ -739,7 +746,9 @@ func (e *Engine) handleDiscordMessageCreate(ctx context.Context, tok string, cfg
 		return
 	}
 	if _, _, inserted, err := e.EnqueueExternalMessage(fleetCh, content, "discord", msg.ID, fileIDs); err == nil && inserted {
-		go e.discordClient().TriggerTyping(context.WithoutCancel(ctx), tok, msg.ChannelID)
+		e.spawnBG(ctx, 5*time.Second, func(tCtx context.Context) {
+			e.discordClient().TriggerTyping(tCtx, tok, msg.ChannelID)
+		})
 	}
 }
 
@@ -1211,7 +1220,7 @@ func (e *Engine) mirrorTurnToDiscord(ctx context.Context, cfg Config, ch Channel
 	}
 }
 
-func (e *Engine) sendApprovalToDiscord(cfg Config, ch Channel, apr Approval) bool {
+func (e *Engine) sendApprovalToDiscord(ctx context.Context, cfg Config, ch Channel, apr Approval) bool {
 	if !cfg.Discord.Enabled {
 		return false
 	}
@@ -1219,13 +1228,15 @@ func (e *Engine) sendApprovalToDiscord(cfg Config, ch Channel, apr Approval) boo
 	if discChannelID == "" || (cfg.Discord.AllowApprovals != nil && !*cfg.Discord.AllowApprovals) {
 		return false
 	}
-	tok, err := e.resolveDiscordBotToken(context.Background(), cfg.Discord)
+	reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	tok, err := e.resolveDiscordBotToken(reqCtx, cfg.Discord)
 	if err != nil {
 		return false
 	}
 	deepLink := buildFleetDeepLink(cfg.Discord.FleetBaseURL, ch.ID)
 	payload := buildApprovalDiscordPayload(apr, deepLink)
-	msgID, err := e.discordClient().CreateMessage(context.Background(), tok, discChannelID, payload)
+	msgID, err := e.discordClient().CreateMessage(reqCtx, tok, discChannelID, payload)
 	if err != nil {
 		return false
 	}

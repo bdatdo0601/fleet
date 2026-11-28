@@ -2,6 +2,7 @@ package session
 
 import (
 	"cmp"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -113,6 +114,7 @@ func rexChildPID(spec Spec, name string) (int, bool) {
 }
 
 func rexShow(spec Spec, sessionID string, stderr io.Writer) bool {
+	stderr = cmp.Or(stderr, io.Discard)
 	out, err := runCmdCapture("rex", "client", "ls", "--json")
 	if err != nil {
 		return false
@@ -128,13 +130,21 @@ func rexShow(spec Spec, sessionID string, stderr io.Writer) bool {
 	if json.Unmarshal([]byte(out), &resp) != nil {
 		return false
 	}
+	pathEnv := AugmentedPath(os.Getenv("PATH"), os.Getenv("HOME"))
+	rexBin := "rex"
+	if resolved, err := lookPathWithEnv("rex", pathEnv); err == nil && resolved != "" {
+		rexBin = resolved
+	}
 	shown := false
 	for _, cl := range resp.Clients {
 		if cl.Info.Kind != "app" || cl.ClientID == "" {
 			continue
 		}
-		cmd := exec.Command("rex", "-C", cl.ClientID, "do", "session.select", "session_id="+sessionID)
+		ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
+		cmd := exec.CommandContext(ctx, rexBin, "-C", cl.ClientID, "do", "session.select", "session_id="+sessionID)
+		cmd.Env = withEnvPath(os.Environ(), pathEnv)
 		resOut, rErr := cmd.CombinedOutput()
+		cancel()
 		text := string(resOut)
 		if rErr == nil && !strings.Contains(text, "Error:") {
 			shown = true
@@ -157,30 +167,29 @@ func readPromptFileIfSet(path string) (string, error) {
 	return string(b), nil
 }
 
-func prepareRexEnvAndHook(spec Spec, self string, stderr io.Writer) (string, error) {
+func prepareRexEnvAndHook(spec Spec, self string, stderr io.Writer) (string, string, error) {
 	pathEnv := AugmentedPath(os.Getenv("PATH"), os.Getenv("HOME"))
-	_ = os.Setenv("PATH", pathEnv)
 	bin, err := lookPathWithEnv(spec.Binary, pathEnv)
 	if err != nil {
-		return "", fmt.Errorf("%s is required. Install %s and sign in first", spec.Binary, spec.DisplayName)
+		return "", "", fmt.Errorf("%s is required. Install %s and sign in first", spec.Binary, spec.DisplayName)
 	}
 	switch spec.Name {
 	case HarnessAgy:
 		if err := EnsureAgyHook(self, ""); err != nil {
-			return "", err
+			return "", "", err
 		}
 	case HarnessCodex:
 		ensureCodexRemoteControl(bin, stderr)
 	}
-	return bin, nil
+	return bin, pathEnv, nil
 }
 
-func runRexChild(bin string, args []string, name string, pol Policy, stateFile string, sigCh <-chan os.Signal, stdout, stderr io.Writer) (bool, error) {
+func runRexChild(bin, pathEnv string, args []string, name string, pol Policy, stateFile string, sigCh <-chan os.Signal, stdout, stderr io.Writer) (bool, error) {
 	cmd := exec.Command(bin, args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(withEnvPath(os.Environ(), pathEnv),
 		"FLEET_SESSION_TARGET=rex",
 		"FLEET_SESSION_NAME="+name,
 		"FLEET_SESSION_POLICY="+string(pol),
@@ -210,6 +219,8 @@ func runRexChild(bin string, args []string, name string, pol Policy, stateFile s
 
 // RunRexWrapper executes the internal `__rex-run` supervision loop inside a Rex block.
 func RunRexWrapper(harness, name, resumeID string, policy Policy, promptFile, selfBin string, stdout, stderr io.Writer) error {
+	stdout = cmp.Or(stdout, io.Discard)
+	stderr = cmp.Or(stderr, io.Discard)
 	spec, err := GetSpec(harness)
 	if err != nil {
 		return err
@@ -257,7 +268,7 @@ func RunRexWrapper(harness, name, resumeID string, policy Policy, promptFile, se
 	lockDir := upgradeLockPath(spec.Name)
 
 	for {
-		bin, err := prepareRexEnvAndHook(spec, self, stderr)
+		bin, pathEnv, err := prepareRexEnvAndHook(spec, self, stderr)
 		if err != nil {
 			return err
 		}
@@ -267,7 +278,7 @@ func RunRexWrapper(harness, name, resumeID string, policy Policy, promptFile, se
 		}
 		prompt = ""
 
-		interrupted, runErr := runRexChild(bin, args, name, pol, stateFile, sigCh, stdout, stderr)
+		interrupted, runErr := runRexChild(bin, pathEnv, args, name, pol, stateFile, sigCh, stdout, stderr)
 		if interrupted {
 			return runErr
 		}
@@ -275,7 +286,9 @@ func RunRexWrapper(harness, name, resumeID string, policy Policy, promptFile, se
 			return runErr
 		}
 		_ = os.Remove(marker)
-		waitForLockRelease(lockDir, stdout, spec.Name)
+		if ok, sig := waitForLockRelease(lockDir, sigCh, stdout, spec.Name); !ok {
+			return signalErr(sig)
+		}
 
 		curResume = ""
 		if st, ok := readTrackedStateFile(stateFile); ok && st.ID != "" {
@@ -294,15 +307,20 @@ func RunRexWrapper(harness, name, resumeID string, policy Policy, promptFile, se
 	}
 }
 
-func waitForLockRelease(lockDir string, stdout io.Writer, harness string) {
-	if _, err := os.Stat(lockDir); err != nil {
-		return
+func waitForLockRelease(lockDir string, sigCh <-chan os.Signal, stdout io.Writer, harness string) (bool, os.Signal) {
+	if !isUpgradeLockActive(lockDir) {
+		return true, nil
 	}
+	stdout = cmp.Or(stdout, io.Discard)
 	_, _ = fmt.Fprintf(stdout, "Waiting for fleet session %s upgrade to finish...\n", harness)
 	for {
-		if _, err := os.Stat(lockDir); err != nil {
-			return
+		if !isUpgradeLockActive(lockDir) {
+			return true, nil
 		}
-		time.Sleep(250 * time.Millisecond)
+		select {
+		case sig := <-sigCh:
+			return false, sig
+		case <-time.After(250 * time.Millisecond):
+		}
 	}
 }

@@ -230,3 +230,74 @@ func TestSyncDynamicSkillsWritesAndPrunes(t *testing.T) {
 		t.Fatalf("expected pruned daily-brief skill dir, err=%v", err)
 	}
 }
+
+func TestSyncDynamicSkillsRejectsTraversalAndDotEntries(t *testing.T) {
+	home := t.TempDir()
+	claudeSkills := filepath.Join(home, ".claude", "skills")
+	outsideSentinel := filepath.Join(home, ".claude", "keep-me")
+	if err := os.MkdirAll(claudeSkills, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outsideSentinel, []byte("intact"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Poison .fleet-synced-skills.json with ".", "..", "../keep-me", and an absolute path.
+	poisonManifest := `["..", ".", "../keep-me", "` + outsideSentinel + `", "good-skill"]`
+	if err := os.WriteFile(filepath.Join(claudeSkills, dynamicSkillManifest), []byte(poisonManifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(claudeSkills, "good-skill"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := syncDynamicSkillsInHome(home, nil, nil, []skills.Skill{
+		{Name: ".", Content: []byte("bad")},
+		{Name: "..", Content: []byte("bad")},
+		{Name: "../escape", Content: []byte("bad")},
+		{Name: "a..b", Content: []byte("bad")},
+		{Name: "BadUpper", Content: []byte("bad")},
+		{Name: "valid-skill", Content: []byte("good")},
+	})
+	if err != nil {
+		t.Fatalf("syncDynamicSkillsInHome failed: %v", err)
+	}
+	if len(changed) == 0 {
+		t.Fatal("expected valid-skill written and good-skill pruned")
+	}
+	if b, err := os.ReadFile(outsideSentinel); err != nil || string(b) != "intact" {
+		t.Fatalf("outside sentinel was modified or deleted: %q err=%v", string(b), err)
+	}
+	if _, err := os.Stat(claudeSkills); err != nil {
+		t.Fatalf("skills base dir was deleted: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(claudeSkills, "good-skill")); !os.IsNotExist(err) {
+		t.Fatalf("expected valid old skill pruned, err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(claudeSkills, "valid-skill", "SKILL.md")); err != nil {
+		t.Fatalf("expected valid-skill installed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".claude", "escape")); !os.IsNotExist(err) {
+		t.Fatalf("traversal skill must not be written")
+	}
+}
+
+func TestCodexHooksEnabledAndConfigReadError(t *testing.T) {
+	if codexHooksEnabled("# hooks = true\n[features]\n# hooks = true\njs_repl = false\n") {
+		t.Fatal("commented hooks = true must not count as enabled")
+	}
+	if codexHooksEnabled("[other]\nhooks = true\n[features]\njs_repl = false\n") {
+		t.Fatal("hooks = true outside [features] must not count as enabled")
+	}
+	if !codexHooksEnabled("[features]\nhooks = true # enabled\n") {
+		t.Fatal("expected hooks = true under [features] with trailing comment to be enabled")
+	}
+
+	// Non-ErrNotExist error reading .codex/config.toml must fail rather than overwrite.
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".codex", "config.toml"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Install(InstallOpts{Home: home, BinPath: "/opt/homebrew/bin/fleet"}); err == nil {
+		t.Fatal("expected Install to fail when config.toml is unreadable/directory")
+	}
+}

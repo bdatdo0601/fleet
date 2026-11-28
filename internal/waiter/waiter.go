@@ -13,7 +13,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -89,31 +88,34 @@ func pidAlive(pid int) bool {
 	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
-func acquirePIDLock(sessionID, lockDir string) (string, error) {
+func acquirePIDLock(sessionID, lockDir string) (*os.File, error) {
 	path := pidLockPath(sessionID, lockDir)
-	if data, err := os.ReadFile(path); err == nil {
-		if oldPID, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && oldPID > 0 && oldPID != os.Getpid() {
-			_ = syscall.Kill(oldPID, syscall.SIGTERM)
-			deadline := time.Now().Add(300 * time.Millisecond)
-			for time.Now().Before(deadline) && pidAlive(oldPID) {
-				time.Sleep(50 * time.Millisecond)
-			}
-		}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
 	}
-	if _, err := paths.WriteFileAtomic(path, fmt.Appendf(nil, "%d\n", os.Getpid()), 0o600, nil, nil); err != nil {
-		return "", err
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
 	}
-	return path, nil
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("another listener/relay already holds lock %s: %w", path, err)
+	}
+	if err := f.Truncate(0); err == nil {
+		_, _ = f.Seek(0, 0)
+		_, _ = fmt.Fprintf(f, "%d\n", os.Getpid())
+	}
+	return f, nil
 }
 
-func releasePIDLock(path string) {
-	data, err := os.ReadFile(path)
-	if err != nil {
+func releasePIDLock(f *os.File) {
+	if f == nil {
 		return
 	}
-	if strings.TrimSpace(string(data)) == strconv.Itoa(os.Getpid()) {
-		_ = os.Remove(path)
-	}
+	path := f.Name()
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	_ = f.Close()
+	_ = os.Remove(path)
 }
 
 func parentGone(initialPPID int) bool {
@@ -191,15 +193,15 @@ func runCommandCapture(ctx context.Context, cmd []string, timeout time.Duration)
 	return 0, strings.TrimSpace(stderr.String())
 }
 
-func ackMessages(ctx context.Context, api, harness, sessionID string, msgs []agents.Message) {
+func ackMessages(ctx context.Context, api, harness, sessionID string, msgs []agents.Message) error {
 	if len(msgs) == 0 || sessionID == "" {
-		return
+		return nil
 	}
 	ids := make([]int64, len(msgs))
 	for i, m := range msgs {
 		ids[i] = m.ID
 	}
-	_ = client.CallContext(ctx, api, "POST", "/v1/agents/ack", map[string]any{
+	return client.CallContext(ctx, api, "POST", "/v1/agents/ack", map[string]any{
 		"harness": harness, "session_id": sessionID, "message_ids": ids,
 	}, 5*time.Second, nil, nil)
 }
@@ -223,11 +225,11 @@ func WaitForInboxCLI(opts WaitCLIOpts) (int, error) {
 		deadline = time.Now().Add(time.Duration(opts.MaxWait * float64(time.Second)))
 	}
 
-	lockPath, err := acquirePIDLock(opts.SessionID, opts.LockDir)
+	lockFile, err := acquirePIDLock(opts.SessionID, opts.LockDir)
 	if err != nil {
 		return 1, err
 	}
-	defer releasePIDLock(lockPath)
+	defer releasePIDLock(lockFile)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -244,7 +246,7 @@ func WaitForInboxCLI(opts WaitCLIOpts) (int, error) {
 			return 0, nil
 		}
 		var resp agents.WaitResult
-		err := client.Call(api, "POST", "/v1/agents/wait", map[string]any{
+		err := client.CallContext(ctx, api, "POST", "/v1/agents/wait", map[string]any{
 			"session_id": currentSID, "harness": resolvedHarness, "timeout": reqTimeout, "mark_read": true,
 		}, time.Duration((reqTimeout+15.0)*float64(time.Second)), nil, &resp)
 		if err != nil {
@@ -309,7 +311,7 @@ type pushBackend interface {
 	preStart() (string, bool)
 	prePoll(knownSID string) bool
 	canDeliver(resp agents.WaitResult) bool
-	deliver(resp agents.WaitResult) (string, bool)
+	deliver(ctx context.Context, resp agents.WaitResult) (string, bool)
 	onStop(sessionID string)
 }
 
@@ -326,7 +328,8 @@ type sessionPushLoop struct {
 	enabled        bool
 	stopping       bool
 	running        bool
-	stopCh         chan struct{}
+	gen            uint64
+	cancel         context.CancelFunc
 	wakeCh         chan struct{}
 	doneCh         chan struct{}
 	sessionID      string
@@ -353,6 +356,12 @@ func (l *sessionPushLoop) Mode() string { return l.backend.mode() }
 
 func (l *sessionPushLoop) Start() ListenerStatus {
 	l.mu.Lock()
+	for l.running && l.stopping && l.doneCh != nil {
+		oldDone := l.doneCh
+		l.mu.Unlock()
+		<-oldDone
+		l.mu.Lock()
+	}
 	defer l.mu.Unlock()
 	if msg, ok := l.backend.preStart(); !ok {
 		l.lastError = &msg
@@ -363,10 +372,12 @@ func (l *sessionPushLoop) Start() ListenerStatus {
 	l.enabled = true
 	if !l.running {
 		l.stopping = false
-		l.stopCh = make(chan struct{})
+		ctx, cancel := context.WithCancel(context.Background())
+		l.cancel = cancel
 		l.doneCh = make(chan struct{})
 		l.running = true
-		go l.loop(l.stopCh, l.doneCh)
+		l.gen++
+		go l.loop(ctx, l.doneCh, l.gen)
 	}
 	select {
 	case l.wakeCh <- struct{}{}:
@@ -386,21 +397,15 @@ func (l *sessionPushLoop) Stop() ListenerStatus {
 	l.mu.Lock()
 	l.enabled = false
 	l.stopping = true
-	stopCh, doneCh, running, sid := l.stopCh, l.doneCh, l.running, l.sessionID
-	if stopCh != nil {
-		select {
-		case <-stopCh:
-		default:
-			close(stopCh)
-		}
-	}
+	cancel, doneCh, running, sid := l.cancel, l.doneCh, l.running, l.sessionID
+	l.cancel = nil
 	l.mu.Unlock()
 
+	if cancel != nil {
+		cancel()
+	}
 	if running && doneCh != nil {
-		select {
-		case <-doneCh:
-		case <-time.After(1 * time.Second):
-		}
+		<-doneCh
 	}
 	l.backend.onStop(sid)
 	return l.Status()
@@ -439,11 +444,11 @@ func (l *sessionPushLoop) setSocket(sock string) {
 	l.mu.Unlock()
 }
 
-func (l *sessionPushLoop) waitIdleOrWake(stopCh <-chan struct{}) bool {
+func (l *sessionPushLoop) waitIdleOrWake(ctx context.Context) bool {
 	t := time.NewTimer(250 * time.Millisecond)
 	defer t.Stop()
 	select {
-	case <-stopCh:
+	case <-ctx.Done():
 		return false
 	case <-l.wakeCh:
 		return true
@@ -452,7 +457,7 @@ func (l *sessionPushLoop) waitIdleOrWake(stopCh <-chan struct{}) bool {
 	}
 }
 
-func (l *sessionPushLoop) pollOnce(knownSID string) (string, agents.WaitResult, error) {
+func (l *sessionPushLoop) pollOnce(ctx context.Context, knownSID string) (string, agents.WaitResult, error) {
 	api, err := client.ResolveAPI(l.apiURL)
 	if err != nil {
 		return "", agents.WaitResult{}, err
@@ -467,50 +472,53 @@ func (l *sessionPushLoop) pollOnce(knownSID string) (string, agents.WaitResult, 
 		payload["session_id"] = knownSID
 	}
 	var resp agents.WaitResult
-	err = client.Call(api, "POST", "/v1/agents/wait", payload, time.Duration((l.pollTimeout+15.0)*float64(time.Second)), nil, &resp)
+	err = client.CallContext(ctx, api, "POST", "/v1/agents/wait", payload, time.Duration((l.pollTimeout+15.0)*float64(time.Second)), nil, &resp)
 	return api, resp, err
 }
 
-func (l *sessionPushLoop) loop(stopCh, doneCh chan struct{}) {
+func (l *sessionPushLoop) loop(ctx context.Context, doneCh chan struct{}, gen uint64) {
 	defer func() {
 		l.mu.Lock()
-		l.running = false
+		if l.gen == gen {
+			l.running = false
+			l.stopping = false
+			l.cancel = nil
+		}
 		l.mu.Unlock()
 		close(doneCh)
 	}()
 
 	backoff := 2.0
 	for {
-		select {
-		case <-stopCh:
+		if ctx.Err() != nil {
 			return
-		default:
 		}
 		l.mu.Lock()
 		enabled, knownSID := l.enabled, l.sessionID
 		l.mu.Unlock()
 
 		if !enabled || !l.backend.prePoll(knownSID) {
-			if !l.waitIdleOrWake(stopCh) {
+			if !l.waitIdleOrWake(ctx) {
 				return
 			}
 			continue
 		}
-		api, resp, err := l.pollOnce(knownSID)
+		api, resp, err := l.pollOnce(ctx, knownSID)
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			l.setError(err.Error(), false)
 			sleepFor := backoff
 			backoff = nextBackoff(backoff)
-			if !sleepOrCancel(stopCh, sleepFor) {
+			if !sleepOrCancel(ctx.Done(), sleepFor) {
 				return
 			}
 			continue
 		}
 		backoff = 2.0
-		select {
-		case <-stopCh:
+		if ctx.Err() != nil {
 			return
-		default:
 		}
 		if resp.Exited {
 			l.mu.Lock()
@@ -528,10 +536,17 @@ func (l *sessionPushLoop) loop(stopCh, doneCh chan struct{}) {
 		stillEnabled := l.enabled
 		l.mu.Unlock()
 		if stillEnabled && len(resp.Messages) > 0 && l.backend.canDeliver(resp) {
-			if errMsg, disable := l.backend.deliver(resp); errMsg != "" {
+			if errMsg, disable := l.backend.deliver(ctx, resp); errMsg != "" {
 				l.setError(errMsg, disable)
+			} else if ackErr := ackMessages(ctx, api, l.harness, resp.SessionID, resp.Messages); ackErr != nil {
+				l.setError(ackErr.Error(), false)
+				sleepFor := backoff
+				backoff = nextBackoff(backoff)
+				if !sleepOrCancel(ctx.Done(), sleepFor) {
+					return
+				}
+				continue
 			} else {
-				ackMessages(context.Background(), api, l.harness, resp.SessionID, resp.Messages)
 				l.mu.Lock()
 				l.deliveredCount += len(resp.Messages)
 				l.lastError = nil
@@ -586,7 +601,7 @@ func (l *CodexQueueListener) prePoll(string) bool { return l.codexBin != "" }
 
 func (l *CodexQueueListener) canDeliver(resp agents.WaitResult) bool { return resp.FullRawID != "" }
 
-func (l *CodexQueueListener) deliver(resp agents.WaitResult) (string, bool) {
+func (l *CodexQueueListener) deliver(ctx context.Context, resp agents.WaitResult) (string, bool) {
 	text := FormatWaitOutput(resp.SessionID, resp.Name, resp.Messages, "")
 	cmd := []string{l.codexBin, "queue", "--thread", resp.FullRawID, "--message", text, "--resume"}
 	var rc int
@@ -594,7 +609,7 @@ func (l *CodexQueueListener) deliver(resp agents.WaitResult) (string, bool) {
 	if l.runQueueFn != nil {
 		rc, errDetail = l.runQueueFn(cmd)
 	} else {
-		rc, errDetail = runCommandCapture(context.Background(), cmd, 15*time.Second)
+		rc, errDetail = runCommandCapture(ctx, cmd, 15*time.Second)
 	}
 	if rc != 0 {
 		return cmp.Or(errDetail, fmt.Sprintf("codex queue exited with status %d", rc)), true

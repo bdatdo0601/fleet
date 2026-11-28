@@ -56,10 +56,34 @@ type eventsAPIPayload struct {
 	} `json:"event"`
 }
 
+var pidLockMu sync.Mutex
+
+func pidAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
 func acquirePIDLock(path, role string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
+	pidLockMu.Lock()
+	defer pidLockMu.Unlock()
+
+	guardPath := path + ".guard"
+	guardFile, err := os.OpenFile(guardPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = guardFile.Close() }()
+	if err := syscall.Flock(int(guardFile.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer func() { _ = syscall.Flock(int(guardFile.Fd()), syscall.LOCK_UN) }()
+
 	for range 2 {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err == nil {
@@ -72,10 +96,13 @@ func acquirePIDLock(path, role string) error {
 		}
 		raw, rErr := os.ReadFile(path)
 		if rErr != nil {
+			if errors.Is(rErr, os.ErrNotExist) {
+				continue
+			}
 			return err
 		}
 		pid, pErr := strconv.Atoi(strings.TrimSpace(string(raw)))
-		if pErr == nil && pid > 0 && pid != os.Getpid() && syscall.Kill(pid, 0) == nil {
+		if pErr == nil && pid != os.Getpid() && pidAlive(pid) {
 			return fmt.Errorf("another %s is already running (pid %d)", role, pid)
 		}
 		_ = os.Remove(path)
@@ -163,6 +190,12 @@ func (h *listenerHub) reconcile(parent context.Context) {
 	h.mu.Lock()
 	var toStop []*accountRunner
 	for id, r := range h.runners {
+		select {
+		case <-r.done:
+			delete(h.runners, id)
+			continue
+		default:
+		}
 		target, ok := want[id]
 		if !ok || target.AppToken != r.appToken {
 			r.cancel()
@@ -243,17 +276,24 @@ func (h *listenerHub) runAccount(ctx context.Context, r *accountRunner, acct Acc
 			continue
 		}
 
-		curBackoff = h.backoff
+		connectedAt := time.Now()
 		h.setConnected(acct.ID, true, "", "")
 		_, _ = fmt.Fprintf(h.stderr, "slacker[%s] listener connected\n", acct.ID)
 
 		reason := h.serveAccountSocket(ctx, conn, acct.ID)
 		_ = conn.Close()
 		h.setConnected(acct.ID, false, "", reason)
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || reason == "account disabled" {
 			return
 		}
 		_, _ = fmt.Fprintf(h.stderr, "slacker[%s] listener disconnected: %s\n", acct.ID, reason)
+		if time.Since(connectedAt) >= 30*time.Second {
+			curBackoff = h.backoff
+		}
+		if !sleepContext(ctx, curBackoff) {
+			return
+		}
+		curBackoff = min(curBackoff*2, 30*time.Second)
 	}
 }
 
@@ -385,17 +425,14 @@ func RunListener(ctx context.Context, opts ListenerOpts) error {
 	}
 }
 
-// HandleAccountEnvelope processes one Socket Mode envelope for acct. It returns shouldACK=true ONLY
-// after any new job has been durably persisted in store (or identified as a duplicate/ignored event).
-func HandleAccountEnvelope(
-	ctx context.Context,
-	acct AccountConfig,
-	cfg Config,
-	env socketEnvelope,
-	store *Store,
-	slack *SlackClient,
-) (shouldACK bool, notifyDevice string, err error) {
-	return handleAccountEnvelope(ctx, acct, cfg, env, store, slack, nil, nil)
+func prefetchDeviceLoad(ctx context.Context, cfg Config, chMap ChannelMapping, loadFn AgentLoadFunc) AgentLoadFunc {
+	if loadFn == nil || len(cfg.EffectiveChannelDevices(chMap)) <= 1 || cfg.EffectiveChannelStrategy(chMap) == StrategyRoundRobin {
+		return nil
+	}
+	liveCounts, _ := loadFn(ctx)
+	return func(context.Context) (map[string]int, error) {
+		return liveCounts, nil
+	}
 }
 
 func handleAccountEnvelope(
@@ -415,10 +452,7 @@ func handleAccountEnvelope(
 	if err := json.Unmarshal(env.Payload, &p); err != nil {
 		return true, "", fmt.Errorf("decode events_api payload: %w", err)
 	}
-	if p.Event.Type != "reaction_added" || p.Event.Item.Type != "message" {
-		return true, "", nil
-	}
-	if acct.AuthorizedUserID == "" || p.Event.User != acct.AuthorizedUserID {
+	if p.Event.Type != "reaction_added" || p.Event.Item.Type != "message" || acct.AuthorizedUserID == "" || p.Event.User != acct.AuthorizedUserID {
 		return true, "", nil
 	}
 	chMap, ok := cfg.FindChannel(acct.ID, p.Event.Item.Channel)
@@ -437,19 +471,14 @@ func handleAccountEnvelope(
 		eventID = acctID + ":" + rawEventID
 	}
 
-	exists, err := store.HasEvent(eventID)
-	if err != nil {
+	if exists, err := store.HasEvent(eventID); err != nil {
 		return false, "", err
-	}
-	if exists {
+	} else if exists {
 		return true, "", nil
 	}
-
-	msgExists, err := store.HasMessageJob(acctID, p.Event.Item.Channel, p.Event.Item.TS)
-	if err != nil {
+	if msgExists, err := store.HasMessageJob(acctID, p.Event.Item.Channel, p.Event.Item.TS); err != nil {
 		return false, "", err
-	}
-	if msgExists {
+	} else if msgExists {
 		return true, "", nil
 	}
 
@@ -466,11 +495,14 @@ func handleAccountEnvelope(
 		MessageTS: p.Event.Item.TS,
 	}
 
+	// Fetch live agent load outside dispatchMu so network/HTTP I/O does not block other accounts.
+	cachedLoadFn := prefetchDeviceLoad(ctx, cfg, chMap, loadFn)
+
 	if dispatchMu != nil {
 		dispatchMu.Lock()
 		defer dispatchMu.Unlock()
 	}
-	targetDevice, resolvedRepo, scope, selErr := SelectTarget(ctx, cfg, acctID, chMap, store, loadFn, time.Now())
+	targetDevice, resolvedRepo, scope, selErr := SelectTarget(ctx, cfg, acctID, chMap, store, cachedLoadFn, time.Now())
 	if selErr != nil {
 		// Configuration error: ACK to prevent Slack retry storm, while surfacing the error in runtime status.
 		return true, "", selErr
@@ -498,7 +530,7 @@ func handleAccountEnvelope(
 		Permalink:    msg.Permalink,
 	}
 
-	inserted, _, err := store.EnqueueJob(job)
+	inserted, _, err := store.EnqueueJobContext(ctx, job)
 	if err != nil {
 		// Persist failed: do NOT ACK!
 		return false, "", err

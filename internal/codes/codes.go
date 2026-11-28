@@ -22,6 +22,9 @@ import (
 const (
 	Request  = "FLEET JOIN REQUEST"
 	Response = "FLEET JOIN RESPONSE"
+
+	maxDecodedBytes = 1 << 20
+	maxBlockBytes   = 1 << 20
 )
 
 // Encode serializes payload as compact JSON, zlib-compresses at level 9, base64-encodes,
@@ -92,9 +95,12 @@ func Decode(label, text string, out any) error {
 		return fmt.Errorf("%s block is damaged; copy it again (%w)", label, err)
 	}
 	defer func() { _ = zr.Close() }()
-	plain, err := io.ReadAll(zr)
+	plain, err := io.ReadAll(io.LimitReader(zr, maxDecodedBytes+1))
 	if err != nil {
 		return fmt.Errorf("%s block is damaged; copy it again (%w)", label, err)
+	}
+	if len(plain) > maxDecodedBytes {
+		return fmt.Errorf("%s block exceeds maximum decoded size (%d bytes)", label, maxDecodedBytes)
 	}
 	if err := json.Unmarshal(plain, out); err != nil {
 		return fmt.Errorf("%s block is damaged; copy it again (%w)", label, err)
@@ -105,45 +111,44 @@ func Decode(label, text string, out any) error {
 // ReadBlock reads lines from r up to and including the first line containing endMarker
 // without over-reading past that newline if r is not already buffered.
 func ReadBlock(endMarker string, r io.Reader) (string, error) {
+	var nextByte func() (byte, error)
 	if br, ok := r.(*bufio.Reader); ok {
-		var out strings.Builder
-		for {
-			line, err := br.ReadString('\n')
-			if line != "" {
-				out.WriteString(line)
-				if strings.Contains(line, endMarker) {
-					return out.String(), nil
+		nextByte = br.ReadByte
+	} else {
+		var b [1]byte
+		nextByte = func() (byte, error) {
+			for {
+				n, err := r.Read(b[:])
+				if n > 0 {
+					return b[0], nil
 				}
-			}
-			if err != nil {
-				if errors.Is(err, io.EOF) {
-					return out.String(), nil
+				if err != nil {
+					return 0, err
 				}
-				return out.String(), err
 			}
 		}
 	}
-	var out strings.Builder
-	var lineBuf strings.Builder
-	var b [1]byte
+	var out, lineBuf strings.Builder
 	for {
-		n, err := r.Read(b[:])
-		if n > 0 {
-			out.WriteByte(b[0])
-			lineBuf.WriteByte(b[0])
-			if b[0] == '\n' {
+		ch, err := nextByte()
+		if err == nil {
+			if out.Len() >= maxBlockBytes {
+				return out.String(), fmt.Errorf("input block exceeds maximum size (%d bytes)", maxBlockBytes)
+			}
+			out.WriteByte(ch)
+			lineBuf.WriteByte(ch)
+			if ch == '\n' {
 				if strings.Contains(lineBuf.String(), endMarker) {
 					return out.String(), nil
 				}
 				lineBuf.Reset()
 			}
+			continue
 		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return out.String(), nil
-			}
-			return out.String(), err
+		if errors.Is(err, io.EOF) {
+			return out.String(), nil
 		}
+		return out.String(), err
 	}
 }
 

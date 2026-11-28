@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -459,5 +460,124 @@ func TestMCPOAuthDiscoveryRefreshRefAndSecretScrubbing(t *testing.T) {
 	})
 	if err == nil || strings.Contains(err.Error(), clientSecret) || strings.Contains(err.Error(), "bad-refresh") {
 		t.Fatalf("expected secrets scrubbed from OAuth error, got %v", err)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestMCPOAuthDiscoverySSRFAndPendingCap(t *testing.T) {
+	makeMgr := func(handler func(*http.Request) (*http.Response, error)) *MCPOAuthManager {
+		cli := &http.Client{Transport: roundTripFunc(handler)}
+		return NewMCPOAuthManager(nil, cli)
+	}
+
+	jsonResp := func(status int, body string, hdrs map[string]string) *http.Response {
+		h := http.Header{"Content-Type": []string{"application/json"}}
+		for k, v := range hdrs {
+			h.Set(k, v)
+		}
+		return &http.Response{
+			StatusCode: status,
+			Header:     h,
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}
+	}
+
+	for _, tc := range []struct {
+		name    string
+		handler func(*http.Request) (*http.Response, error)
+	}{
+		{
+			name: "authorization_servers_metadata_ip",
+			handler: func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path == "/.well-known/oauth-protected-resource" {
+					return jsonResp(200, `{"authorization_servers":["http://169.254.169.254"]}`, nil), nil
+				}
+				return jsonResp(200, `{"authorization_endpoint":"https://auth.example.com/a","token_endpoint":"https://auth.example.com/t"}`, nil), nil
+			},
+		},
+		{
+			name: "authorization_servers_non_https",
+			handler: func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path == "/.well-known/oauth-protected-resource" {
+					return jsonResp(200, `{"authorization_servers":["http://auth.example.com"]}`, nil), nil
+				}
+				return jsonResp(404, `{}`, nil), nil
+			},
+		},
+		{
+			name: "authorization_endpoint_loopback",
+			handler: func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path == "/.well-known/oauth-protected-resource" {
+					return jsonResp(404, `{}`, nil), nil
+				}
+				return jsonResp(200, `{"authorization_endpoint":"https://127.0.0.1/auth","token_endpoint":"https://auth.example.com/token"}`, nil), nil
+			},
+		},
+		{
+			name: "token_endpoint_mesh_ip",
+			handler: func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path == "/.well-known/oauth-protected-resource" {
+					return jsonResp(404, `{}`, nil), nil
+				}
+				return jsonResp(200, `{"authorization_endpoint":"https://auth.example.com/auth","token_endpoint":"https://10.213.0.1/token"}`, nil), nil
+			},
+		},
+		{
+			name: "discovery_redirect_to_private_ip",
+			handler: func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path == "/.well-known/oauth-protected-resource" {
+					return jsonResp(404, `{}`, nil), nil
+				}
+				return jsonResp(302, ``, map[string]string{"Location": "http://169.254.169.254/latest/meta-data"}), nil
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr := makeMgr(tc.handler)
+			if _, _, err := mgr.discoverEndpoints(t.Context(), "https://mcp.example.com/mcp"); err == nil {
+				t.Fatalf("expected SSRF discovery case %s to fail", tc.name)
+			}
+		})
+	}
+
+	// Verify pending map cap eviction and Revoke cleanup of serverLocks.
+	mgr := NewMCPOAuthManager(nil, nil)
+	for i := range maxPendingMCPOAuth + 10 {
+		srv := MCPServerConfig{
+			Name:      "srv",
+			Transport: "http",
+			URL:       "https://mcp.example.com/mcp",
+			Enabled:   true,
+			OAuth: &MCPOAuthConfig{
+				Enabled:     true,
+				ClientID:    "cid",
+				AuthURL:     "https://auth.example.com/auth",
+				TokenURL:    "https://auth.example.com/token",
+				RedirectURI: "http://127.0.0.1:9999/cb",
+			},
+		}
+		if _, err := mgr.StartAuth(t.Context(), srv, nil, ""); err != nil {
+			t.Fatalf("StartAuth %d failed: %v", i, err)
+		}
+	}
+	mgr.mu.Lock()
+	pendingLen := len(mgr.pending)
+	mgr.mu.Unlock()
+	if pendingLen > maxPendingMCPOAuth {
+		t.Fatalf("expected pending capped at %d, got %d", maxPendingMCPOAuth, pendingLen)
+	}
+	_ = mgr.lockServer("srv")
+	if err := mgr.Revoke("srv"); err != nil {
+		t.Fatalf("Revoke failed: %v", err)
+	}
+	mgr.mu.Lock()
+	_, hasLock := mgr.serverLocks["srv"]
+	pendingAfterRevoke := len(mgr.pending)
+	mgr.mu.Unlock()
+	if hasLock || pendingAfterRevoke != 0 {
+		t.Fatalf("expected Revoke to clear serverLocks and pending, hasLock=%v pending=%d", hasLock, pendingAfterRevoke)
 	}
 }

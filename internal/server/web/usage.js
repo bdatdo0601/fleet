@@ -128,7 +128,7 @@ function renderUsageTile(id, label, item) {
             },
             el("div", {
               className: `usage-bar-fill ${fillClass(pct)}`,
-              style: `width: ${pct}%`,
+              style: { width: `${pct}%` },
             }),
           ),
         ),

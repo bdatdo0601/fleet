@@ -14,6 +14,7 @@ import (
 	"github.com/bdatdo0601/fleet/internal/agents"
 	"github.com/bdatdo0601/fleet/internal/core"
 	"github.com/bdatdo0601/fleet/internal/ddns"
+	"github.com/bdatdo0601/fleet/internal/memory"
 	"github.com/bdatdo0601/fleet/internal/paths"
 	"github.com/bdatdo0601/fleet/internal/registry"
 	"github.com/bdatdo0601/fleet/internal/tlsdns"
@@ -128,14 +129,21 @@ func buildDDNSSummary(cfg *ddns.Route53) map[string]any {
 	}
 }
 
-func buildOverviewPayload(fleet *core.Fleet, c *registry.Device, startedAt time.Time) (map[string]any, error) {
+func buildOverviewPayload(fleet *core.Fleet, c *registry.Device, startedAt time.Time, tlsMgr *tlsdns.Manager) (map[string]any, error) {
 	agentSummary, err := buildAgentSummary(fleet)
 	if err != nil {
 		return nil, err
 	}
-	memStats, err := fleet.Memory.Stats()
-	if err != nil {
-		return nil, err
+	var memStats memory.Stats
+	if fleet.Memory != nil {
+		memStats, err = fleet.Memory.Stats()
+		if err != nil {
+			return nil, err
+		}
+	}
+	var curatorStatus memory.CuratorStatus
+	if fleet.Curator != nil {
+		curatorStatus = fleet.Curator.Status()
 	}
 	usageList, uErr := fleet.Agents.ListUsage()
 	if uErr != nil {
@@ -171,7 +179,7 @@ func buildOverviewPayload(fleet *core.Fleet, c *registry.Device, startedAt time.
 		"agents":  agentSummary,
 		"usage":   usageList,
 		"memory":  memStats,
-		"curator": fleet.Curator.Status(),
+		"curator": curatorStatus,
 	}
 	if !isAdmin {
 		return payload, nil
@@ -205,7 +213,7 @@ func buildOverviewPayload(fleet *core.Fleet, c *registry.Device, startedAt time.
 	payload["settings"] = settings
 	payload["manifest"] = manifest
 	payload["ddns"] = buildDDNSSummary(ddnsCfg)
-	if tlsSummary, err := buildTLSSummary(fleet, nil); err == nil {
+	if tlsSummary, err := buildTLSSummary(fleet, tlsMgr); err == nil {
 		payload["tls"] = tlsSummary
 	}
 	payload["slacker"] = slkSummary
@@ -307,7 +315,7 @@ func registerAdminRoutes(
 	route func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc,
 ) {
 	mux.HandleFunc("GET /v1/overview", route(false, func(w http.ResponseWriter, _ *http.Request, c *registry.Device) error {
-		payload, err := buildOverviewPayload(fleet, c, startedAt)
+		payload, err := buildOverviewPayload(fleet, c, startedAt, tlsMgr)
 		if err != nil {
 			return err
 		}

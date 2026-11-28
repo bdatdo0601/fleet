@@ -1,13 +1,11 @@
 package tlsdns
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/netip"
-	"os/exec"
 	"strings"
 	"time"
 
@@ -15,8 +13,9 @@ import (
 )
 
 const (
-	staticATTL   = 300
-	challengeTTL = 60
+	staticATTL           = 300
+	challengeTTL         = 60
+	maxRoute53PollErrors = 5
 )
 
 // PolicyOpts configures least-privilege Route 53 IAM policy generation.
@@ -86,69 +85,13 @@ func Policy(opts PolicyOpts) (map[string]any, error) {
 	}, nil
 }
 
-func defaultRunCmd(name string, args ...string) (string, string, error) {
-	cmd := exec.Command(name, args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	return stdout.String(), stderr.String(), err
-}
-
-func resolveAWSBin(awsBin string) (string, error) {
-	if awsBin != "" {
-		return awsBin, nil
-	}
-	found, err := exec.LookPath("aws")
-	if err != nil {
-		return "", errors.New("aws CLI not found (brew install awscli)")
-	}
-	return found, nil
-}
-
-func runRoute53Change(cfg Config, batch map[string]any, awsBin string, runFn ddns.RunCmdFn) (string, error) {
-	bin, err := resolveAWSBin(awsBin)
-	if err != nil {
-		return "", err
-	}
-	if runFn == nil {
-		runFn = defaultRunCmd
-	}
-	batchJSON, err := json.Marshal(batch)
-	if err != nil {
-		return "", err
-	}
-	stdout, stderr, err := runFn(
-		bin,
-		"route53", "change-resource-record-sets",
-		"--profile", cfg.Profile,
-		"--hosted-zone-id", cfg.ZoneID,
-		"--change-batch", string(batchJSON),
-		"--output", "json",
-	)
-	if err != nil {
-		detail := strings.TrimSpace(stderr)
-		if detail == "" {
-			detail = strings.TrimSpace(stdout)
-		}
-		if detail == "" {
-			detail = err.Error()
-		}
-		return "", fmt.Errorf("route 53 update failed: %s", detail)
-	}
-	var parsed struct {
-		ChangeInfo struct {
-			ID string `json:"Id"`
-		} `json:"ChangeInfo"`
-	}
-	if err := json.Unmarshal([]byte(stdout), &parsed); err != nil {
-		return "", err
-	}
-	return parsed.ChangeInfo.ID, nil
-}
-
 // UpsertStaticA upserts an A record for cfg.Domain pointing to ip (typically 10.213.0.1).
 func UpsertStaticA(cfg Config, ip, awsBin string, runFn ddns.RunCmdFn) (string, error) {
+	return UpsertStaticAContext(context.Background(), cfg, ip, awsBin, runFn)
+}
+
+// UpsertStaticAContext upserts an A record for cfg.Domain pointing to ip bounded by ctx.
+func UpsertStaticAContext(ctx context.Context, cfg Config, ip, awsBin string, runFn ddns.RunCmdFn) (string, error) {
 	domain, err := NormalizeDomain(cfg.Domain)
 	if err != nil {
 		return "", err
@@ -171,7 +114,7 @@ func UpsertStaticA(cfg Config, ip, awsBin string, runFn ddns.RunCmdFn) (string, 
 			},
 		},
 	}
-	return runRoute53Change(cfg, batch, awsBin, runFn)
+	return ddns.RunRoute53ChangeContext(ctx, cfg.Profile, cfg.ZoneID, batch, awsBin, runFn)
 }
 
 // CheckStaticA queries cfg.Nameservers for cfg.Domain's public A record.
@@ -187,8 +130,8 @@ func CheckStaticA(cfg Config, digFn ddns.DigFn) (*string, error) {
 	}, digFn)
 }
 
-// ChangeTXT upserts or deletes a Route 53 TXT record for ACME DNS-01 challenges.
-func ChangeTXT(cfg Config, fqdn, action, value, awsBin string, runFn ddns.RunCmdFn) (string, error) {
+// ChangeTXTContext upserts or deletes a Route 53 TXT record for ACME DNS-01 challenges bounded by ctx.
+func ChangeTXTContext(ctx context.Context, cfg Config, fqdn, action, value, awsBin string, runFn ddns.RunCmdFn) (string, error) {
 	name := strings.ToLower(strings.TrimRight(strings.TrimSpace(fqdn), "."))
 	if name == "" {
 		return "", errors.New("TXT record name is required")
@@ -212,10 +155,10 @@ func ChangeTXT(cfg Config, fqdn, action, value, awsBin string, runFn ddns.RunCmd
 			},
 		},
 	}
-	return runRoute53Change(cfg, batch, awsBin, runFn)
+	return ddns.RunRoute53ChangeContext(ctx, cfg.Profile, cfg.ZoneID, batch, awsBin, runFn)
 }
 
-// WaitChangeInSync polls Route 53 until changeID reaches INSYNC or ctx expires.
+// WaitChangeInSync polls Route 53 until changeID reaches INSYNC, ctx expires, or consecutive errors reach the threshold.
 func WaitChangeInSync(
 	ctx context.Context,
 	profile, changeID, awsBin string,
@@ -225,29 +168,44 @@ func WaitChangeInSync(
 	if changeID == "" {
 		return nil
 	}
-	bin, err := resolveAWSBin(awsBin)
+	bin, err := ddns.ResolveAWSBin(awsBin)
 	if err != nil {
 		return err
-	}
-	if runFn == nil {
-		runFn = defaultRunCmd
 	}
 	if pollInterval <= 0 {
 		pollInterval = 2 * time.Second
 	}
+	args := []string{"route53", "get-change", "--profile", profile, "--id", changeID, "--output", "json"}
+	consecutiveErrs := 0
 	for {
-		stdout, stderr, err := runFn(bin, "route53", "get-change", "--profile", profile, "--id", changeID, "--output", "json")
+		var stdout, stderr string
+		if runFn != nil {
+			stdout, stderr, err = runFn(bin, args...)
+		} else {
+			stdout, stderr, err = ddns.DefaultRunCmdContext(ctx, bin, args...)
+		}
 		if err == nil {
 			var parsed struct {
 				ChangeInfo struct {
 					Status string `json:"Status"`
 				} `json:"ChangeInfo"`
 			}
-			if jErr := json.Unmarshal([]byte(stdout), &parsed); jErr == nil && strings.EqualFold(parsed.ChangeInfo.Status, "INSYNC") {
-				return nil
+			if jErr := json.Unmarshal([]byte(stdout), &parsed); jErr == nil {
+				consecutiveErrs = 0
+				if strings.EqualFold(parsed.ChangeInfo.Status, "INSYNC") {
+					return nil
+				}
+			} else {
+				consecutiveErrs++
+				if ctx.Err() != nil || consecutiveErrs >= maxRoute53PollErrors {
+					return fmt.Errorf("route 53 get-change %s invalid response: %w", changeID, jErr)
+				}
 			}
-		} else if ctx.Err() != nil {
-			return fmt.Errorf("route 53 get-change %s failed: %w (%s)", changeID, err, strings.TrimSpace(stderr))
+		} else {
+			consecutiveErrs++
+			if ctx.Err() != nil || consecutiveErrs >= maxRoute53PollErrors {
+				return fmt.Errorf("route 53 get-change %s failed: %w (%s)", changeID, err, strings.TrimSpace(stderr))
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -279,7 +237,9 @@ func WaitTXTPropagated(
 		return nil
 	}
 	if digFn == nil {
-		digFn = ddns.DefaultDig
+		digFn = func(args ...string) ([]string, error) {
+			return ddns.DefaultDigContext(ctx, args...)
+		}
 	}
 	if pollInterval <= 0 {
 		pollInterval = 2 * time.Second

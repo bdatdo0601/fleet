@@ -1,4 +1,4 @@
-import { api, badge, clear, el, formatDuration, relTime, section, shortDate, state, toast } from "./lib.js";
+import { api, badge, clear, el, formatDuration, formatMessageTarget, relTime, section, shortDate, state, toast } from "./lib.js";
 import { openAgentInspectModal, openQuickMessageModal } from "./agents.js";
 import { renderUsageCard } from "./usage.js";
 
@@ -132,19 +132,6 @@ function renderWaitingCard(waiting, ctx) {
   return card;
 }
 
-function formatMsgTarget(m) {
-  if (m.to_session) {
-    return m.to_session;
-  }
-  if (m.to_device) {
-    return `device:${m.to_device}`;
-  }
-  if (m.to_repo) {
-    return `repo:${m.to_repo}`;
-  }
-  return "all";
-}
-
 function renderMessagesCard(messages) {
   const card = el(
     "article",
@@ -170,7 +157,7 @@ function renderMessagesCard(messages) {
         el(
           "div",
           { className: "message-meta" },
-          el("span", null, el("strong", { text: sender }), " → ", el("span", { className: "mono", text: formatMsgTarget(m) })),
+          el("span", null, el("strong", { text: sender }), " → ", el("span", { className: "mono", text: formatMessageTarget(m) })),
           el("span", { text: relTime(m.created_at) }),
         ),
         el("div", { className: "message-body small", text: snippet }),
@@ -181,6 +168,7 @@ function renderMessagesCard(messages) {
 }
 
 export async function renderOverview(root, ctx) {
+  const signal = ctx && ctx.signal;
   const ov = state.overview;
   if (!ov) {
     root.appendChild(el("div", { className: "loading-box", text: "Loading overview…" }));
@@ -191,13 +179,22 @@ export async function renderOverview(root, ctx) {
   let messages = [];
   try {
     const [wRes, mRes] = await Promise.all([
-      api("GET", "/v1/agents?state=waiting"),
-      api("GET", "/v1/agents/messages?limit=8"),
+      api("GET", "/v1/agents?state=waiting", undefined, { signal }),
+      api("GET", "/v1/agents/messages?limit=8", undefined, { signal }),
     ]);
+    if (signal && signal.aborted) {
+      return;
+    }
     waiting = wRes.agents || [];
     messages = mRes.messages || [];
   } catch (err) {
+    if ((err && err.name === "AbortError") || (signal && signal.aborted)) {
+      return;
+    }
     toast(`Failed loading overview details: ${err.message}`, "warn");
+  }
+  if (signal && signal.aborted) {
+    return;
   }
 
   clear(root);

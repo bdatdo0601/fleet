@@ -207,6 +207,7 @@ type Curator struct {
 	httpClient *http.Client
 
 	mu        sync.Mutex
+	drainMu   sync.Mutex
 	cfg       CuratorConfig
 	lastRunAt string
 	lastError string
@@ -386,9 +387,9 @@ func (c *Curator) loop(ctx context.Context) {
 				return
 			case <-time.After(1500 * time.Millisecond):
 			}
-			_, _ = c.drainQueue(ctx, 20)
+			c.drainQueue(ctx, 20)
 		case <-ticker.C:
-			_, _ = c.drainQueue(ctx, 10)
+			c.drainQueue(ctx, 10)
 		}
 	}
 }
@@ -703,115 +704,87 @@ func (c *Curator) applyPromoteGlobal(cand Item, cfg CuratorConfig, dec CuratorDe
 	if cfg.ReviewGlobal {
 		return c.queueProposal(cand, "promote_global", "global", targetKey, kind, "always", summary, body, cmp.Or(dec.Reason, "cross-fleet preference candidate"), cfg.Model)
 	}
-	if detail, err := c.store.Get("global", targetKey, false); err == nil {
-		if detail.Item.Status == "archived" && isProtectedTarget(&detail.Item) {
-			return CurateActionReport{
-				MemoryScope: cand.Scope,
-				MemoryKey:   cand.Key,
-				Action:      "keep",
-				TargetScope: "global",
-				TargetKey:   targetKey,
-				Applied:     false,
-				Reason:      "opted out (archived by human)",
-			}, nil
-		}
-		if isProtectedTarget(&detail.Item) {
-			return c.queueProposal(cand, "promote_global", "global", targetKey, kind, "always", summary, body, "target global entry is locked/human-edited", cfg.Model)
-		}
-	}
-	ur, err := c.store.Upsert(UpsertParams{
-		Scope:         "global",
-		Key:           targetKey,
-		Kind:          kind,
-		Tier:          "always",
-		Summary:       summary,
-		Body:          body,
-		Source:        "curator",
-		Reason:        cmp.Or(dec.Reason, "curator_promote_global"),
-		EnqueueCurate: new(false),
-	})
+	res, err := c.store.ApplyCuratorPromoteGlobal(cand.ID, cand.Revision, targetKey, kind, summary, body, dec.Reason)
 	if err != nil {
 		return CurateActionReport{}, err
 	}
+	if res.Skipped || res.Stale {
+		return CurateActionReport{
+			MemoryScope: cand.Scope, MemoryKey: cand.Key, Action: "keep", Applied: false, Reason: res.Reason,
+		}, nil
+	}
+	if res.OptedOut {
+		return CurateActionReport{
+			MemoryScope: cand.Scope, MemoryKey: cand.Key, Action: "keep",
+			TargetScope: "global", TargetKey: targetKey, Applied: false, Reason: res.Reason,
+		}, nil
+	}
+	if res.Protected {
+		return c.queueProposal(cand, "promote_global", "global", targetKey, kind, "always", summary, body, res.Reason, cfg.Model)
+	}
 	return CurateActionReport{
 		MemoryScope: cand.Scope, MemoryKey: cand.Key, Action: "promote_global",
-		TargetScope: ur.Item.Scope, TargetKey: ur.Item.Key, Applied: true, Reason: dec.Reason,
+		TargetScope: res.Target.Scope, TargetKey: res.Target.Key, Applied: true, Reason: dec.Reason,
 	}, nil
 }
 
 func (c *Curator) applyMergeOrSupersede(cand Item, cfg CuratorConfig, dec CuratorDecision, targetKey, kind, tier, summary, body string) (CurateActionReport, error) {
 	if targetKey == "" || targetKey == cand.Key {
-		return c.applyUpdate(cand, dec, cand.Kind, cand.Tier, summary, body)
-	}
-	detail, err := c.store.Get(cand.Scope, targetKey, false)
-	if err != nil {
-		return c.applyUpdate(cand, dec, kind, tier, summary, body)
-	}
-	target := detail.Item
-	if isProtectedTarget(&target) {
-		return c.queueProposal(cand, dec.Action, target.Scope, target.Key, target.Kind, target.Tier, summary, body, "target entry is locked/human-edited", cfg.Model)
+		return c.applyUpdate(cand, cfg, dec, cand.Kind, cand.Tier, "active", summary, body)
 	}
 
+	var res CurateMutationResult
+	var err error
 	if dec.Action == "merge" {
-		if _, err := c.store.Upsert(UpsertParams{
-			Scope: target.Scope, Key: target.Key, Kind: target.Kind, Tier: target.Tier,
-			Summary: summary, Body: body, Source: "curator",
-			Reason: "curator_merge_from_" + cand.Key, EnqueueCurate: new(false),
-		}); err != nil {
-			return CurateActionReport{}, err
-		}
-		if _, err := c.store.Upsert(UpsertParams{
-			Scope: cand.Scope, Key: cand.Key, Kind: cand.Kind, Tier: cand.Tier, Status: "superseded",
-			Summary: cand.Summary, Body: cand.Body, Source: "curator",
-			SupersededBy: target.Scope + "/" + target.Key,
-			Reason:       cmp.Or(dec.Reason, "merged into "+target.Key), EnqueueCurate: new(false),
-		}); err != nil {
-			return CurateActionReport{}, err
-		}
+		res, err = c.store.ApplyCuratorMerge(cand.ID, cand.Revision, cand.Scope, targetKey, summary, body, dec.Reason)
+	} else {
+		res, err = c.store.ApplyCuratorSupersede(cand.ID, cand.Revision, cand.Scope, targetKey, kind, tier, summary, body, dec.Reason)
+	}
+	if err != nil {
+		return CurateActionReport{}, err
+	}
+	if res.TargetMissing {
+		return c.applyUpdate(cand, cfg, dec, kind, tier, "active", summary, body)
+	}
+	if res.Skipped || res.Stale {
 		return CurateActionReport{
-			MemoryScope: cand.Scope, MemoryKey: cand.Key, Action: "merge",
-			TargetScope: target.Scope, TargetKey: target.Key, Applied: true, Reason: dec.Reason,
+			MemoryScope: cand.Scope, MemoryKey: cand.Key, Action: "keep", Applied: false, Reason: res.Reason,
 		}, nil
 	}
-
-	// supersede: mark older target superseded, keep candidate active
-	if _, err := c.store.Upsert(UpsertParams{
-		Scope: target.Scope, Key: target.Key, Kind: target.Kind, Tier: target.Tier, Status: "superseded",
-		Summary: target.Summary, Body: target.Body, Source: "curator",
-		SupersededBy: cand.Scope + "/" + cand.Key,
-		Reason:       cmp.Or(dec.Reason, "superseded by "+cand.Key), EnqueueCurate: new(false),
-	}); err != nil {
-		return CurateActionReport{}, err
-	}
-	if _, err := c.store.Upsert(UpsertParams{
-		Scope: cand.Scope, Key: cand.Key, Kind: kind, Tier: tier,
-		Summary: summary, Body: body, Source: "curator",
-		Reason: cmp.Or(dec.Reason, "supersedes "+target.Key), EnqueueCurate: new(false),
-	}); err != nil {
-		return CurateActionReport{}, err
+	if res.Protected {
+		if res.Target != nil {
+			return c.queueProposal(cand, dec.Action, res.Target.Scope, res.Target.Key, res.Target.Kind, res.Target.Tier, summary, body, res.Reason, cfg.Model)
+		}
+		return c.queueProposal(cand, dec.Action, cand.Scope, cand.Key, kind, tier, summary, body, res.Reason, cfg.Model)
 	}
 	return CurateActionReport{
-		MemoryScope: cand.Scope, MemoryKey: cand.Key, Action: "supersede",
-		TargetScope: target.Scope, TargetKey: target.Key, Applied: true, Reason: dec.Reason,
+		MemoryScope: cand.Scope, MemoryKey: cand.Key, Action: dec.Action,
+		TargetScope: res.Target.Scope, TargetKey: res.Target.Key, Applied: true, Reason: dec.Reason,
 	}, nil
 }
 
-func (c *Curator) applyUpdate(cand Item, dec CuratorDecision, kind, tier, summary, body string) (CurateActionReport, error) {
-	// Guard dense technical notes against accidental small-model truncation.
-	if (cand.Kind == "project" || cand.Kind == "reference") && len(body) < len(cand.Body)/2 {
-		body = cand.Body
+func (c *Curator) applyUpdate(cand Item, cfg CuratorConfig, dec CuratorDecision, kind, tier, status, summary, body string) (CurateActionReport, error) {
+	action := "update"
+	reason := cmp.Or(dec.Reason, "curator_update")
+	if status == "archived" {
+		action = "archive"
+		reason = cmp.Or(dec.Reason, "curator_archive")
 	}
-	ur, err := c.store.Upsert(UpsertParams{
-		Scope: cand.Scope, Key: cand.Key, Kind: kind, Tier: tier,
-		Summary: summary, Body: body, Source: "curator",
-		Reason: cmp.Or(dec.Reason, "curator_update"), EnqueueCurate: new(false),
-	})
+	res, err := c.store.ApplyCuratorUpdate(cand.ID, cand.Revision, kind, tier, status, summary, body, reason)
 	if err != nil {
 		return CurateActionReport{}, err
 	}
+	if res.Skipped || res.Stale {
+		return CurateActionReport{
+			MemoryScope: cand.Scope, MemoryKey: cand.Key, Action: "keep", Applied: false, Reason: res.Reason,
+		}, nil
+	}
+	if res.Protected {
+		return c.queueProposal(cand, action, cand.Scope, cand.Key, kind, tier, summary, body, res.Reason, cfg.Model)
+	}
 	return CurateActionReport{
-		MemoryScope: cand.Scope, MemoryKey: cand.Key, Action: "update",
-		Applied: ur.Action == "updated", Reason: dec.Reason,
+		MemoryScope: cand.Scope, MemoryKey: cand.Key, Action: action,
+		Applied: res.Applied, Reason: dec.Reason,
 	}, nil
 }
 
@@ -820,7 +793,7 @@ func (c *Curator) applyDecision(cand Item, cfg CuratorConfig, dec CuratorDecisio
 
 	if dec.Action == "keep" {
 		if cand.Summary == "" && summary != "" && !isProtectedTarget(&cand) {
-			return c.applyUpdate(cand, dec, cand.Kind, cand.Tier, summary, cand.Body)
+			return c.applyUpdate(cand, cfg, dec, cand.Kind, cand.Tier, "active", summary, cand.Body)
 		}
 		return CurateActionReport{MemoryScope: cand.Scope, MemoryKey: cand.Key, Action: "keep", Reason: dec.Reason}, nil
 	}
@@ -841,19 +814,11 @@ func (c *Curator) applyDecision(cand Item, cfg CuratorConfig, dec CuratorDecisio
 
 	switch dec.Action {
 	case "archive":
-		ur, err := c.store.Upsert(UpsertParams{
-			Scope: cand.Scope, Key: cand.Key, Kind: cand.Kind, Tier: cand.Tier, Status: "archived",
-			Summary: cand.Summary, Body: cand.Body, Source: "curator",
-			Reason: cmp.Or(dec.Reason, "curator_archive"), EnqueueCurate: new(false),
-		})
-		if err != nil {
-			return CurateActionReport{}, err
-		}
-		return CurateActionReport{MemoryScope: cand.Scope, MemoryKey: cand.Key, Action: "archive", Applied: ur.Action == "updated", Reason: dec.Reason}, nil
+		return c.applyUpdate(cand, cfg, dec, cand.Kind, cand.Tier, "archived", cand.Summary, cand.Body)
 	case "merge", "supersede":
 		return c.applyMergeOrSupersede(cand, cfg, dec, targetKey, kind, tier, summary, body)
 	default:
-		return c.applyUpdate(cand, dec, kind, tier, summary, body)
+		return c.applyUpdate(cand, cfg, dec, kind, tier, "active", summary, body)
 	}
 }
 
@@ -871,7 +836,13 @@ func (c *Curator) currentConfig() CuratorConfig {
 	return c.cfg
 }
 
-func (c *Curator) drainQueue(ctx context.Context, limit int) ([]CurateActionReport, error) {
+func (c *Curator) drainQueue(ctx context.Context, limit int) {
+	c.drainMu.Lock()
+	defer c.drainMu.Unlock()
+	_, _ = c.drainQueueLocked(ctx, limit)
+}
+
+func (c *Curator) drainQueueLocked(ctx context.Context, limit int) ([]CurateActionReport, error) {
 	cfg := c.currentConfig()
 	if !cfg.Enabled || cfg.BaseURL == "" || cfg.Model == "" {
 		return nil, nil
@@ -951,13 +922,15 @@ func (c *Curator) RunPending(ctx context.Context, limit int, dryRun, includeAll 
 	if dryRun {
 		return c.dryRunEvaluate(ctx, cfg, limit, includeAll)
 	}
+	c.drainMu.Lock()
+	defer c.drainMu.Unlock()
 	_, _ = c.store.ResetFailedJobs()
 	if includeAll {
 		if _, err := c.store.EnqueueAllActive([]string{"preference", "feedback"}); err != nil {
 			return nil, err
 		}
 	}
-	return c.drainQueue(ctx, limit)
+	return c.drainQueueLocked(ctx, limit)
 }
 
 func (c *Curator) dryRunEvaluate(ctx context.Context, cfg CuratorConfig, limit int, includeAll bool) ([]CurateActionReport, error) {
@@ -973,7 +946,7 @@ func (c *Curator) dryRunEvaluate(ctx context.Context, cfg CuratorConfig, limit i
 		}
 	} else {
 		// Evaluate active items whose IDs are currently in curation_jobs without claiming them.
-		cands, err = c.queuedCandidates(limit)
+		cands, err = c.store.QueuedCandidates(limit)
 	}
 	if err != nil {
 		return nil, err
@@ -1007,31 +980,4 @@ func (c *Curator) dryRunEvaluate(ctx context.Context, cfg CuratorConfig, limit i
 		})
 	}
 	return reports, nil
-}
-
-func (c *Curator) queuedCandidates(limit int) ([]Item, error) {
-	c.store.mu.Lock()
-	defer c.store.mu.Unlock()
-	rows, err := c.store.db.Query(
-		`SELECT `+itemSelectCols+` FROM curation_jobs j
-		 JOIN memories m ON m.id = j.memory_id
-		 WHERE m.status = 'active' AND (j.status = 'pending' OR (j.status = 'failed' AND j.attempts < 3))
-		 ORDER BY j.updated_at ASC, j.id ASC LIMIT ?`,
-		limit,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	var out []Item
-	for rows.Next() {
-		it, err := scanItem(rows, false)
-		if err != nil {
-			return nil, err
-		}
-		if it != nil {
-			out = append(out, *it)
-		}
-	}
-	return out, rows.Err()
 }

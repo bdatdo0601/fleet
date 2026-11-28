@@ -11,6 +11,36 @@ import (
 	"strings"
 )
 
+func resolveJailedPath(root, cleanRel, escapeMsg string) (string, error) {
+	rootClean := filepath.Clean(root)
+	rootReal, err := filepath.EvalSymlinks(rootClean)
+	if err != nil {
+		rootReal = rootClean
+	}
+	full := filepath.Join(rootClean, cleanRel)
+	cur := full
+	for {
+		if resolved, rErr := filepath.EvalSymlinks(cur); rErr == nil {
+			relCheck, relErr := filepath.Rel(rootReal, resolved)
+			if relErr != nil || relCheck == ".." || strings.HasPrefix(relCheck, ".."+string(filepath.Separator)) {
+				return "", newErr(escapeMsg, http.StatusForbidden)
+			}
+			return full, nil
+		}
+		if fi, lErr := os.Lstat(cur); lErr == nil && fi.Mode()&os.ModeSymlink != 0 {
+			return "", newErr(escapeMsg, http.StatusForbidden)
+		}
+		if cur == rootClean {
+			return full, nil
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return "", newErr(escapeMsg, http.StatusForbidden)
+		}
+		cur = parent
+	}
+}
+
 func isSafeInlineImageMIME(m string) bool {
 	base := strings.ToLower(strings.TrimSpace(strings.Split(m, ";")[0]))
 	switch base {

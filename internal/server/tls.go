@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -8,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
@@ -18,11 +21,32 @@ import (
 	"github.com/bdatdo0601/fleet/internal/tlsdns"
 )
 
+const (
+	edgeDaemonCacheTTL     = 5 * time.Second
+	edgeDaemonProbeTimeout = 2 * time.Second
+)
+
+var edgeDaemonCache struct {
+	mu        sync.Mutex
+	checkedAt time.Time
+	loaded    bool
+}
+
 func isEdgeDaemonLoaded() bool {
-	if _, err := os.Stat(filepath.Join("/Library/LaunchDaemons", paths.EdgeLabel+".plist")); err != nil {
-		return false
+	edgeDaemonCache.mu.Lock()
+	defer edgeDaemonCache.mu.Unlock()
+	if !edgeDaemonCache.checkedAt.IsZero() && time.Since(edgeDaemonCache.checkedAt) < edgeDaemonCacheTTL {
+		return edgeDaemonCache.loaded
 	}
-	return exec.Command("launchctl", "print", "system/"+paths.EdgeLabel).Run() == nil
+	loaded := false
+	if _, err := os.Stat(filepath.Join("/Library/LaunchDaemons", paths.EdgeLabel+".plist")); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), edgeDaemonProbeTimeout)
+		defer cancel()
+		loaded = exec.CommandContext(ctx, "launchctl", "print", "system/"+paths.EdgeLabel).Run() == nil
+	}
+	edgeDaemonCache.checkedAt = time.Now()
+	edgeDaemonCache.loaded = loaded
+	return loaded
 }
 
 func buildTLSSummary(fleet *core.Fleet, tlsMgr *tlsdns.Manager) (map[string]any, error) {
@@ -195,7 +219,11 @@ func registerTLSRoutes(
 		}
 		res, err := mgr.RenewNow(r.Context(), req.Force)
 		if err != nil {
-			return &core.FleetError{Msg: err.Error(), Status: http.StatusBadGateway}
+			status := http.StatusBadGateway
+			if errors.Is(err, tlsdns.ErrRenewalInProgress) {
+				status = http.StatusConflict
+			}
+			return &core.FleetError{Msg: err.Error(), Status: status}
 		}
 		writeJSON(w, http.StatusOK, res)
 		return nil

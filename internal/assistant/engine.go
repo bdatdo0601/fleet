@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -80,8 +79,13 @@ type Engine struct {
 	mcp         *MCPManager
 	skills      *SkillRegistry
 	sandbox     *SandboxManager
-	opReader    OPReaderFunc
 	Probes      DoctorProbes
+
+	opMu     sync.RWMutex
+	opReader OPReaderFunc
+
+	configWriteMu sync.Mutex
+	memoryMu      sync.Mutex
 
 	cfgMu      sync.RWMutex
 	cfg        Config
@@ -90,6 +94,9 @@ type Engine struct {
 	cachedAt   time.Time
 	opVaults   []OPVaultMeta
 	opVaultsAt time.Time
+	stopCh     chan struct{}
+	cancel     context.CancelFunc
+	stopped    bool
 
 	subMu       sync.Mutex
 	subscribers map[chan StreamEvent]struct{}
@@ -109,7 +116,6 @@ type Engine struct {
 	discordReloadCh       chan struct{}
 
 	notifyCh chan struct{}
-	cancel   context.CancelFunc
 	wg       sync.WaitGroup
 }
 
@@ -168,20 +174,78 @@ func (e *Engine) Start(parent context.Context) {
 	}
 	ctx, cancel := context.WithCancel(parent)
 	e.cancel = cancel
+	e.stopCh = make(chan struct{})
+	e.stopped = false
+	e.wg.Add(3)
 	e.cfgMu.Unlock()
 
-	e.wg.Add(3)
 	go e.runWorker(ctx)
 	go e.runScheduler(ctx)
 	go e.runDiscordGateway(ctx)
 }
 
+func (e *Engine) trackWG(fn func()) {
+	e.cfgMu.RLock()
+	if e.stopped {
+		e.cfgMu.RUnlock()
+		return
+	}
+	e.wg.Add(1)
+	e.cfgMu.RUnlock()
+	go func() {
+		defer e.wg.Done()
+		fn()
+	}()
+}
+
+func (e *Engine) spawnBG(fallbackCtx context.Context, timeout time.Duration, fn func(context.Context)) {
+	e.cfgMu.RLock()
+	if e.stopped {
+		e.cfgMu.RUnlock()
+		return
+	}
+	stopCh := e.stopCh
+	e.wg.Add(1)
+	e.cfgMu.RUnlock()
+
+	base := context.WithoutCancel(fallbackCtx)
+	var bgCtx context.Context
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		bgCtx, cancel = context.WithTimeout(base, timeout)
+	} else {
+		bgCtx, cancel = context.WithCancel(base)
+	}
+	var watchWG sync.WaitGroup
+	if stopCh != nil {
+		watchWG.Go(func() {
+			select {
+			case <-stopCh:
+				cancel()
+			case <-bgCtx.Done():
+			}
+		})
+	}
+	go func() {
+		defer e.wg.Done()
+		defer watchWG.Wait()
+		defer cancel()
+		fn(bgCtx)
+	}()
+}
+
 // Stop stops background goroutines and waits for them to exit.
 func (e *Engine) Stop() {
 	e.cfgMu.Lock()
+	e.stopped = true
 	cancel := e.cancel
 	e.cancel = nil
+	stopCh := e.stopCh
+	e.stopCh = nil
 	e.cfgMu.Unlock()
+	if stopCh != nil {
+		close(stopCh)
+	}
 	if cancel != nil {
 		cancel()
 	}
@@ -298,363 +362,6 @@ func (e *Engine) SearchVaults(vaultName, query string, limit int) ([]VaultSearch
 	return out, nil
 }
 
-// Config returns a copy of the current assistant Config.
-func (e *Engine) Config() Config {
-	e.cfgMu.RLock()
-	defer e.cfgMu.RUnlock()
-	return e.cfg
-}
-
-// ConfigView returns the safe non-secret ConfigView.
-func (e *Engine) ConfigView() ConfigView {
-	cfg := e.Config()
-	return cfg.View(ResolveVaultRoot(cfg.VaultPath, e.vaultDir))
-}
-
-// Status returns combined config view and live queue counts.
-func (e *Engine) Status() map[string]any {
-	e.discordMu.RLock()
-	discConnected := e.discordConnected
-	e.discordMu.RUnlock()
-	return map[string]any{
-		"config":            e.ConfigView(),
-		"summary":           e.store.Summary(),
-		"discord_connected": discConnected,
-	}
-}
-
-func isZeroNotificationsConfig(n NotificationsConfig) bool {
-	return n.NotifyApprovals == nil && !n.Enabled && n.DiscordWebhookOPRef == "" &&
-		len(n.DiscordChannelOPRefs) == 0 && n.FleetBaseURL == "" && n.MinPriority == ""
-}
-
-func isZeroDiscordConfig(d DiscordConfig) bool {
-	return d.AllowApprovals == nil && d.MirrorWebTurns == nil && d.AutoSyncChannels == nil &&
-		!d.Enabled && !d.AutoApprove && d.BotTokenOPRef == "" && d.AuthorizedUserID == "" &&
-		d.GuildID == "" && d.CategoryName == "" && len(d.Channels) == 0 && d.FleetBaseURL == ""
-}
-
-func mergePreservedConfig(cur, next Config, clearAPIKey bool) Config {
-	if !clearAPIKey && strings.TrimSpace(next.APIKey) == "" && strings.TrimSpace(next.APIKeyOPRef) == "" {
-		next.APIKey = cur.APIKey
-		next.APIKeyOPRef = cur.APIKeyOPRef
-	}
-	if next.Credentials == nil {
-		next.Credentials = append([]CredentialPolicy(nil), cur.Credentials...)
-	}
-	if next.MCPServers == nil {
-		next.MCPServers = append([]MCPServerConfig(nil), cur.MCPServers...)
-	} else {
-		next.MCPServers = preserveMaskedMCPEnv(cur.MCPServers, next.MCPServers)
-	}
-	if next.ExtraVaults == nil {
-		next.ExtraVaults = append([]VaultMount(nil), cur.ExtraVaults...)
-	}
-	if isZeroNotificationsConfig(next.Notifications) {
-		next.Notifications = cur.Notifications
-	}
-	if next.Routing == (RoutingConfig{}) {
-		next.Routing = cur.Routing
-	}
-	if isZeroSandboxConfig(next.Sandbox) {
-		next.Sandbox = cur.Sandbox
-	}
-	if isZeroDiscordConfig(next.Discord) {
-		next.Discord = cur.Discord
-	}
-	return NormalizeConfig(next)
-}
-
-// UpdateConfig validates, saves, and applies new assistant configuration.
-func (e *Engine) UpdateConfig(next Config, clearAPIKey bool) (ConfigView, error) {
-	next = mergePreservedConfig(e.Config(), next, clearAPIKey)
-	if err := validateSandboxPackages(next.Sandbox); err != nil {
-		return ConfigView{}, err
-	}
-	if err := ValidateDiscordConfig(next.Discord); err != nil {
-		return ConfigView{}, err
-	}
-	for _, srv := range next.MCPServers {
-		if err := ValidateMCPServerConfig(srv, false); err != nil {
-			return ConfigView{}, err
-		}
-	}
-	if err := validateExtraVaults(next.ExtraVaults); err != nil {
-		return ConfigView{}, err
-	}
-	vaultRoot := ResolveVaultRoot(next.VaultPath, e.vaultDir)
-	if _, err := OpenVault(vaultRoot); err != nil {
-		return ConfigView{}, err
-	}
-	if err := SaveConfig(e.configPath, next); err != nil {
-		return ConfigView{}, err
-	}
-	e.cfgMu.Lock()
-	e.cfg = next
-	e.cachedKey = ""
-	e.cachedRef = ""
-	e.cfgMu.Unlock()
-	if e.mcp != nil {
-		e.mcp.Reload(next.MCPServers)
-	}
-	e.notifyDiscordReload()
-	e.notify()
-	view := next.View(vaultRoot)
-	e.publishEvent(StreamEvent{
-		Type: "config_updated",
-		Data: map[string]any{
-			"auto_approve":         view.AutoApprove,
-			"discord_auto_approve": view.Discord.AutoApprove,
-		},
-	})
-	return view, nil
-}
-
-// SetAutoApprove updates global and/or Discord HITL bypass flags without reloading the Discord Gateway socket.
-func (e *Engine) SetAutoApprove(global, discord *bool) (ConfigView, error) {
-	e.cfgMu.Lock()
-	next := e.cfg
-	if global != nil {
-		next.AutoApprove = *global
-	}
-	if discord != nil {
-		next.Discord.AutoApprove = *discord
-	}
-	next = NormalizeConfig(next)
-	if err := SaveConfig(e.configPath, next); err != nil {
-		e.cfgMu.Unlock()
-		return ConfigView{}, err
-	}
-	e.cfg = next
-	e.cfgMu.Unlock()
-
-	view := next.View(ResolveVaultRoot(next.VaultPath, e.vaultDir))
-	e.publishEvent(StreamEvent{
-		Type: "config_updated",
-		Data: map[string]any{
-			"auto_approve":         view.AutoApprove,
-			"discord_auto_approve": view.Discord.AutoApprove,
-		},
-	})
-	return view, nil
-}
-
-// SaveOPServiceAccountToken persists or clears the 1Password service account token on disk (0600).
-func (e *Engine) SaveOPServiceAccountToken(token string) error {
-	if err := SaveOPToken(e.opTokenPath, token); err != nil {
-		return err
-	}
-	e.cfgMu.Lock()
-	e.cachedKey = ""
-	e.cachedRef = ""
-	e.opVaults = nil
-	e.opVaultsAt = time.Time{}
-	e.cfgMu.Unlock()
-	return nil
-}
-
-func (e *Engine) listOPVaultsCached(ctx context.Context) ([]OPVaultMeta, error) {
-	e.cfgMu.RLock()
-	cached := e.opVaults
-	at := e.opVaultsAt
-	e.cfgMu.RUnlock()
-	if len(cached) > 0 && time.Since(at) < 5*time.Minute {
-		return cached, nil
-	}
-	lister := e.Probes.ListVaults
-	if lister == nil {
-		lister = ListOPVaults
-	}
-	vaults, err := lister(ctx, e.opTokenPath)
-	if err != nil {
-		return nil, err
-	}
-	e.cfgMu.Lock()
-	e.opVaults = vaults
-	e.opVaultsAt = time.Now()
-	e.cfgMu.Unlock()
-	return vaults, nil
-}
-
-func (e *Engine) resolveRuntimeConfig(ctx context.Context) (Config, error) {
-	e.cfgMu.RLock()
-	cfg := e.cfg
-	cachedKey := e.cachedKey
-	cachedRef := e.cachedRef
-	cachedAt := e.cachedAt
-	e.cfgMu.RUnlock()
-
-	if strings.TrimSpace(cfg.APIKey) != "" || strings.TrimSpace(cfg.APIKeyOPRef) == "" {
-		return cfg, nil
-	}
-	if cachedKey != "" && cachedRef == cfg.APIKeyOPRef && time.Since(cachedAt) < 5*time.Minute {
-		cfg.APIKey = cachedKey
-		return cfg, nil
-	}
-	reader := e.opReader
-	if reader == nil {
-		reader = defaultOPReader
-	}
-	secret, err := reader(ctx, cfg.APIKeyOPRef)
-	if err != nil {
-		return cfg, err
-	}
-	e.cfgMu.Lock()
-	e.cachedKey = secret
-	e.cachedRef = cfg.APIKeyOPRef
-	e.cachedAt = time.Now()
-	e.cfgMu.Unlock()
-	cfg.APIKey = secret
-	return cfg, nil
-}
-
-func preserveMaskedMCPEnv(prev, next []MCPServerConfig) []MCPServerConfig {
-	prevByName := make(map[string]MCPServerConfig, len(prev))
-	for _, s := range prev {
-		prevByName[s.Name] = s
-	}
-	out := make([]MCPServerConfig, 0, len(next))
-	for _, srv := range next {
-		ps, ok := prevByName[srv.Name]
-		if ok && len(srv.Env) > 0 && len(ps.Env) > 0 {
-			restored := make(map[string]string, len(srv.Env))
-			for k, v := range srv.Env {
-				if oldVal, exists := ps.Env[k]; exists && v == maskSecret(oldVal) {
-					restored[k] = oldVal
-				} else {
-					restored[k] = v
-				}
-			}
-			srv.Env = restored
-		}
-		if ok && len(srv.Headers) > 0 && len(ps.Headers) > 0 {
-			restoredH := make(map[string]string, len(srv.Headers))
-			for k, v := range srv.Headers {
-				if oldVal, exists := ps.Headers[k]; exists && v == maskSecret(oldVal) {
-					restoredH[k] = oldVal
-				} else {
-					restoredH[k] = v
-				}
-			}
-			srv.Headers = restoredH
-		}
-		if ok && srv.OAuth != nil && ps.OAuth != nil && srv.OAuth.ClientSecret != "" && srv.OAuth.ClientSecret == maskSecret(ps.OAuth.ClientSecret) {
-			cp := copyMCPOAuthConfig(srv.OAuth)
-			cp.ClientSecret = ps.OAuth.ClientSecret
-			srv.OAuth = cp
-		}
-		out = append(out, srv)
-	}
-	return out
-}
-
-func (e *Engine) findMCPServer(name string) (MCPServerConfig, error) {
-	clean := strings.ToLower(strings.TrimSpace(name))
-	if clean == "" {
-		return MCPServerConfig{}, newErr("MCP server name is required", http.StatusBadRequest)
-	}
-	for _, srv := range e.Config().MCPServers {
-		if strings.EqualFold(srv.Name, clean) {
-			return NormalizeMCPServerConfig(srv), nil
-		}
-	}
-	return MCPServerConfig{}, newErr(fmt.Sprintf("MCP server %q not found", clean), http.StatusNotFound)
-}
-
-// ListMCPStatuses returns redacted MCP server configs alongside live connection/OAuth status.
-func (e *Engine) ListMCPStatuses(ctx context.Context) ([]MCPServerConfig, []MCPServerStatus) {
-	cfg := e.Config()
-	var statuses []MCPServerStatus
-	if e.mcp != nil {
-		statuses = e.mcp.ListServerStatuses(ctx, cfg.MCPServers)
-	}
-	return redactMCPServers(cfg.MCPServers), statuses
-}
-
-// StartMCPOAuth initiates an OAuth 2.0/2.1 PKCE authorization flow for a configured HTTP MCP server.
-func (e *Engine) StartMCPOAuth(ctx context.Context, serverName, redirectURI string) (MCPOAuthStartResult, error) {
-	if e.mcp == nil || e.mcp.OAuth() == nil {
-		return MCPOAuthStartResult{}, newErr("MCP manager unavailable", http.StatusServiceUnavailable)
-	}
-	srv, err := e.findMCPServer(serverName)
-	if err != nil {
-		return MCPOAuthStartResult{}, err
-	}
-	return e.mcp.OAuth().StartAuth(ctx, srv, e.opReader, redirectURI)
-}
-
-// CompleteMCPOAuth exchanges an authorization code for OAuth tokens and tests the MCP server handshake.
-func (e *Engine) CompleteMCPOAuth(ctx context.Context, serverName, state, code string) (MCPOAuthCompleteResult, error) {
-	if e.mcp == nil || e.mcp.OAuth() == nil {
-		return MCPOAuthCompleteResult{}, newErr("MCP manager unavailable", http.StatusServiceUnavailable)
-	}
-	srv, err := e.findMCPServer(serverName)
-	if err != nil {
-		return MCPOAuthCompleteResult{}, err
-	}
-	tok, err := e.mcp.OAuth().ExchangeCode(ctx, srv, e.opReader, state, code)
-	if err != nil {
-		return MCPOAuthCompleteResult{}, err
-	}
-	e.mcp.ResetServer(srv.Name)
-	res := MCPOAuthCompleteResult{
-		ServerName: srv.Name,
-		Authorized: true,
-		Scope:      tok.Scope,
-		ExpiresAt:  tok.ExpiresAt,
-	}
-	if srv.Enabled {
-		tCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		defer cancel()
-		tools, tErr := e.mcp.TestServer(tCtx, srv)
-		if tErr != nil {
-			res.TestError = tErr.Error()
-		} else {
-			res.ToolCount = len(tools)
-			res.Tools = make([]string, 0, len(tools))
-			for _, t := range tools {
-				res.Tools = append(res.Tools, t.RemoteName)
-			}
-		}
-	}
-	return res, nil
-}
-
-// CompleteMCPOAuthByState completes an OAuth callback using only state and code.
-func (e *Engine) CompleteMCPOAuthByState(ctx context.Context, state, code string) (MCPOAuthCompleteResult, error) {
-	if e.mcp == nil || e.mcp.OAuth() == nil {
-		return MCPOAuthCompleteResult{}, newErr("MCP manager unavailable", http.StatusServiceUnavailable)
-	}
-	srvName, err := e.mcp.OAuth().LookupPendingServer(state)
-	if err != nil {
-		return MCPOAuthCompleteResult{}, err
-	}
-	return e.CompleteMCPOAuth(ctx, srvName, state, code)
-}
-
-// RevokeMCPOAuth clears stored OAuth tokens and closes any cached connection for serverName.
-func (e *Engine) RevokeMCPOAuth(serverName string) error {
-	if e.mcp == nil || e.mcp.OAuth() == nil {
-		return nil
-	}
-	clean := strings.ToLower(strings.TrimSpace(serverName))
-	if err := e.mcp.OAuth().Revoke(clean); err != nil {
-		return err
-	}
-	e.mcp.ResetServer(clean)
-	return nil
-}
-
-// TestConnection verifies OpenRouter connectivity and model response.
-func (e *Engine) TestConnection(ctx context.Context) error {
-	cfg, err := e.resolveRuntimeConfig(ctx)
-	if err != nil {
-		return err
-	}
-	_, err = e.llm.CompleteText(ctx, cfg, cfg.Models.Fast, "Reply with OK.", "ping", 16)
-	return err
-}
-
 // Subscribe registers an SSE subscriber channel.
 func (e *Engine) Subscribe() chan StreamEvent {
 	ch := make(chan StreamEvent, 64)
@@ -687,85 +394,6 @@ func (e *Engine) notify() {
 	case e.notifyCh <- struct{}{}:
 	default:
 	}
-}
-
-func isZeroSandboxConfig(s SandboxConfig) bool {
-	return !s.Enabled && s.Image == "" && s.BaseImage == "" && s.Network == "" &&
-		s.CPUs == 0 && s.MemoryMB == 0 && s.IdleMinutes == 0 && s.MaxFileMB == 0 &&
-		len(s.ExtraAptPackages) == 0 && len(s.ExtraPipPackages) == 0
-}
-
-// SetSandboxRunner overrides the container runtime backend (used in tests).
-func (e *Engine) SetSandboxRunner(r SandboxRunner) {
-	if e.sandbox != nil {
-		e.sandbox.setRunner(r)
-	}
-}
-
-// SetSkillRegistry overrides the remote skill registry client (used in tests).
-func (e *Engine) SetSkillRegistry(r *SkillRegistry) {
-	e.cfgMu.Lock()
-	e.skills = r
-	e.cfgMu.Unlock()
-}
-
-func (e *Engine) skillRegistry() *SkillRegistry {
-	e.cfgMu.RLock()
-	r := e.skills
-	e.cfgMu.RUnlock()
-	if r != nil {
-		return r
-	}
-	return NewSkillRegistry()
-}
-
-// SearchSkills searches the configured skills registry (skills.sh) for matching playbooks.
-func (e *Engine) SearchSkills(ctx context.Context, query string, limit int) ([]SkillSearchResult, error) {
-	return e.skillRegistry().Search(ctx, query, limit)
-}
-
-// FetchSkill fetches and validates a remote skill bundle without writing it to the vault.
-func (e *Engine) FetchSkill(ctx context.Context, source, skill, ref, slug string) (*FetchedSkillBundle, error) {
-	return e.skillRegistry().Fetch(ctx, source, skill, ref, slug)
-}
-
-// InstallSkill fetches a remote skill bundle and saves it into _skills/<slug>/ in the primary vault.
-func (e *Engine) InstallSkill(ctx context.Context, source, skill, ref, slug string, overwrite bool) (Skill, *FetchedSkillBundle, error) {
-	bundle, err := e.FetchSkill(ctx, source, skill, ref, slug)
-	if err != nil {
-		return Skill{}, nil, err
-	}
-	v, err := e.vault()
-	if err != nil {
-		return Skill{}, nil, err
-	}
-	if !overwrite {
-		if _, gErr := v.GetSkill(bundle.Slug); gErr == nil {
-			return Skill{}, nil, newErr(fmt.Sprintf("skill %q already exists; set overwrite=true to update", bundle.Slug), http.StatusConflict)
-		}
-	}
-	sk, err := v.SaveSkillBundle(bundle.Slug, bundle.Content, bundle.ExtraFiles, &bundle.Provenance)
-	if err != nil {
-		return Skill{}, nil, err
-	}
-	v.MaybeGitCommit(e.Config().GitAutoCommit, "assistant: install skill "+sk.Name)
-	return sk, bundle, nil
-}
-
-// BuildSandboxImages builds or rebuilds the sandbox OCI images and offline network.
-func (e *Engine) BuildSandboxImages(ctx context.Context, rebuildBase bool) (SandboxBuildResult, error) {
-	if e.sandbox == nil {
-		return SandboxBuildResult{}, newErr("sandbox unavailable", http.StatusServiceUnavailable)
-	}
-	return e.sandbox.BuildImages(ctx, e.Config().Sandbox, rebuildBase)
-}
-
-// ResetSandbox stops/removes the channel sandbox container and optionally clears /work/out.
-func (e *Engine) ResetSandbox(ctx context.Context, channelID string, clearOutput bool) error {
-	if e.sandbox == nil {
-		return newErr("sandbox unavailable", http.StatusServiceUnavailable)
-	}
-	return e.sandbox.Reset(ctx, channelID, clearOutput)
 }
 
 // EnqueueUserMessage stores a user message, queues a wakeup, and wakes the worker.
@@ -984,22 +612,6 @@ func (e *Engine) RetryWithFrontier(channelID string, replaceMsgID int64, prompt 
 	return ev, nil
 }
 
-func (e *Engine) persistDiscordMapping(guildID string, channels map[string]string) error {
-	e.cfgMu.Lock()
-	defer e.cfgMu.Unlock()
-	next := e.cfg
-	if guildID != "" {
-		next.Discord.GuildID = guildID
-	}
-	next.Discord.Channels = maps.Clone(channels)
-	next = NormalizeConfig(next)
-	if err := SaveConfig(e.configPath, next); err != nil {
-		return err
-	}
-	e.cfg = next
-	return nil
-}
-
 // UpsertChannel creates or updates a Fleet channel and triggers Discord auto-sync if needed.
 func (e *Engine) UpsertChannel(ctx context.Context, id, title, description, model string) (Channel, error) {
 	ch, err := e.store.UpsertChannel(id, title, description, model)
@@ -1013,11 +625,9 @@ func (e *Engine) UpsertChannel(ctx context.Context, id, title, description, mode
 	})
 	d := e.Config().Discord
 	if d.Enabled && (d.AutoSyncChannels == nil || *d.AutoSyncChannels) && d.Channels[ch.ID] == "" {
-		syncCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-		go func() {
-			defer cancel()
+		e.spawnBG(ctx, 10*time.Second, func(syncCtx context.Context) {
 			_, _ = e.SyncDiscordChannels(syncCtx)
-		}()
+		})
 	}
 	return ch, nil
 }
@@ -1041,7 +651,9 @@ func (e *Engine) resetChannelInternal(ctx context.Context, id string, clearHisto
 	if origin != "discord" {
 		cfg := e.Config()
 		if cfg.Discord.Enabled && cfg.Discord.Channels[ch.ID] != "" {
-			go e.postDiscordContextCleared(context.WithoutCancel(ctx), cfg, ch, origin, clearHistory)
+			e.spawnBG(ctx, 15*time.Second, func(postCtx context.Context) {
+				e.postDiscordContextCleared(postCtx, cfg, ch, origin, clearHistory)
+			})
 		}
 	}
 	return ch, nil
@@ -1244,420 +856,6 @@ func (e *Engine) handleFrontierEscalationResume(ctx context.Context, cfg Config,
 	return e.runAgentTurn(ctx, cfg, ch, "chat", args.OriginalPrompt, frontierModel, turnOptions{TrackGrant: isTopic, TriggerSource: "approval"})
 }
 
-func isAutoApproveDirective(key string) bool {
-	return key == "auto-approve" || key == "autoapprove" || key == "yolo"
-}
-
-func parseTurnDirectives(text string, aliases map[string]string) (model string, autoApprove bool, cleaned string) {
-	cur := strings.TrimSpace(text)
-	matched := false
-	for range 2 {
-		if !strings.HasPrefix(cur, "/") {
-			break
-		}
-		first, rest, hasRest := strings.Cut(cur, " ")
-		rest = strings.TrimSpace(rest)
-		if !hasRest || rest == "" {
-			break
-		}
-		key := strings.ToLower(strings.TrimPrefix(first, "/"))
-		if isAutoApproveDirective(key) && !autoApprove {
-			autoApprove = true
-			cur = rest
-			matched = true
-			continue
-		}
-		if resolved, ok := aliases[key]; ok && model == "" {
-			model = resolved
-			cur = rest
-			matched = true
-			continue
-		}
-		break
-	}
-	if !matched {
-		return "", false, text
-	}
-	return model, autoApprove, cur
-}
-
-func (e *Engine) resolveTurnRoute(ctx context.Context, cfg Config, ch Channel, source, userText, explicit string, tail []Message, skills []Skill, opts turnOptions) turnRoute {
-	slashModel, slashAutoApprove, cleanText := parseTurnDirectives(userText, cfg.Models.Aliases)
-	bypassHITL := cfg.AutoApprove || opts.AutoApprove || slashAutoApprove || (opts.TriggerSource == "discord" && cfg.Discord.AutoApprove)
-	chosen := cmp.Or(slashModel, strings.TrimSpace(explicit))
-	if chosen == "" {
-		for _, sk := range skills {
-			if sk.Model != "" && strings.Contains(strings.ToLower(cleanText), strings.ToLower(sk.Name)) {
-				chosen = sk.Model
-				break
-			}
-		}
-	}
-	if chosen == "" {
-		chosen = strings.TrimSpace(ch.Model)
-	}
-	if chosen == "" {
-		switch {
-		case source == "heartbeat":
-			chosen = cfg.Models.Heartbeat
-		case source == "chat" && cfg.Routing.Mode != RoutingModeOff:
-			chosen = "auto"
-		default:
-			chosen = concreteDefaultChat(cfg)
-		}
-	}
-	if alias, ok := cfg.Models.Aliases[strings.ToLower(chosen)]; ok {
-		chosen = alias
-	}
-	if !strings.EqualFold(chosen, "auto") {
-		return turnRoute{Model: chosen, CleanText: cleanText, BypassHITL: bypassHITL}
-	}
-	if source != "chat" {
-		return turnRoute{Model: e.decideLegacyTier(ctx, cfg, cleanText), CleanText: cleanText, BypassHITL: bypassHITL}
-	}
-	return e.routeInteractiveChat(ctx, cfg, ch, cleanText, userText, tail, bypassHITL)
-}
-
-func (e *Engine) decideLegacyTier(ctx context.Context, cfg Config, cleanText string) string {
-	fallback := concreteDefaultChat(cfg)
-	ans, err := e.llm.Decide(ctx, cfg, cleanText, []DecisionQuestion{{
-		ID:           "tier",
-		Type:         "choice",
-		Instructions: "Choose model capability tier needed for this user request.",
-		Criteria: map[string]string{
-			"fast":     "Simple question, greeting, reminder, or single-step status lookup",
-			"balanced": "Normal assistant work, tool orchestration, summarization, or multi-step chat",
-			"frontier": "Complex planning, deep reasoning, architecture design, or subtle analysis",
-		},
-	}})
-	if err != nil {
-		return fallback
-	}
-	switch ans["tier"].Value {
-	case "fast":
-		return cfg.Models.Fast
-	case "frontier":
-		return cfg.Models.Frontier
-	default:
-		return fallback
-	}
-}
-
-func buildRoutingState(chID, cleanText, rawUserText string, tail []Message, activeGrant *FrontierGrant) map[string]any {
-	state := map[string]any{
-		"input":        cleanText,
-		"user_message": cleanText,
-		"channel":      chID,
-	}
-	hist := tail
-	if len(hist) > 0 && hist[len(hist)-1].Role == "user" {
-		lastContent := strings.TrimSpace(hist[len(hist)-1].Content)
-		if lastContent == strings.TrimSpace(rawUserText) || lastContent == strings.TrimSpace(cleanText) {
-			hist = hist[:len(hist)-1]
-		}
-	}
-	if len(hist) > 4 {
-		hist = hist[len(hist)-4:]
-	}
-	if len(hist) > 0 {
-		recent := make([]string, 0, len(hist))
-		for _, m := range hist {
-			if m.Role != "user" && m.Role != "assistant" {
-				continue
-			}
-			recent = append(recent, m.Role+": "+truncateText(m.Content, 300))
-		}
-		if len(recent) > 0 {
-			state["recent_context"] = recent
-		}
-	}
-	if activeGrant != nil && strings.TrimSpace(activeGrant.TopicSummary) != "" {
-		state["active_frontier_topic"] = activeGrant.TopicSummary
-	}
-	return state
-}
-
-func (e *Engine) routeInteractiveChat(ctx context.Context, cfg Config, ch Channel, cleanText, rawUserText string, tail []Message, bypassHITL bool) turnRoute {
-	fallback := concreteDefaultChat(cfg)
-	routing := normalizeRoutingConfig(cfg.Routing)
-	effMode := routing.Mode
-	if effMode == RoutingModeOff {
-		effMode = RoutingModeAuto
-	}
-	now := time.Now().UTC()
-	activeGrant, _ := e.store.GetActiveFrontierGrant(ch.ID, ch.ContextEpoch, now)
-	questions := []DecisionQuestion{{
-		ID:   "needs_frontier",
-		Type: "noul",
-		Instructions: "Does this turn require a frontier reasoning model (complex architecture, subtle debugging, multi-step planning, deep trade-off analysis) " +
-			"rather than a fast balanced assistant model (routine questions, status checks, simple edits, summarization)?",
-		Criteria: map[string]string{
-			"true":  "Requires deep reasoning, complex planning, architecture design, or subtle analysis",
-			"false": "Routine chat, lookups, greetings, simple tool calls, or straightforward summarization",
-		},
-	}}
-	if activeGrant != nil {
-		questions = append(questions, DecisionQuestion{
-			ID:           "same_topic",
-			Type:         "noul",
-			Instructions: "Is the latest user message continuing the same task/topic as active_frontier_topic and recent_context, rather than pivoting to a new unrelated topic?",
-			Criteria: map[string]string{
-				"true":  "Continuation or follow-up on the active frontier topic",
-				"false": "New or unrelated topic pivot",
-			},
-		})
-	}
-	state := buildRoutingState(ch.ID, cleanText, rawUserText, tail, activeGrant)
-	ans, err := e.llm.DecideState(ctx, cfg, state, questions)
-	if err != nil {
-		return turnRoute{Model: fallback, CleanText: cleanText, BypassHITL: bypassHITL}
-	}
-	pFrontier := ans["needs_frontier"].Prob("true")
-	if _, hasNF := ans["needs_frontier"]; !hasNF {
-		if tAns, hasTier := ans["tier"]; hasTier {
-			pFrontier = tAns.Prob("frontier")
-		}
-	}
-	if activeGrant != nil {
-		if ans["same_topic"].Prob("true") < DefaultSameTopicProb {
-			_ = e.store.DeleteFrontierGrant(ch.ID)
-			e.publishEvent(StreamEvent{Type: "grant_updated", ChannelID: ch.ID})
-			activeGrant = nil
-		}
-	}
-	if pFrontier >= routing.GateProb {
-		if bypassHITL || effMode == RoutingModeAuto {
-			return turnRoute{Model: cfg.Models.Frontier, CleanText: cleanText, BypassHITL: bypassHITL}
-		}
-		todayStart := now.Format("2006-01-02") + "T00:00:00+00:00"
-		dailySpend := e.store.DailySpendUSD(todayStart)
-		if activeGrant != nil && (routing.DailySoftCapUSD <= 0 || dailySpend < routing.DailySoftCapUSD) {
-			return turnRoute{Model: cfg.Models.Frontier, CleanText: cleanText, BypassHITL: bypassHITL, UsedGrant: activeGrant}
-		}
-		return turnRoute{
-			CleanText:  cleanText,
-			BypassHITL: bypassHITL,
-			Escalate: &frontierEscalationArgs{
-				OriginalPrompt: cleanText,
-				FrontierModel:  cfg.Models.Frontier,
-				FallbackModel:  fallback,
-				Probability:    pFrontier,
-				TopicHint:      truncateText(cleanText, 160),
-				DailySpendUSD:  dailySpend,
-				GrantMaxTurns:  routing.GrantMaxTurns,
-				GrantMaxCost:   routing.GrantMaxCostUSD,
-			},
-		}
-	}
-	if effMode == RoutingModeHybrid && pFrontier >= routing.BorderlineProb {
-		return turnRoute{Model: fallback, CleanText: cleanText, BypassHITL: bypassHITL, BorderlineProb: pFrontier}
-	}
-	return turnRoute{Model: fallback, CleanText: cleanText, BypassHITL: bypassHITL}
-}
-
-func (e *Engine) buildPromptMessages(ctx context.Context, ch Channel, tail []Message, slashAliases map[string]string) []ChatMessage {
-	v, _ := e.vault()
-	var soul, reflections, observations, fleetCtx string
-	var skills []Skill
-	if v != nil {
-		soul, _ = v.ReadFile("_agent/SOUL.md")
-		reflections, _ = v.ReadFile("_agent/memory/REFLECTIONS.md")
-		observations, _ = v.ReadFile("_agent/memory/OBSERVATIONS.md")
-		skills, _ = v.ListSkills()
-	}
-	if e.deps != nil {
-		fleetCtx, _ = e.deps.MemoryContext("", "lighthouse")
-	}
-	var sysStatic strings.Builder
-	sysStatic.WriteString(soul)
-	sysStatic.WriteString("\nCurrent UTC time: " + time.Now().UTC().Format(time.RFC3339) + "\n")
-	sysStatic.WriteString("Active channel: #" + ch.ID + "\n")
-	sysStatic.WriteString("\n## Skills Catalog\n")
-	if len(skills) > 0 {
-		for _, sk := range skills {
-			extra := ""
-			if len(sk.Files) > 0 {
-				extra = fmt.Sprintf(" (+%d files)", len(sk.Files))
-			}
-			fmt.Fprintf(&sysStatic, "- %s%s: %s\n", sk.Name, extra, cmp.Or(sk.Description, "(no description)"))
-		}
-	} else {
-		sysStatic.WriteString("- (no installed skills yet)\n")
-	}
-	sysStatic.WriteString("Use `skill_read` (with optional `file`) to load `SKILL.md` and companion files; use `skill_search` + `skill_fetch` to discover/preview `skills.sh` or GitHub (`owner/repo@skill`) playbooks, `skill_install` (approval-gated, direct chat only) to install bundles, `skill_write` to author or adapt skills to Fleet tools, and `skill_remove` to uninstall. Bundled skill scripts are non-executable on the host and must only be inspected or run inside `sandbox_exec` if needed.\n")
-	if fleetCtx != "" {
-		sysStatic.WriteString("\n## Fleet Standing Memory\n" + fleetCtx + "\n")
-	}
-	if vaultsSection := e.buildVaultsPromptSection(); vaultsSection != "" {
-		sysStatic.WriteString(vaultsSection)
-	}
-	if opSection := e.buildOPPromptSection(ctx); opSection != "" {
-		sysStatic.WriteString(opSection)
-	}
-	if sbSection := buildSandboxPromptSection(e.Config()); sbSection != "" {
-		sysStatic.WriteString(sbSection)
-	}
-	if lhSection := e.buildLighthouseWorkerPromptSection(); lhSection != "" {
-		sysStatic.WriteString(lhSection)
-	}
-	sysStatic.WriteString(buildGenerativeUIPromptSection())
-
-	var memPrefix strings.Builder
-	if reflections != "" {
-		memPrefix.WriteString("## Reflections\n" + reflections + "\n\n")
-	}
-	if observations != "" {
-		memPrefix.WriteString("## Observations\n" + observations + "\n")
-	}
-
-	parts := []PromptPart{{Type: "text", Text: sysStatic.String()}}
-	if memPrefix.Len() > 0 {
-		parts = append(parts, PromptPart{
-			Type:         "text",
-			Text:         memPrefix.String(),
-			CacheControl: map[string]any{"type": "ephemeral"},
-		})
-	} else {
-		parts[0].CacheControl = map[string]any{"type": "ephemeral"}
-	}
-	out := []ChatMessage{{Role: "system", Content: parts}}
-	for _, m := range tail {
-		if m.Role != "user" && m.Role != "assistant" {
-			continue
-		}
-		txt := m.Content
-		if m.Role == "user" {
-			_, _, txt = parseTurnDirectives(txt, slashAliases)
-			if hint := formatAttachedFilesHint(m.Widgets); hint != "" {
-				txt += "\n" + hint
-			}
-		}
-		out = append(out, ChatMessage{Role: m.Role, Content: txt})
-	}
-	return out
-}
-
-func formatAttachedFilesHint(widgets []WidgetPayload) string {
-	var parts []string
-	for _, w := range widgets {
-		if w.Kind != "files" {
-			continue
-		}
-		dataMap, ok := w.Data.(map[string]any)
-		if !ok {
-			continue
-		}
-		rawFiles, ok := dataMap["files"].([]any)
-		if !ok {
-			continue
-		}
-		for _, item := range rawFiles {
-			fm, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			name, _ := fm["name"].(string)
-			mimeType, _ := fm["mime_type"].(string)
-			var sizeBytes int64
-			switch v := fm["size_bytes"].(type) {
-			case float64:
-				sizeBytes = int64(v)
-			case int64:
-				sizeBytes = v
-			}
-			if name != "" {
-				parts = append(parts, fmt.Sprintf("%s (%s, %s)", name, formatByteSize(sizeBytes), cmp.Or(mimeType, "application/octet-stream")))
-			}
-		}
-	}
-	if len(parts) == 0 {
-		return ""
-	}
-	return "[Attached files staged in sandbox /work/in/: " + strings.Join(parts, ", ") + "]"
-}
-
-func (e *Engine) buildVaultsPromptSection() string {
-	cfg := e.Config()
-	var b strings.Builder
-	b.WriteString("\n## Mounted Obsidian Vaults\n")
-	fmt.Fprintf(&b, "- %s (primary): _agent/, _skills/, Observational Memory; auto-write: [%s]; approval required elsewhere\n", PrimaryVaultName, strings.Join(cfg.AutoWriteDirs, ", "))
-	for _, m := range cfg.ExtraVaults {
-		var policy string
-		switch {
-		case m.ReadOnly:
-			policy = "read-only"
-		case len(m.AutoWriteDirs) > 0:
-			policy = fmt.Sprintf("auto-write: [%s]; approval required elsewhere", strings.Join(m.AutoWriteDirs, ", "))
-		default:
-			policy = "read anywhere; all writes require human approval"
-		}
-		fmt.Fprintf(&b, "- %s (%s): %s\n", m.Name, m.Path, policy)
-	}
-	b.WriteString("Use `vault_search` (with optional `vault`: \"all\", \"agent\", or a mounted vault name) and pass optional `vault` to `vault_read`, `vault_write`, and `vault_append`.\n")
-	return b.String()
-}
-
-func (e *Engine) buildOPPromptSection(ctx context.Context) string {
-	hasTok := ResolveOPToken(e.opTokenPath) != ""
-	if !hasTok && e.Probes.ListVaults == nil {
-		return ""
-	}
-	vaults, err := e.listOPVaultsCached(ctx)
-	if (err != nil || len(vaults) == 0) && !hasTok {
-		return ""
-	}
-	var b strings.Builder
-	b.WriteString("\n## 1Password Agent Vault (Zero-Exposure)\n")
-	if len(vaults) > 0 {
-		names := make([]string, 0, len(vaults))
-		for _, v := range vaults {
-			names = append(names, v.Name)
-		}
-		b.WriteString("Accessible vaults: " + strings.Join(names, ", ") + "\n")
-	}
-	b.WriteString("Use `onepassword_list_items`, `onepassword_get_item_meta`, `http_request_with_credential`, and `onepassword_store_item` to inspect item metadata/op:// references and inject credentials at runtime without ever requesting or displaying plaintext secrets.\n")
-	b.WriteString("For external or internal MCP setup, use `mcp_list`, `mcp_configure` (approval-gated; pass secrets via `op://` in `env_refs`, `header_refs`, or `oauth.client_secret_op_ref`, never plaintext; for official Google Workspace MCPs set `oauth: {\"enabled\":true,\"provider\":\"google\",\"client_id\":\"...\",\"client_secret_op_ref\":\"op://...\",\"scopes\":[...]}`), `mcp_oauth_connect` (attaches an interactive sign-in card in `#chat` whenever OAuth sign-in or re-authorization is needed), and `mcp_test`.\n")
-	return b.String()
-}
-
-func (e *Engine) buildLighthouseWorkerPromptSection() string {
-	if e.deps == nil {
-		return ""
-	}
-	lh := e.deps.LighthouseWorkerStatus()
-	if lh.Device == "" {
-		return ""
-	}
-	var b strings.Builder
-	if lh.WorkerOnline {
-		fmt.Fprintf(&b, "\n## Lighthouse Host Worker (%s, online)\n", lh.Device)
-		fmt.Fprintf(&b, "- `%s` has a local Fleet worker online for lighthouse host self-configuration (e.g. installing `uv`, `node`, `brew` packages, or troubleshooting stdio MCP servers) via `fleet_spawn_agent(device=%q, harness=\"agy\", repo_path=\"~\", ...)` (`harness` defaults to `agy` on `%s` unless the user specifies another harness) — call `skill_read(\"lighthouse-self-config\")` before spawning for the playbook. Always requires explicit user approval.\n", lh.Device, lh.Device, lh.Device)
-		b.WriteString("- Keep using `sandbox_*` for document/data/file tasks and other awake Macs (`laptop`/`office`) for normal software repo coding.\n")
-	} else {
-		fmt.Fprintf(&b, "\n## Lighthouse Host Worker (%s, offline)\n", lh.Device)
-		fmt.Fprintf(&b, "- `%s`'s host worker is currently offline; if host self-configuration is needed, tell the user they can enable it once with `fleet assistant worker-install` on `%s` (using Rex or tmux).\n", lh.Device, lh.Device)
-	}
-	return b.String()
-}
-
-func buildGenerativeUIPromptSection() string {
-	return `
-## Generative UI (` + "`render_card`" + ` & ` + "`render_widget`" + `)
-- Prefer ` + "`render_card`" + ` for structured mobile-friendly UI and quick follow-ups; use ` + "`render_widget`" + ` for interactive or Generative UI charts, graphs, diagrams, and custom visualizations (call ` + "`render_widget`" + ` directly — do NOT paste raw HTML/SVG into Markdown text, and do NOT use ` + "`sandbox_exec`" + ` unless the user asked for a downloadable PNG/PDF file).
-- ` + "`render_card`" + ` ` + "`data`" + ` schemas by ` + "`kind`" + `:
-  - ` + "`choices`" + `: ` + "`{\"choices\":[{\"label\":\"Button label\",\"value\":\"Prompt sent on tap\"}]}`" + `
-  - ` + "`key_value`" + `: ` + "`{\"Field\":\"Value\"}`" + `
-  - ` + "`agents`" + `: ` + "`{\"agents\":[{\"name\":\"...\",\"device\":\"...\",\"state\":\"...\"}]}`" + `
-  - ` + "`agenda`" + `: ` + "`{\"items\":[{\"time\":\"09:00\",\"title\":\"...\"}]}`" + `
-  - ` + "`markdown`" + `: ` + "`{\"markdown\":\"...\"}`" + `
-  - ` + "`mcp_oauth`" + `: ` + "`{\"server\":\"...\"}`" + ` (prefer calling ` + "`mcp_oauth_connect`" + ` so server metadata and scopes are populated automatically)
-- ` + "`render_widget`" + ` rules (sandboxed iframe, strict CSP ` + "`default-src 'none'`" + `):
-  - Self-contained HTML with inline ` + "`<style>`" + `, ` + "`<svg viewBox=\"...\">`" + ` or ` + "`<canvas>`" + `, and inline ` + "`<script>`" + ` only (never wrap ` + "`html`" + ` in markdown code fences); external URLs/CDNs/Chart.js/D3/Plotly/fonts are blocked and rejected (only ` + "`data:`" + ` images work).
-  - Style with host CSS variables (` + "`--text`" + `, ` + "`--muted`" + `, ` + "`--border`" + `, ` + "`--accent`" + `, ` + "`--surface`" + `) so light and dark themes adapt cleanly.
-  - Add ` + "`data-fleet-action=\"<prompt text>\"`" + ` to clickable elements to send follow-up prompts into ` + "`#chat`" + `; keep layouts mobile-friendly and compact (<= 480px tall).
-`
-}
-
 func (e *Engine) loadTurnTail(ch Channel, opts turnOptions) ([]Message, error) {
 	tail, err := e.store.ListContextMessages(ch.ID, ch.ContextEpoch, 40)
 	if err != nil {
@@ -1699,7 +897,7 @@ func (e *Engine) runAgentTurn(ctx context.Context, cfg Config, ch Channel, sourc
 	}
 	route := e.resolveTurnRoute(ctx, cfg, ch, source, userText, explicitModel, tail, skills, opts)
 	if route.Escalate != nil {
-		return e.pauseForFrontierEscalation(ch, route.Escalate)
+		return e.pauseForFrontierEscalation(ctx, ch, route.Escalate)
 	}
 	model := route.Model
 	msgs := e.buildPromptMessages(ctx, ch, tail, cfg.Models.Aliases)
@@ -1760,7 +958,7 @@ func (e *Engine) runAgentTurn(ctx context.Context, cfg Config, ch Channel, sourc
 			e.publishEvent(StreamEvent{Type: "tool_start", ChannelID: ch.ID, Data: map[string]string{"name": tc.Function.Name}})
 			outStr, execErr := e.executeTool(ctx, tc, tctx)
 			if aprErr, ok := errors.AsType[*approvalRequiredError](execErr); ok {
-				return e.pauseForApproval(ch, model, totalUsage, widgets, aprErr)
+				return e.pauseForApproval(ctx, ch, model, totalUsage, widgets, aprErr)
 			}
 			if execErr != nil {
 				outStr = fmt.Sprintf(`{"error":%q}`, execErr.Error())
@@ -1800,7 +998,7 @@ func (e *Engine) recordTurnGrantUsage(cfg Config, channelID string, costUSD floa
 	}
 }
 
-func (e *Engine) pauseForFrontierEscalation(ch Channel, esc *frontierEscalationArgs) error {
+func (e *Engine) pauseForFrontierEscalation(ctx context.Context, ch Channel, esc *frontierEscalationArgs) error {
 	rawArgs, err := json.Marshal(esc)
 	if err != nil {
 		return err
@@ -1816,7 +1014,7 @@ func (e *Engine) pauseForFrontierEscalation(ch Channel, esc *frontierEscalationA
 		return err
 	}
 	e.publishEvent(StreamEvent{Type: "approval", ChannelID: ch.ID, Data: apr})
-	_ = e.sendApprovalToDiscord(e.Config(), ch, apr)
+	_ = e.sendApprovalToDiscord(ctx, e.Config(), ch, apr)
 	return nil
 }
 
@@ -1842,7 +1040,7 @@ func (e *Engine) finishTurnSuccess(ctx context.Context, cfg Config, ch Channel, 
 	return nil
 }
 
-func (e *Engine) pauseForApproval(ch Channel, model string, usage StreamUsage, widgets []WidgetPayload, aprErr *approvalRequiredError) error {
+func (e *Engine) pauseForApproval(ctx context.Context, ch Channel, model string, usage StreamUsage, widgets []WidgetPayload, aprErr *approvalRequiredError) error {
 	msg, err := e.store.AppendMessage(Message{
 		ChannelID:        ch.ID,
 		ContextEpoch:     ch.ContextEpoch,
@@ -1873,13 +1071,11 @@ func (e *Engine) pauseForApproval(ch Channel, model string, usage StreamUsage, w
 	e.publishEvent(StreamEvent{Type: "message_done", ChannelID: ch.ID, Data: msg})
 	e.publishEvent(StreamEvent{Type: "approval", ChannelID: ch.ID, Data: apr})
 	cfg := e.Config()
-	sentInteractive := e.sendApprovalToDiscord(cfg, ch, apr)
+	sentInteractive := e.sendApprovalToDiscord(ctx, cfg, ch, apr)
 	if !sentInteractive && cfg.Notifications.Enabled && (cfg.Notifications.NotifyApprovals == nil || *cfg.Notifications.NotifyApprovals) {
-		go func() {
-			nCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
+		e.spawnBG(ctx, 10*time.Second, func(nCtx context.Context) {
 			_ = e.dispatchNotification(nCtx, Notification{
-				Category:  "approvals",
+				Category:  "approval",
 				ChannelID: ch.ID,
 				Priority:  "urgent",
 				Title:     "Approval needed: " + apr.ToolName,
@@ -1889,121 +1085,9 @@ func (e *Engine) pauseForApproval(ch Channel, model string, usage StreamUsage, w
 					{Name: "Risk", Value: apr.RiskLevel, Inline: true},
 				},
 			})
-		}()
+		})
 	}
 	return nil
-}
-
-func (e *Engine) maybeAutoObserve(ctx context.Context, cfg Config, channelID string) {
-	msgs, err := e.store.ListUnobservedMessages(channelID, 200)
-	if err != nil || len(msgs) < 6 {
-		return
-	}
-	var chars int
-	for _, m := range msgs {
-		chars += len(m.Content)
-	}
-	if chars/4 < cfg.ObserverThresholdTokens {
-		return
-	}
-	_, _ = e.RunObserver(ctx, channelID)
-}
-
-// RunObserver distills unobserved messages into _agent/memory/OBSERVATIONS.md and triggers Reflector when large.
-func (e *Engine) RunObserver(ctx context.Context, channelID string) (map[string]any, error) {
-	cfg, err := e.resolveRuntimeConfig(ctx)
-	if err != nil {
-		return nil, err
-	}
-	msgs, err := e.store.ListUnobservedMessages(channelID, 200)
-	if err != nil {
-		return nil, err
-	}
-	if len(msgs) == 0 {
-		return map[string]any{"observed": 0, "reflected": false}, nil
-	}
-	var transcript strings.Builder
-	var maxID int64
-	for _, m := range msgs {
-		if m.ID > maxID {
-			maxID = m.ID
-		}
-		fmt.Fprintf(&transcript, "[%s #%s %s] %s\n", m.CreatedAt, m.ChannelID, m.Role, m.Content)
-	}
-	sys := `You are the Observational Memory Observer.
-Convert the raw transcript into concise, dated Markdown bullet observations using priority markers:
-- 🔴 critical decisions, blockers, explicit user instructions
-- 🟡 ongoing tasks, preferences, context
-- 🟢 minor FYI facts
-Omit small talk. Output only Markdown bullets.`
-	obsText, err := e.llm.CompleteText(ctx, cfg, cfg.Models.Observer, sys, transcript.String(), 1024)
-	if err != nil {
-		return nil, err
-	}
-	v, err := e.vault()
-	if err != nil {
-		return nil, err
-	}
-	header := fmt.Sprintf("\n### %s\n%s\n", time.Now().UTC().Format("2006-01-02 15:04 UTC"), strings.TrimSpace(obsText))
-	if _, err := v.AppendFile("_agent/memory/OBSERVATIONS.md", header); err != nil {
-		return nil, err
-	}
-	if err := e.store.MarkMessagesObserved(channelID, maxID); err != nil {
-		return nil, err
-	}
-	v.MaybeGitCommit(cfg.GitAutoCommit, "assistant: observational memory pass")
-
-	reflected := false
-	if curObs, rErr := v.ReadFile("_agent/memory/OBSERVATIONS.md"); rErr == nil && len(curObs) > cfg.ReflectorThresholdBytes {
-		if _, refErr := e.RunReflector(ctx); refErr == nil {
-			reflected = true
-		}
-	}
-	return map[string]any{"observed": len(msgs), "reflected": reflected}, nil
-}
-
-// RunReflector condenses _agent/memory/OBSERVATIONS.md into _agent/memory/REFLECTIONS.md and archives old observations.
-func (e *Engine) RunReflector(ctx context.Context) (string, error) {
-	cfg, err := e.resolveRuntimeConfig(ctx)
-	if err != nil {
-		return "", err
-	}
-	v, err := e.vault()
-	if err != nil {
-		return "", err
-	}
-	reflections, _ := v.ReadFile("_agent/memory/REFLECTIONS.md")
-	observations, err := v.ReadFile("_agent/memory/OBSERVATIONS.md")
-	if err != nil {
-		return "", err
-	}
-	sys := `You are the Observational Memory Reflector.
-Merge the existing REFLECTIONS.md with new OBSERVATIONS.md into an updated, compact REFLECTIONS.md.
-Preserve durable preferences, active projects, open follow-ups, and key dates; drop resolved or obsolete items.
-Output only the updated Markdown for REFLECTIONS.md.`
-	prompt := "## Current REFLECTIONS.md\n" + reflections + "\n\n## New OBSERVATIONS.md\n" + observations
-	nextRefl, err := e.llm.CompleteText(ctx, cfg, cfg.Models.Reflector, sys, prompt, 1500)
-	if err != nil {
-		return "", err
-	}
-	archiveRel := filepath.ToSlash(filepath.Join("_agent/memory/archive", time.Now().UTC().Format("2006-01")+".md"))
-	_, _ = v.AppendFile(archiveRel, observations)
-	if _, err := v.WriteFile("_agent/memory/REFLECTIONS.md", strings.TrimSpace(nextRefl)+"\n"); err != nil {
-		return "", err
-	}
-	if _, err := v.WriteFile("_agent/memory/OBSERVATIONS.md", "# Observations\n_Append-only dated observation log maintained by the background Observer._\n"); err != nil {
-		return "", err
-	}
-	v.MaybeGitCommit(cfg.GitAutoCommit, "assistant: reflector compaction")
-	return nextRefl, nil
-}
-
-// SetOPReader overrides 1Password resolution (used by tests or custom brokers).
-func (e *Engine) SetOPReader(fn OPReaderFunc) {
-	e.opReader = fn
-	if e.mcp != nil {
-		e.mcp.reader = fn
-	}
 }
 
 func (e *Engine) refreshDelegationsFlag() {
@@ -2129,7 +1213,7 @@ func (e *Engine) activeNotifier(cfg NotificationsConfig) Notifier {
 	if custom != nil {
 		return custom
 	}
-	return NewDiscordWebhookNotifier(cfg, e.opReader, nil)
+	return NewDiscordWebhookNotifier(cfg, e.getOPReader(), nil)
 }
 
 func (e *Engine) dispatchNotification(ctx context.Context, n Notification) error {
@@ -2140,18 +1224,18 @@ func (e *Engine) dispatchNotification(ctx context.Context, n Notification) error
 	return e.activeNotifier(cfg.Notifications).Send(ctx, n)
 }
 
-func (e *Engine) dispatchOutboxNotification(item OutboxItem) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func (e *Engine) dispatchOutboxNotification(ctx context.Context, item OutboxItem) {
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	cfg := e.Config()
-	if e.sendOutboxToDiscord(ctx, cfg, item) {
+	if e.sendOutboxToDiscord(reqCtx, cfg, item) {
 		_ = e.store.MarkOutboxDelivered(item.ID)
 		return
 	}
 	if !cfg.Notifications.Enabled {
 		return
 	}
-	if err := e.dispatchNotification(ctx, Notification{
+	if err := e.dispatchNotification(reqCtx, Notification{
 		Category:  "outbox",
 		ChannelID: item.ChannelID,
 		Priority:  item.Priority,

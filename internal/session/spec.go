@@ -47,6 +47,9 @@ type Spec struct {
 }
 
 var (
+	// ErrTmuxRequired is returned when tmux is needed for a session operation but not found on PATH.
+	ErrTmuxRequired = errors.New("tmux is required (macOS: brew install tmux)")
+
 	nameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`)
 	uuidRE = regexp.MustCompile(`^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$`)
 	agyRE  = regexp.MustCompile(`(^|[\s/])(agy|antigravity)([\s]|$)`)
@@ -184,6 +187,25 @@ func AugmentedPath(basePath, home string) string {
 	return strings.Join(parts, string(os.PathListSeparator))
 }
 
+func withEnvPath(environ []string, pathEnv string) []string {
+	out := make([]string, 0, len(environ)+1)
+	replaced := false
+	for _, kv := range environ {
+		if strings.HasPrefix(kv, "PATH=") {
+			if !replaced {
+				out = append(out, "PATH="+pathEnv)
+				replaced = true
+			}
+			continue
+		}
+		out = append(out, kv)
+	}
+	if !replaced {
+		out = append(out, "PATH="+pathEnv)
+	}
+	return out
+}
+
 func lookPathWithEnv(name, pathEnv string) (string, error) {
 	if strings.Contains(name, string(os.PathSeparator)) {
 		return filepath.Abs(name)
@@ -281,77 +303,86 @@ func buildClaudeSettingsJSON(selfBin string) (string, error) {
 	return string(b), nil
 }
 
+func buildClaudeArgs(name, selfBin, resumeID, prompt string, pol Policy) ([]string, error) {
+	settingsJSON, err := buildClaudeSettingsJSON(selfBin)
+	if err != nil {
+		return nil, err
+	}
+	var args []string
+	switch pol {
+	case PolicySafe:
+		args = append(args, "--permission-mode", "manual")
+	case PolicyBypass:
+		args = append(args, "--dangerously-skip-permissions")
+	default:
+		args = append(args, "--permission-mode", "auto")
+	}
+	args = append(args, "--remote-control", name, "--settings", settingsJSON)
+	if resumeID != "" {
+		args = append(args, "--resume", resumeID)
+	}
+	if prompt != "" {
+		args = append(args, "--", prompt)
+	}
+	return args, nil
+}
+
+func buildAgyArgs(resumeID, prompt string, pol Policy) []string {
+	var args []string
+	switch pol {
+	case PolicySafe:
+		args = append(args, "--sandbox", "--mode", "plan")
+	case PolicyBypass:
+		args = append(args, "--dangerously-skip-permissions")
+	default:
+		args = append(args, "--mode", "auto")
+	}
+	args = append(args, "--remote-control")
+	if resumeID != "" {
+		args = append(args, "--conversation", resumeID)
+	}
+	if prompt != "" {
+		args = append(args, "--prompt-interactive", prompt)
+	}
+	return args
+}
+
+func buildCodexArgs(resumeID, prompt string, pol Policy) []string {
+	var args []string
+	if resumeID != "" {
+		args = append(args, "resume")
+	}
+	switch pol {
+	case PolicySafe:
+		args = append(args, "-s", "workspace-write", "-a", "on-request")
+	case PolicyBypass:
+		args = append(args, "--dangerously-bypass-approvals-and-sandbox")
+	default:
+		args = append(args, "--approve-for-me")
+	}
+	if resumeID != "" {
+		args = append(args, resumeID)
+	}
+	if prompt != "" {
+		if resumeID != "" {
+			args = append(args, prompt)
+		} else {
+			args = append(args, "--", prompt)
+		}
+	}
+	return args
+}
+
 // BuildHarnessArgs constructs exact CLI arguments for launching or resuming a harness process.
 func BuildHarnessArgs(spec Spec, name, selfBin, resumeID, prompt string, policy Policy) ([]string, error) {
 	pol := cmp.Or(policy, PolicyAuto)
 	switch spec.Name {
 	case HarnessClaude:
-		settingsJSON, err := buildClaudeSettingsJSON(selfBin)
-		if err != nil {
-			return nil, err
-		}
-		var args []string
-		switch pol {
-		case PolicySafe:
-			args = append(args, "--permission-mode", "manual")
-		case PolicyBypass:
-			args = append(args, "--dangerously-skip-permissions")
-		default:
-			args = append(args, "--permission-mode", "auto")
-		}
-		args = append(args, "--remote-control", name, "--settings", settingsJSON)
-		if resumeID != "" {
-			args = append(args, "--resume", resumeID)
-		}
-		if prompt != "" {
-			args = append(args, "--", prompt)
-		}
-		return args, nil
-
+		return buildClaudeArgs(name, selfBin, resumeID, prompt, pol)
 	case HarnessAgy:
-		var args []string
-		switch pol {
-		case PolicySafe:
-			args = append(args, "--sandbox", "--mode", "plan")
-		case PolicyBypass:
-			args = append(args, "--dangerously-skip-permissions")
-		default:
-			args = append(args, "--mode", "auto")
-		}
-		args = append(args, "--remote-control")
-		if resumeID != "" {
-			args = append(args, "--conversation", resumeID)
-		}
-		if prompt != "" {
-			args = append(args, "--prompt-interactive", prompt)
-		}
-		return args, nil
-
+		return buildAgyArgs(resumeID, prompt, pol), nil
 	case HarnessCodex:
-		var args []string
-		if resumeID != "" {
-			args = append(args, "resume")
-		}
-		switch pol {
-		case PolicySafe:
-			args = append(args, "-s", "workspace-write", "-a", "on-request")
-		case PolicyBypass:
-			args = append(args, "--dangerously-bypass-approvals-and-sandbox")
-		default:
-			args = append(args, "--approve-for-me")
-		}
-		if resumeID != "" {
-			args = append(args, resumeID)
-		}
-		if prompt != "" {
-			if resumeID != "" {
-				args = append(args, prompt)
-			} else {
-				args = append(args, "--", prompt)
-			}
-		}
-		return args, nil
-
+		return buildCodexArgs(resumeID, prompt, pol), nil
 	default:
 		return nil, fmt.Errorf("unsupported harness %q", spec.Name)
 	}

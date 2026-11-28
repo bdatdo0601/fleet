@@ -15,6 +15,8 @@ import (
 	"github.com/bdatdo0601/fleet/internal/paths"
 )
 
+const maxHookPayloadBytes = 1 << 20
+
 func agyHooksPath(override string) string {
 	if override != "" {
 		return override
@@ -104,6 +106,7 @@ func (p rawHookPayload) isSubagent() bool {
 
 // HandleHook implements `fleet session <harness> __hook`, reading hook JSON from stdin and always writing `{}` on stdout.
 func HandleHook(harness string, stdin io.Reader, stdout io.Writer) error {
+	stdout = cmp.Or(stdout, io.Discard)
 	defer func() {
 		_, _ = io.WriteString(stdout, "{}\n")
 	}()
@@ -111,7 +114,7 @@ func HandleHook(harness string, stdin io.Reader, stdout io.Writer) error {
 	if err != nil {
 		return nil
 	}
-	raw, err := io.ReadAll(stdin)
+	raw, err := io.ReadAll(io.LimitReader(stdin, maxHookPayloadBytes))
 	if err != nil || len(bytes.TrimSpace(raw)) == 0 {
 		return nil
 	}
@@ -212,10 +215,14 @@ func ExecWithPrompt(harness, harnessBin, promptFile string, baseArgs []string) e
 	argv := make([]string, 0, len(baseArgs)+4)
 	argv = append(argv, filepath.Base(harnessBin))
 	argv = append(argv, baseArgs...)
-	if spec.Name == HarnessAgy {
+	switch {
+	case spec.Name == HarnessAgy:
 		argv = append(argv, "--prompt-interactive", prompt)
-	} else {
+	case spec.Name == HarnessCodex && len(baseArgs) > 0 && baseArgs[0] == "resume":
+		argv = append(argv, prompt)
+	default:
 		argv = append(argv, "--", prompt)
 	}
-	return syscall.Exec(harnessBin, argv, os.Environ())
+	pathEnv := AugmentedPath(os.Getenv("PATH"), os.Getenv("HOME"))
+	return syscall.Exec(harnessBin, argv, withEnvPath(os.Environ(), pathEnv))
 }

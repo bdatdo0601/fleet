@@ -3,7 +3,6 @@ package cli
 import (
 	"cmp"
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -29,8 +28,12 @@ func cmdEdge(args []string, cio *IO) error {
 	apiURL := fs.String("api", fmt.Sprintf("http://127.0.0.1:%d", paths.APIPort()), "upstream fleet serve URL")
 	httpsPort := fs.Int("https-port", paths.HTTPSPort(), "HTTPS listen port")
 	dnsPort := fs.Int("dns-port", paths.DNSPort(), "DNS listen port")
-	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
 		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(pos, " "))
 	}
 	resolvedState := strings.TrimSpace(*stateDir)
 	if resolvedState == "" {
@@ -81,8 +84,12 @@ func cmdTLSPolicy(args []string, cio *IO) error {
 	domain := fs.String("domain", "", "TLS/DNS domain (e.g. fleet.example.com)")
 	ddnsName := fs.String("ddns-name", "", "optional DDNS A record name to include")
 	noPublicA := fs.Bool("no-public-a", false, "omit static A record permission on <domain>")
-	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
 		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(pos, " "))
 	}
 	if *zoneID == "" || *domain == "" {
 		return fmt.Errorf("usage: fleet tls policy --zone-id Z... --domain HOST [--ddns-name HOST] [--no-public-a]")
@@ -105,10 +112,7 @@ func cmdTLSPolicy(args []string, cio *IO) error {
 	if err != nil {
 		return err
 	}
-	enc := json.NewEncoder(cio.Stdout)
-	enc.SetEscapeHTML(false)
-	enc.SetIndent("", "  ")
-	return enc.Encode(pol)
+	return writeJSONOut(cio.Stdout, pol)
 }
 
 func tlsPreflight(domain, zoneID, profile, email string, publicA, privateDNS, staging bool) (tlsdns.Config, error) {
@@ -164,11 +168,57 @@ func refreshLighthouseConfigAndNebula(cio *IO, fleet *core.Fleet) {
 	if wrote {
 		if label := system.NebulaLabel(""); label != "" && system.LaunchdLoaded(label) {
 			if rErr := system.Reload(label); rErr != nil {
-				system.Restart(label)
+				if rsErr := system.RestartService(label); rsErr != nil {
+					cio.printf("warning: restart %s: %v\n", label, rsErr)
+				}
 			}
 		}
 		cio.info("updated lighthouse Nebula firewall (TCP 443, UDP/TCP 53)")
 	}
+}
+
+func resolveTLSZoneAndProfile(fleet *core.Fleet, zoneID, profile string) (string, string, error) {
+	zid := strings.TrimSpace(zoneID)
+	prof := strings.TrimSpace(profile)
+	if ddnsCfg, dErr := fleet.DDNSConfig(); dErr == nil && ddnsCfg != nil {
+		zid = cmp.Or(zid, ddnsCfg.ZoneID)
+		prof = cmp.Or(prof, ddnsCfg.Profile)
+	}
+	prof = cmp.Or(prof, "fleet-ddns")
+	if zid == "" {
+		return "", "", fmt.Errorf("--zone-id is required (no Route 53 DDNS zone configured yet)")
+	}
+	return zid, prof, nil
+}
+
+func installAndStartTLSDaemons(cio *IO, fleet *core.Fleet, cfg tlsdns.Config) error {
+	if _, err := tlsdns.EnsureEdgeToken(fleet.Root); err != nil {
+		return err
+	}
+	instBin, err := ensureInstalledSelf()
+	if err != nil {
+		return err
+	}
+	cio.info("installing & starting fleet edge (HTTPS :443 + mesh DNS :53) ...")
+	if err := system.InstallEdgeDaemon(instBin, fleet.Root, fleet.Root); err != nil {
+		return err
+	}
+	if system.LaunchdLoaded(paths.ServeLabel) {
+		if err := system.RestartService(paths.ServeLabel); err != nil {
+			return err
+		}
+	} else if err := system.InstallServeDaemon(instBin, currentUsername(), fleet.Root, fleet.Root); err != nil {
+		return err
+	}
+	refreshLighthouseConfigAndNebula(cio, fleet)
+	if cfg.PrivateDNS {
+		if _, _, err := system.SyncMacResolver(paths.ResolverDir, cfg.Domain, paths.LighthouseIP); err != nil {
+			cio.printf("warning: configure local /etc/resolver/%s: %v\n", cfg.Domain, err)
+		} else {
+			cio.info(fmt.Sprintf("configured macOS split-DNS /etc/resolver/%s -> %s", cfg.Domain, paths.LighthouseIP))
+		}
+	}
+	return nil
 }
 
 func cmdTLSSetup(args []string, cio *IO) error {
@@ -180,8 +230,12 @@ func cmdTLSSetup(args []string, cio *IO) error {
 	publicA := fs.Bool("public-a", true, "maintain Route 53 A record pointing to 10.213.0.1")
 	privateDNS := fs.Bool("private-dns", true, "serve private split-DNS inside Nebula on port 53")
 	staging := fs.Bool("staging", false, "use Let's Encrypt staging CA (for testing)")
-	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
 		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(pos, " "))
 	}
 	if strings.TrimSpace(*domain) == "" {
 		return fmt.Errorf("usage: fleet tls setup --domain HOST [--zone-id Z...] [--profile fleet-ddns] [--email EMAIL] [--public-a=true] [--private-dns=true] [--staging]")
@@ -196,17 +250,10 @@ func cmdTLSSetup(args []string, cio *IO) error {
 	}
 	defer func() { _ = fleet.Close() }()
 
-	zid := strings.TrimSpace(*zoneID)
-	prof := strings.TrimSpace(*profile)
-	if ddnsCfg, dErr := fleet.DDNSConfig(); dErr == nil && ddnsCfg != nil {
-		zid = cmp.Or(zid, ddnsCfg.ZoneID)
-		prof = cmp.Or(prof, ddnsCfg.Profile)
+	zid, prof, err := resolveTLSZoneAndProfile(fleet, *zoneID, *profile)
+	if err != nil {
+		return err
 	}
-	prof = cmp.Or(prof, "fleet-ddns")
-	if zid == "" {
-		return fmt.Errorf("--zone-id is required (no Route 53 DDNS zone configured yet)")
-	}
-
 	cfg, err := tlsPreflight(*domain, zid, prof, *email, *publicA, *privateDNS, *staging)
 	if err != nil {
 		return err
@@ -214,7 +261,6 @@ func cmdTLSSetup(args []string, cio *IO) error {
 	if err := fleet.SetTLS(cfg); err != nil {
 		return err
 	}
-
 	if cfg.PublicA {
 		cio.info(fmt.Sprintf("setting Route 53 A record %s -> %s ...", cfg.Domain, paths.LighthouseIP))
 		if _, err := tlsdns.UpsertStaticA(cfg, paths.LighthouseIP, "", nil); err != nil {
@@ -237,32 +283,9 @@ func cmdTLSSetup(args []string, cio *IO) error {
 		cio.info(fmt.Sprintf("existing certificate is valid (%d days remaining)", status.DaysRemaining))
 	}
 
-	if _, err := tlsdns.EnsureEdgeToken(fleet.Root); err != nil {
+	if err := installAndStartTLSDaemons(cio, fleet, cfg); err != nil {
 		return err
 	}
-	instBin, err := ensureInstalledSelf()
-	if err != nil {
-		return err
-	}
-	cio.info("installing & starting fleet edge (HTTPS :443 + mesh DNS :53) ...")
-	if err := system.InstallEdgeDaemon(instBin, fleet.Root, fleet.Root); err != nil {
-		return err
-	}
-	if system.LaunchdLoaded(paths.ServeLabel) {
-		system.Restart(paths.ServeLabel)
-	} else if err := system.InstallServeDaemon(instBin, currentUsername(), fleet.Root, fleet.Root); err != nil {
-		return err
-	}
-	refreshLighthouseConfigAndNebula(cio, fleet)
-
-	if cfg.PrivateDNS {
-		if _, _, err := system.SyncMacResolver(paths.ResolverDir, cfg.Domain, paths.LighthouseIP); err != nil {
-			cio.printf("warning: configure local /etc/resolver/%s: %v\n", cfg.Domain, err)
-		} else {
-			cio.info(fmt.Sprintf("configured macOS split-DNS /etc/resolver/%s -> %s", cfg.Domain, paths.LighthouseIP))
-		}
-	}
-
 	cio.printf("\nFleet Console HTTPS: https://%s/\n", cfg.Domain)
 	cio.printf("  Macs: run `sudo fleet sync` (or wait <= 5m) to configure /etc/resolver/%s.\n", cfg.Domain)
 	cio.printf("  iPhone/iPad: connect Mobile Nebula (optionally set DNS %s / match domain %s) and open https://%s/ in Safari -> Share -> Add to Home Screen.\n",
@@ -337,8 +360,12 @@ func cmdTLSStatus(args []string, cio *IO) error {
 func cmdTLSRenew(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("tls renew", flag.ContinueOnError)
 	force := fs.Bool("force", false, "force certificate renewal even if >30 days remain")
-	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
 		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(pos, " "))
 	}
 	node, err := client.LoadNode()
 	if err != nil {
@@ -376,7 +403,9 @@ func cmdTLSDisable(args []string, cio *IO) error {
 		return err
 	}
 	if system.LaunchdLoaded(paths.ServeLabel) {
-		system.Restart(paths.ServeLabel)
+		if err := system.RestartService(paths.ServeLabel); err != nil {
+			cio.printf("warning: restart %s: %v\n", paths.ServeLabel, err)
+		}
 	}
 	if _, _, err := system.SyncMacResolver(paths.ResolverDir, "", ""); err != nil {
 		cio.printf("warning: cleanup /etc/resolver: %v\n", err)

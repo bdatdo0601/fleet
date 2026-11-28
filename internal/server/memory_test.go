@@ -90,4 +90,55 @@ func TestMemoryHTTPEndpointsAndPermissions(t *testing.T) {
 	if err := client.Call(srv.URL, http.MethodPost, "/v1/memory/curator/run", map[string]any{"limit": 5}, 5*time.Second, nil, nil); err == nil || !strings.Contains(err.Error(), "HTTP 403") {
 		t.Fatalf("expected 403 for managed POST /v1/memory/curator/run, got %v", err)
 	}
+
+	// Managed device POST /v1/memory forces req.Device = caller.Name even if spoofing another device.
+	var spoofRes memory.UpsertResult
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/memory", map[string]any{
+		"scope":  "global",
+		"key":    "spoof-check",
+		"kind":   "preference",
+		"body":   "Check device attribution.",
+		"device": "mini",
+	}, 5*time.Second, nil, &spoofRes); err != nil {
+		t.Fatalf("managed POST /v1/memory failed: %v", err)
+	}
+	if spoofRes.Item.Device != "office" {
+		t.Fatalf("expected Item.Device forced to office, got %q", spoofRes.Item.Device)
+	}
+
+	// Managed device is forbidden from resolving or batch-resolving proposals (route(true)).
+	prop1, err := f.Memory.CreateProposal(memory.ProposalParams{
+		Action:         "promote",
+		SourceMemoryID: upRes.Item.ID,
+		TargetScope:    "global",
+		TargetKey:      "prop-1",
+		Kind:           "preference",
+		Tier:           "always",
+		Summary:        "s1",
+		Body:           "b1",
+		Reason:         "r1",
+		Model:          "m1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/memory/proposals/resolve", map[string]any{
+		"id": prop1.ID, "decision": "approve",
+	}, 5*time.Second, nil, nil); err == nil || !strings.Contains(err.Error(), "HTTP 403") {
+		t.Fatalf("expected 403 for managed POST /v1/memory/proposals/resolve, got %v", err)
+	}
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/memory/proposals/batch", map[string]any{
+		"ids": []int64{prop1.ID}, "decision": "reject",
+	}, 5*time.Second, nil, nil); err == nil || !strings.Contains(err.Error(), "HTTP 403") {
+		t.Fatalf("expected 403 for managed POST /v1/memory/proposals/batch, got %v", err)
+	}
+
+	// Admin CAN resolve proposals.
+	f.IdentifyOverride = nil
+	var resOut map[string]any
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/memory/proposals/resolve", map[string]any{
+		"id": prop1.ID, "decision": "reject",
+	}, 5*time.Second, nil, &resOut); err != nil {
+		t.Fatalf("admin resolve failed: %v", err)
+	}
 }

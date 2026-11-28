@@ -398,8 +398,12 @@ func cmdMemoryEdit(args []string, cio *IO) error {
 	_ = tmp.Close()
 
 	editor := cmp.Or(os.Getenv("VISUAL"), os.Getenv("EDITOR"), "vi")
-	cmd := exec.Command(editor, tmpPath)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, cio.Stdout, cio.Stderr
+	parts := strings.Fields(editor)
+	if len(parts) == 0 {
+		parts = []string{"vi"}
+	}
+	cmd := exec.Command(parts[0], append(parts[1:], tmpPath)...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = cio.Stdin, cio.Stdout, cio.Stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("editor failed: %w", err)
 	}
@@ -958,6 +962,9 @@ func cmdMemoryCurator(args []string, cio *IO) error {
 	case "run":
 		return cmdMemoryCuratorRun(args[1:], cio)
 	case "status":
+		if err := parseFlagsNoPositional("memory curator status", args[1:]); err != nil {
+			return err
+		}
 		api, err := client.ResolveAPI("")
 		if err != nil {
 			return err
@@ -969,6 +976,9 @@ func cmdMemoryCurator(args []string, cio *IO) error {
 		printCuratorStatus(cio, st)
 		return nil
 	case "disable":
+		if err := parseFlagsNoPositional("memory curator disable", args[1:]); err != nil {
+			return err
+		}
 		api, err := client.ResolveAPI("")
 		if err != nil {
 			return err

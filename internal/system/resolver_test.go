@@ -63,4 +63,12 @@ func TestSyncMacResolver(t *testing.T) {
 	if _, _, err := SyncMacResolver(dir, "bad/domain", "10.213.0.1"); err == nil {
 		t.Fatal("expected error for invalid domain")
 	}
+
+	// Existing non-fleet resolver with matching domain must not be overwritten.
+	if _, _, err := SyncMacResolver(dir, "corp.internal", "10.213.0.1"); err == nil {
+		t.Fatal("expected error refusing to overwrite non-fleet resolver")
+	}
+	if raw, err := os.ReadFile(userFile); err != nil || string(raw) != "nameserver 192.168.10.1\n" {
+		t.Fatalf("non-fleet resolver was modified: raw=%q err=%v", string(raw), err)
+	}
 }

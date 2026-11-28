@@ -1,6 +1,7 @@
 package assistant
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -105,32 +107,51 @@ func SaveOPToken(tokenPath, token string) error {
 	return os.Rename(tmp, tokenPath)
 }
 
-func opCommand(ctx context.Context, tokenPath string, args ...string) *exec.Cmd {
+func opCommand(ctx context.Context, tokenPath string, stdin []byte, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, "op", args...)
-	cmd.Stdin = nil
+	if len(stdin) > 0 {
+		cmd.Stdin = bytes.NewReader(stdin)
+	} else {
+		cmd.Stdin = nil
+	}
 	if tok := ResolveOPToken(tokenPath); tok != "" {
 		cmd.Env = append(os.Environ(), "OP_SERVICE_ACCOUNT_TOKEN="+tok)
 	}
 	return cmd
 }
 
+func validateOPPositionalArg(val, label string) (string, error) {
+	clean := strings.TrimSpace(val)
+	if clean != "" && strings.HasPrefix(clean, "-") {
+		return "", newErr(fmt.Sprintf("invalid %s: must not start with '-'", label), http.StatusBadRequest)
+	}
+	return clean, nil
+}
+
 // NewOPReader returns an OPReaderFunc that reads op:// refs using ResolveOPToken(tokenPath).
 func NewOPReader(tokenPath string) OPReaderFunc {
 	return func(ctx context.Context, ref string) (string, error) {
+		cleanRef, err := validateOPPositionalArg(ref, "1Password reference")
+		if err != nil {
+			return "", err
+		}
+		if cleanRef == "" {
+			return "", newErr("1Password reference is required", http.StatusBadRequest)
+		}
 		if _, err := exec.LookPath("op"); err != nil {
 			return "", errors.New("1Password CLI (`op`) not found: install with `brew install 1password-cli`")
 		}
-		out, err := opCommand(ctx, tokenPath, "read", ref).Output()
+		out, err := opCommand(ctx, tokenPath, nil, "read", "--", cleanRef).Output()
 		if err != nil {
 			var exitErr *exec.ExitError
 			if errors.As(err, &exitErr) && len(exitErr.Stderr) > 0 {
-				return "", fmt.Errorf("op read %s: %s", ref, strings.TrimSpace(string(exitErr.Stderr)))
+				return "", fmt.Errorf("op read %s: %s", cleanRef, strings.TrimSpace(string(exitErr.Stderr)))
 			}
-			return "", fmt.Errorf("op read %s: %w", ref, err)
+			return "", fmt.Errorf("op read %s: %w", cleanRef, err)
 		}
 		val := strings.TrimSpace(string(out))
 		if val == "" {
-			return "", fmt.Errorf("op read %s returned empty secret", ref)
+			return "", fmt.Errorf("op read %s returned empty secret", cleanRef)
 		}
 		return val, nil
 	}
@@ -152,7 +173,7 @@ func CheckOPHealth(ctx context.Context, tokenPath string) (binPath string, hasTo
 	}
 	cCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	out, wErr := opCommand(cCtx, tokenPath, "whoami", "--format", "json").Output()
+	out, wErr := opCommand(cCtx, tokenPath, nil, "whoami", "--format", "json").Output()
 	if wErr == nil {
 		var who struct {
 			Email       string `json:"email"`
@@ -168,7 +189,7 @@ func CheckOPHealth(ctx context.Context, tokenPath string) (binPath string, hasTo
 		return binPath, true, identity, nil
 	}
 	// Some service accounts only allow `op vault list`.
-	if vOut, vErr := opCommand(cCtx, tokenPath, "vault", "list", "--format", "json").Output(); vErr == nil {
+	if vOut, vErr := opCommand(cCtx, tokenPath, nil, "vault", "list", "--format", "json").Output(); vErr == nil {
 		var vaults []struct {
 			Name string `json:"name"`
 		}
@@ -185,12 +206,16 @@ func CheckOPHealth(ctx context.Context, tokenPath string) (binPath string, hasTo
 }
 
 func runOPJSON(ctx context.Context, tokenPath string, args ...string) ([]byte, error) {
+	return runOPJSONWithStdin(ctx, tokenPath, nil, args...)
+}
+
+func runOPJSONWithStdin(ctx context.Context, tokenPath string, stdin []byte, args ...string) ([]byte, error) {
 	if _, err := exec.LookPath("op"); err != nil {
 		return nil, errors.New("1Password CLI (`op`) not found on lighthouse")
 	}
 	cCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	out, err := opCommand(cCtx, tokenPath, args...).Output()
+	out, err := opCommand(cCtx, tokenPath, stdin, args...).Output()
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && len(exitErr.Stderr) > 0 {
@@ -216,9 +241,13 @@ func ListOPVaults(ctx context.Context, tokenPath string) ([]OPVaultMeta, error) 
 
 // ListOPItems lists item metadata (title, category, vault, URLs, tags — no secrets).
 func ListOPItems(ctx context.Context, tokenPath, vault string) ([]OPItemMeta, error) {
+	cleanVault, err := validateOPPositionalArg(vault, "vault")
+	if err != nil {
+		return nil, err
+	}
 	args := []string{"item", "list", "--format", "json"}
-	if v := strings.TrimSpace(vault); v != "" {
-		args = append(args, "--vault", v)
+	if cleanVault != "" {
+		args = append(args, "--vault", cleanVault)
 	}
 	out, err := runOPJSON(ctx, tokenPath, args...)
 	if err != nil {
@@ -314,13 +343,22 @@ func parseOPItemDetailMeta(raw []byte) (OPItemDetailMeta, error) {
 
 // GetOPItemMeta returns field labels, types, URLs, and op:// references without any secret values.
 func GetOPItemMeta(ctx context.Context, tokenPath, item, vault string) (OPItemDetailMeta, error) {
-	if strings.TrimSpace(item) == "" {
+	cleanItem, err := validateOPPositionalArg(item, "item")
+	if err != nil {
+		return OPItemDetailMeta{}, err
+	}
+	if cleanItem == "" {
 		return OPItemDetailMeta{}, newErr("item name or ID is required", http.StatusBadRequest)
 	}
-	args := []string{"item", "get", strings.TrimSpace(item), "--format", "json"}
-	if v := strings.TrimSpace(vault); v != "" {
-		args = append(args, "--vault", v)
+	cleanVault, err := validateOPPositionalArg(vault, "vault")
+	if err != nil {
+		return OPItemDetailMeta{}, err
 	}
+	args := []string{"item", "get", "--format", "json"}
+	if cleanVault != "" {
+		args = append(args, "--vault", cleanVault)
+	}
+	args = append(args, "--", cleanItem)
 	out, err := runOPJSON(ctx, tokenPath, args...)
 	if err != nil {
 		return OPItemDetailMeta{}, err
@@ -330,26 +368,74 @@ func GetOPItemMeta(ctx context.Context, tokenPath, item, vault string) (OPItemDe
 
 // StoreOPItem creates a new item in a scoped 1Password vault and returns metadata only.
 func StoreOPItem(ctx context.Context, tokenPath, vault, title, category, itemURL string, fields map[string]string) (OPItemDetailMeta, error) {
-	if strings.TrimSpace(vault) == "" || strings.TrimSpace(title) == "" {
+	cleanVault, err := validateOPPositionalArg(vault, "vault")
+	if err != nil {
+		return OPItemDetailMeta{}, err
+	}
+	cleanTitle, err := validateOPPositionalArg(title, "title")
+	if err != nil {
+		return OPItemDetailMeta{}, err
+	}
+	if cleanVault == "" || cleanTitle == "" {
 		return OPItemDetailMeta{}, newErr("vault and title are required", http.StatusBadRequest)
+	}
+	cleanCat, err := validateOPPositionalArg(category, "category")
+	if err != nil {
+		return OPItemDetailMeta{}, err
+	}
+	cleanURL, err := validateOPPositionalArg(itemURL, "url")
+	if err != nil {
+		return OPItemDetailMeta{}, err
+	}
+	keys := make([]string, 0, len(fields))
+	for k := range fields {
+		ck, kErr := validateOPPositionalArg(k, "field key")
+		if kErr != nil {
+			return OPItemDetailMeta{}, kErr
+		}
+		if ck != "" {
+			keys = append(keys, k)
+		}
+	}
+	slices.Sort(keys)
+
+	type opItemFieldTemplate struct {
+		Label string `json:"label"`
+		Type  string `json:"type"`
+		Value string `json:"value"`
+	}
+	tmplFields := make([]opItemFieldTemplate, 0, len(keys))
+	for _, k := range keys {
+		tmplFields = append(tmplFields, opItemFieldTemplate{
+			Label: strings.TrimSpace(k),
+			Type:  "CONCEALED",
+			Value: fields[k],
+		})
+	}
+	tmpl := map[string]any{
+		"title":    cleanTitle,
+		"category": cmp.Or(cleanCat, "API Credential"),
+		"fields":   tmplFields,
+	}
+	if cleanURL != "" {
+		tmpl["urls"] = []map[string]any{{"href": cleanURL, "primary": true}}
+	}
+	stdinJSON, err := json.Marshal(tmpl)
+	if err != nil {
+		return OPItemDetailMeta{}, err
 	}
 	args := []string{
 		"item", "create",
-		"--vault", strings.TrimSpace(vault),
-		"--category", cmp.Or(strings.TrimSpace(category), "API Credential"),
-		"--title", strings.TrimSpace(title),
+		"--vault", cleanVault,
+		"--category", cmp.Or(cleanCat, "API Credential"),
+		"--title", cleanTitle,
 		"--format", "json",
 	}
-	if u := strings.TrimSpace(itemURL); u != "" {
-		args = append(args, "--url", u)
+	if cleanURL != "" {
+		args = append(args, "--url", cleanURL)
 	}
-	for k, v := range fields {
-		if strings.TrimSpace(k) == "" {
-			continue
-		}
-		args = append(args, strings.TrimSpace(k)+"="+v)
-	}
-	out, err := runOPJSON(ctx, tokenPath, args...)
+	args = append(args, "-")
+	out, err := runOPJSONWithStdin(ctx, tokenPath, stdinJSON, args...)
 	if err != nil {
 		return OPItemDetailMeta{}, err
 	}
@@ -399,6 +485,44 @@ func scrubSecret(text, secret string) string {
 		out = strings.ReplaceAll(out, esc, "[REDACTED]")
 	}
 	return out
+}
+
+func credentialHTTPClient(base *http.Client, initialURL *url.URL, allowedHosts []string, hdrName, label string) *http.Client {
+	var cli http.Client
+	if base != nil {
+		cli = *base
+	} else {
+		cli.Timeout = 30 * time.Second
+	}
+	prevRedirect := cli.CheckRedirect
+	initialHost := initialURL.Hostname()
+	initialScheme := initialURL.Scheme
+	cli.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		if req.URL.Scheme != "https" && req.URL.Scheme != "http" {
+			return newErr("redirect to non-http/https scheme blocked", http.StatusForbidden)
+		}
+		if initialScheme == "https" && req.URL.Scheme != "https" {
+			return newErr("redirect HTTPS to HTTP downgrade blocked", http.StatusForbidden)
+		}
+		if len(via) > 0 && via[len(via)-1].URL.Scheme == "https" && req.URL.Scheme != "https" {
+			return newErr("redirect HTTPS to HTTP downgrade blocked", http.StatusForbidden)
+		}
+		if !hostAllowed(req.URL.Hostname(), allowedHosts) {
+			return newErr(fmt.Sprintf("redirect host %q is not allowlisted for credential %q", req.URL.Hostname(), label), http.StatusForbidden)
+		}
+		if !strings.EqualFold(req.URL.Hostname(), initialHost) {
+			req.Header.Del(hdrName)
+			return newErr(fmt.Sprintf("cross-domain credential redirect from %q to %q blocked", initialHost, req.URL.Hostname()), http.StatusForbidden)
+		}
+		if prevRedirect != nil {
+			return prevRedirect(req, via)
+		}
+		return nil
+	}
+	return &cli
 }
 
 // ExecuteCredentialHTTP resolves a 1Password secret in memory, enforces host allowlisting,
@@ -463,10 +587,7 @@ func ExecuteCredentialHTTP(
 	}
 	req.Header.Set(hdrName, hdrVal)
 
-	cli := httpClient
-	if cli == nil {
-		cli = &http.Client{Timeout: 30 * time.Second}
-	}
+	cli := credentialHTTPClient(httpClient, u, allowedHosts, hdrName, label)
 	resp, err := cli.Do(req)
 	if err != nil {
 		return nil, errors.New(scrubSecret(err.Error(), secret))

@@ -16,10 +16,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bdatdo0601/fleet/internal/agents"
 	"github.com/bdatdo0601/fleet/internal/client"
 	"github.com/bdatdo0601/fleet/internal/core"
 	"github.com/bdatdo0601/fleet/internal/pki"
 	"github.com/bdatdo0601/fleet/internal/registry"
+	"github.com/bdatdo0601/fleet/internal/tlsdns"
 )
 
 const testPass = "correct horse battery staple"
@@ -259,4 +261,86 @@ func TestServeUntilCanceledAbortsLongPollImmediately(t *testing.T) {
 		t.Fatalf("shutdown took %v; expected immediate cancellation of long-poll", elapsed)
 	}
 	<-pollDone
+}
+
+func TestEdgeProxyHeadersFailClosedAndUsageAuthAndOverviewNilSafety(t *testing.T) {
+	f, srv, tmp := setupTestServer(t)
+	_, office := approveTestDevice(t, f, tmp, "office", "mac", "managed")
+
+	// 1. Loopback requests carrying proxy headers fail closed when EdgeToken is empty.
+	for _, hdrs := range []map[string]string{
+		{tlsdns.HeaderEdgeToken: "anything", tlsdns.HeaderClientIP: office.IP},
+		{tlsdns.HeaderClientIP: office.IP},
+		{"X-Forwarded-Proto": "https"},
+	} {
+		st, _, _ := doRawReq(t, srv.URL+"/v1/overview", http.MethodGet, "", hdrs, "")
+		if st != http.StatusForbidden {
+			t.Fatalf("expected 403 when EdgeToken unset and headers=%v, got %d", hdrs, st)
+		}
+	}
+
+	// 2. With EdgeToken set, mismatched token or invalid X-Fleet-Client-IP is rejected (403); valid token+IP resolves caller.
+	f.EdgeToken = "edge-secret-token"
+	for _, hdrs := range []map[string]string{
+		{tlsdns.HeaderEdgeToken: "wrong-token", tlsdns.HeaderClientIP: office.IP},
+		{tlsdns.HeaderEdgeToken: "edge-secret-token", tlsdns.HeaderClientIP: "not-an-ip"},
+		{tlsdns.HeaderEdgeToken: "edge-secret-token", "X-Forwarded-Proto": "https"},
+	} {
+		st, _, _ := doRawReq(t, srv.URL+"/v1/overview", http.MethodGet, "", hdrs, "")
+		if st != http.StatusForbidden {
+			t.Fatalf("expected 403 for invalid proxy headers=%v, got %d", hdrs, st)
+		}
+	}
+	var ov struct {
+		Caller struct {
+			Name string `json:"name"`
+		} `json:"caller"`
+	}
+	if err := client.Call(srv.URL, http.MethodGet, "/v1/overview", nil, 5*time.Second, map[string]string{
+		tlsdns.HeaderEdgeToken: "edge-secret-token",
+		tlsdns.HeaderClientIP:  office.IP,
+		"X-Forwarded-Proto":    "https",
+	}, &ov); err != nil {
+		t.Fatalf("valid edge proxy request failed: %v", err)
+	}
+	if ov.Caller.Name != "office" {
+		t.Fatalf("expected forwarded caller office, got %q", ov.Caller.Name)
+	}
+
+	// 3. Non-admin POST /v1/usage forces u.Device = caller.Name.
+	f.EdgeToken = ""
+	f.IdentifyOverride = func(string) *registry.Device { return office }
+	var usageRes struct {
+		Usage []agents.HarnessUsage `json:"usage"`
+	}
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/usage", map[string]any{
+		"harness": "claude",
+		"device":  "mini",
+		"status":  "ok",
+	}, 5*time.Second, nil, &usageRes); err != nil {
+		t.Fatalf("managed POST /v1/usage failed: %v", err)
+	}
+	if len(usageRes.Usage) != 1 || usageRes.Usage[0].Device != "office" {
+		t.Fatalf("expected u.Device forced to office, got %+v", usageRes.Usage)
+	}
+
+	// 4. buildOverviewPayload handles nil Memory/Curator and non-nil tlsMgr without panicking.
+	f.IdentifyOverride = nil
+	origMem, origCur := f.Memory, f.Curator
+	f.Memory = nil
+	f.Curator = nil
+	t.Cleanup(func() {
+		f.Memory = origMem
+		f.Curator = origCur
+	})
+	miniDev, _ := f.Registry.Get("mini")
+	tlsMgr := tlsdns.NewManager(f.Root, f.TLSConfig, tlsdns.ACMEDeps{})
+	payload, err := buildOverviewPayload(f, miniDev, time.Now().UTC(), tlsMgr)
+	if err != nil {
+		t.Fatalf("buildOverviewPayload with nil Memory/Curator failed: %v", err)
+	}
+	tlsSummary, ok := payload["tls"].(map[string]any)
+	if !ok || tlsSummary == nil {
+		t.Fatalf("expected tls summary in admin overview payload, got %#v", payload["tls"])
+	}
 }

@@ -87,24 +87,27 @@ function updateThemeUI(mode) {
   }
 }
 
+function resolveTheme(saved, sysDark) {
+  if (saved === "light" || saved === "dark") {
+    return saved;
+  }
+  return sysDark ? "dark" : "light";
+}
+
 function applySavedTheme() {
   const saved = localStorage.getItem("fleet_theme");
-  if (saved === "light" || saved === "dark") {
-    document.documentElement.setAttribute("data-theme", saved);
-    updateThemeUI(saved);
-  } else {
-    document.documentElement.removeAttribute("data-theme");
-    updateThemeUI("auto");
-  }
+  const sysDark = Boolean(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  document.documentElement.setAttribute("data-theme", resolveTheme(saved, sysDark));
+  updateThemeUI(saved === "light" || saved === "dark" ? saved : "auto");
   window.dispatchEvent(new CustomEvent("fleet-theme-change"));
 }
 
 function toggleTheme() {
-  const cur = document.documentElement.getAttribute("data-theme");
+  const saved = localStorage.getItem("fleet_theme");
   let next = "dark";
-  if (cur === "dark") {
+  if (saved === "dark") {
     next = "light";
-  } else if (cur === "light") {
+  } else if (saved === "light") {
     next = "auto";
   } else {
     const sysDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
@@ -246,7 +249,7 @@ function renderTopbar(ov, activeSection) {
   if (callerBadge && ov && ov.caller) {
     callerBadge.textContent = `${ov.caller.name} · ${ov.caller.ip} · ${ov.caller.group}`;
   }
-  updateAppBadgeCount(aprCount + waitingCount);
+  syncOverviewBadgeCount();
   updateAlertsUI();
   const drawerCaller = document.getElementById("drawer-caller");
   if (drawerCaller && ov && ov.caller) {
@@ -291,6 +294,7 @@ function navigate(hash) {
 }
 
 let renderSeq = 0;
+let routeAbortController = null;
 
 async function refresh() {
   const seq = ++renderSeq;
@@ -326,10 +330,18 @@ async function renderRoute() {
 }
 
 async function renderCurrentRoute(seq) {
+  if (routeAbortController) {
+    routeAbortController.abort();
+    routeAbortController = null;
+  }
   if (typeof state.routeCleanup === "function") {
     state.routeCleanup();
     state.routeCleanup = null;
   }
+  const ac = new AbortController();
+  routeAbortController = ac;
+  const { signal } = ac;
+
   let { section, sub } = parseHash();
   if (!section) {
     section = state.isAdmin ? "chat" : "overview";
@@ -352,36 +364,43 @@ async function renderCurrentRoute(seq) {
   renderTopbar(state.overview, section);
 
   const main = document.getElementById("app-main");
-  if (!main || seq !== renderSeq) {
+  if (!main || seq !== renderSeq || signal.aborted) {
     return;
   }
-  const ctx = { refresh, navigate, openMenu: () => setDrawerOpen(true) };
+  const ctx = { refresh, navigate, openMenu: () => setDrawerOpen(true), signal };
 
-  switch (section) {
-    case "chat":
-      await renderChat(main, ctx, sub);
-      break;
-    case "skills":
-      await renderSkills(main, ctx, sub);
-      break;
-    case "devices":
-      await renderDevices(main, ctx);
-      break;
-    case "agents":
-      await renderAgents(main, ctx, sub);
-      break;
-    case "memory":
-      await renderMemory(main, ctx, sub);
-      break;
-    case "slacker":
-      await renderSlacker(main, ctx, sub);
-      break;
-    case "system":
-      await renderSystem(main, ctx);
-      break;
-    default:
-      await renderOverview(main, ctx);
-      break;
+  try {
+    switch (section) {
+      case "chat":
+        await renderChat(main, ctx, sub);
+        break;
+      case "skills":
+        await renderSkills(main, ctx, sub);
+        break;
+      case "devices":
+        await renderDevices(main, ctx);
+        break;
+      case "agents":
+        await renderAgents(main, ctx, sub);
+        break;
+      case "memory":
+        await renderMemory(main, ctx, sub);
+        break;
+      case "slacker":
+        await renderSlacker(main, ctx, sub);
+        break;
+      case "system":
+        await renderSystem(main, ctx);
+        break;
+      default:
+        await renderOverview(main, ctx);
+        break;
+    }
+  } catch (err) {
+    if (err && err.name === "AbortError") {
+      return;
+    }
+    throw err;
   }
 }
 
@@ -398,6 +417,7 @@ const SSE_EVENT_TYPES = [
   "approval",
   "approval_decided",
   "channel_reset",
+  "channels_updated",
   "config_updated",
   "grant_updated",
   "outbox",
@@ -420,6 +440,12 @@ function updateAlertsUI() {
     btn.classList.toggle("hidden", !state.isAdmin);
     btn.textContent = label;
   }
+}
+
+function syncOverviewBadgeCount() {
+  const waitingCount = (state.overview && state.overview.agents && state.overview.agents.waiting) || 0;
+  const aprCount = (state.overview && state.overview.assistant && state.overview.assistant.pending_approvals) || 0;
+  updateAppBadgeCount(aprCount + waitingCount);
 }
 
 function updateAppBadgeCount(count) {
@@ -499,11 +525,22 @@ function ensureAssistantSSE() {
     return;
   }
   if (assistantES) {
-    return;
+    if (assistantES.readyState !== EventSource.CLOSED) {
+      return;
+    }
+    assistantES.close();
+    assistantES = null;
   }
   state.sseStatus = "connecting";
   assistantES = new EventSource("/v1/assistant/stream");
   assistantES.onerror = () => {
+    if (assistantES && assistantES.readyState === EventSource.CLOSED) {
+      assistantES.close();
+      assistantES = null;
+      state.sseStatus = "disconnected";
+      dispatchSSE("status", { status: "disconnected" });
+      return;
+    }
     state.sseStatus = "reconnecting";
     dispatchSSE("status", { status: "reconnecting" });
   };
@@ -536,7 +573,7 @@ function ensureAssistantSSE() {
         if (state.overview && state.overview.assistant) {
           state.overview.assistant.pending_approvals = curApr + 1;
         }
-        updateAppBadgeCount(curApr + 1);
+        syncOverviewBadgeCount();
         const viewingChannel = state.route === "chat" && state.activeChatChannel === ch;
         if (apr.tool_name === "frontier_escalation") {
           if (!document.hidden && !viewingChannel) {
@@ -549,6 +586,12 @@ function ensureAssistantSSE() {
         } else {
           showBrowserAlert(`Approval needed (#${ch})`, apr.summary || apr.tool_name || "", ch);
         }
+      } else if (evType === "approval_decided") {
+        const curApr = (state.overview && state.overview.assistant && state.overview.assistant.pending_approvals) || 0;
+        if (state.overview && state.overview.assistant) {
+          state.overview.assistant.pending_approvals = Math.max(0, curApr - 1);
+        }
+        syncOverviewBadgeCount();
       }
       dispatchSSE(evType, payload);
     });
@@ -621,6 +664,15 @@ function setupPWA() {
 
 function init() {
   applySavedTheme();
+  const darkMedia = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
+  if (darkMedia && typeof darkMedia.addEventListener === "function") {
+    darkMedia.addEventListener("change", () => {
+      const saved = localStorage.getItem("fleet_theme");
+      if (saved !== "light" && saved !== "dark") {
+        applySavedTheme();
+      }
+    });
+  }
   setupPWA();
   updateOfflineBanner(false);
 

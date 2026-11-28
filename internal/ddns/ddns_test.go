@@ -151,4 +151,9 @@ func TestPolicyAndZoneID(t *testing.T) {
 	if _, err := NormalizeZoneID("example.com"); err == nil {
 		t.Fatal("expected error for invalid zone id")
 	}
+	for _, bad := range []string{"", "localhost", "bad domain.com", "*.example.com", "-bad.example.com"} {
+		if _, err := Policy("Z0123ABC", bad); err == nil {
+			t.Fatalf("expected Policy error for invalid domain %q", bad)
+		}
+	}
 }

@@ -23,7 +23,7 @@ import (
 	"github.com/bdatdo0601/fleet/internal/client"
 	"github.com/bdatdo0601/fleet/internal/paths"
 	"github.com/bdatdo0601/fleet/internal/registry"
-	_ "modernc.org/sqlite"
+	_ "modernc.org/sqlite" // register pure-Go SQLite driver for database/sql
 )
 
 // CollectOpts configures CollectAll.
@@ -120,156 +120,117 @@ func parseResetTimestamp(raw any) string {
 	return ""
 }
 
-// CollectCodex queries Codex rate limits and token usage via `codex app-server --listen stdio://`.
-func CollectCodex(ctx context.Context, codexBin string) agents.HarnessUsage {
-	now := registry.NowISO()
-	base := agents.HarnessUsage{
-		Harness:   "codex",
-		Source:    "codex-app-server",
-		Status:    "unavailable",
-		Windows:   []agents.UsageWindow{},
-		UpdatedAt: now,
-	}
-	if os.Geteuid() == 0 {
-		base.Detail = "skipped as root"
-		return base
-	}
-	home, _ := os.UserHomeDir()
-	bin := findExec(codexBin, "codex", []string{
-		filepath.Join(home, ".local", "bin", "codex"),
-		"/opt/homebrew/bin/codex",
-		"/usr/local/bin/codex",
-	})
-	if bin == "" {
-		base.Detail = "codex CLI not installed"
-		return base
-	}
+type codexRPCEnvelope struct {
+	ID     *int            `json:"id"`
+	Result json.RawMessage `json:"result"`
+	Error  *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
 
+type codexRPCClient struct {
+	cancel    context.CancelFunc
+	cmd       *exec.Cmd
+	stdin     io.WriteCloser
+	stderrBuf bytes.Buffer
+	msgCh     chan codexRPCEnvelope
+	pending   map[int]codexRPCEnvelope
+	stdoutWG  sync.WaitGroup
+	waitOnce  sync.Once
+}
+
+func startCodexAppServer(ctx context.Context, bin string) (*codexRPCClient, error) {
 	runCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
 	cmd := exec.CommandContext(runCtx, bin, "app-server", "--listen", "stdio://")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		base.Status = "error"
-		base.Detail = err.Error()
-		return base
+		cancel()
+		return nil, err
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		base.Status = "error"
-		base.Detail = err.Error()
-		return base
+		cancel()
+		return nil, err
 	}
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = &stderrBuf
+	c := &codexRPCClient{
+		cancel:  cancel,
+		cmd:     cmd,
+		stdin:   stdin,
+		msgCh:   make(chan codexRPCEnvelope, 16),
+		pending: make(map[int]codexRPCEnvelope),
+	}
+	cmd.Stderr = &c.stderrBuf
 	if err := cmd.Start(); err != nil {
-		base.Status = "error"
-		base.Detail = err.Error()
-		return base
+		cancel()
+		return nil, err
 	}
-	defer func() {
-		_ = stdin.Close()
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-		_ = cmd.Wait()
-	}()
-
-	type rpcEnvelope struct {
-		ID     *int            `json:"id"`
-		Result json.RawMessage `json:"result"`
-		Error  *struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-
-	msgCh := make(chan rpcEnvelope, 16)
-	go func() {
-		defer close(msgCh)
+	c.stdoutWG.Go(func() {
+		defer close(c.msgCh)
 		sc := bufio.NewScanner(stdout)
 		sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 		for sc.Scan() {
-			var env rpcEnvelope
+			var env codexRPCEnvelope
 			if json.Unmarshal(sc.Bytes(), &env) == nil && env.ID != nil {
 				select {
-				case msgCh <- env:
+				case c.msgCh <- env:
 				case <-runCtx.Done():
 					return
 				}
 			}
 		}
-	}()
+	})
+	return c, nil
+}
 
-	writeRPC := func(obj any) error {
-		b, mErr := json.Marshal(obj)
-		if mErr != nil {
-			return mErr
-		}
-		_, wErr := stdin.Write(append(b, '\n'))
-		return wErr
-	}
-	awaitID := func(want int) (rpcEnvelope, error) {
-		for {
-			select {
-			case <-runCtx.Done():
-				return rpcEnvelope{}, runCtx.Err()
-			case env, ok := <-msgCh:
-				if !ok {
-					detail := strings.TrimSpace(stderrBuf.String())
-					return rpcEnvelope{}, fmt.Errorf("app-server closed pipe%s", func() string {
-						if detail != "" {
-							return ": " + detail
-						}
-						return ""
-					}())
-				}
-				if env.ID != nil && *env.ID == want {
-					return env, nil
-				}
-			}
-		}
-	}
+func (c *codexRPCClient) wait() {
+	c.waitOnce.Do(func() {
+		_ = c.stdin.Close()
+		c.cancel()
+		c.stdoutWG.Wait()
+		_ = c.cmd.Wait()
+	})
+}
 
-	if err := writeRPC(map[string]any{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  "initialize",
-		"params": map[string]any{
-			"clientInfo": map[string]string{"name": "fleet-usage", "version": "0.1"},
-		},
-	}); err != nil {
-		base.Status = "error"
-		base.Detail = err.Error()
-		return base
-	}
-	if _, err := awaitID(1); err != nil {
-		base.Status = "error"
-		base.Detail = err.Error()
-		return base
-	}
-	_ = writeRPC(map[string]any{"jsonrpc": "2.0", "method": "initialized", "params": map[string]any{}})
-
-	if err := writeRPC(map[string]any{"jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read", "params": nil}); err != nil {
-		base.Status = "error"
-		base.Detail = err.Error()
-		return base
-	}
-	_ = writeRPC(map[string]any{"jsonrpc": "2.0", "id": 3, "method": "account/usage/read", "params": nil})
-
-	rlResp, err := awaitID(2)
+func (c *codexRPCClient) writeRPC(obj any) error {
+	b, err := json.Marshal(obj)
 	if err != nil {
-		base.Status = "error"
-		base.Detail = err.Error()
-		return base
+		return err
 	}
-	if rlResp.Error != nil {
-		base.Status = "error"
-		base.Detail = rlResp.Error.Message
-		return base
-	}
+	_, err = c.stdin.Write(append(b, '\n'))
+	return err
+}
 
+func (c *codexRPCClient) awaitID(ctx context.Context, want int) (codexRPCEnvelope, error) {
+	if env, ok := c.pending[want]; ok {
+		delete(c.pending, want)
+		return env, nil
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return codexRPCEnvelope{}, ctx.Err()
+		case env, ok := <-c.msgCh:
+			if !ok {
+				c.wait()
+				detail := strings.TrimSpace(c.stderrBuf.String())
+				if detail != "" {
+					return codexRPCEnvelope{}, fmt.Errorf("app-server closed pipe: %s", detail)
+				}
+				return codexRPCEnvelope{}, fmt.Errorf("app-server closed pipe")
+			}
+			if env.ID == nil {
+				continue
+			}
+			if *env.ID == want {
+				return env, nil
+			}
+			c.pending[*env.ID] = env
+		}
+	}
+}
+
+func applyCodexRateLimits(base *agents.HarnessUsage, metrics map[string]any, raw json.RawMessage) error {
 	type codexWindow struct {
 		UsedPercent        float64 `json:"usedPercent"`
 		WindowDurationMins int     `json:"windowDurationMins"`
@@ -291,13 +252,9 @@ func CollectCodex(ctx context.Context, codexBin string) agents.HarnessUsage {
 			} `json:"credits"`
 		} `json:"rateLimits"`
 	}
-	if err := json.Unmarshal(rlResp.Result, &rl); err != nil {
-		base.Status = "error"
-		base.Detail = err.Error()
-		return base
+	if err := json.Unmarshal(raw, &rl); err != nil {
+		return err
 	}
-
-	metrics := map[string]any{}
 	if rl.RateLimits != nil {
 		base.Plan = rl.RateLimits.PlanType
 		for _, cw := range []*codexWindow{rl.RateLimits.Secondary, rl.RateLimits.Primary} {
@@ -324,27 +281,109 @@ func CollectCodex(ctx context.Context, codexBin string) agents.HarnessUsage {
 	if rl.OrdinaryUsageAllowed != nil && !*rl.OrdinaryUsageAllowed && base.Detail == "" {
 		base.Detail = "rate limit reached"
 	}
+	return nil
+}
 
-	// Best-effort token usage read (already sent before awaiting id 2).
-	if tokResp, tErr := awaitID(3); tErr == nil && tokResp.Error == nil && len(tokResp.Result) > 0 {
-		var tu struct {
-			Summary *struct {
-				LifetimeTokens    *int64 `json:"lifetimeTokens"`
-				PeakDailyTokens   *int64 `json:"peakDailyTokens"`
-				CurrentStreakDays *int64 `json:"currentStreakDays"`
-			} `json:"summary"`
-		}
-		if json.Unmarshal(tokResp.Result, &tu) == nil && tu.Summary != nil {
-			if tu.Summary.LifetimeTokens != nil {
-				metrics["lifetime_tokens"] = *tu.Summary.LifetimeTokens
-			}
-			if tu.Summary.PeakDailyTokens != nil {
-				metrics["peak_daily_tokens"] = *tu.Summary.PeakDailyTokens
-			}
-			if tu.Summary.CurrentStreakDays != nil {
-				metrics["current_streak_days"] = *tu.Summary.CurrentStreakDays
-			}
-		}
+func applyCodexTokenUsage(metrics map[string]any, tokResp codexRPCEnvelope) {
+	if tokResp.Error != nil || len(tokResp.Result) == 0 {
+		return
+	}
+	var tu struct {
+		Summary *struct {
+			LifetimeTokens    *int64 `json:"lifetimeTokens"`
+			PeakDailyTokens   *int64 `json:"peakDailyTokens"`
+			CurrentStreakDays *int64 `json:"currentStreakDays"`
+		} `json:"summary"`
+	}
+	if json.Unmarshal(tokResp.Result, &tu) != nil || tu.Summary == nil {
+		return
+	}
+	if tu.Summary.LifetimeTokens != nil {
+		metrics["lifetime_tokens"] = *tu.Summary.LifetimeTokens
+	}
+	if tu.Summary.PeakDailyTokens != nil {
+		metrics["peak_daily_tokens"] = *tu.Summary.PeakDailyTokens
+	}
+	if tu.Summary.CurrentStreakDays != nil {
+		metrics["current_streak_days"] = *tu.Summary.CurrentStreakDays
+	}
+}
+
+func setCodexError(base agents.HarnessUsage, err error) agents.HarnessUsage {
+	base.Status = "error"
+	base.Detail = err.Error()
+	return base
+}
+
+// CollectCodex queries Codex rate limits and token usage via `codex app-server --listen stdio://`.
+func CollectCodex(ctx context.Context, codexBin, home string) agents.HarnessUsage {
+	base := agents.HarnessUsage{
+		Harness:   "codex",
+		Source:    "codex-app-server",
+		Status:    "unavailable",
+		Windows:   []agents.UsageWindow{},
+		UpdatedAt: registry.NowISO(),
+	}
+	if os.Geteuid() == 0 {
+		base.Detail = "skipped as root"
+		return base
+	}
+	h := resolveHome(home)
+	bin := findExec(codexBin, "codex", []string{
+		filepath.Join(h, ".local", "bin", "codex"),
+		"/opt/homebrew/bin/codex",
+		"/usr/local/bin/codex",
+	})
+	if bin == "" {
+		base.Detail = "codex CLI not installed"
+		return base
+	}
+
+	rpc, err := startCodexAppServer(ctx, bin)
+	if err != nil {
+		return setCodexError(base, err)
+	}
+	defer rpc.wait()
+
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	if err := rpc.writeRPC(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params": map[string]any{
+			"clientInfo": map[string]string{"name": "fleet-usage", "version": "0.1"},
+		},
+	}); err != nil {
+		return setCodexError(base, err)
+	}
+	if _, err := rpc.awaitID(reqCtx, 1); err != nil {
+		return setCodexError(base, err)
+	}
+	_ = rpc.writeRPC(map[string]any{"jsonrpc": "2.0", "method": "initialized", "params": map[string]any{}})
+
+	if err := rpc.writeRPC(map[string]any{"jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read", "params": nil}); err != nil {
+		return setCodexError(base, err)
+	}
+	_ = rpc.writeRPC(map[string]any{"jsonrpc": "2.0", "id": 3, "method": "account/usage/read", "params": nil})
+
+	rlResp, err := rpc.awaitID(reqCtx, 2)
+	if err != nil {
+		return setCodexError(base, err)
+	}
+	if rlResp.Error != nil {
+		base.Status = "error"
+		base.Detail = rlResp.Error.Message
+		return base
+	}
+
+	metrics := map[string]any{}
+	if err := applyCodexRateLimits(&base, metrics, rlResp.Result); err != nil {
+		return setCodexError(base, err)
+	}
+	if tokResp, tErr := rpc.awaitID(reqCtx, 3); tErr == nil {
+		applyCodexTokenUsage(metrics, tokResp)
 	}
 	if len(metrics) > 0 {
 		base.Metrics = metrics
@@ -612,7 +651,7 @@ func CollectAntigravity(ctx context.Context, home string) agents.HarnessUsage {
 	if _, err := os.Stat(dbPath); err == nil {
 		if db, oErr := sql.Open("sqlite", "file:"+dbPath+"?mode=ro&_pragma=busy_timeout(2000)"); oErr == nil {
 			var total, conv24h, steps24h, active int
-			err := db.QueryRow(`
+			err := db.QueryRowContext(ctx, `
 				SELECT
 					COUNT(*),
 					COALESCE(SUM(CASE WHEN datetime(last_modified_time) >= datetime('now', '-1 day') THEN 1 ELSE 0 END), 0),
@@ -689,7 +728,7 @@ func CollectAll(ctx context.Context, opts CollectOpts) []agents.HarnessUsage {
 			}
 			return
 		}
-		u := CollectCodex(ctx, opts.CodexBin)
+		u := CollectCodex(ctx, opts.CodexBin, home)
 		u.Device = dev
 		res[1] = u
 	}()
@@ -705,6 +744,11 @@ func CollectAll(ctx context.Context, opts CollectOpts) []agents.HarnessUsage {
 
 // ReportToLighthouse sends collected usage snapshots to POST /v1/usage.
 func ReportToLighthouse(apiURL string, items []agents.HarnessUsage) error {
+	return ReportToLighthouseContext(context.Background(), apiURL, items)
+}
+
+// ReportToLighthouseContext sends collected usage snapshots to POST /v1/usage using ctx.
+func ReportToLighthouseContext(ctx context.Context, apiURL string, items []agents.HarnessUsage) error {
 	if len(items) == 0 {
 		return nil
 	}
@@ -712,7 +756,7 @@ func ReportToLighthouse(apiURL string, items []agents.HarnessUsage) error {
 	if err != nil {
 		return err
 	}
-	return client.Call(api, "POST", "/v1/usage", map[string]any{"usage": items}, 10*time.Second, nil, nil)
+	return client.CallContext(ctx, api, "POST", "/v1/usage", map[string]any{"usage": items}, 10*time.Second, nil, nil)
 }
 
 // StartPeriodicReporter runs a best-effort background loop reporting harness usage to the lighthouse.
@@ -729,7 +773,7 @@ func StartPeriodicReporter(ctx context.Context, interval time.Duration, apiURL s
 				return
 			case <-timer.C:
 				items := CollectAll(ctx, CollectOpts{})
-				_ = ReportToLighthouse(apiURL, items)
+				_ = ReportToLighthouseContext(ctx, apiURL, items)
 				timer.Reset(interval)
 			}
 		}

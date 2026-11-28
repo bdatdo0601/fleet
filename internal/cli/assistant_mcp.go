@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -33,7 +34,7 @@ func cmdAssistantMCPAuth(args []string, cio *IO) error {
 	if err != nil {
 		return err
 	}
-	if len(pos) == 0 || strings.TrimSpace(pos[0]) == "" {
+	if len(pos) != 1 || strings.TrimSpace(pos[0]) == "" {
 		return errors.New("usage: fleet assistant mcp-auth [--port N] [--redirect-uri URL] [--no-open] [--manual] [--revoke] <server-name>")
 	}
 	srvName := strings.ToLower(strings.TrimSpace(pos[0]))
@@ -117,16 +118,16 @@ func runManualMCPOAuth(api, srvName, explicitRedir string, noOpen bool, cio *IO)
 	return completeMCPOAuthFlow(api, srvName, state, code, cio)
 }
 
-func resolveLoopbackBind(port int, explicitRedir string) (bindAddr, callbackPath, redirURL string, err error) {
+func resolveLoopbackBind(port int, explicitRedir string) (bindAddr, callbackPath string, err error) {
 	callbackPath = "/oauth2callback"
 	if strings.TrimSpace(explicitRedir) != "" {
 		u, pErr := url.Parse(strings.TrimSpace(explicitRedir))
 		if pErr != nil || u.Scheme != "http" {
-			return "", "", "", errors.New("--redirect-uri in loopback mode must use http://127.0.0.1:<port>/... (or pass --manual)")
+			return "", "", errors.New("--redirect-uri in loopback mode must use http://127.0.0.1:<port>/... (or pass --manual)")
 		}
 		host := u.Hostname()
 		if host != "127.0.0.1" && !strings.EqualFold(host, "localhost") && host != "::1" {
-			return "", "", "", errors.New("--redirect-uri in loopback mode must use a loopback host (or pass --manual)")
+			return "", "", errors.New("--redirect-uri in loopback mode must use a loopback host (or pass --manual)")
 		}
 		p := u.Port()
 		if p == "" {
@@ -135,13 +136,27 @@ func resolveLoopbackBind(port int, explicitRedir string) (bindAddr, callbackPath
 		if u.Path != "" {
 			callbackPath = u.Path
 		}
-		return net.JoinHostPort(host, p), callbackPath, u.String(), nil
+		return net.JoinHostPort(host, p), callbackPath, nil
 	}
-	return fmt.Sprintf("127.0.0.1:%d", port), callbackPath, "", nil
+	return fmt.Sprintf("127.0.0.1:%d", port), callbackPath, nil
+}
+
+func finalizeLoopbackRedirectURL(explicitRedir string, tcpAddr *net.TCPAddr, cbPath string) (string, error) {
+	if strings.TrimSpace(explicitRedir) == "" {
+		return fmt.Sprintf("http://127.0.0.1:%d%s", tcpAddr.Port, cbPath), nil
+	}
+	u, err := url.Parse(strings.TrimSpace(explicitRedir))
+	if err != nil {
+		return "", err
+	}
+	if p := u.Port(); p == "" || p == "0" {
+		u.Host = net.JoinHostPort(u.Hostname(), strconv.Itoa(tcpAddr.Port))
+	}
+	return u.String(), nil
 }
 
 func runLoopbackMCPOAuth(api, srvName string, port int, explicitRedir string, noOpen bool, cio *IO) error {
-	bindAddr, cbPath, redirURL, err := resolveLoopbackBind(port, explicitRedir)
+	bindAddr, cbPath, err := resolveLoopbackBind(port, explicitRedir)
 	if err != nil {
 		return err
 	}
@@ -150,12 +165,13 @@ func runLoopbackMCPOAuth(api, srvName string, port int, explicitRedir string, no
 		return fmt.Errorf("listen loopback callback on %s: %w", bindAddr, err)
 	}
 	defer func() { _ = ln.Close() }()
-	if redirURL == "" {
-		tcpAddr, ok := ln.Addr().(*net.TCPAddr)
-		if !ok {
-			return errors.New("unexpected loopback listener address")
-		}
-		redirURL = fmt.Sprintf("http://127.0.0.1:%d%s", tcpAddr.Port, cbPath)
+	tcpAddr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		return errors.New("unexpected loopback listener address")
+	}
+	redirURL, err := finalizeLoopbackRedirectURL(explicitRedir, tcpAddr, cbPath)
+	if err != nil {
+		return err
 	}
 	startRes, err := startMCPOAuthFlow(api, srvName, redirURL)
 	if err != nil {
@@ -247,15 +263,35 @@ func writeLoopbackHTML(w http.ResponseWriter, status int, title, msg string) {
 		html.EscapeString(title), html.EscapeString(msg))
 }
 
+func validateBrowserURL(targetURL string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(targetURL))
+	if err != nil {
+		return "", err
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if (scheme != "http" && scheme != "https") || u.Host == "" {
+		return "", fmt.Errorf("browser URL must use http or https scheme: %q", targetURL)
+	}
+	return u.String(), nil
+}
+
 func openLocalBrowser(targetURL string) {
+	cleanURL, err := validateBrowserURL(targetURL)
+	if err != nil {
+		return
+	}
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "darwin":
-		cmd = exec.Command("open", targetURL)
+		cmd = exec.Command("open", cleanURL)
 	case "linux":
-		cmd = exec.Command("xdg-open", targetURL)
+		cmd = exec.Command("xdg-open", cleanURL)
 	default:
 		return
 	}
-	_ = cmd.Start()
+	if err := cmd.Start(); err == nil {
+		go func() {
+			_ = cmd.Wait()
+		}()
+	}
 }

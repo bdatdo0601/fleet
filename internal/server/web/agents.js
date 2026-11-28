@@ -6,10 +6,13 @@ import {
   clear,
   closeModal,
   confirmDialog,
+  createDevicePoolPicker,
   el,
   fetchPathsCatalog,
   field,
   formatDuration,
+  formatMessageTarget,
+  isWorkerOnline,
   makeCopyBtn,
   openModal,
   populateDatalist,
@@ -64,19 +67,6 @@ function deliveryVariant(del) {
 
 function canControlSession(ag) {
   return state.isAdmin || (state.caller && ag.device === state.caller.name);
-}
-
-function formatMessageTarget(m) {
-  if (m.to_session) {
-    return m.to_session;
-  }
-  if (m.to_device) {
-    return `device:${m.to_device}`;
-  }
-  if (m.to_repo) {
-    return `repo:${m.to_repo}`;
-  }
-  return "all";
 }
 
 function buildSendMessageForm(initialTo = "", opts = {}, onSent = null) {
@@ -183,15 +173,6 @@ export function openQuickMessageModal(target, opts = {}, onSent = null) {
   });
 }
 
-function workerIsOnline(runtimes, dev) {
-  const rt = (runtimes || []).find((r) => r.role === `worker:${dev}`);
-  if (!rt || !rt.connected) {
-    return false;
-  }
-  const ts = Date.parse(rt.last_poll_at || rt.updated_at || "");
-  return Number.isFinite(ts) && Date.now() - ts <= 90 * 1000;
-}
-
 export async function openSpawnSessionModal(onSpawned = null, initial = {}) {
   let statusRes;
   let devicesRes;
@@ -261,10 +242,6 @@ export async function openSpawnSessionModal(onSpawned = null, initial = {}) {
       : devices.length > 0
         ? [devices[0]]
         : [];
-  const poolHint = el("span", {
-    className: "small muted",
-    text: selectedDevices.length === 0 ? `default (${defaultDevices.length > 0 ? defaultDevices.join(", ") : "none"})` : "",
-  });
 
   const markEditing = () => {
     state.editing = Boolean(promptIn.value.trim() || repoIn.value.trim() || nameIn.value.trim());
@@ -294,27 +271,19 @@ export async function openSpawnSessionModal(onSpawned = null, initial = {}) {
     repoChipsRow.classList.toggle("hidden", suggestions.length === 0);
   };
 
-  const chipButtons = devices.map((devName) => {
-    const load = (agentCounts[devName] || 0) + (pendingCounts[devName] || 0);
-    const online = workerIsOnline(runtimes, devName);
-    const btn = el("button", {
-      type: "button",
-      className: `chip${selectedDevices.includes(devName) ? " active" : ""}`,
-      text: `${devName} (${load})${online ? " · online" : ""}`,
-      onclick: () => {
-        const cur = new Set(selectedDevices);
-        if (cur.has(devName)) {
-          cur.delete(devName);
-        } else {
-          cur.add(devName);
-        }
-        selectedDevices = devices.filter((d) => cur.has(d));
-        btn.classList.toggle("active", cur.has(devName));
-        poolHint.textContent = selectedDevices.length === 0 ? `default (${defaultDevices.length > 0 ? defaultDevices.join(", ") : "none"})` : "";
-        syncRepoSuggestions();
-      },
-    });
-    return btn;
+  const { element: deviceChipsBox } = createDevicePoolPicker({
+    pool: devices,
+    selected: selectedDevices,
+    defaultDevices,
+    labelForDevice: (devName) => {
+      const load = (agentCounts[devName] || 0) + (pendingCounts[devName] || 0);
+      const online = isWorkerOnline(runtimes, devName);
+      return `${devName} (${load})${online ? " · online" : ""}`;
+    },
+    onChange: (next) => {
+      selectedDevices = next;
+      syncRepoSuggestions();
+    },
   });
 
   promptIn.addEventListener("input", markEditing);
@@ -374,7 +343,7 @@ export async function openSpawnSessionModal(onSpawned = null, initial = {}) {
       "div",
       { className: "field" },
       el("span", { className: "field-label", text: "Target Machine(s)" }),
-      el("div", { className: "chips-row" }, ...chipButtons, poolHint),
+      deviceChipsBox,
     ),
     el(
       "div",
@@ -746,23 +715,66 @@ function renderSessionsView(root, sessions, ctx, pathsCatalog) {
     },
   });
 
-  const liveByHarness = { claude: 0, codex: 0, antigravity: 0 };
-  let totalLiveForScope = 0;
-  const scopeDevice = state.isAdmin ? agentsFilter.device : state.caller ? state.caller.name : "";
-  for (const s of sessions) {
-    if (!s.live) {
-      continue;
+  const computeScopeStats = () => {
+    const scopeDevice = state.isAdmin ? agentsFilter.device : state.caller ? state.caller.name : "";
+    const liveByHarness = { claude: 0, codex: 0, antigravity: 0 };
+    let totalLiveForScope = 0;
+    for (const s of sessions) {
+      if (!s.live) {
+        continue;
+      }
+      if (scopeDevice && s.device !== scopeDevice) {
+        continue;
+      }
+      totalLiveForScope++;
+      if (s.harness in liveByHarness) {
+        liveByHarness[s.harness]++;
+      }
     }
-    if (scopeDevice && s.device !== scopeDevice) {
-      continue;
+    return { scopeDevice, liveByHarness, totalLiveForScope };
+  };
+
+  const killSummary = el("summary");
+  const killButtonsRow = el("div", { className: "actions-row mt-2" });
+  const killControls = el("details", { className: "details-box m-0" }, killSummary, killButtonsRow);
+
+  const updateBulkControls = () => {
+    const { scopeDevice, liveByHarness, totalLiveForScope } = computeScopeStats();
+    killSummary.textContent = scopeDevice ? `Bulk Session Controls (${scopeDevice})` : "Bulk Session Controls (all devices)";
+    clear(killButtonsRow);
+    for (const [h, label] of [
+      ["claude", "Claude"],
+      ["codex", "Codex"],
+      ["antigravity", "Antigravity"],
+    ]) {
+      const cnt = liveByHarness[h];
+      killButtonsRow.appendChild(
+        el("button", {
+          type: "button",
+          className: "btn btn-sm",
+          text: cnt > 0 ? `Kill ${label} (${cnt})` : `Kill ${label}`,
+          onclick: () => {
+            const latest = computeScopeStats();
+            killAllAgents(h, `${label} Agents`, latest.scopeDevice, latest.liveByHarness[h], () => ctx.refresh());
+          },
+        }),
+      );
     }
-    totalLiveForScope++;
-    if (s.harness in liveByHarness) {
-      liveByHarness[s.harness]++;
-    }
-  }
+    killButtonsRow.appendChild(
+      el("button", {
+        type: "button",
+        className: "btn btn-sm btn-danger",
+        text: totalLiveForScope > 0 ? `Kill All Agents (${totalLiveForScope})` : "Kill All Agents",
+        onclick: () => {
+          const latest = computeScopeStats();
+          killAllAgents("all", "All Agents", latest.scopeDevice, latest.totalLiveForScope, () => ctx.refresh());
+        },
+      }),
+    );
+  };
 
   const drawTable = () => {
+    updateBulkControls();
     clear(tableContainer);
     const q = agentsFilter.query.trim().toLowerCase();
     const filtered = sessions.filter((s) => {
@@ -921,41 +933,13 @@ function renderSessionsView(root, sessions, ctx, pathsCatalog) {
     ),
   );
 
-  const killControls = el(
-    "details",
-    { className: "details-box m-0" },
-    el("summary", {
-      text: scopeDevice ? `Bulk Session Controls (${scopeDevice})` : "Bulk Session Controls (all devices)",
-    }),
-    el(
-      "div",
-      { className: "actions-row mt-2" },
-      ...[
-        ["claude", "Claude", liveByHarness.claude],
-        ["codex", "Codex", liveByHarness.codex],
-        ["antigravity", "Antigravity", liveByHarness.antigravity],
-      ].map(([h, label, cnt]) =>
-        el("button", {
-          type: "button",
-          className: "btn btn-sm",
-          text: cnt > 0 ? `Kill ${label} (${cnt})` : `Kill ${label}`,
-          onclick: () => killAllAgents(h, `${label} Agents`, scopeDevice, cnt, () => ctx.refresh()),
-        }),
-      ),
-      el("button", {
-        type: "button",
-        className: "btn btn-sm btn-danger",
-        text: totalLiveForScope > 0 ? `Kill All Agents (${totalLiveForScope})` : "Kill All Agents",
-        onclick: () => killAllAgents("all", "All Agents", scopeDevice, totalLiveForScope, () => ctx.refresh()),
-      }),
-    ),
-  );
   root.appendChild(section(null, { ariaLabel: "Bulk session controls", className: "ui-section" }, killControls));
 
   drawTable();
 }
 
 async function renderMessagesView(root, sessions, ctx, pathsCatalog) {
+  const signal = ctx && ctx.signal;
   const liveSessions = sessions.filter((s) => s.live);
   const devices = [...new Set(sessions.map((s) => s.device).filter(Boolean))].sort();
   const repos = [...new Set([...sessions.map((s) => s.repo), ...(pathsCatalog.repos || [])].filter(Boolean))].sort();
@@ -974,9 +958,15 @@ async function renderMessagesView(root, sessions, ctx, pathsCatalog) {
     }
     q.set("limit", String(agentsFilter.msgLimit));
     try {
-      const res = await api("GET", `/v1/agents/messages?${q.toString()}`);
+      const res = await api("GET", `/v1/agents/messages?${q.toString()}`, undefined, { signal });
+      if (signal && signal.aborted) {
+        return;
+      }
       renderFeed(res.messages || []);
     } catch (err) {
+      if ((err && err.name === "AbortError") || (signal && signal.aborted)) {
+        return;
+      }
       clear(feedBox);
       feedBox.appendChild(el("div", { className: "alert-banner alert-danger", text: err.message }));
     }
@@ -1157,6 +1147,7 @@ function renderUsageAndPathsView(root, sessions, ctx, pathsCatalog) {
 }
 
 export async function renderAgents(root, ctx, subRoute = "") {
+  const signal = ctx && ctx.signal;
   if (subRoute === "waiting") {
     agentsFilter.tab = "sessions";
     agentsFilter.stateChip = "waiting";
@@ -1171,10 +1162,19 @@ export async function renderAgents(root, ctx, subRoute = "") {
   let sessions = [];
   let pathsCatalog = { paths: [], repos: [], workspaces: {} };
   try {
-    const [res, cat] = await Promise.all([api("GET", "/v1/agents?include_stale=true"), fetchPathsCatalog()]);
+    const [res, cat] = await Promise.all([
+      api("GET", "/v1/agents?include_stale=true", undefined, { signal }),
+      fetchPathsCatalog("", { signal }),
+    ]);
+    if (signal && signal.aborted) {
+      return;
+    }
     sessions = res.agents || [];
     pathsCatalog = cat;
   } catch (err) {
+    if ((err && err.name === "AbortError") || (signal && signal.aborted)) {
+      return;
+    }
     clear(root);
     root.appendChild(el("div", { className: "alert-banner alert-danger", text: err.message }));
     return;

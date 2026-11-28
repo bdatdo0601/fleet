@@ -1,7 +1,10 @@
 # Device state lives in the lighthouse's SQLite registry (~/.fleet), never in git.
 *.key
 *.db
+*.db-wal
+*.db-shm
+*.out
+.chunkhound/
 .DS_Store
 /fleet
 *.test
-

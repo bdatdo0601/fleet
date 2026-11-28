@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func openTestStore(t *testing.T) *Store {
@@ -673,7 +674,7 @@ func TestProposalDedupeAndLookup(t *testing.T) {
 	_, err = st.db.Exec(
 		`INSERT INTO memory_proposals (action, source_memory_id, target_scope, target_key, kind, tier, summary, body, reason, status, model, created_at)
 		 VALUES
-		   ('promote_global', 42, 'global', 'old-slug', 'feedback', 'always', 'dup1', 'b', 'r', 'pending', 'm1', '2026-11-24T00:00:00+00:00'),
+		   ('promote_global', 99, 'global', 'old-slug', 'feedback', 'always', 'dup1', 'b', 'r', 'pending', 'm1', '2026-11-24T00:00:00+00:00'),
 		   ('promote_global', 77, 'global', 'shared-browser', 'feedback', 'always', 'old', 'b', 'r', 'pending', 'm1', '2026-11-24T00:00:00+00:00'),
 		   ('promote_global', 77, 'global', 'shared-browser-2', 'feedback', 'always', 'newest', 'b2', 'r', 'pending', 'm1', '2026-11-24T00:01:00+00:00')`,
 	)
@@ -694,5 +695,190 @@ func TestProposalDedupeAndLookup(t *testing.T) {
 	}
 	if props[0].TargetKey != "shared-browser-2" {
 		t.Fatalf("expected newest row kept for source 77, got %+v", props[0])
+	}
+}
+
+func TestCuratorTOCTOUProtectionAndProposalPersistence(t *testing.T) {
+	st := openTestStore(t)
+	cur := NewCurator(st, filepath.Join(t.TempDir(), "curator.json"))
+
+	// Create candidate (fleet) and merge target (curator).
+	candRes, err := st.Upsert(UpsertParams{
+		Scope: "repo:app", Key: "cand-note", Kind: "feedback",
+		Body: "Original fleet note", Source: "fleet",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Upsert(UpsertParams{
+		Scope: "repo:app", Key: "target-note", Kind: "feedback",
+		Body: "Original target note", Source: "curator", EnqueueCurate: new(false),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var mode string
+	var humanEdited bool
+	llmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		userMsg := req["messages"].([]any)[1].(map[string]any)["content"].(string)
+		content := `{"ok":true}`
+		if strings.Contains(userMsg, "CANDIDATE:") {
+			switch mode {
+			case "update":
+				// Simulate concurrent human edit & lock while LLM call is in flight!
+				if !humanEdited {
+					humanEdited = true
+					_, _ = st.Upsert(UpsertParams{
+						Scope: "repo:app", Key: "cand-note", Kind: "feedback",
+						Body: "Human edited body", Source: "human", Locked: new(true), EnqueueCurate: new(false),
+					})
+				}
+				content = `{"action":"update","target_key":"","scope":"repo:app","kind":"feedback","tier":"searchable","summary":"LLM summary","body":"LLM overwrite","reason":"refine"}`
+			case "merge":
+				// Simulate concurrent human lock on target-note while LLM call is in flight!
+				_, _ = st.Upsert(UpsertParams{
+					Scope: "repo:app", Key: "target-note", Kind: "feedback",
+					Body: "Human locked target", Source: "human", Locked: new(true), EnqueueCurate: new(false),
+				})
+				content = `{"action":"merge","target_key":"target-note","scope":"repo:app","kind":"feedback","tier":"searchable","summary":"Merged","body":"LLM merged body","reason":"dup"}`
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"finish_reason": "stop", "message": map[string]any{"content": content}}},
+		})
+	}))
+	defer llmSrv.Close()
+
+	if _, err := cur.Configure(context.Background(), CuratorConfig{
+		Enabled: true, Provider: "openrouter", BaseURL: llmSrv.URL,
+		Model: DefaultOpenRouterModel, APIKey: "sk-or-v1-secretkey12345678",
+	}, true); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. TOCTOU on candidate update: human edit during LLM call must NOT be overwritten.
+	mode = "update"
+	reps, err := cur.RunPending(context.Background(), 10, false, false)
+	if err != nil || len(reps) != 1 || reps[0].Applied || reps[0].QueuedProposalID == 0 {
+		t.Fatalf("expected queued proposal on TOCTOU human edit, got %+v err=%v", reps, err)
+	}
+	det, _ := st.Get("repo:app", "cand-note", false)
+	if det.Item.Body != "Human edited body" || det.Item.Source != "human" || !det.Item.Locked {
+		t.Fatalf("human edit was overwritten by curator: %+v", det.Item)
+	}
+
+	// 2. TOCTOU on merge target: human edit on target during LLM call must NOT overwrite target or supersede candidate2.
+	if _, err := st.Upsert(UpsertParams{
+		Scope: "repo:app", Key: "cand-two", Kind: "feedback",
+		Body: "Second fleet note", Source: "fleet",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mode = "merge"
+	reps2, err := cur.RunPending(context.Background(), 10, false, false)
+	if err != nil || len(reps2) != 1 || reps2[0].Applied || reps2[0].QueuedProposalID == 0 {
+		t.Fatalf("expected queued proposal on TOCTOU protected merge target, got %+v err=%v", reps2, err)
+	}
+	tDet, _ := st.Get("repo:app", "target-note", false)
+	c2Det, _ := st.Get("repo:app", "cand-two", false)
+	if tDet.Item.Body != "Human locked target" || c2Det.Item.Status != "active" {
+		t.Fatalf("merge mutated protected target or candidate: target=%+v cand2=%+v", tDet.Item, c2Det.Item)
+	}
+
+	// 3. CreateProposal UPDATE persists action and source_memory_id.
+	pA, err := st.CreateProposal(ProposalParams{
+		Action: "promote_global", SourceMemoryID: candRes.Item.ID,
+		TargetScope: "global", TargetKey: "same-key", Kind: "feedback", Tier: "always", Body: "body A",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pB, err := st.CreateProposal(ProposalParams{
+		Action: "update", SourceMemoryID: c2Det.Item.ID,
+		TargetScope: "global", TargetKey: "same-key", Kind: "feedback", Tier: "always", Body: "body B",
+	})
+	if err != nil || pB.ID != pA.ID {
+		t.Fatalf("expected in-place proposal update, got pA=%+v pB=%+v err=%v", pA, pB, err)
+	}
+	fetched, err := st.GetProposal(pA.ID)
+	if err != nil || fetched.Action != "update" || fetched.SourceMemoryID != c2Det.Item.ID {
+		t.Fatalf("expected persisted action & source_memory_id, got %+v err=%v", fetched, err)
+	}
+
+	// 4. Post-Close returns error cleanly without nil-DB panic.
+	_ = st.Close()
+	if _, err := st.Get("repo:app", "cand-note", false); err == nil {
+		t.Fatal("expected error after Store.Close()")
+	}
+}
+
+func TestTrimBodyAndRenderContextUTF8Boundaries(t *testing.T) {
+	// Place a 3-byte UTF-8 rune ('世', 3 bytes) so it straddles the byte cut point.
+	const suffix = "\n\n[truncated at 32KB]"
+	limit := MaxBodyBytes - len(suffix)
+	prefix := strings.Repeat("a", limit-1)
+	raw := prefix + "世" + strings.Repeat("b", 100)
+
+	trimmed := trimBodyToMaxBytes(raw)
+	if len(trimmed) > MaxBodyBytes {
+		t.Fatalf("trimmed exceeded MaxBodyBytes: %d > %d", len(trimmed), MaxBodyBytes)
+	}
+	if !utf8.ValidString(trimmed) {
+		t.Fatalf("trimmed contains invalid UTF-8 at boundary")
+	}
+	if !strings.HasSuffix(trimmed, suffix) {
+		t.Fatalf("expected truncation suffix")
+	}
+
+	// Also test 4-byte emoji ('🚀') straddling the byte cut point.
+	prefix4 := strings.Repeat("a", limit-2)
+	trimmed4 := trimBodyToMaxBytes(prefix4 + "🚀" + strings.Repeat("c", 100))
+	if len(trimmed4) > MaxBodyBytes || !utf8.ValidString(trimmed4) {
+		t.Fatalf("4-byte UTF-8 truncation invalid: len=%d valid=%v", len(trimmed4), utf8.ValidString(trimmed4))
+	}
+
+	// RenderContext with multi-byte UTF-8 items stays <= MaxContextBytes and valid UTF-8.
+	st := openTestStore(t)
+	for i := range 25 {
+		if _, err := st.Upsert(UpsertParams{
+			Scope:   "global",
+			Key:     strings.Repeat("u", 10) + string(rune('a'+i)),
+			Kind:    "preference",
+			Tier:    "always",
+			Summary: strings.Repeat("世", 120),
+			Body:    "Body",
+			Source:  "human",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctxRes, err := st.RenderContext("repo", "dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ctxRes.Rendered) > MaxContextBytes || !utf8.ValidString(ctxRes.Rendered) {
+		t.Fatalf("RenderContext exceeded bytes or broke UTF-8: len=%d valid=%v", len(ctxRes.Rendered), utf8.ValidString(ctxRes.Rendered))
+	}
+
+	// Concurrent SaveContextCache preserves all repo entries via flock.
+	cacheDir := t.TempDir()
+	var wg sync.WaitGroup
+	for _, repo := range []string{"alpha", "beta", "gamma", "delta"} {
+		wg.Add(1)
+		go func(r string) {
+			defer wg.Done()
+			if err := SaveContextCache(cacheDir, r, "ctx-"+r, nil, nil); err != nil {
+				t.Errorf("SaveContextCache(%s): %v", r, err)
+			}
+		}(repo)
+	}
+	wg.Wait()
+	for _, repo := range []string{"alpha", "beta", "gamma", "delta"} {
+		if got := LoadContextCache(cacheDir, repo); got != "ctx-"+repo {
+			t.Fatalf("expected cached context for %s, got %q", repo, got)
+		}
 	}
 }

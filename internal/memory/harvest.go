@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/bdatdo0601/fleet/internal/client"
@@ -81,11 +83,11 @@ type cachedContextEntry struct {
 	UpdatedAt string `json:"updated_at"`
 }
 
-func runGit(cwd string, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+func runGit(ctx context.Context, cwd string, args ...string) (string, error) {
+	cmdCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
 	defer cancel()
 	cmdArgs := append([]string{"-C", cwd}, args...)
-	out, err := exec.CommandContext(ctx, "git", cmdArgs...).Output()
+	out, err := exec.CommandContext(cmdCtx, "git", cmdArgs...).Output()
 	if err != nil {
 		return "", err
 	}
@@ -108,6 +110,11 @@ func repoNameFromRemoteURL(raw string) string {
 
 // CanonicalRepo resolves cwd to a canonical git repository slug so worktrees and checkouts share one scope.
 func CanonicalRepo(cwd string) string {
+	return CanonicalRepoContext(context.Background(), cwd)
+}
+
+// CanonicalRepoContext resolves cwd to a canonical git repository slug using ctx.
+func CanonicalRepoContext(ctx context.Context, cwd string) string {
 	if cwd == "" {
 		return ""
 	}
@@ -115,12 +122,12 @@ func CanonicalRepo(cwd string) string {
 	if err != nil || !info.IsDir() {
 		return NormalizeSlug(filepath.Base(cwd), 80)
 	}
-	if remote, err := runGit(cwd, "remote", "get-url", "origin"); err == nil {
+	if remote, err := runGit(ctx, cwd, "remote", "get-url", "origin"); err == nil {
 		if slug := repoNameFromRemoteURL(remote); slug != "" {
 			return slug
 		}
 	}
-	if commonDir, err := runGit(cwd, "rev-parse", "--git-common-dir"); err == nil && commonDir != "" {
+	if commonDir, err := runGit(ctx, cwd, "rev-parse", "--git-common-dir"); err == nil && commonDir != "" {
 		if !filepath.IsAbs(commonDir) {
 			commonDir = filepath.Join(cwd, commonDir)
 		}
@@ -131,7 +138,7 @@ func CanonicalRepo(cwd string) string {
 		}
 		return NormalizeSlug(strings.TrimSuffix(base, ".git"), 80)
 	}
-	if top, err := runGit(cwd, "rev-parse", "--show-toplevel"); err == nil && top != "" {
+	if top, err := runGit(ctx, cwd, "rev-parse", "--show-toplevel"); err == nil && top != "" {
 		return NormalizeSlug(filepath.Base(top), 80)
 	}
 	return NormalizeSlug(filepath.Base(cwd), 80)
@@ -224,11 +231,7 @@ func trimBodyToMaxBytes(body string) string {
 	if limit <= 0 {
 		return ""
 	}
-	cut := body[:limit]
-	for len(cut) > 0 && (cut[len(cut)-1]&0xc0) == 0x80 {
-		cut = cut[:len(cut)-1]
-	}
-	return strings.TrimSpace(cut) + suffix
+	return strings.TrimSpace(truncateUTF8Bytes(body, limit)) + suffix
 }
 
 // ParseClaudeMemoryFile parses a Claude/Codex markdown memory file and its YAML frontmatter.
@@ -622,6 +625,8 @@ func contextCacheKey(repo string) string {
 	return cmp.Or(NormalizeSlug(repo, 80), "global")
 }
 
+var contextCacheMu sync.Mutex
+
 // SaveContextCache stores the latest rendered SessionStart memory block in the local offline cache.
 func SaveContextCache(cacheDir, repo, rendered string, uid, gid *int) error {
 	if rendered == "" {
@@ -630,6 +635,27 @@ func SaveContextCache(cacheDir, repo, rendered string, uid, gid *int) error {
 	if cacheDir == "" {
 		cacheDir = paths.CacheDir()
 	}
+	if err := paths.EnsureDir(cacheDir, 0o755, uid, gid); err != nil {
+		return err
+	}
+
+	contextCacheMu.Lock()
+	defer contextCacheMu.Unlock()
+
+	lockPath := filepath.Join(cacheDir, "memory-context.lock")
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lockFile.Close() }()
+	if os.Geteuid() == 0 && uid != nil && gid != nil {
+		_ = os.Chown(lockPath, *uid, *gid)
+	}
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer func() { _ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN) }()
+
 	path := filepath.Join(cacheDir, "memory-context.json")
 	entries := map[string]cachedContextEntry{}
 	if raw, err := os.ReadFile(path); err == nil && len(bytes.TrimSpace(raw)) > 0 {

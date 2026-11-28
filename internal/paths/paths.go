@@ -50,34 +50,28 @@ var (
 	NebulaLabels = []string{"sh.brew.nebula", "homebrew.mxcl.nebula"}
 )
 
-// APIPort returns the HTTP API port (FLEET_API_PORT or 7443).
-func APIPort() int {
-	if raw := os.Getenv("FLEET_API_PORT"); raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+func envPort(key string, def int) int {
+	if raw := strings.TrimSpace(os.Getenv(key)); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 1 && n <= 65535 {
 			return n
 		}
 	}
-	return 7443
+	return def
+}
+
+// APIPort returns the HTTP API port (FLEET_API_PORT or 7443).
+func APIPort() int {
+	return envPort("FLEET_API_PORT", 7443)
 }
 
 // HTTPSPort returns the HTTPS edge proxy port (FLEET_HTTPS_PORT or 443).
 func HTTPSPort() int {
-	if raw := os.Getenv("FLEET_HTTPS_PORT"); raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
-			return n
-		}
-	}
-	return 443
+	return envPort("FLEET_HTTPS_PORT", 443)
 }
 
 // DNSPort returns the private mesh DNS port (FLEET_DNS_PORT or 53).
 func DNSPort() int {
-	if raw := os.Getenv("FLEET_DNS_PORT"); raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
-			return n
-		}
-	}
-	return 53
+	return envPort("FLEET_DNS_PORT", 53)
 }
 
 // TLSDir returns the directory storing ACME account and TLS certificate files.

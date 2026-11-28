@@ -108,7 +108,7 @@ func (e *Engine) dispatchSandboxTool(ctx context.Context, name string, args map[
 		}
 		return map[string]any{"published": true, "file": f}, nil
 	case "sandbox_vault_bridge":
-		return e.execSandboxVaultBridgeTool(args, tctx)
+		return e.execSandboxVaultBridgeTool(ctx, args, tctx)
 	case "sandbox_install_packages":
 		return e.execSandboxInstallPackagesTool(ctx, args, rawArgs, tctx)
 	case "sandbox_reset":
@@ -164,7 +164,7 @@ func (e *Engine) execSandboxExecTool(ctx context.Context, args map[string]any, r
 	return e.sandbox.Exec(ctx, tctx.Config.Sandbox, tctx.ChannelID, req)
 }
 
-func (e *Engine) execSandboxVaultBridgeTool(args map[string]any, tctx *toolExecContext) (any, error) {
+func (e *Engine) execSandboxVaultBridgeTool(ctx context.Context, args map[string]any, tctx *toolExecContext) (any, error) {
 	action := strings.ToLower(strArg(args, "action"))
 	vaultName := strArg(args, "vault")
 	vaultPath := strArg(args, "vault_path")
@@ -219,7 +219,7 @@ func (e *Engine) execSandboxVaultBridgeTool(args map[string]any, tctx *toolExecC
 			"content": content,
 		}
 		rawWrite, _ := json.Marshal(writeArgs)
-		return e.execVaultWriteTool("vault_write", writeArgs, string(rawWrite), tctx)
+		return e.execVaultWriteTool(ctx, "vault_write", writeArgs, string(rawWrite), tctx)
 	default:
 		return nil, newErr("action must be \"import\" or \"export\"", http.StatusBadRequest)
 	}
@@ -264,10 +264,12 @@ func (e *Engine) execSandboxInstallPackagesTool(ctx context.Context, args map[st
 		}
 	}
 
+	e.configWriteMu.Lock()
 	cur := e.Config()
 	cur.Sandbox.ExtraAptPackages = normalizeStringList(append(cur.Sandbox.ExtraAptPackages, aptPkgs...))
 	cur.Sandbox.ExtraPipPackages = normalizeStringList(append(cur.Sandbox.ExtraPipPackages, pipPkgs...))
-	view, err := e.UpdateConfig(cur, false)
+	view, err := e.updateConfigLocked(cur, false)
+	e.configWriteMu.Unlock()
 	if err != nil {
 		return nil, err
 	}

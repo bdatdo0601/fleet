@@ -2,6 +2,7 @@ package waiter
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net"
 	"os"
@@ -139,7 +140,10 @@ func (l *ClaudeSocketListener) prePoll(knownSID string) bool {
 
 func (l *ClaudeSocketListener) canDeliver(resp agents.WaitResult) bool { return resp.SessionID != "" }
 
-func (l *ClaudeSocketListener) deliver(resp agents.WaitResult) (string, bool) {
+func (l *ClaudeSocketListener) deliver(ctx context.Context, resp agents.WaitResult) (string, bool) {
+	if ctx.Err() != nil {
+		return ctx.Err().Error(), false
+	}
 	sock, token, ok := l.resolveSocket(resp.SessionID)
 	if !ok {
 		return "claude messaging socket unavailable", true

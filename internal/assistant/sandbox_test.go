@@ -1,10 +1,12 @@
 package assistant
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -610,5 +612,84 @@ exit 0
 	}
 	if !strings.Contains(err.Error(), "FATAL_END_MARKER") || strings.Contains(err.Error(), "PREFIX ") {
 		t.Fatalf("expected error to preserve tail and drop prefix, got:\n%s", err.Error())
+	}
+}
+
+func TestEgressProxyCloseTerminatesActiveTunnels(t *testing.T) {
+	upstreamLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = upstreamLn.Close() }()
+
+	upstreamDone := make(chan struct{})
+	go func() {
+		defer close(upstreamDone)
+		conn, aErr := upstreamLn.Accept()
+		if aErr != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = conn.Write([]byte("hello"))
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+
+	px, err := StartEgressProxy("127.0.0.1:0", []string{"api.example.com"}, func(_ context.Context, _ string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	px.dialTCP = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, upstreamLn.Addr().String())
+	}
+
+	proxyParsed, _ := url.Parse(px.ProxyURL())
+	clientConn, err := net.DialTimeout("tcp", proxyParsed.Host, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = clientConn.Close() }()
+
+	tok := base64.StdEncoding.EncodeToString([]byte("fleet:" + px.token))
+	reqStr := "CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\nProxy-Authorization: Basic " + tok + "\r\n\r\n"
+	if _, err := io.WriteString(clientConn, reqStr); err != nil {
+		t.Fatal(err)
+	}
+	_ = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	br := bufio.NewReader(clientConn)
+	statusLine, err := br.ReadString('\n')
+	if err != nil || !strings.Contains(statusLine, "200 Connection Established") {
+		t.Fatalf("expected 200 Connection Established, got %q (err=%v)", statusLine, err)
+	}
+	for {
+		hdrLine, hErr := br.ReadString('\n')
+		if hErr != nil {
+			t.Fatalf("reading CONNECT headers: %v", hErr)
+		}
+		if hdrLine == "\r\n" || hdrLine == "\n" {
+			break
+		}
+	}
+
+	// Wait for initial greeting bytes from upstream before closing proxy.
+	helloBuf := make([]byte, 5)
+	if _, err := io.ReadFull(br, helloBuf); err != nil || string(helloBuf) != "hello" {
+		t.Fatalf("expected upstream hello over tunnel, got %q (err=%v)", string(helloBuf), err)
+	}
+
+	if err := px.Close(); err != nil {
+		t.Fatalf("px.Close() failed: %v", err)
+	}
+
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 256)
+	if _, err := br.Read(buf); err == nil {
+		t.Fatalf("expected client tunnel connection to close on px.Close()")
+	}
+	select {
+	case <-upstreamDone:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("expected upstream tunnel connection to close on px.Close()")
 	}
 }

@@ -94,6 +94,11 @@ func defaultOBRunningFor(name, vaultPath string) bool {
 	return vaultPath != "" && exec.Command("pgrep", "-f", vaultPath).Run() == nil
 }
 
+// CheckOP verifies 1Password CLI availability, token presence, and authentication health.
+func (e *Engine) CheckOP(ctx context.Context) DoctorCheck {
+	return e.checkOPDoctor(ctx, e.Config())
+}
+
 // Doctor verifies all assistant subsystems on the lighthouse and returns actionable hints.
 func (e *Engine) Doctor(ctx context.Context) DoctorReport {
 	cfg := e.Config()
@@ -447,7 +452,7 @@ func (e *Engine) checkNotificationsDoctor(ctx context.Context, cfg Config) Docto
 			Hint:   "Set discord_webhook_op_ref (e.g. op://Fleet-Agent/Discord/webhook) in Settings or `fleet assistant setup`",
 		}
 	}
-	reader := e.opReader
+	reader := e.getOPReader()
 	if reader == nil {
 		reader = defaultOPReader
 	}

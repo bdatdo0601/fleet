@@ -291,6 +291,12 @@ func (c *SlackClient) ReadMessages(ctx context.Context, userToken string, opts R
 			Messages []SlackMessage `json:"messages"`
 		}
 		rq := url.Values{"channel": {chID}, "ts": {threadTS}, "limit": {strconv.Itoa(limit)}}
+		if opts.Oldest != "" {
+			rq.Set("oldest", opts.Oldest)
+		}
+		if opts.Latest != "" {
+			rq.Set("latest", opts.Latest)
+		}
 		if err := c.doAPI(ctx, http.MethodGet, "/conversations.replies?"+rq.Encode(), userToken, &rep); err != nil {
 			return res, err
 		}

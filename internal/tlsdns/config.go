@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/bdatdo0601/fleet/internal/ddns"
 	"github.com/bdatdo0601/fleet/internal/paths"
 )
 
@@ -43,16 +44,20 @@ type Paths struct {
 	StagingAccountKey string
 }
 
+// CertPathsForDir computes TLS file locations inside tlsDir.
+func CertPathsForDir(tlsDir string) Paths {
+	return Paths{
+		Dir:               tlsDir,
+		Fullchain:         filepath.Join(tlsDir, "fullchain.pem"),
+		Privkey:           filepath.Join(tlsDir, "privkey.pem"),
+		ProdAccountKey:    filepath.Join(tlsDir, "account.key"),
+		StagingAccountKey: filepath.Join(tlsDir, "account-staging.key"),
+	}
+}
+
 // CertPaths computes TLS file locations under stateDir/tls.
 func CertPaths(stateDir string) Paths {
-	dir := paths.TLSDir(stateDir)
-	return Paths{
-		Dir:               dir,
-		Fullchain:         filepath.Join(dir, "fullchain.pem"),
-		Privkey:           filepath.Join(dir, "privkey.pem"),
-		ProdAccountKey:    filepath.Join(dir, "account.key"),
-		StagingAccountKey: filepath.Join(dir, "account-staging.key"),
-	}
+	return CertPathsForDir(paths.TLSDir(stateDir))
 }
 
 // AccountKey returns the ACME account key path for staging or production.
@@ -65,42 +70,7 @@ func (p Paths) AccountKey(staging bool) string {
 
 // NormalizeDomain lowercases, trims trailing dots, and validates a DNS FQDN.
 func NormalizeDomain(raw string) (string, error) {
-	d := strings.ToLower(strings.TrimSpace(raw))
-	d = strings.TrimRight(d, ".")
-	if d == "" || len(d) > 253 {
-		return "", fmt.Errorf("invalid domain %q", raw)
-	}
-	if strings.ContainsAny(d, "/\\ \t\r\n:*?") {
-		return "", fmt.Errorf("invalid domain %q", raw)
-	}
-	labels := strings.Split(d, ".")
-	if len(labels) < 2 {
-		return "", fmt.Errorf("domain %q must be a fully qualified domain name (e.g. fleet.example.com)", raw)
-	}
-	for _, lbl := range labels {
-		if !validDNSLabel(lbl) {
-			return "", fmt.Errorf("invalid DNS label %q in domain %q", lbl, raw)
-		}
-	}
-	return d, nil
-}
-
-func validDNSLabel(lbl string) bool {
-	if len(lbl) == 0 || len(lbl) > 63 {
-		return false
-	}
-	if lbl[0] == '-' || lbl[len(lbl)-1] == '-' {
-		return false
-	}
-	for i := 0; i < len(lbl); i++ {
-		c := lbl[i]
-		isLower := c >= 'a' && c <= 'z'
-		isDigit := c >= '0' && c <= '9'
-		if !isLower && !isDigit && c != '-' {
-			return false
-		}
-	}
-	return true
+	return ddns.NormalizeDomain(raw)
 }
 
 func isValidHexToken(s string) bool {

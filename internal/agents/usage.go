@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -106,6 +107,9 @@ func (h *Hub) UpsertUsage(u HarnessUsage) (HarnessUsage, error) {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if err := h.checkOpenLocked(); err != nil {
+		return HarnessUsage{}, err
+	}
 
 	row := h.db.QueryRow(`
 		SELECT harness, device, source, plan, status, detail, windows_json, metrics_json, updated_at
@@ -121,7 +125,7 @@ func (h *Hub) UpsertUsage(u HarnessUsage) (HarnessUsage, error) {
 				return existing, nil
 			}
 		}
-	} else if err != sql.ErrNoRows {
+	} else if !errors.Is(err, sql.ErrNoRows) {
 		return HarnessUsage{}, err
 	}
 
@@ -159,6 +163,9 @@ func (h *Hub) UpsertUsage(u HarnessUsage) (HarnessUsage, error) {
 func (h *Hub) ListUsage() ([]HarnessUsage, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if err := h.checkOpenLocked(); err != nil {
+		return nil, err
+	}
 
 	rows, err := h.db.Query(`
 		SELECT harness, device, source, plan, status, detail, windows_json, metrics_json, updated_at

@@ -3,6 +3,7 @@ package session
 import (
 	"bytes"
 	"cmp"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -19,8 +20,13 @@ import (
 	"time"
 
 	"github.com/bdatdo0601/fleet/internal/paths"
+	// Register the pure-Go sqlite driver for database/sql.
 	_ "modernc.org/sqlite"
 )
+
+const maxAgyResponseBytes = 4 << 20
+
+var agyHTTPClient = &http.Client{Timeout: 15 * time.Second}
 
 type agyHubInfo struct {
 	PID       int    `json:"pid"`
@@ -84,7 +90,9 @@ func defaultOpenAgyApp() error {
 	if runtime.GOOS != "darwin" || os.Getenv("FLEET_SESSION_NO_OPEN") == "1" {
 		return nil
 	}
-	return exec.Command("open", "-a", "Antigravity").Run()
+	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
+	defer cancel()
+	return exec.CommandContext(ctx, "open", "-a", "Antigravity").Run()
 }
 
 func agyAppDataDir() string {
@@ -131,7 +139,7 @@ func discoverAgyHub() (agyHubInfo, error) {
 			return best, nil
 		}
 	}
-	return agyHubInfo{}, fmt.Errorf("Antigravity app is not running (no active hub in %s); open Antigravity or pass --rex / --tmux", daemonDir)
+	return agyHubInfo{}, fmt.Errorf("antigravity app is not running (no active hub in %s); open Antigravity or pass --rex / --tmux", daemonDir)
 }
 
 func canonicalPath(p string) string {
@@ -147,7 +155,12 @@ func resolveAgyProjectID(directory string) string {
 	if _, err := os.Stat(dbPath); err != nil {
 		return ""
 	}
-	db, err := sql.Open("sqlite", "file:"+dbPath+"?mode=ro&_pragma=busy_timeout(2000)")
+	dsn := (&url.URL{
+		Scheme:   "file",
+		Path:     filepath.ToSlash(dbPath),
+		RawQuery: "mode=ro&_pragma=busy_timeout(2000)",
+	}).String()
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return ""
 	}
@@ -184,6 +197,9 @@ func resolveAgyProjectID(directory string) string {
 			}
 		}
 	}
+	if rows.Err() != nil {
+		return ""
+	}
 	return ""
 }
 
@@ -201,14 +217,13 @@ func callConversationService(hub agyHubInfo, method string, reqBody any, respOut
 	req.Header.Set("Connect-Protocol-Version", "1")
 	req.Header.Set("x-antigravity-csrf-token", hub.CSRFToken)
 
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := agyHTTPClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("Antigravity ConversationService/%s: %w", method, err)
+		return fmt.Errorf("antigravity ConversationService/%s: %w", method, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxAgyResponseBytes))
 	if err != nil {
 		return err
 	}
@@ -252,7 +267,7 @@ func agyCreateConversation(hub agyHubInfo, projectID, title, model, prompt strin
 		return agyConversation{}, err
 	}
 	if resp.Conversation.ID == "" {
-		return agyConversation{}, errors.New("Antigravity CreateConversation returned empty conversation ID")
+		return agyConversation{}, errors.New("antigravity CreateConversation returned empty conversation ID")
 	}
 	return resp.Conversation, nil
 }
@@ -306,8 +321,8 @@ func writeAppSessionState(harness, name string, st appSessionState) error {
 	return err
 }
 
-func removeAppSessionState(harness, name string) {
-	_ = os.Remove(appStatePath(harness, name))
+func removeAppSessionState(name string) {
+	_ = os.Remove(appStatePath(HarnessAgy, name))
 }
 
 func listAppSessionStates(harness string) []appSessionState {
@@ -341,19 +356,21 @@ func agyAppSessionActive(name string) (appSessionState, bool) {
 	conv, err := agyGetConversation(hub, st.ConversationID)
 	if err != nil {
 		if isConnectNotFound(err) {
-			removeAppSessionState(HarnessAgy, name)
+			removeAppSessionState(name)
 			return appSessionState{}, false
 		}
 		return st, true
 	}
 	if conv.Annotations.Archived {
-		removeAppSessionState(HarnessAgy, name)
+		removeAppSessionState(name)
 		return appSessionState{}, false
 	}
 	return st, true
 }
 
 func startAgyAppSession(opts StartOpts, directory string) error {
+	stdout := cmp.Or(opts.Stdout, io.Discard)
+	stderr := cmp.Or(opts.Stderr, io.Discard)
 	hub, err := discoverAgyHub()
 	if err != nil {
 		return err
@@ -377,10 +394,10 @@ func startAgyAppSession(opts StartOpts, directory string) error {
 		}); wErr != nil {
 			return wErr
 		}
-		_, _ = fmt.Fprintf(opts.Stdout, "Attached Antigravity app session %s (%s)\n", opts.Name, opts.ResumeID)
+		_, _ = fmt.Fprintf(stdout, "Attached Antigravity app session %s (%s)\n", opts.Name, opts.ResumeID)
 		if opts.Attach {
 			if oErr := openAgyAppFn(); oErr != nil {
-				_, _ = fmt.Fprintf(opts.Stderr, "fleet session agy: could not open Antigravity app: %v\n", oErr)
+				_, _ = fmt.Fprintf(stderr, "fleet session agy: could not open Antigravity app: %v\n", oErr)
 			}
 		}
 		return nil
@@ -389,7 +406,7 @@ func startAgyAppSession(opts StartOpts, directory string) error {
 	projectID := resolveAgyProjectID(directory)
 	promptText := opts.Prompt
 	if projectID == "" {
-		_, _ = fmt.Fprintf(opts.Stderr, "fleet session agy: no existing Antigravity project found for %s; creating conversation without project binding.\n", directory)
+		_, _ = fmt.Fprintf(stderr, "fleet session agy: no existing Antigravity project found for %s; creating conversation without project binding.\n", directory)
 		if promptText != "" {
 			promptText = "Working directory: " + directory + "\n\n" + promptText
 		}
@@ -410,12 +427,12 @@ func startAgyAppSession(opts StartOpts, directory string) error {
 		return err
 	}
 
-	_, _ = fmt.Fprintf(opts.Stdout, "Started Antigravity app session %s (%s) in %s\n", opts.Name, conv.ID, directory)
+	_, _ = fmt.Fprintf(stdout, "Started Antigravity app session %s (%s) in %s\n", opts.Name, conv.ID, directory)
 	if opts.Attach {
 		if oErr := openAgyAppFn(); oErr != nil {
-			_, _ = fmt.Fprintf(opts.Stderr, "fleet session agy: could not open Antigravity app: %v\n", oErr)
+			_, _ = fmt.Fprintf(stderr, "fleet session agy: could not open Antigravity app: %v\n", oErr)
 		}
 	}
-	_, _ = fmt.Fprintln(opts.Stdout, "Open it in the Antigravity app or at https://antigravity.google.com")
+	_, _ = fmt.Fprintln(stdout, "Open it in the Antigravity app or at https://antigravity.google.com")
 	return nil
 }

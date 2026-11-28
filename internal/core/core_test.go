@@ -12,6 +12,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"github.com/bdatdo0601/fleet/internal/agents"
 	"github.com/bdatdo0601/fleet/internal/pki"
 	"github.com/bdatdo0601/fleet/internal/registry"
 )
@@ -302,7 +303,7 @@ func TestLegacyFleetDBMigrationAndNumericSort(t *testing.T) {
 
 func TestSpawnAgentLighthouseDefaultsRepoToHome(t *testing.T) {
 	f, _, _ := newTestFleet(t)
-	res, err := f.SpawnAgent(context.Background(), nil, SpawnAgentRequest{
+	res, err := f.SpawnAgent(context.Background(), InternalAdminCaller(), SpawnAgentRequest{
 		Device: "mini",
 		Prompt: "install uv",
 	})
@@ -315,10 +316,95 @@ func TestSpawnAgentLighthouseDefaultsRepoToHome(t *testing.T) {
 	if list, err := f.Agents.ListPaths("mini", ""); err != nil || len(list) != 0 {
 		t.Fatalf("expected ~ not recorded as project repo path, got %+v (err=%v)", list, err)
 	}
-	if _, err := f.SpawnAgent(context.Background(), nil, SpawnAgentRequest{
+	if _, err := f.SpawnAgent(context.Background(), InternalAdminCaller(), SpawnAgentRequest{
 		Device: "laptop",
 		Prompt: "fix bug",
 	}); err == nil || !strings.Contains(err.Error(), "unknown harness") {
 		t.Fatalf("expected unknown harness error on non-lighthouse device with empty harness, got %v", err)
+	}
+}
+
+func TestSpawnAndKillAgentAuthBoundaries(t *testing.T) {
+	f, tmp, _ := newTestFleet(t)
+
+	_, lapPub := makeKeypair(t, tmp, "laptop")
+	if _, err := f.Approve(ApproveOpts{
+		Name: "laptop", Pubkey: lapPub, Kind: "mac", Group: "managed", Passphrase: testPassphrase,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, officePub := makeKeypair(t, tmp, "office")
+	if _, err := f.Approve(ApproveOpts{
+		Name: "office", Pubkey: officePub, Kind: "mac", Group: "managed", Passphrase: testPassphrase,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// nil caller must fail closed for both SpawnAgent and KillAgent.
+	if _, err := f.SpawnAgent(context.Background(), nil, SpawnAgentRequest{
+		Harness: "claude", Device: "mini", Prompt: "hi",
+	}); err == nil {
+		t.Fatal("expected SpawnAgent with nil caller to fail")
+	} else if fe, ok := errors.AsType[*FleetError](err); !ok || fe.Status != 401 {
+		t.Fatalf("expected 401 FleetError, got %v", err)
+	}
+	if _, err := f.KillAgent(nil, "some-session"); err == nil {
+		t.Fatal("expected KillAgent with nil caller to fail")
+	} else if fe, ok := errors.AsType[*FleetError](err); !ok || fe.Status != 401 {
+		t.Fatalf("expected 401 FleetError, got %v", err)
+	}
+
+	// Non-admin cross-device SpawnAgent fails closed with 403.
+	laptopDev := &registry.Device{Name: "laptop", Grp: "managed"}
+	if _, err := f.SpawnAgent(context.Background(), laptopDev, SpawnAgentRequest{
+		Harness: "claude", Device: "office", Prompt: "hi",
+	}); err == nil {
+		t.Fatal("expected non-admin cross-device SpawnAgent to fail")
+	} else if fe, ok := errors.AsType[*FleetError](err); !ok || fe.Status != 403 {
+		t.Fatalf("expected 403 FleetError, got %v", err)
+	}
+
+	// Register a session on office and verify non-admin laptop cannot kill it.
+	hbRes, err := f.Agents.Heartbeat(agents.HeartbeatParams{
+		Device:  "office",
+		Harness: "claude",
+		RawID:   "sess1",
+		State:   "working",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.KillAgent(laptopDev, hbRes.SessionID); err == nil {
+		t.Fatal("expected non-admin cross-device KillAgent to fail")
+	} else if fe, ok := errors.AsType[*FleetError](err); !ok || fe.Status != 403 {
+		t.Fatalf("expected 403 FleetError, got %v", err)
+	}
+
+	// IPv4-mapped IPv6 addresses should unmap and identify properly.
+	if d, err := f.Identify("::ffff:127.0.0.1"); err != nil || d == nil || d.Name != "mini" {
+		t.Fatalf("expected loopback v4-mapped IPv6 to identify mini, got %+v err=%v", d, err)
+	}
+	if d, err := f.Identify("::ffff:10.213.0.2"); err != nil || d == nil || d.Name != "laptop" {
+		t.Fatalf("expected mesh v4-mapped IPv6 to identify laptop, got %+v err=%v", d, err)
+	}
+}
+
+func TestInitializeCleansUpPartialFilesOnFailure(t *testing.T) {
+	tmp := t.TempDir()
+	root := filepath.Join(tmp, "state")
+	// Invalid pubkey causes f.sign inside Initialize to fail after CA and DBs were created.
+	if _, err := Initialize(InitOpts{
+		Root:             root,
+		Host:             "home.example.com",
+		Port:             443,
+		Passphrase:       testPassphrase,
+		LighthousePubkey: "not-a-valid-pubkey",
+	}); err == nil {
+		t.Fatal("expected Initialize to fail with invalid pubkey")
+	}
+	for _, name := range []string{"ca.key", "ca.crt", "fleet.db", "agents.db", "memory.db", "slacker.db", "assistant.db"} {
+		if _, err := os.Stat(filepath.Join(root, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("expected %s to be cleaned up after failed Initialize, stat err=%v", name, err)
+		}
 	}
 }

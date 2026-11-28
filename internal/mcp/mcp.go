@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"cmp"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,7 +25,11 @@ import (
 	"github.com/bdatdo0601/fleet/internal/waiter"
 )
 
-const HeartbeatIntervalSeconds = 45.0
+const (
+	HeartbeatIntervalSeconds = 45.0
+	maxMCPRequestBytes       = 4 * 1024 * 1024
+	maxConcurrentToolCalls   = 16
+)
 
 type toolSchemaProp struct {
 	Type        string   `json:"type"`
@@ -307,14 +312,14 @@ func deregister(apiURL, harness string, ppid int) {
 	_ = client.Call(api, "POST", "/v1/agents/deregister", map[string]any{"harness": harness, "pid": ppid}, 2*time.Second, nil, nil)
 }
 
-func resolveSIDNonDestructive(api, harness, cwd string, ppid int, explicitSID string) (string, error) {
+func resolveSIDNonDestructive(ctx context.Context, api, harness, cwd string, ppid int, explicitSID string) (string, error) {
 	if explicitSID != "" {
 		return explicitSID, nil
 	}
 	var resp struct {
 		SessionID string `json:"session_id"`
 	}
-	if err := client.Call(api, "POST", "/v1/agents/inbox", map[string]any{
+	if err := client.CallContext(ctx, api, "POST", "/v1/agents/inbox", map[string]any{
 		"harness":     harness,
 		"cwd":         cwd,
 		"pid":         ppid,
@@ -326,14 +331,14 @@ func resolveSIDNonDestructive(api, harness, cwd string, ppid int, explicitSID st
 	return resp.SessionID, nil
 }
 
-func fetchAgentSession(api, sid string) *agents.SessionDetail {
+func fetchAgentSession(ctx context.Context, api, sid string) *agents.SessionDetail {
 	if sid == "" {
 		return nil
 	}
 	var resp struct {
 		Agent agents.SessionDetail `json:"agent"`
 	}
-	if err := client.Call(api, "GET", "/v1/agents/"+url.PathEscape(sid), nil, 30*time.Second, nil, &resp); err != nil {
+	if err := client.CallContext(ctx, api, "GET", "/v1/agents/"+url.PathEscape(sid), nil, 30*time.Second, nil, &resp); err != nil {
 		return nil
 	}
 	return &resp.Agent
@@ -348,27 +353,27 @@ func decodeArgs[T any](raw json.RawMessage) (T, error) {
 	return args, err
 }
 
-func callJSON(api, method, path string, body any, timeout time.Duration) (any, error) {
+func callJSON(ctx context.Context, api, method, path string, body any, timeout time.Duration) (any, error) {
 	var out map[string]any
-	if err := client.Call(api, method, path, body, timeout, nil, &out); err != nil {
+	if err := client.CallContext(ctx, api, method, path, body, timeout, nil, &out); err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func callListenTool(api, harness, cwd string, ppid int, listener waiter.SessionListener, action, explicitSID string) (any, error) {
+func callListenTool(ctx context.Context, api, harness, cwd string, ppid int, listener waiter.SessionListener, action, explicitSID string) (any, error) {
 	action = cmp.Or(action, "status")
 	if action != "status" && action != "start" && action != "stop" {
 		return nil, fmt.Errorf("invalid action %q", action)
 	}
 	if listener != nil {
-		return callSessionListener(api, harness, cwd, ppid, listener, action, explicitSID), nil
+		return callSessionListener(ctx, api, harness, cwd, ppid, listener, action, explicitSID), nil
 	}
-	sid, err := resolveSIDNonDestructive(api, harness, cwd, ppid, explicitSID)
+	sid, err := resolveSIDNonDestructive(ctx, api, harness, cwd, ppid, explicitSID)
 	if err != nil {
 		return nil, err
 	}
-	sess := fetchAgentSession(api, sid)
+	sess := fetchAgentSession(ctx, api, sid)
 	var sessName string
 	var listening bool
 	delivery := "offline"
@@ -401,7 +406,7 @@ func callListenTool(api, harness, cwd string, ppid int, listener waiter.SessionL
 	}, nil
 }
 
-func callSessionListener(api, harness, cwd string, ppid int, listener waiter.SessionListener, action, explicitSID string) map[string]any {
+func callSessionListener(ctx context.Context, api, harness, cwd string, ppid int, listener waiter.SessionListener, action, explicitSID string) map[string]any {
 	var st waiter.ListenerStatus
 	switch action {
 	case "start":
@@ -413,11 +418,11 @@ func callSessionListener(api, harness, cwd string, ppid int, listener waiter.Ses
 	}
 	sid := cmp.Or(explicitSID, st.SessionID)
 	if sid == "" {
-		if resolved, err := resolveSIDNonDestructive(api, harness, cwd, ppid, ""); err == nil {
+		if resolved, err := resolveSIDNonDestructive(ctx, api, harness, cwd, ppid, ""); err == nil {
 			sid = resolved
 		}
 	}
-	sess := fetchAgentSession(api, sid)
+	sess := fetchAgentSession(ctx, api, sid)
 	var sessName string
 	listening := st.Enabled
 	delivery := "queued_idle"
@@ -441,7 +446,7 @@ func callSessionListener(api, harness, cwd string, ppid int, listener waiter.Ses
 	return out
 }
 
-func callListAgents(api string, rawArgs json.RawMessage) (any, error) {
+func callListAgents(ctx context.Context, api string, rawArgs json.RawMessage) (any, error) {
 	a, err := decodeArgs[struct {
 		Device       string `json:"device"`
 		Repo         string `json:"repo"`
@@ -465,10 +470,10 @@ func callListAgents(api string, rawArgs json.RawMessage) (any, error) {
 	if enc := q.Encode(); enc != "" {
 		qs = "?" + enc
 	}
-	return callJSON(api, "GET", "/v1/agents"+qs, nil, 30*time.Second)
+	return callJSON(ctx, api, "GET", "/v1/agents"+qs, nil, 30*time.Second)
 }
 
-func callInspectAgent(api string, rawArgs json.RawMessage) (any, error) {
+func callInspectAgent(ctx context.Context, api string, rawArgs json.RawMessage) (any, error) {
 	a, err := decodeArgs[struct {
 		AgentID   string `json:"agent_id"`
 		TailLimit *int   `json:"tail_limit"`
@@ -481,7 +486,7 @@ func callInspectAgent(api string, rawArgs json.RawMessage) (any, error) {
 		return nil, errors.New("agent_id is required")
 	}
 	var out map[string]any
-	if err := client.Call(api, "GET", "/v1/agents/"+url.PathEscape(agentID), nil, 30*time.Second, nil, &out); err != nil {
+	if err := client.CallContext(ctx, api, "GET", "/v1/agents/"+url.PathEscape(agentID), nil, 30*time.Second, nil, &out); err != nil {
 		return nil, err
 	}
 	if a.TailLimit != nil {
@@ -495,7 +500,7 @@ func callInspectAgent(api string, rawArgs json.RawMessage) (any, error) {
 	return out, nil
 }
 
-func callAskAgent(api, harness, cwd string, ppid int, rawArgs json.RawMessage) (any, error) {
+func callAskAgent(ctx context.Context, api, harness, cwd string, ppid int, rawArgs json.RawMessage) (any, error) {
 	a, err := decodeArgs[struct {
 		To             string   `json:"to"`
 		Question       string   `json:"question"`
@@ -518,19 +523,19 @@ func callAskAgent(api, harness, cwd string, ppid int, rawArgs json.RawMessage) (
 		body["session_id"] = a.SessionID
 	}
 	httpTimeout := max(min(timeoutSec, 120.0)+10.0, 5.0)
-	return callJSON(api, "POST", "/v1/agents/ask", body, time.Duration(httpTimeout*float64(time.Second)))
+	return callJSON(ctx, api, "POST", "/v1/agents/ask", body, time.Duration(httpTimeout*float64(time.Second)))
 }
 
-func callTool(name string, rawArgs json.RawMessage, apiURL, harness string, ppid int, cwd string, listener waiter.SessionListener) (any, error) {
+func callTool(ctx context.Context, name string, rawArgs json.RawMessage, apiURL, harness string, ppid int, cwd string, listener waiter.SessionListener) (any, error) {
 	api, err := client.ResolveAPI(apiURL)
 	if err != nil {
 		return nil, err
 	}
 	switch name {
 	case "fleet_list_agents":
-		return callListAgents(api, rawArgs)
+		return callListAgents(ctx, api, rawArgs)
 	case "fleet_inspect_agent":
-		return callInspectAgent(api, rawArgs)
+		return callInspectAgent(ctx, api, rawArgs)
 	case "fleet_send_message":
 		a, err := decodeArgs[struct {
 			To        string `json:"to"`
@@ -552,7 +557,7 @@ func callTool(name string, rawArgs json.RawMessage, apiURL, harness string, ppid
 		if a.ReplyTo != nil {
 			body["reply_to"] = *a.ReplyTo
 		}
-		return callJSON(api, "POST", "/v1/agents/send", body, 30*time.Second)
+		return callJSON(ctx, api, "POST", "/v1/agents/send", body, 30*time.Second)
 
 	case "fleet_check_inbox":
 		a, err := decodeArgs[struct {
@@ -566,10 +571,10 @@ func callTool(name string, rawArgs json.RawMessage, apiURL, harness string, ppid
 		if a.SessionID != "" {
 			body["session_id"] = a.SessionID
 		}
-		return callJSON(api, "POST", "/v1/agents/inbox", body, 30*time.Second)
+		return callJSON(ctx, api, "POST", "/v1/agents/inbox", body, 30*time.Second)
 
 	case "fleet_ask_agent":
-		return callAskAgent(api, harness, cwd, ppid, rawArgs)
+		return callAskAgent(ctx, api, harness, cwd, ppid, rawArgs)
 
 	case "fleet_set_name":
 		a, err := decodeArgs[struct {
@@ -583,7 +588,7 @@ func callTool(name string, rawArgs json.RawMessage, apiURL, harness string, ppid
 		if a.SessionID != "" {
 			body["session_id"] = a.SessionID
 		}
-		return callJSON(api, "POST", "/v1/agents/rename", body, 30*time.Second)
+		return callJSON(ctx, api, "POST", "/v1/agents/rename", body, 30*time.Second)
 
 	case "fleet_listen":
 		a, err := decodeArgs[struct {
@@ -593,13 +598,13 @@ func callTool(name string, rawArgs json.RawMessage, apiURL, harness string, ppid
 		if err != nil {
 			return nil, err
 		}
-		return callListenTool(api, harness, cwd, ppid, listener, a.Action, a.SessionID)
+		return callListenTool(ctx, api, harness, cwd, ppid, listener, a.Action, a.SessionID)
 
 	case "fleet_memory_search", "fleet_memory_get", "fleet_memory_set", "fleet_memory_delete":
-		return callMemoryTool(name, rawArgs, api, harness, cwd)
+		return callMemoryTool(ctx, name, rawArgs, api, harness, cwd)
 
 	case "fleet_slack_channels", "fleet_slack_read", "fleet_slack_send":
-		return callSlackTool(name, rawArgs, api)
+		return callSlackTool(ctx, name, rawArgs, api)
 
 	default:
 		return nil, fmt.Errorf("unknown tool %q", name)
@@ -634,13 +639,17 @@ type toolCallResult struct {
 	IsError bool          `json:"isError"`
 }
 
-func dispatchRPC(req rpcRequest, opts ServeOpts, ppid int, cwd string, listener waiter.SessionListener) rpcResponse {
+func dispatchRPC(ctx context.Context, req rpcRequest, opts ServeOpts, ppid int, cwd string, listener waiter.SessionListener) rpcResponse {
 	switch req.Method {
 	case "initialize":
 		var p struct {
 			ProtocolVersion string `json:"protocolVersion"`
 		}
-		_ = json.Unmarshal(req.Params, &p)
+		if trimmed := bytes.TrimSpace(req.Params); len(trimmed) > 0 && string(trimmed) != "null" {
+			if json.Unmarshal(trimmed, &p) != nil {
+				return rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32602, Message: "invalid params"}}
+			}
+		}
 		return rpcResponse{
 			JSONRPC: "2.0",
 			ID:      req.ID,
@@ -659,8 +668,11 @@ func dispatchRPC(req rpcRequest, opts ServeOpts, ppid int, cwd string, listener 
 			Name      string          `json:"name"`
 			Arguments json.RawMessage `json:"arguments"`
 		}
-		_ = json.Unmarshal(req.Params, &p)
-		data, callErr := callTool(p.Name, p.Arguments, opts.APIURL, opts.Harness, ppid, cwd, listener)
+		trimmed := bytes.TrimSpace(req.Params)
+		if len(trimmed) == 0 || string(trimmed) == "null" || json.Unmarshal(trimmed, &p) != nil || strings.TrimSpace(p.Name) == "" {
+			return rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32602, Message: "invalid params"}}
+		}
+		data, callErr := callTool(ctx, p.Name, p.Arguments, opts.APIURL, opts.Harness, ppid, cwd, listener)
 		if callErr != nil {
 			return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: toolCallResult{
 				Content: []textContent{{Type: "text", Text: callErr.Error()}},
@@ -722,19 +734,65 @@ func startBackgroundWorkers(opts ServeOpts, ppid int, cwd string, stopCh <-chan 
 	return hbDone, listener
 }
 
+func readLineBounded(br *bufio.Reader, maxBytes int) ([]byte, bool, error) {
+	var buf []byte
+	for {
+		frag, err := br.ReadSlice('\n')
+		if len(buf)+len(frag) > maxBytes {
+			for errors.Is(err, bufio.ErrBufferFull) {
+				_, err = br.ReadSlice('\n')
+			}
+			return nil, true, err
+		}
+		buf = append(buf, frag...)
+		if !errors.Is(err, bufio.ErrBufferFull) {
+			return buf, false, err
+		}
+	}
+}
+
+func handleRPCLine(
+	rpcCtx context.Context,
+	trimmed []byte,
+	opts ServeOpts,
+	ppid int,
+	cwd string,
+	listener waiter.SessionListener,
+	sem chan struct{},
+	rpcWG *sync.WaitGroup,
+	writeResp func(rpcResponse),
+) {
+	var req rpcRequest
+	if json.Unmarshal(trimmed, &req) != nil {
+		writeResp(rpcResponse{JSONRPC: "2.0", Error: &rpcError{Code: -32700, Message: "parse error"}})
+		return
+	}
+	if req.ID == nil {
+		return
+	}
+	if req.Method != "tools/call" {
+		writeResp(dispatchRPC(rpcCtx, req, opts, ppid, cwd, listener))
+		return
+	}
+	select {
+	case sem <- struct{}{}:
+		rpcWG.Add(1)
+		go func(r rpcRequest) {
+			defer rpcWG.Done()
+			defer func() { <-sem }()
+			writeResp(dispatchRPC(rpcCtx, r, opts, ppid, cwd, listener))
+		}(req)
+	case <-rpcCtx.Done():
+	}
+}
+
 // ServeStdio runs the newline-delimited JSON-RPC 2.0 MCP server on stdin/stdout.
 func ServeStdio(opts ServeOpts) (int, error) {
 	if !paths.ValidHarness(opts.Harness) {
 		return 1, fmt.Errorf("unknown harness %q", opts.Harness)
 	}
-	stdin := opts.Stdin
-	if stdin == nil {
-		stdin = os.Stdin
-	}
-	stdout := opts.Stdout
-	if stdout == nil {
-		stdout = os.Stdout
-	}
+	stdin := cmp.Or(opts.Stdin, io.Reader(os.Stdin))
+	stdout := cmp.Or(opts.Stdout, io.Writer(os.Stdout))
 	ppid := os.Getppid()
 	if opts.Harness == "claude" {
 		ppid = hooks.ClaudeProcessPID()
@@ -769,20 +827,24 @@ func ServeStdio(opts ServeOpts) (int, error) {
 		}
 	}
 
+	rpcCtx, cancelRPC := context.WithCancel(context.Background())
+	defer cancelRPC()
+	sem := make(chan struct{}, maxConcurrentToolCalls)
+	var rpcWG sync.WaitGroup
+
 	br := bufio.NewReader(stdin)
 	for {
-		line, err := br.ReadBytes('\n')
-		if trimmed := bytes.TrimSpace(line); len(trimmed) > 0 {
-			var req rpcRequest
-			if json.Unmarshal(trimmed, &req) != nil {
-				writeResp(rpcResponse{JSONRPC: "2.0", Error: &rpcError{Code: -32700, Message: "parse error"}})
-			} else if req.ID != nil {
-				writeResp(dispatchRPC(req, opts, ppid, cwd, listener))
-			}
+		line, tooLong, err := readLineBounded(br, maxMCPRequestBytes)
+		if tooLong {
+			writeResp(rpcResponse{JSONRPC: "2.0", Error: &rpcError{Code: -32700, Message: "request exceeds maximum line size"}})
+		} else if trimmed := bytes.TrimSpace(line); len(trimmed) > 0 {
+			handleRPCLine(rpcCtx, trimmed, opts, ppid, cwd, listener, sem, &rpcWG, writeResp)
 		}
 		if err != nil {
 			break
 		}
 	}
+	cancelRPC()
+	rpcWG.Wait()
 	return 0, nil
 }

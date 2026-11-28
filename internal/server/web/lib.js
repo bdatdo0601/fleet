@@ -10,17 +10,20 @@ export const state = {
 
 let nextFieldID = 0;
 
-export async function api(method, path, body) {
-  const opts = {
+export async function api(method, path, body, opts = {}) {
+  const fetchOpts = {
     method,
     headers: {},
     credentials: "same-origin",
   };
-  if (body !== undefined) {
-    opts.headers["Content-Type"] = "application/json";
-    opts.body = JSON.stringify(body);
+  if (opts && opts.signal) {
+    fetchOpts.signal = opts.signal;
   }
-  const resp = await fetch(path, opts);
+  if (body !== undefined) {
+    fetchOpts.headers["Content-Type"] = "application/json";
+    fetchOpts.body = JSON.stringify(body);
+  }
+  const resp = await fetch(path, fetchOpts);
   const text = await resp.text();
   let data = null;
   if (text) {
@@ -50,6 +53,10 @@ export function el(tag, props, ...children) {
         node.className = val;
       } else if (key === "text") {
         node.textContent = String(val);
+      } else if (key === "style") {
+        if (typeof val === "object" && !Array.isArray(val)) {
+          Object.assign(node.style, val);
+        }
       } else if (key === "dataset" && typeof val === "object") {
         for (const [dk, dv] of Object.entries(val)) {
           if (dv !== undefined && dv !== null) {
@@ -266,10 +273,12 @@ export function closeModal() {
     modalCleanup = null;
     fn();
   }
-  if (lastFocusedEl && typeof lastFocusedEl.focus === "function" && lastFocusedEl.isConnected) {
-    lastFocusedEl.focus();
+  if (!state.modalOpen) {
+    if (lastFocusedEl && typeof lastFocusedEl.focus === "function" && lastFocusedEl.isConnected) {
+      lastFocusedEl.focus();
+    }
+    lastFocusedEl = null;
   }
-  lastFocusedEl = null;
 }
 
 export function openModal(title, contentEl, opts = {}) {
@@ -279,7 +288,7 @@ export function openModal(title, contentEl, opts = {}) {
   if (!backdrop || !titleEl || !body) {
     return;
   }
-  if (!state.modalOpen && document.activeElement instanceof HTMLElement) {
+  if (!state.modalOpen && document.activeElement && typeof document.activeElement.focus === "function") {
     lastFocusedEl = document.activeElement;
   }
   if (modalCleanup) {
@@ -297,7 +306,11 @@ export function openModal(title, contentEl, opts = {}) {
   backdrop.setAttribute("aria-hidden", "false");
   const focusTarget = body.querySelector("input:not([disabled]), textarea:not([disabled]), select:not([disabled]), button:not([disabled])") || document.getElementById("modal-close");
   if (focusTarget && typeof focusTarget.focus === "function") {
-    requestAnimationFrame(() => focusTarget.focus());
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(() => focusTarget.focus());
+    } else {
+      focusTarget.focus();
+    }
   }
 }
 
@@ -479,18 +492,93 @@ export function badge(text, variant = "neutral") {
   return el("span", { className: `badge badge-${variant}`, text });
 }
 
-export async function fetchPathsCatalog(device = "") {
+export async function fetchPathsCatalog(device = "", opts = {}) {
   const qs = device ? `?device=${encodeURIComponent(device)}` : "";
   try {
-    const res = await api("GET", `/v1/agents/paths${qs}`);
+    const res = await api("GET", `/v1/agents/paths${qs}`, undefined, opts);
     return {
       paths: Array.isArray(res.paths) ? res.paths : [],
       repos: Array.isArray(res.repos) ? res.repos : [],
       workspaces: res.workspaces && typeof res.workspaces === "object" ? res.workspaces : {},
     };
-  } catch {
+  } catch (err) {
+    if (err && err.name === "AbortError") {
+      throw err;
+    }
     return { paths: [], repos: [], workspaces: {} };
   }
+}
+
+export function isWorkerOnline(runtimes, dev, nowMs = Date.now()) {
+  const rt = (runtimes || []).find((r) => r.role === `worker:${dev}`);
+  if (!rt || !rt.connected) {
+    return false;
+  }
+  const ts = Date.parse(rt.last_poll_at || rt.updated_at || "");
+  return Number.isFinite(ts) && nowMs - ts <= 90 * 1000;
+}
+
+export function formatMessageTarget(m) {
+  if (!m) {
+    return "all";
+  }
+  if (m.to_session) {
+    return m.to_session;
+  }
+  if (m.to_device) {
+    return `device:${m.to_device}`;
+  }
+  if (m.to_repo) {
+    return `repo:${m.to_repo}`;
+  }
+  return "all";
+}
+
+export function formatDefaultPoolHint(defaultDevices = []) {
+  return `default (${defaultDevices.length > 0 ? defaultDevices.join(", ") : "none"})`;
+}
+
+export function createDevicePoolPicker({
+  pool = [],
+  selected = [],
+  defaultDevices = [],
+  labelForDevice = (devName) => devName,
+  onChange = null,
+}) {
+  let currentSelected = pool.filter((d) => selected.includes(d));
+  const poolHint = el("span", {
+    className: "small muted",
+    text: currentSelected.length === 0 ? formatDefaultPoolHint(defaultDevices) : "",
+  });
+
+  const chipButtons = pool.map((devName) => {
+    const isSelected = currentSelected.includes(devName);
+    const btn = el("button", {
+      type: "button",
+      className: `chip${isSelected ? " active" : ""}`,
+      text: labelForDevice(devName),
+      onclick: () => {
+        const cur = new Set(currentSelected);
+        if (cur.has(devName)) {
+          cur.delete(devName);
+        } else {
+          cur.add(devName);
+        }
+        currentSelected = pool.filter((d) => cur.has(d));
+        btn.classList.toggle("active", cur.has(devName));
+        poolHint.textContent = currentSelected.length === 0 ? formatDefaultPoolHint(defaultDevices) : "";
+        if (onChange) {
+          onChange(currentSelected.slice());
+        }
+      },
+    });
+    return btn;
+  });
+
+  return {
+    element: el("div", { className: "chips-row" }, ...chipButtons, poolHint),
+    getSelected: () => currentSelected.slice(),
+  };
 }
 
 export function populateDatalist(listEl, items) {

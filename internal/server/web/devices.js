@@ -436,6 +436,7 @@ async function handleRevoke(dev, onDone) {
 }
 
 export async function renderDevices(root, ctx) {
+  const signal = ctx && ctx.signal;
   if (!state.isAdmin) {
     root.appendChild(el("div", { className: "empty-state", text: "Admin privileges required to manage devices." }));
     return;
@@ -444,10 +445,19 @@ export async function renderDevices(root, ctx) {
   let devData;
   let revData;
   try {
-    [devData, revData] = await Promise.all([api("GET", "/v1/devices"), api("GET", "/v1/revocations")]);
+    [devData, revData] = await Promise.all([
+      api("GET", "/v1/devices", undefined, { signal }),
+      api("GET", "/v1/revocations", undefined, { signal }),
+    ]);
   } catch (err) {
+    if ((err && err.name === "AbortError") || (signal && signal.aborted)) {
+      return;
+    }
     clear(root);
     root.appendChild(el("div", { className: "alert-banner alert-danger", text: err.message }));
+    return;
+  }
+  if (signal && signal.aborted) {
     return;
   }
 

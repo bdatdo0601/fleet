@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"math"
@@ -198,10 +197,7 @@ func cmdUsage(args []string, cio *IO) error {
 	}
 
 	if *jsonOut {
-		enc := json.NewEncoder(cio.Stdout)
-		enc.SetEscapeHTML(false)
-		enc.SetIndent("", "  ")
-		return enc.Encode(map[string]any{"usage": items})
+		return writeJSONOut(cio.Stdout, map[string]any{"usage": items})
 	}
 	printUsageTable(cio, items)
 	return nil

@@ -238,3 +238,36 @@ func TestCLISlackerMapWorkspaceDefaultAndMultiDeviceChannel(t *testing.T) {
 		t.Fatalf("workspace rm laptop failed: rc=%d out=%q err=%q", rc, out, errStr)
 	}
 }
+
+func TestCLISlackerLogsValidationAndChunkedTail(t *testing.T) {
+	for _, arg := range []string{"-1", "0"} {
+		var out, errBuf bytes.Buffer
+		rc := Run([]string{"slacker", "logs", "--lines", arg}, &IO{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errBuf})
+		if rc == 0 || !strings.Contains(errBuf.String(), "--lines must be positive") {
+			t.Fatalf("expected --lines validation error for %s, got rc=%d err=%q", arg, rc, errBuf.String())
+		}
+	}
+
+	tmp := t.TempDir()
+	logPath := filepath.Join(tmp, "worker.log")
+	var sb strings.Builder
+	for i := 1; i <= 300; i++ {
+		sb.WriteString(strings.Repeat("x", 40))
+		sb.WriteString(" line-")
+		sb.WriteByte(byte('0' + (i/100)%10))
+		sb.WriteByte(byte('0' + (i/10)%10))
+		sb.WriteByte(byte('0' + i%10))
+		sb.WriteByte('\n')
+	}
+	if err := os.WriteFile(logPath, []byte(sb.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := tailLocalFile(logPath, 3, &out); err != nil {
+		t.Fatal(err)
+	}
+	gotLines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
+	if len(gotLines) != 3 || !strings.HasSuffix(gotLines[0], "line-298") || !strings.HasSuffix(gotLines[2], "line-300") {
+		t.Fatalf("unexpected chunked tail output: %q", out.String())
+	}
+}

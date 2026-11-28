@@ -3,6 +3,7 @@ package ddns
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,7 +16,11 @@ import (
 	"time"
 )
 
-const TTL = 60
+const (
+	TTL               = 60
+	defaultDigTimeout = 15 * time.Second
+	defaultCmdTimeout = 30 * time.Second
+)
 
 // CheckIPURLs lists public IP echo endpoints tried in order.
 var CheckIPURLs = []string{
@@ -100,13 +105,56 @@ func NormalizeZoneID(zoneID string) (string, error) {
 	return trimmed, nil
 }
 
+func validDNSLabel(lbl string) bool {
+	if len(lbl) == 0 || len(lbl) > 63 {
+		return false
+	}
+	if lbl[0] == '-' || lbl[len(lbl)-1] == '-' {
+		return false
+	}
+	for i := 0; i < len(lbl); i++ {
+		c := lbl[i]
+		isLower := c >= 'a' && c <= 'z'
+		isDigit := c >= '0' && c <= '9'
+		if !isLower && !isDigit && c != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+// NormalizeDomain lowercases, trims trailing dots, and validates a DNS FQDN.
+func NormalizeDomain(raw string) (string, error) {
+	d := strings.ToLower(strings.TrimSpace(raw))
+	d = strings.TrimRight(d, ".")
+	if d == "" || len(d) > 253 {
+		return "", fmt.Errorf("invalid domain %q", raw)
+	}
+	if strings.ContainsAny(d, "/\\ \t\r\n:*?") {
+		return "", fmt.Errorf("invalid domain %q", raw)
+	}
+	labels := strings.Split(d, ".")
+	if len(labels) < 2 {
+		return "", fmt.Errorf("domain %q must be a fully qualified domain name (e.g. fleet.example.com)", raw)
+	}
+	for _, lbl := range labels {
+		if !validDNSLabel(lbl) {
+			return "", fmt.Errorf("invalid DNS label %q in domain %q", lbl, raw)
+		}
+	}
+	return d, nil
+}
+
 // Policy builds the least-privilege IAM policy allowing UPSERT of only this A record.
 func Policy(zoneID, name string) (map[string]any, error) {
 	zid, err := NormalizeZoneID(zoneID)
 	if err != nil {
 		return nil, err
 	}
-	normName := strings.ToLower(strings.TrimRight(name, "."))
+	normName, err := NormalizeDomain(name)
+	if err != nil {
+		return nil, err
+	}
 	return map[string]any{
 		"Version": "2012-10-17",
 		"Statement": []map[string]any{
@@ -176,17 +224,30 @@ func PublicIPv4(fetch FetchFn) (string, error) {
 
 // DefaultDig executes `dig +short +time=3 +tries=2 <args...>`.
 func DefaultDig(args ...string) ([]string, error) {
+	return DefaultDigContext(context.Background(), args...)
+}
+
+// DefaultDigContext executes `dig +short +time=3 +tries=2 <args...>` bounded by ctx.
+func DefaultDigContext(ctx context.Context, args ...string) ([]string, error) {
 	bin, err := exec.LookPath("dig")
 	if err != nil {
 		return nil, errors.New("dig not found")
 	}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultDigTimeout)
+		defer cancel()
+	}
 	cmdArgs := append([]string{"+short", "+time=3", "+tries=2"}, args...)
-	cmd := exec.Command(bin, cmdArgs...)
+	cmd := exec.CommandContext(ctx, bin, cmdArgs...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		detail := strings.TrimSpace(stdout.String() + stderr.String())
+		if detail == "" {
+			detail = err.Error()
+		}
 		return nil, fmt.Errorf("dig %s failed: %s", strings.Join(args, " "), detail)
 	}
 	var lines []string
@@ -264,8 +325,26 @@ func ChangeBatch(name, ip string) map[string]any {
 	}
 }
 
-func defaultRunCmd(name string, args ...string) (string, string, error) {
-	cmd := exec.Command(name, args...)
+// ResolveAWSBin returns awsBin if non-empty or locates `aws` on PATH.
+func ResolveAWSBin(awsBin string) (string, error) {
+	if awsBin != "" {
+		return awsBin, nil
+	}
+	found, err := exec.LookPath("aws")
+	if err != nil {
+		return "", errors.New("aws CLI not found (brew install awscli)")
+	}
+	return found, nil
+}
+
+// DefaultRunCmdContext runs an external command bounded by ctx (default 30s if no deadline).
+func DefaultRunCmdContext(ctx context.Context, name string, args ...string) (string, string, error) {
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultCmdTimeout)
+		defer cancel()
+	}
+	cmd := exec.CommandContext(ctx, name, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -273,30 +352,35 @@ func defaultRunCmd(name string, args ...string) (string, string, error) {
 	return stdout.String(), stderr.String(), err
 }
 
-// Upsert applies an A record UPSERT via the AWS CLI.
-func Upsert(cfg Route53, ip string, awsBin string, runFn RunCmdFn) (string, error) {
-	if awsBin == "" {
-		found, err := exec.LookPath("aws")
-		if err != nil {
-			return "", errors.New("aws CLI not found (brew install awscli)")
-		}
-		awsBin = found
-	}
-	if runFn == nil {
-		runFn = defaultRunCmd
-	}
-	batchJSON, err := json.Marshal(ChangeBatch(cfg.Name, ip))
+// RunRoute53ChangeContext submits a Route 53 change-resource-record-sets batch via AWS CLI.
+func RunRoute53ChangeContext(
+	ctx context.Context,
+	profile, zoneID string,
+	batch map[string]any,
+	awsBin string,
+	runFn RunCmdFn,
+) (string, error) {
+	bin, err := ResolveAWSBin(awsBin)
 	if err != nil {
 		return "", err
 	}
-	stdout, stderr, err := runFn(
-		awsBin,
+	batchJSON, err := json.Marshal(batch)
+	if err != nil {
+		return "", err
+	}
+	args := []string{
 		"route53", "change-resource-record-sets",
-		"--profile", cfg.Profile,
-		"--hosted-zone-id", cfg.ZoneID,
+		"--profile", profile,
+		"--hosted-zone-id", zoneID,
 		"--change-batch", string(batchJSON),
 		"--output", "json",
-	)
+	}
+	var stdout, stderr string
+	if runFn != nil {
+		stdout, stderr, err = runFn(bin, args...)
+	} else {
+		stdout, stderr, err = DefaultRunCmdContext(ctx, bin, args...)
+	}
 	if err != nil {
 		detail := strings.TrimSpace(stderr)
 		if detail == "" {
@@ -316,6 +400,16 @@ func Upsert(cfg Route53, ip string, awsBin string, runFn RunCmdFn) (string, erro
 		return "", err
 	}
 	return parsed.ChangeInfo.ID, nil
+}
+
+// Upsert applies an A record UPSERT via the AWS CLI.
+func Upsert(cfg Route53, ip string, awsBin string, runFn RunCmdFn) (string, error) {
+	return UpsertContext(context.Background(), cfg, ip, awsBin, runFn)
+}
+
+// UpsertContext applies an A record UPSERT via the AWS CLI bounded by ctx.
+func UpsertContext(ctx context.Context, cfg Route53, ip string, awsBin string, runFn RunCmdFn) (string, error) {
+	return RunRoute53ChangeContext(ctx, cfg.Profile, cfg.ZoneID, ChangeBatch(cfg.Name, ip), awsBin, runFn)
 }
 
 // Sync checks public IPv4 against authoritative DNS and updates Route 53 if changed.

@@ -73,9 +73,13 @@ type EgressProxy struct {
 	token        string
 	allowedHosts []string
 	lookupIP     func(context.Context, string) ([]netip.Addr, error)
+	dialTCP      func(context.Context, string, string) (net.Conn, error)
 
 	mu        sync.Mutex
+	closed    bool
 	contacted map[string]struct{}
+	conns     map[net.Conn]struct{}
+	tunnelWG  sync.WaitGroup
 }
 
 // StartEgressProxy binds an authenticating HTTP/CONNECT proxy on listenAddr.
@@ -99,6 +103,7 @@ func StartEgressProxy(listenAddr string, allowedHosts []string, lookupFn func(co
 		allowedHosts: append([]string(nil), allowedHosts...),
 		lookupIP:     lookupFn,
 		contacted:    make(map[string]struct{}),
+		conns:        make(map[net.Conn]struct{}),
 	}
 	p.transport = &http.Transport{
 		DialContext:           p.dialVerified,
@@ -133,13 +138,45 @@ func (p *EgressProxy) ContactedHosts() []string {
 	return out
 }
 
-// Close shuts down the ephemeral egress proxy.
+// Close shuts down the ephemeral egress proxy and terminates active hijacked tunnels.
 func (p *EgressProxy) Close() error {
 	if p == nil {
 		return nil
 	}
+	p.mu.Lock()
+	p.closed = true
+	active := make([]net.Conn, 0, len(p.conns))
+	for c := range p.conns {
+		active = append(active, c)
+	}
+	clear(p.conns)
+	p.mu.Unlock()
+
+	for _, c := range active {
+		_ = c.Close()
+	}
 	p.transport.CloseIdleConnections()
-	return p.srv.Close()
+	err := p.srv.Close()
+	p.tunnelWG.Wait()
+	return err
+}
+
+func (p *EgressProxy) trackTunnelConns(a, b net.Conn) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return false
+	}
+	p.conns[a] = struct{}{}
+	p.conns[b] = struct{}{}
+	return true
+}
+
+func (p *EgressProxy) untrackTunnelConns(a, b net.Conn) {
+	p.mu.Lock()
+	delete(p.conns, a)
+	delete(p.conns, b)
+	p.mu.Unlock()
 }
 
 func (p *EgressProxy) authorized(r *http.Request) bool {
@@ -202,6 +239,9 @@ func (p *EgressProxy) dialVerified(ctx context.Context, _, addr string) (net.Con
 	p.mu.Lock()
 	p.contacted[strings.ToLower(cleanHost)] = struct{}{}
 	p.mu.Unlock()
+	if p.dialTCP != nil {
+		return p.dialTCP(ctx, "tcp", net.JoinHostPort(ips[0].Unmap().String(), port))
+	}
 	dialer := &net.Dialer{Timeout: 15 * time.Second}
 	return dialer.DialContext(ctx, "tcp", net.JoinHostPort(ips[0].Unmap().String(), port))
 }
@@ -232,16 +272,32 @@ func (p *EgressProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		_ = upstream.Close()
 		return
 	}
+	if !p.trackTunnelConns(clientConn, upstream) {
+		_ = clientConn.Close()
+		_ = upstream.Close()
+		return
+	}
+	var copyWG sync.WaitGroup
+	copyWG.Add(2)
+	p.tunnelWG.Add(2)
 	go func() {
+		defer p.tunnelWG.Done()
+		defer copyWG.Done()
 		defer func() { _ = upstream.Close() }()
 		defer func() { _ = clientConn.Close() }()
 		_, _ = io.Copy(upstream, clientConn)
 	}()
 	go func() {
+		defer p.tunnelWG.Done()
+		defer copyWG.Done()
 		defer func() { _ = upstream.Close() }()
 		defer func() { _ = clientConn.Close() }()
 		_, _ = io.Copy(clientConn, upstream)
 	}()
+	p.tunnelWG.Go(func() {
+		copyWG.Wait()
+		p.untrackTunnelConns(clientConn, upstream)
+	})
 }
 
 func (p *EgressProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {

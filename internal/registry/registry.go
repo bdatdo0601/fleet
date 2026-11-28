@@ -175,6 +175,9 @@ func migrateTable(db *sql.DB, table string, migrations []ColumnMigration) error 
 	return nil
 }
 
+// errRegistryClosed is returned when a Registry method is called after Close.
+var errRegistryClosed = errors.New("registry is closed")
+
 // Open opens or initializes fleet.db at path, applying additive schema migrations.
 func Open(path string) (*Registry, error) {
 	db, err := OpenSQLite(path, schema, "devices", []ColumnMigration{
@@ -202,9 +205,12 @@ func (r *Registry) Close() error {
 func (r *Registry) Setting(key string) (string, bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.db == nil {
+		return "", false, errRegistryClosed
+	}
 	var val string
 	err := r.db.QueryRow("SELECT value FROM settings WHERE key = ?", key).Scan(&val)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
 	if err != nil {
@@ -217,11 +223,44 @@ func (r *Registry) Setting(key string) (string, bool, error) {
 func (r *Registry) SetSetting(key, value string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.db == nil {
+		return errRegistryClosed
+	}
 	_, err := r.db.Exec(
 		"INSERT INTO settings(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
 		key, value,
 	)
 	return err
+}
+
+// SetSettings upserts multiple key/value settings inside a single transaction.
+func (r *Registry) SetSettings(kv map[string]string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.db == nil {
+		return errRegistryClosed
+	}
+	if len(kv) == 0 {
+		return nil
+	}
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	stmt, err := tx.Prepare(
+		"INSERT INTO settings(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+	)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = stmt.Close() }()
+	for k, v := range kv {
+		if _, err := stmt.Exec(k, v); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 const deviceSelectCols = "name, ip, kind, grp, pubkey, cert, fingerprint, not_after, created_at, revoked_at, last_seen, client_version"
@@ -250,6 +289,9 @@ func (r *Registry) getLocked(name string) (*Device, error) {
 func (r *Registry) Get(name string) (*Device, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.db == nil {
+		return nil, errRegistryClosed
+	}
 	return r.getLocked(name)
 }
 
@@ -257,6 +299,9 @@ func (r *Registry) Get(name string) (*Device, error) {
 func (r *Registry) ByIP(ip string) (*Device, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.db == nil {
+		return nil, errRegistryClosed
+	}
 	return scanDevice(r.db.QueryRow("SELECT "+deviceSelectCols+" FROM devices WHERE ip = ?", ip))
 }
 
@@ -264,6 +309,9 @@ func (r *Registry) ByIP(ip string) (*Device, error) {
 func (r *Registry) Lighthouse() (*Device, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.db == nil {
+		return nil, errRegistryClosed
+	}
 	return scanDevice(r.db.QueryRow("SELECT " + deviceSelectCols + " FROM devices WHERE kind = 'lighthouse'"))
 }
 
@@ -271,6 +319,9 @@ func (r *Registry) Lighthouse() (*Device, error) {
 func (r *Registry) Devices() ([]Device, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.db == nil {
+		return nil, errRegistryClosed
+	}
 	rows, err := r.db.Query("SELECT " + deviceSelectCols + " FROM devices ORDER BY ip")
 	if err != nil {
 		return nil, err
@@ -322,6 +373,9 @@ func (r *Registry) usedIPsLocked() (map[string]bool, error) {
 func (r *Registry) NextIP() (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.db == nil {
+		return "", errRegistryClosed
+	}
 	used, err := r.usedIPsLocked()
 	if err != nil {
 		return "", err
@@ -350,6 +404,9 @@ func (r *Registry) NextIP() (string, error) {
 func (r *Registry) Add(p AddParams) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.db == nil {
+		return errRegistryClosed
+	}
 	_, err := r.db.Exec(
 		"INSERT INTO devices(name, ip, kind, grp, pubkey, cert, fingerprint, not_after, created_at) "+
 			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -363,6 +420,9 @@ func (r *Registry) Add(p AddParams) error {
 func (r *Registry) ReplaceCert(p ReplaceCertParams) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.db == nil {
+		return errRegistryClosed
+	}
 	old, err := r.getLocked(p.Name)
 	if err != nil {
 		return err
@@ -395,6 +455,9 @@ func (r *Registry) ReplaceCert(p ReplaceCertParams) error {
 func (r *Registry) Revoke(name string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.db == nil {
+		return errRegistryClosed
+	}
 	dev, err := r.getLocked(name)
 	if err != nil {
 		return err
@@ -424,6 +487,9 @@ func (r *Registry) Revoke(name string) error {
 func (r *Registry) Blocklist() ([]string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.db == nil {
+		return nil, errRegistryClosed
+	}
 	rows, err := r.db.Query("SELECT fingerprint FROM revoked_certs ORDER BY fingerprint")
 	if err != nil {
 		return nil, err
@@ -452,6 +518,9 @@ type RevokedCert struct {
 func (r *Registry) RevokedCerts() ([]RevokedCert, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.db == nil {
+		return nil, errRegistryClosed
+	}
 	rows, err := r.db.Query(
 		"SELECT fingerprint, name, revoked_at, reason FROM revoked_certs ORDER BY revoked_at DESC, fingerprint ASC",
 	)
@@ -474,6 +543,9 @@ func (r *Registry) RevokedCerts() ([]RevokedCert, error) {
 func (r *Registry) Touch(name, clientVersion string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.db == nil {
+		return errRegistryClosed
+	}
 	now := NowISO()
 	if clientVersion != "" {
 		_, err := r.db.Exec(

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -19,17 +20,22 @@ import (
 	"github.com/bdatdo0601/fleet/internal/usage"
 )
 
+const receiptTTL = 24 * time.Hour
+
+var safeReceiptIDRE = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
+
 // LocalReceipt persists worker-side launch state for crash/restart reconciliation.
 type LocalReceipt struct {
-	JobID       string `json:"job_id"`
-	ReceiptID   string `json:"receipt_id"`
-	SessionName string `json:"session_name"`
-	Harness     string `json:"harness"`
-	Backend     string `json:"backend"`
-	Status      string `json:"status"`
-	Error       string `json:"error,omitempty"`
-	Acked       bool   `json:"acked"`
-	CreatedAt   string `json:"created_at"`
+	JobID        string `json:"job_id"`
+	ReceiptID    string `json:"receipt_id"`
+	AttemptCount int    `json:"attempt_count,omitempty"`
+	SessionName  string `json:"session_name"`
+	Harness      string `json:"harness"`
+	Backend      string `json:"backend"`
+	Status       string `json:"status"`
+	Error        string `json:"error,omitempty"`
+	Acked        bool   `json:"acked"`
+	CreatedAt    string `json:"created_at"`
 }
 
 // WorkerOpts configures RunWorker.
@@ -63,7 +69,15 @@ func expandHomePath(p string) (string, error) {
 	return p, nil
 }
 
-func defaultLaunchJob(job Job, useRex, useTmux bool, stdout, stderr io.Writer) (string, error) {
+func defaultLaunchJob(job Job, useTmux bool, stdout, stderr io.Writer) (string, error) {
+	return launchJobWithRex(job, false, useTmux, stdout, stderr)
+}
+
+func defaultLaunchJobRex(job Job, useTmux bool, stdout, stderr io.Writer) (string, error) {
+	return launchJobWithRex(job, true, useTmux, stdout, stderr)
+}
+
+func launchJobWithRex(job Job, useRex, useTmux bool, stdout, stderr io.Writer) (string, error) {
 	dir, err := expandHomePath(job.RepoPath)
 	if err != nil {
 		return "", err
@@ -114,8 +128,17 @@ func receiptsDir(localStateDir string) string {
 	return filepath.Join(localStateDir, "receipts")
 }
 
+func sanitizeReceiptJobID(jobID string) string {
+	s := safeReceiptIDRE.ReplaceAllString(strings.TrimSpace(jobID), "_")
+	s = strings.Trim(s, "._-")
+	if s == "" {
+		return "job"
+	}
+	return s
+}
+
 func receiptPath(localStateDir, jobID string) string {
-	return filepath.Join(receiptsDir(localStateDir), jobID+".json")
+	return filepath.Join(receiptsDir(localStateDir), sanitizeReceiptJobID(jobID)+".json")
 }
 
 func loadLocalReceipt(path string) (LocalReceipt, bool) {
@@ -150,19 +173,36 @@ func postReceipt(ctx context.Context, api string, r LocalReceipt) error {
 	}, 15*time.Second, nil, nil)
 }
 
+func receiptExpired(ent os.DirEntry, r LocalReceipt, now time.Time) bool {
+	if ts, err := time.Parse(time.RFC3339, r.CreatedAt); err == nil {
+		return now.Sub(ts) > receiptTTL
+	}
+	if fi, err := ent.Info(); err == nil {
+		return now.Sub(fi.ModTime()) > receiptTTL
+	}
+	return false
+}
+
 func replayPendingReceipts(ctx context.Context, api, localStateDir string, stderr io.Writer) {
 	dir := receiptsDir(localStateDir)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
+	now := time.Now()
 	for _, ent := range entries {
 		if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".json") {
 			continue
 		}
 		p := filepath.Join(dir, ent.Name())
 		r, ok := loadLocalReceipt(p)
-		if !ok || r.Acked {
+		if !ok {
+			continue
+		}
+		if r.Acked {
+			if receiptExpired(ent, r, now) {
+				_ = os.Remove(p)
+			}
 			continue
 		}
 		if err := postReceipt(ctx, api, r); err != nil {
@@ -174,9 +214,16 @@ func replayPendingReceipts(ctx context.Context, api, localStateDir string, stder
 	}
 }
 
+func shouldShortCircuitReceipt(existing LocalReceipt, job Job) bool {
+	if existing.Status == "launched" {
+		return true
+	}
+	return existing.Status == "failed" && existing.AttemptCount >= job.AttemptCount
+}
+
 func processJob(ctx context.Context, api, localStateDir string, job Job, opts WorkerOpts) error {
 	rPath := receiptPath(localStateDir, job.ID)
-	if existing, ok := loadLocalReceipt(rPath); ok {
+	if existing, ok := loadLocalReceipt(rPath); ok && shouldShortCircuitReceipt(existing, job) {
 		if !existing.Acked {
 			if err := postReceipt(ctx, api, existing); err != nil {
 				return err
@@ -193,17 +240,20 @@ func processJob(ctx context.Context, api, localStateDir string, job Job, opts Wo
 	}
 	launchFn := opts.LaunchFn
 	if launchFn == nil {
-		launchFn = func(job Job, useTmux bool, stdout, stderr io.Writer) (string, error) {
-			return defaultLaunchJob(job, opts.UseRex, useTmux, stdout, stderr)
+		if opts.UseRex {
+			launchFn = defaultLaunchJobRex
+		} else {
+			launchFn = defaultLaunchJob
 		}
 	}
 
 	rec := LocalReceipt{
-		JobID:       job.ID,
-		ReceiptID:   fmt.Sprintf("rcpt-%s-%d", job.ID, time.Now().UnixNano()),
-		SessionName: job.SessionName,
-		Harness:     job.Harness,
-		CreatedAt:   registry.NowISO(),
+		JobID:        job.ID,
+		ReceiptID:    fmt.Sprintf("rcpt-%s-%d", job.ID, time.Now().UnixNano()),
+		AttemptCount: job.AttemptCount,
+		SessionName:  job.SessionName,
+		Harness:      job.Harness,
+		CreatedAt:    registry.NowISO(),
 	}
 
 	if job.Reaction == "kill" || job.Reaction == "kill-all" {

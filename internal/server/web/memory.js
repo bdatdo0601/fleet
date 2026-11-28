@@ -358,7 +358,7 @@ async function openMemoryDetailModal(scope, key, onDone) {
   openModal(`${it.scope}/${it.key}`, wrapper);
 }
 
-async function renderEntriesView(root, scopes, ctx) {
+async function renderEntriesView(root, scopes, ctx, signal) {
   const q = new URLSearchParams();
   if (memState.q.trim()) {
     q.set("q", memState.q.trim());
@@ -381,9 +381,15 @@ async function renderEntriesView(root, scopes, ctx) {
 
   let items = [];
   try {
-    const res = await api("GET", `/v1/memory?${q.toString()}`);
+    const res = await api("GET", `/v1/memory?${q.toString()}`, undefined, { signal });
+    if (signal && signal.aborted) {
+      return;
+    }
     items = res.memories || [];
   } catch (err) {
+    if ((err && err.name === "AbortError") || (signal && signal.aborted)) {
+      return;
+    }
     root.appendChild(el("div", { className: "alert-banner alert-danger", text: err.message }));
     return;
   }
@@ -538,18 +544,30 @@ async function renderEntriesView(root, scopes, ctx) {
   root.appendChild(section("Memory Entries", { className: "ui-section" }, filterBlock, resultsNode));
 }
 
-async function renderProposalsView(root, ctx) {
+async function renderProposalsView(root, ctx, signal) {
   const qs = memState.propStatus ? `?status=${encodeURIComponent(memState.propStatus)}&limit=200` : "?limit=200";
   let proposals = [];
   try {
-    const res = await api("GET", `/v1/memory/proposals${qs}`);
+    const res = await api("GET", `/v1/memory/proposals${qs}`, undefined, { signal });
+    if (signal && signal.aborted) {
+      return;
+    }
     proposals = res.proposals || [];
   } catch (err) {
+    if ((err && err.name === "AbortError") || (signal && signal.aborted)) {
+      return;
+    }
     root.appendChild(el("div", { className: "alert-banner alert-danger", text: err.message }));
     return;
   }
 
   const pendingProps = proposals.filter((p) => p.status === "pending");
+  const pendingIDs = new Set(pendingProps.map((p) => p.id));
+  for (const id of memState.selectedProps) {
+    if (!pendingIDs.has(id)) {
+      memState.selectedProps.delete(id);
+    }
+  }
 
   const runBatch = async (body, label) => {
     try {
@@ -578,6 +596,30 @@ async function renderProposalsView(root, ctx) {
     el("option", { value: "rejected", text: "rejected", selected: memState.propStatus === "rejected" }),
   );
 
+  const rowCheckboxes = new Map();
+  const approveSelectedBtn = el("button", {
+    type: "button",
+    className: "btn btn-sm btn-primary",
+    text: "Approve Selected",
+    disabled: memState.selectedProps.size === 0,
+    onclick: () => runBatch({ ids: [...memState.selectedProps], decision: "approve" }, "Approved"),
+  });
+  const rejectSelectedBtn = el("button", {
+    type: "button",
+    className: "btn btn-sm btn-danger",
+    text: "Reject Selected",
+    disabled: memState.selectedProps.size === 0,
+    onclick: () => runBatch({ ids: [...memState.selectedProps], decision: "reject" }, "Rejected"),
+  });
+  const syncSelectionUI = () => {
+    const hasSel = memState.selectedProps.size > 0;
+    approveSelectedBtn.disabled = !hasSel;
+    rejectSelectedBtn.disabled = !hasSel;
+    for (const [id, cb] of rowCheckboxes) {
+      cb.checked = memState.selectedProps.has(id);
+    }
+  };
+
   const batchBar = el(
     "div",
     { className: "toolbar" },
@@ -591,23 +633,11 @@ async function renderProposalsView(root, ctx) {
         for (const p of pendingProps) {
           memState.selectedProps.add(p.id);
         }
-        ctx.refresh();
+        syncSelectionUI();
       },
     }),
-    el("button", {
-      type: "button",
-      className: "btn btn-sm btn-primary",
-      text: "Approve Selected",
-      disabled: memState.selectedProps.size === 0,
-      onclick: () => runBatch({ ids: [...memState.selectedProps], decision: "approve" }, "Approved"),
-    }),
-    el("button", {
-      type: "button",
-      className: "btn btn-sm btn-danger",
-      text: "Reject Selected",
-      disabled: memState.selectedProps.size === 0,
-      onclick: () => runBatch({ ids: [...memState.selectedProps], decision: "reject" }, "Rejected"),
-    }),
+    approveSelectedBtn,
+    rejectSelectedBtn,
     el("div", { className: "toolbar-spacer" }),
     el("button", {
       type: "button",
@@ -650,10 +680,13 @@ async function renderProposalsView(root, ctx) {
               } else {
                 memState.selectedProps.delete(p.id);
               }
-              ctx.refresh();
+              syncSelectionUI();
             },
           })
         : null;
+      if (cb) {
+        rowCheckboxes.set(p.id, cb);
+      }
 
       const resolveOne = async (decision) => {
         try {
@@ -708,7 +741,7 @@ async function renderProposalsView(root, ctx) {
   root.appendChild(section("Curator Proposals", { className: "ui-section" }, batchBar, listWrap));
 }
 
-async function renderContextView(root, scopes) {
+async function renderContextView(root, scopes, signal) {
   const repoChoices = scopes.filter((s) => s.startsWith("repo:")).map((s) => s.slice(5));
   const repoInput = el("input", {
     type: "text",
@@ -734,7 +767,10 @@ async function renderContextView(root, scopes) {
       q.set("device", memState.ctxDevice);
     }
     try {
-      const res = await api("GET", `/v1/memory/context?${q.toString()}`);
+      const res = await api("GET", `/v1/memory/context?${q.toString()}`, undefined, { signal });
+      if (signal && signal.aborted) {
+        return;
+      }
       clear(resultBox);
       resultBox.appendChild(
         el(
@@ -757,6 +793,9 @@ async function renderContextView(root, scopes) {
         ),
       );
     } catch (err) {
+      if ((err && err.name === "AbortError") || (signal && signal.aborted)) {
+        return;
+      }
       toast(err.message, "error");
     }
   };
@@ -787,12 +826,18 @@ async function renderContextView(root, scopes) {
   await loadContext();
 }
 
-async function renderHistoryView(root, ctx) {
+async function renderHistoryView(root, ctx, signal) {
   let revs = [];
   try {
-    const res = await api("GET", "/v1/memory/history?limit=100");
+    const res = await api("GET", "/v1/memory/history?limit=100", undefined, { signal });
+    if (signal && signal.aborted) {
+      return;
+    }
     revs = res.revisions || [];
   } catch (err) {
+    if ((err && err.name === "AbortError") || (signal && signal.aborted)) {
+      return;
+    }
     root.appendChild(el("div", { className: "alert-banner alert-danger", text: err.message }));
     return;
   }
@@ -854,11 +899,17 @@ async function renderHistoryView(root, ctx) {
   root.appendChild(section("Audit History", { className: "ui-section" }, list));
 }
 
-async function renderCuratorView(root, ctx) {
+async function renderCuratorView(root, ctx, signal) {
   let st;
   try {
-    st = await api("GET", "/v1/memory/curator");
+    st = await api("GET", "/v1/memory/curator", undefined, { signal });
+    if (signal && signal.aborted) {
+      return;
+    }
   } catch (err) {
+    if ((err && err.name === "AbortError") || (signal && signal.aborted)) {
+      return;
+    }
     root.appendChild(el("div", { className: "alert-banner alert-danger", text: err.message }));
     return;
   }
@@ -1087,19 +1138,29 @@ async function renderCuratorView(root, ctx) {
 }
 
 export async function renderMemory(root, ctx, subRoute = "") {
+  const signal = ctx && ctx.signal;
   if (["entries", "proposals", "context", "history", "curator"].includes(subRoute)) {
     memState.tab = subRoute;
   }
 
   let scopes = ["global"];
   try {
-    const [res, cat] = await Promise.all([api("GET", "/v1/memory/scopes"), fetchPathsCatalog()]);
+    const [res, cat] = await Promise.all([
+      api("GET", "/v1/memory/scopes", undefined, { signal }),
+      fetchPathsCatalog("", { signal }),
+    ]);
     const set = new Set([...(res.scopes || []), ...(cat.repos || []).map((r) => `repo:${r}`)]);
     if (set.size > 0) {
       scopes = Array.from(set).sort();
     }
-  } catch {
+  } catch (err) {
+    if ((err && err.name === "AbortError") || (signal && signal.aborted)) {
+      return;
+    }
     // fallback to global
+  }
+  if (signal && signal.aborted) {
+    return;
   }
 
   const ovMem = state.overview && state.overview.memory;
@@ -1153,19 +1214,19 @@ export async function renderMemory(root, ctx, subRoute = "") {
 
   switch (memState.tab) {
     case "proposals":
-      await renderProposalsView(root, ctx);
+      await renderProposalsView(root, ctx, signal);
       break;
     case "context":
-      await renderContextView(root, scopes);
+      await renderContextView(root, scopes, signal);
       break;
     case "history":
-      await renderHistoryView(root, ctx);
+      await renderHistoryView(root, ctx, signal);
       break;
     case "curator":
-      await renderCuratorView(root, ctx);
+      await renderCuratorView(root, ctx, signal);
       break;
     default:
-      await renderEntriesView(root, scopes, ctx);
+      await renderEntriesView(root, scopes, ctx, signal);
       break;
   }
 }

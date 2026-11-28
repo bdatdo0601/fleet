@@ -244,14 +244,7 @@ func registerAssistantAdminRoutes(
 		if err := fleet.Assistant.SaveOPServiceAccountToken(tok); err != nil {
 			return err
 		}
-		rep := fleet.Assistant.Doctor(r.Context())
-		var opCheck assistant.DoctorCheck
-		for _, c := range rep.Checks {
-			if c.Name == "onepassword" {
-				opCheck = c
-				break
-			}
-		}
+		opCheck := fleet.Assistant.CheckOP(r.Context())
 		writeJSON(w, http.StatusOK, map[string]any{"ok": opCheck.Status == "ok", "check": opCheck})
 		return nil
 	}))
@@ -322,7 +315,7 @@ func registerAssistantChatRoutes(
 		if req.Model != nil {
 			model = *req.Model
 		}
-		ch, err := fleet.Assistant.Store().UpsertChannel(id, title, desc, model)
+		ch, err := fleet.Assistant.UpsertChannel(r.Context(), id, title, desc, model)
 		if err != nil {
 			return err
 		}
@@ -798,7 +791,7 @@ func registerAssistantSandboxRoutes(
 		}
 		maxLimit := int64(maxMB+1) << 20
 		r.Body = http.MaxBytesReader(w, r.Body, maxLimit)
-		if err := r.ParseMultipartForm(maxLimit); err != nil {
+		if err := r.ParseMultipartForm(8 << 20); err != nil {
 			return &core.FleetError{Msg: "invalid file upload: " + err.Error(), Status: http.StatusBadRequest}
 		}
 		defer func() {
