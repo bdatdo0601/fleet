@@ -573,7 +573,7 @@ exit 0
 		t.Fatal(err)
 	}
 
-	// Case 1: builder not running initially -> started with explicit --dns before build.
+	// Case 1: builder not running initially -> started with explicit --dns before build, and build itself passes --dns.
 	if out, err := runner.BuildImage(t.Context(), "test:c1", cfPath, tmp, 4, 4096, false); err != nil || !strings.Contains(out, "build ok") {
 		t.Fatalf("Case 1 BuildImage failed: out=%q err=%v", out, err)
 	}
@@ -583,6 +583,9 @@ exit 0
 	buildIdx := strings.Index(calls1, "build -t test:c1")
 	if startIdx == -1 || buildIdx == -1 || startIdx > buildIdx {
 		t.Fatalf("expected builder start with DNS before build, got log:\n%s", calls1)
+	}
+	if !strings.Contains(calls1, "-c 4 -m 4096M --dns 1.1.1.1 --dns 8.8.8.8") {
+		t.Fatalf("expected container build command to include --dns flags, got log:\n%s", calls1)
 	}
 
 	// Case 2: already-running builder hits DNS failure -> deleted, restarted with DNS, retried cleanly.

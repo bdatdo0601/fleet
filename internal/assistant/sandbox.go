@@ -377,6 +377,8 @@ func (r *AppleContainerRunner) BuildImage(ctx context.Context, tag, containerfil
 		"-f", containerfilePath,
 		"-c", strconv.Itoa(buildCPUs),
 		"-m", fmt.Sprintf("%dM", buildMemMB),
+		"--dns", "1.1.1.1",
+		"--dns", "8.8.8.8",
 		"--progress", "plain",
 	}
 	if noCache {
