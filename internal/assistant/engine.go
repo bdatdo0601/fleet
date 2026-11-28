@@ -545,15 +545,20 @@ func (e *Engine) DecideApproval(id string, approve bool, note string) (Approval,
 	return e.DecideApprovalWithScope(id, approve, "", note)
 }
 
-// DecideApprovalWithScope resolves a pending HITL approval with an optional scope ("once" or "topic").
+// DecideApprovalWithScope resolves a pending HITL approval with an optional scope ("once" or "topic") or elicitation choice.
 func (e *Engine) DecideApprovalWithScope(id string, approve bool, scope, note string) (Approval, error) {
-	cleanScope := strings.ToLower(strings.TrimSpace(scope))
+	rawChoice := strings.TrimSpace(scope)
+	cleanScope := strings.ToLower(rawChoice)
 	if cleanScope != "topic" {
 		cleanScope = "once"
 	}
 	storedNote := strings.TrimSpace(note)
-	if approve && cleanScope == "topic" && storedNote == "" {
-		storedNote = "scope:topic"
+	if storedNote == "" {
+		if approve && cleanScope == "topic" {
+			storedNote = "scope:topic"
+		} else if rawChoice != "" && cleanScope != "once" && cleanScope != "topic" {
+			storedNote = "choice:" + rawChoice
+		}
 	}
 	apr, err := e.store.DecideApproval(id, approve, storedNote)
 	if err != nil {
@@ -564,6 +569,7 @@ func (e *Engine) DecideApprovalWithScope(id string, approve bool, scope, note st
 		"approval_id": apr.ID,
 		"approved":    approve,
 		"scope":       cleanScope,
+		"choice":      rawChoice,
 	}, "")
 	if err != nil {
 		return Approval{}, err
@@ -904,6 +910,9 @@ func (e *Engine) handleApprovalResume(ctx context.Context, cfg Config, ch Channe
 	if apr.ToolName == FrontierEscalationTool {
 		return e.handleFrontierEscalationResume(ctx, cfg, ch, apr, payload)
 	}
+	if apr.ToolName == MCPElicitationApprovalTool {
+		return e.handleMCPElicitationResume(ctx, cfg, ch, apr, payload)
+	}
 	var toolSummary string
 	var widgets []WidgetPayload
 	var ephemeral *ephemeralToolResult
@@ -941,6 +950,111 @@ func (e *Engine) handleApprovalResume(ctx context.Context, cfg Config, ch Channe
 		TriggerSource:       "approval",
 		EphemeralToolResult: ephemeral,
 		InitialWidgets:      widgets,
+	})
+}
+
+func (e *Engine) completeMCPElicitationApproval(ctx context.Context, cfg Config, challenge MCPElicitationChallenge, choice string) (any, error) {
+	selected := cmp.Or(choice, PickAutoAllowElicitationChoice(challenge.Options))
+	if selected == "" {
+		return nil, newErr(fmt.Sprintf("no allow choice available for %s", challenge.FullToolName), http.StatusBadRequest)
+	}
+	res, err := e.mcp.CallToolWithElicitation(ctx, challenge.FullToolName, challenge.Arguments, challenge.RequestState, BuildMCPElicitationResponses(challenge.RequestKey, challenge.FieldName, "accept", selected))
+	if cfg.AutoApprove {
+		for range maxMCPElicitationAutoRound - 1 {
+			eligErr, ok := errors.AsType[*MCPElicitationRequiredError](err)
+			if !ok {
+				break
+			}
+			next := PickAutoAllowElicitationChoice(eligErr.Challenge.Options)
+			if next == "" {
+				break
+			}
+			res, err = e.mcp.CallToolWithElicitation(ctx, eligErr.Challenge.FullToolName, eligErr.Challenge.Arguments, eligErr.Challenge.RequestState, BuildMCPElicitationResponses(eligErr.Challenge.RequestKey, eligErr.Challenge.FieldName, "accept", next))
+		}
+	}
+	return res, err
+}
+
+func (e *Engine) handleMCPElicitationResume(ctx context.Context, cfg Config, ch Channel, apr *Approval, payload map[string]any) error {
+	var challenge MCPElicitationChallenge
+	_ = json.Unmarshal([]byte(apr.ArgsJSON), &challenge)
+	choice := strings.TrimSpace(strArg(payload, "choice"))
+	if choice == "" {
+		if after, ok := strings.CutPrefix(strings.TrimSpace(apr.DecisionNote), "choice:"); ok {
+			choice = strings.TrimSpace(after)
+		}
+	}
+	resumeModel := e.store.GetMessageModel(apr.MessageID)
+	var toolSummary string
+	var ephemeral *ephemeralToolResult
+
+	if apr.Status == "approved" && !strings.HasPrefix(strings.ToUpper(choice), "DENY_") {
+		if e.mcp == nil {
+			err := errors.New("MCP manager unavailable")
+			_ = e.store.SetApprovalResult(apr.ID, "failed", err.Error())
+			toolSummary = fmt.Sprintf("Confirmed action `%s` failed: %s", challenge.FullToolName, err.Error())
+		} else {
+			res, execErr := e.completeMCPElicitationApproval(ctx, cfg, challenge, choice)
+			if eligErr, ok := errors.AsType[*MCPElicitationRequiredError](execErr); ok {
+				rawCh, mErr := json.Marshal(eligErr.Challenge)
+				if mErr == nil {
+					_ = e.store.SetApprovalResult(apr.ID, "executed", "chained confirmation")
+					return e.pauseForApproval(ctx, ch, resumeModel, StreamUsage{}, nil, &approvalRequiredError{
+						ToolName:   MCPElicitationApprovalTool,
+						ServerName: eligErr.Challenge.ServerName,
+						Summary:    cmp.Or(eligErr.Challenge.Title, "Confirm "+eligErr.Challenge.FullToolName),
+						RiskLevel:  "mcp_elicitation",
+						ArgsJSON:   string(rawCh),
+					})
+				}
+			}
+			if execErr != nil {
+				_ = e.store.SetApprovalResult(apr.ID, "failed", execErr.Error())
+				toolSummary = fmt.Sprintf("Confirmed action `%s` failed: %s", cmp.Or(challenge.FullToolName, apr.ToolName), truncateText(execErr.Error(), 600))
+			} else {
+				resJSON, _ := json.Marshal(res)
+				resStr := string(resJSON)
+				_ = e.store.SetApprovalResult(apr.ID, "executed", resStr)
+				shaped := e.formatToolResultForLLM(ch.ID, challenge.FullToolName, resStr)
+				toolSummary = fmt.Sprintf("Confirmed action `%s` executed (%s; approval %s).", cmp.Or(challenge.FullToolName, apr.ToolName), formatByteSize(int64(len(resStr))), apr.ID)
+				argsJSON, _ := json.Marshal(cmp.Or[any](challenge.Arguments, map[string]any{}))
+				ephemeral = &ephemeralToolResult{
+					CallID:   apr.ID,
+					ToolName: challenge.FullToolName,
+					ArgsJSON: string(argsJSON),
+					Content:  shaped,
+				}
+			}
+		}
+	} else {
+		if e.mcp != nil && challenge.FullToolName != "" && challenge.RequestState != "" {
+			denyAction, denyVal := "cancel", ""
+			if strings.HasPrefix(strings.ToUpper(choice), "DENY_") {
+				denyAction, denyVal = "accept", choice
+			} else {
+				for _, opt := range challenge.Options {
+					if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(opt.Value)), "DENY_") {
+						denyAction, denyVal = "accept", opt.Value
+						break
+					}
+				}
+			}
+			dCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			_, _ = e.mcp.CallToolWithElicitation(dCtx, challenge.FullToolName, challenge.Arguments, challenge.RequestState, BuildMCPElicitationResponses(challenge.RequestKey, challenge.FieldName, denyAction, denyVal))
+			cancel()
+		}
+		toolSummary = fmt.Sprintf("Action `%s` was denied by user (%s).", cmp.Or(challenge.FullToolName, apr.ToolName), cmp.Or(apr.DecisionNote, choice, "declined"))
+	}
+
+	_, _ = e.store.AppendMessage(Message{
+		ChannelID:    ch.ID,
+		ContextEpoch: ch.ContextEpoch,
+		Role:         "user",
+		Content:      "[approval_result] " + toolSummary,
+	})
+	return e.runAgentTurn(ctx, cfg, ch, "approval", toolSummary, resumeModel, turnOptions{
+		TriggerSource:       "approval",
+		EphemeralToolResult: ephemeral,
 	})
 }
 

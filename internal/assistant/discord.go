@@ -779,11 +779,19 @@ func (e *Engine) handleDiscordInteraction(ctx context.Context, tok string, cfg D
 	if !ok {
 		return
 	}
-	action, aprID, ok := strings.Cut(rest, ":")
-	if !ok || (action != "approve" && action != "deny") || aprID == "" {
+	parts := strings.SplitN(rest, ":", 3)
+	if len(parts) < 2 {
 		return
 	}
-	apr, err := e.DecideApproval(aprID, action == "approve", "decided via Discord")
+	action, aprID := parts[0], parts[1]
+	choice := ""
+	if len(parts) == 3 {
+		choice = parts[2]
+	}
+	if (action != "approve" && action != "deny") || aprID == "" {
+		return
+	}
+	apr, err := e.DecideApprovalWithScope(aprID, action == "approve", choice, "decided via Discord")
 	if err != nil {
 		existing, gErr := e.store.GetApproval(aprID)
 		if gErr != nil || existing == nil {
@@ -947,7 +955,72 @@ func widgetsToDiscordEmbeds(widgets []WidgetPayload) ([]map[string]any, bool) {
 	return embeds, hasHTML
 }
 
+func buildElicitationApprovalDiscordPayload(apr Approval, deepLink string) map[string]any {
+	var ch MCPElicitationChallenge
+	_ = json.Unmarshal([]byte(apr.ArgsJSON), &ch)
+	var descParts []string
+	if t := strings.TrimSpace(cmp.Or(ch.Title, apr.Summary)); t != "" {
+		descParts = append(descParts, "**"+t+"**")
+	}
+	if m := strings.TrimSpace(ch.Message); m != "" {
+		descParts = append(descParts, m)
+	}
+	desc := truncateText(strings.Join(descParts, "\n\n"), 1800)
+	if deepLink != "" {
+		desc += fmt.Sprintf("\n\n[Open in Fleet Console](%s)", deepLink)
+	}
+	buttons := make([]map[string]any, 0, min(len(ch.Options), 5))
+	for _, opt := range ch.Options {
+		if len(buttons) >= 5 {
+			break
+		}
+		isDeny := strings.HasPrefix(strings.ToUpper(strings.TrimSpace(opt.Value)), "DENY_")
+		action, style := "approve", 1
+		if isDeny {
+			action, style = "deny", 4
+		} else if len(buttons) == 0 || strings.EqualFold(opt.Value, "ALLOW_ONCE") {
+			style = 3
+		}
+		customID := "fleet_apr:" + action + ":" + apr.ID
+		if opt.Value != "" && len(customID)+1+len(opt.Value) <= 100 {
+			customID += ":" + opt.Value
+		}
+		buttons = append(buttons, map[string]any{
+			"type":      2,
+			"style":     style,
+			"label":     truncateText(cmp.Or(strings.TrimSpace(opt.Label), opt.Value), 80),
+			"custom_id": customID,
+		})
+	}
+	if len(buttons) == 0 {
+		buttons = []map[string]any{
+			{"type": 2, "style": 3, "label": "Allow once", "custom_id": "fleet_apr:approve:" + apr.ID + ":ALLOW_ONCE"},
+			{"type": 2, "style": 4, "label": "Don't allow", "custom_id": "fleet_apr:deny:" + apr.ID + ":DENY_ONCE"},
+		}
+	}
+	return map[string]any{
+		"embeds": []map[string]any{{
+			"title":       truncateText("MCP confirmation: "+cmp.Or(ch.FullToolName, apr.ToolName), 120),
+			"description": desc,
+			"color":       0x0ea5e9,
+			"fields": []map[string]any{
+				{"name": "Channel", "value": "#" + apr.ChannelID, "inline": true},
+				{"name": "Server", "value": cmp.Or(ch.ServerName, apr.ServerName, "mcp"), "inline": true},
+			},
+			"footer":    map[string]string{"text": "Fleet Assistant · ID " + apr.ID},
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+		}},
+		"components": []map[string]any{{
+			"type":       1,
+			"components": buttons,
+		}},
+	}
+}
+
 func buildApprovalDiscordPayload(apr Approval, deepLink string) map[string]any {
+	if apr.ToolName == MCPElicitationApprovalTool {
+		return buildElicitationApprovalDiscordPayload(apr, deepLink)
+	}
 	desc := truncateText(strings.TrimSpace(apr.Summary), 350)
 	if deepLink != "" {
 		desc += fmt.Sprintf("\n\n[Open in Fleet Console](%s)", deepLink)

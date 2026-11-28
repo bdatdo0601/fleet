@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
@@ -23,7 +24,93 @@ import (
 	"github.com/bdatdo0601/fleet/internal/paths"
 )
 
-const mcpMaxHTTPResponseBytes = 4 * 1024 * 1024
+const (
+	mcpMaxHTTPResponseBytes    = 4 * 1024 * 1024
+	mcpProtocolVersion         = "2026-07-28"
+	MCPElicitationApprovalTool = "mcp_elicitation"
+	maxMCPElicitationAutoRound = 3
+)
+
+// MCPElicitationOption represents a single server-provided approval choice.
+type MCPElicitationOption struct {
+	Value string `json:"value"`
+	Label string `json:"label"`
+}
+
+// MCPElicitationChallenge holds a stateless 2026-07-28 form elicitation prompt returned by an MCP server.
+type MCPElicitationChallenge struct {
+	ServerName   string                 `json:"server_name"`
+	FullToolName string                 `json:"full_tool_name"`
+	RemoteTool   string                 `json:"remote_tool"`
+	RequestKey   string                 `json:"request_key"`
+	FieldName    string                 `json:"field_name"`
+	Title        string                 `json:"title,omitempty"`
+	Message      string                 `json:"message,omitempty"`
+	RequestState string                 `json:"request_state"`
+	Options      []MCPElicitationOption `json:"options,omitempty"`
+	Arguments    map[string]any         `json:"arguments,omitempty"`
+}
+
+// MCPElicitationRequiredError is returned when an MCP server responds with resultType="input_required".
+type MCPElicitationRequiredError struct {
+	Challenge MCPElicitationChallenge
+}
+
+func (e *MCPElicitationRequiredError) Error() string {
+	return fmt.Sprintf("MCP server %s requested confirmation for %s", e.Challenge.ServerName, e.Challenge.RemoteTool)
+}
+
+func mcpClientInfo() map[string]string {
+	return map[string]string{"name": "Fleet Assistant", "version": "1.0.0"}
+}
+
+func mcpClientCapabilities() map[string]any {
+	return map[string]any{"elicitation": map[string]any{"form": map[string]any{}}}
+}
+
+func mcpStatelessMeta() map[string]any {
+	return map[string]any{
+		"io.modelcontextprotocol/protocolVersion":    mcpProtocolVersion,
+		"io.modelcontextprotocol/clientInfo":         mcpClientInfo(),
+		"io.modelcontextprotocol/clientCapabilities": mcpClientCapabilities(),
+	}
+}
+
+// BuildMCPElicitationResponses formats params.inputResponses for a 2026-07-28 stateless retry call.
+func BuildMCPElicitationResponses(requestKey, fieldName, action, choice string) map[string]any {
+	rKey := cmp.Or(strings.TrimSpace(requestKey), "approval_choice")
+	fName := cmp.Or(strings.TrimSpace(fieldName), rKey)
+	act := strings.ToLower(strings.TrimSpace(action))
+	if act == "accept" && strings.TrimSpace(choice) != "" {
+		return map[string]any{
+			rKey: map[string]any{
+				"action":  "accept",
+				"content": map[string]any{fName: strings.TrimSpace(choice)},
+			},
+		}
+	}
+	return map[string]any{
+		rKey: map[string]any{
+			"action": cmp.Or(act, "cancel"),
+		},
+	}
+}
+
+// PickAutoAllowElicitationChoice chooses the safest allow option when auto-approve is active.
+func PickAutoAllowElicitationChoice(options []MCPElicitationOption) string {
+	for _, opt := range options {
+		if strings.EqualFold(strings.TrimSpace(opt.Value), "ALLOW_ONCE") {
+			return opt.Value
+		}
+	}
+	for _, opt := range options {
+		up := strings.ToUpper(strings.TrimSpace(opt.Value))
+		if up != "" && !strings.HasPrefix(up, "DENY_") {
+			return opt.Value
+		}
+	}
+	return ""
+}
 
 // ExternalTool describes one discovered tool from a configured stdio or HTTP MCP server.
 type ExternalTool struct {
@@ -316,6 +403,11 @@ func (m *MCPManager) FindTool(ctx context.Context, fullName string) (ExternalToo
 
 // CallTool invokes a namespaced external MCP tool (mcp__<server>__<tool>).
 func (m *MCPManager) CallTool(ctx context.Context, fullName string, args map[string]any) (any, error) {
+	return m.CallToolWithElicitation(ctx, fullName, args, "", nil)
+}
+
+// CallToolWithElicitation invokes an external MCP tool, optionally supplying 2026-07-28 elicitation retry fields.
+func (m *MCPManager) CallToolWithElicitation(ctx context.Context, fullName string, args map[string]any, requestState string, inputResponses map[string]any) (any, error) {
 	tool, ok := m.FindTool(ctx, fullName)
 	if !ok {
 		return nil, fmt.Errorf("external MCP tool %q not found", fullName)
@@ -327,7 +419,7 @@ func (m *MCPManager) CallTool(ctx context.Context, fullName string, args map[str
 	m.mu.Lock()
 	reader := m.reader
 	m.mu.Unlock()
-	return conn.callTool(ctx, reader, tool.RemoteName, args)
+	return conn.callToolWithElicitation(ctx, reader, tool.RemoteName, args, requestState, inputResponses)
 }
 
 func (c *mcpClientConn) snapshotTools() []ExternalTool {
@@ -513,10 +605,14 @@ func (c *mcpClientConn) startStdioLocked(ctx context.Context, opReader OPReaderF
 }
 
 func (c *mcpClientConn) handshakeLocked(ctx context.Context, opReader OPReaderFunc) error {
+	caps := map[string]any{}
+	if c.cfg.Transport == "http" {
+		caps = mcpClientCapabilities()
+	}
 	if _, err := c.rpcCallLocked(ctx, opReader, "initialize", map[string]any{
-		"protocolVersion": "2025-03-26",
-		"capabilities":    map[string]any{},
-		"clientInfo":      map[string]string{"name": "fleet-assistant", "version": "1.0.0"},
+		"protocolVersion": mcpProtocolVersion,
+		"capabilities":    caps,
+		"clientInfo":      mcpClientInfo(),
 	}); err != nil {
 		return err
 	}
@@ -527,6 +623,9 @@ func (c *mcpClientConn) handshakeLocked(ctx context.Context, opReader OPReaderFu
 	cursor := ""
 	for range 20 {
 		params := map[string]any{}
+		if c.cfg.Transport == "http" {
+			params["_meta"] = mcpStatelessMeta()
+		}
 		if cursor != "" {
 			params["cursor"] = cursor
 		}
@@ -585,6 +684,10 @@ func (c *mcpClientConn) handshakeLocked(ctx context.Context, opReader OPReaderFu
 }
 
 func (c *mcpClientConn) callTool(ctx context.Context, opReader OPReaderFunc, remoteName string, args map[string]any) (any, error) {
+	return c.callToolWithElicitation(ctx, opReader, remoteName, args, "", nil)
+}
+
+func (c *mcpClientConn) callToolWithElicitation(ctx context.Context, opReader OPReaderFunc, remoteName string, args map[string]any, requestState string, inputResponses map[string]any) (any, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !c.started {
@@ -593,18 +696,128 @@ func (c *mcpClientConn) callTool(ctx context.Context, opReader OPReaderFunc, rem
 	if opReader == nil {
 		opReader = defaultOPReader
 	}
-	raw, err := c.rpcCallLocked(ctx, opReader, "tools/call", map[string]any{
+	params := map[string]any{
 		"name":      remoteName,
 		"arguments": cmp.Or[any](args, map[string]any{}),
-	})
+	}
+	if c.cfg.Transport == "http" {
+		params["_meta"] = mcpStatelessMeta()
+	}
+	if strings.TrimSpace(requestState) != "" {
+		params["requestState"] = requestState
+	}
+	if len(inputResponses) > 0 {
+		params["inputResponses"] = inputResponses
+	}
+	raw, err := c.rpcCallLocked(ctx, opReader, "tools/call", params)
 	if err != nil {
 		return nil, err
+	}
+	if ch, ok := parseMCPElicitationChallenge(raw, c.cfg.Name, "mcp__"+c.cfg.Name+"__"+remoteName, remoteName, args); ok {
+		return nil, &MCPElicitationRequiredError{Challenge: ch}
 	}
 	var out any
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return string(raw), nil
 	}
 	return out, nil
+}
+
+func parseMCPElicitationChallenge(raw json.RawMessage, serverName, fullTool, remoteTool string, args map[string]any) (MCPElicitationChallenge, bool) {
+	var env struct {
+		ResultType    string                     `json:"resultType"`
+		RequestState  string                     `json:"requestState"`
+		InputRequests map[string]json.RawMessage `json:"inputRequests"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil || env.ResultType != "input_required" || strings.TrimSpace(env.RequestState) == "" || len(env.InputRequests) == 0 {
+		return MCPElicitationChallenge{}, false
+	}
+	reqKey := selectInputRequestKey(env.InputRequests)
+	if reqKey == "" {
+		return MCPElicitationChallenge{}, false
+	}
+	var reqObj struct {
+		Method string `json:"method"`
+		Params struct {
+			Mode            string `json:"mode"`
+			Message         string `json:"message"`
+			RequestedSchema struct {
+				Properties map[string]struct {
+					Title     string   `json:"title"`
+					Enum      []string `json:"enum"`
+					EnumNames []string `json:"enumNames"`
+					OneOf     []struct {
+						Const string `json:"const"`
+						Title string `json:"title"`
+					} `json:"oneOf"`
+				} `json:"properties"`
+			} `json:"requestedSchema"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(env.InputRequests[reqKey], &reqObj); err != nil {
+		return MCPElicitationChallenge{}, false
+	}
+	if reqObj.Method != "elicitation/create" || (reqObj.Params.Mode != "" && reqObj.Params.Mode != "form") {
+		return MCPElicitationChallenge{}, false
+	}
+	fieldName := selectSchemaFieldName(reqKey, reqObj.Params.RequestedSchema.Properties)
+	prop := reqObj.Params.RequestedSchema.Properties[fieldName]
+	options := make([]MCPElicitationOption, 0, len(prop.Enum)+len(prop.OneOf))
+	if len(prop.Enum) > 0 {
+		for i, val := range prop.Enum {
+			lbl := val
+			if i < len(prop.EnumNames) && strings.TrimSpace(prop.EnumNames[i]) != "" {
+				lbl = prop.EnumNames[i]
+			}
+			options = append(options, MCPElicitationOption{Value: val, Label: lbl})
+		}
+	} else {
+		for _, item := range prop.OneOf {
+			options = append(options, MCPElicitationOption{Value: item.Const, Label: cmp.Or(item.Title, item.Const)})
+		}
+	}
+	return MCPElicitationChallenge{
+		ServerName:   serverName,
+		FullToolName: fullTool,
+		RemoteTool:   remoteTool,
+		RequestKey:   reqKey,
+		FieldName:    cmp.Or(fieldName, reqKey),
+		Title:        cmp.Or(strings.TrimSpace(prop.Title), "Confirm "+fullTool),
+		Message:      strings.TrimSpace(reqObj.Params.Message),
+		RequestState: env.RequestState,
+		Options:      options,
+		Arguments:    maps.Clone(args),
+	}, true
+}
+
+func selectInputRequestKey(reqs map[string]json.RawMessage) string {
+	if _, ok := reqs["approval_choice"]; ok {
+		return "approval_choice"
+	}
+	keys := make([]string, 0, len(reqs))
+	for k := range reqs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	if len(keys) == 0 {
+		return ""
+	}
+	return keys[0]
+}
+
+func selectSchemaFieldName[V any](preferred string, props map[string]V) string {
+	if _, ok := props[preferred]; ok {
+		return preferred
+	}
+	keys := make([]string, 0, len(props))
+	for k := range props {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	if len(keys) == 0 {
+		return ""
+	}
+	return keys[0]
 }
 
 func (c *mcpClientConn) writeFrameLocked(payload any) error {
@@ -750,6 +963,7 @@ func (c *mcpClientConn) doHTTPPostOnceLocked(ctx context.Context, opReader OPRea
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("MCP-Protocol-Version", mcpProtocolVersion)
 	if c.sessionID != "" {
 		req.Header.Set("Mcp-Session-Id", c.sessionID)
 	}

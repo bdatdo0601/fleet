@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -398,6 +399,39 @@ func (e *Engine) dispatchTool(ctx context.Context, name string, args map[string]
 	return nil, newErr(fmt.Sprintf("unknown tool %q", name), http.StatusBadRequest)
 }
 
+func (e *Engine) callExternalMCPWithElicitation(ctx context.Context, name string, args map[string]any, bypassHITL bool) (any, error) {
+	res, err := e.mcp.CallTool(ctx, name, args)
+	for range maxMCPElicitationAutoRound {
+		eligErr, ok := errors.AsType[*MCPElicitationRequiredError](err)
+		if !ok {
+			return res, err
+		}
+		ch := eligErr.Challenge
+		if !bypassHITL {
+			rawCh, mErr := json.Marshal(ch)
+			if mErr != nil {
+				return nil, mErr
+			}
+			return nil, &approvalRequiredError{
+				ToolName:   MCPElicitationApprovalTool,
+				ServerName: ch.ServerName,
+				Summary:    cmp.Or(ch.Title, "Confirm "+ch.FullToolName),
+				RiskLevel:  "mcp_elicitation",
+				ArgsJSON:   string(rawCh),
+			}
+		}
+		choice := PickAutoAllowElicitationChoice(ch.Options)
+		if choice == "" {
+			return nil, newErr(fmt.Sprintf("auto-approve enabled, but MCP confirmation for %s offered no allow option", ch.FullToolName), http.StatusBadRequest)
+		}
+		res, err = e.mcp.CallToolWithElicitation(ctx, ch.FullToolName, ch.Arguments, ch.RequestState, BuildMCPElicitationResponses(ch.RequestKey, ch.FieldName, "accept", choice))
+	}
+	if _, ok := errors.AsType[*MCPElicitationRequiredError](err); ok {
+		return nil, newErr(fmt.Sprintf("MCP server requested too many chained confirmations for %s", name), http.StatusBadGateway)
+	}
+	return res, err
+}
+
 func (e *Engine) dispatchExternalMCPTool(ctx context.Context, name string, args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {
 	ext, ok := e.mcp.FindTool(ctx, name)
 	if !ok {
@@ -412,7 +446,7 @@ func (e *Engine) dispatchExternalMCPTool(ctx context.Context, name string, args 
 			ArgsJSON:   cmp.Or(rawArgs, "{}"),
 		}
 	}
-	return e.mcp.CallTool(ctx, name, args)
+	return e.callExternalMCPWithElicitation(ctx, name, args, tctx.BypassHITL)
 }
 
 func (e *Engine) dispatchFleetTool(ctx context.Context, name string, args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {

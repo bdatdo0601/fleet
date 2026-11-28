@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -167,12 +168,12 @@ func TestMCPOAuthFullPKCEFlowRefreshPaginationAnd401Retry(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch req.Method {
 		case "initialize":
-			if pv, _ := req.Params["protocolVersion"].(string); pv != "2025-03-26" {
+			if pv, _ := req.Params["protocolVersion"].(string); pv != "2026-07-28" {
 				http.Error(w, "unexpected protocolVersion "+pv, http.StatusBadRequest)
 				return
 			}
 			w.Header().Set("Mcp-Session-Id", "sess-oauth-1")
-			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{"protocolVersion": "2025-03-26"}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{"protocolVersion": "2026-07-28"}})
 		case "notifications/initialized":
 			w.WriteHeader(http.StatusAccepted)
 		case "tools/list":
@@ -589,5 +590,268 @@ func TestMCPOAuthDiscoverySSRFAndPendingCap(t *testing.T) {
 	mgr.mu.Unlock()
 	if hasLock || pendingAfterRevoke != 0 {
 		t.Fatalf("expected Revoke to clear serverLocks and pending, hasLock=%v pending=%d", hasLock, pendingAfterRevoke)
+	}
+}
+
+func TestMCPElicitationManualApprovalAndAutoApprove(t *testing.T) {
+	var seenProtocolHeader atomic.Value
+	var seenInitCaps atomic.Bool
+	var seenMetaCaps atomic.Bool
+	var replayChoices []string
+	var replayMu sync.Mutex
+
+	mcpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenProtocolHeader.Store(r.Header.Get("MCP-Protocol-Version"))
+		var req struct {
+			ID     int64          `json:"id"`
+			Method string         `json:"method"`
+			Params map[string]any `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Content-Type", "application/json")
+		switch req.Method {
+		case "initialize":
+			if caps, _ := req.Params["capabilities"].(map[string]any); caps != nil {
+				if elic, _ := caps["elicitation"].(map[string]any); elic != nil {
+					if _, hasForm := elic["form"]; hasForm {
+						seenInitCaps.Store(true)
+					}
+				}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req.ID,
+				"result":  map[string]any{"protocolVersion": "2026-07-28"},
+			})
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/list":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req.ID,
+				"result": map[string]any{
+					"tools": []map[string]any{{
+						"name":        "search_threads",
+						"description": "Search Gmail threads",
+						"annotations": map[string]any{"readOnlyHint": true},
+					}},
+				},
+			})
+		case "tools/call":
+			if meta, _ := req.Params["_meta"].(map[string]any); meta != nil {
+				if cc, _ := meta["io.modelcontextprotocol/clientCapabilities"].(map[string]any); cc != nil {
+					if elic, _ := cc["elicitation"].(map[string]any); elic != nil {
+						if _, hasForm := elic["form"]; hasForm {
+							seenMetaCaps.Store(true)
+						}
+					}
+				}
+			}
+			reqState, _ := req.Params["requestState"].(string)
+			inResp, _ := req.Params["inputResponses"].(map[string]any)
+			if reqState == "" || len(inResp) == 0 {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      req.ID,
+					"result": map[string]any{
+						"resultType":   "input_required",
+						"requestState": `{"elicitationId":"el-1","requestBinding":"bind-1"}`,
+						"inputRequests": map[string]any{
+							"approval_choice": map[string]any{
+								"method": "elicitation/create",
+								"params": map[string]any{
+									"mode":    "form",
+									"message": "**Gmail Search**\nRead recent inbox threads?",
+									"requestedSchema": map[string]any{
+										"type": "object",
+										"properties": map[string]any{
+											"approval_choice": map[string]any{
+												"type":      "string",
+												"title":     "Allow Fleet Assistant to use search_threads?",
+												"enum":      []string{"ALLOW_ONCE", "ALLOW_OWNER_ALWAYS", "ALLOW_TOOL_ALWAYS", "DENY_ONCE"},
+												"enumNames": []string{"Allow once", "Always allow for these senders", "Always allow this tool", "Don't allow"},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				})
+				return
+			}
+			if reqState != `{"elicitationId":"el-1","requestBinding":"bind-1"}` {
+				http.Error(w, "mismatched requestState: "+reqState, http.StatusBadRequest)
+				return
+			}
+			ac, _ := inResp["approval_choice"].(map[string]any)
+			content, _ := ac["content"].(map[string]any)
+			choice, _ := content["approval_choice"].(string)
+			replayMu.Lock()
+			replayChoices = append(replayChoices, choice)
+			replayMu.Unlock()
+			if choice == "DENY_ONCE" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      req.ID,
+					"result": map[string]any{
+						"resultType": "complete",
+						"isError":    true,
+						"content":    []map[string]any{{"type": "text", "text": "Action canceled."}},
+					},
+				})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req.ID,
+				"result": map[string]any{
+					"resultType": "complete",
+					"threads":    []map[string]any{{"id": "th-1", "subject": "Flight Confirmation"}},
+				},
+			})
+		}
+	}))
+	defer mcpSrv.Close()
+
+	var llmRound atomic.Int32
+	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/chat/completions":
+			n := llmRound.Add(1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			if n == 1 {
+				_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tc1\",\"type\":\"function\",\"function\":{\"name\":\"mcp__gmail__search_threads\",\"arguments\":\"{\\\"query\\\":\\\"in:inbox\\\"}\"}}]}}]}\n\n")
+				_, _ = io.WriteString(w, "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n")
+				_, _ = io.WriteString(w, "data: [DONE]\n\n")
+				return
+			}
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Found thread Flight Confirmation.\"}}]}\n\n")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":8}}\n\n")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		case "/models":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{}})
+		}
+	}))
+	defer mockLLM.Close()
+
+	tmp := t.TempDir()
+	eng, err := Open(filepath.Join(tmp, "assistant.db"), filepath.Join(tmp, "assistant.json"), filepath.Join(tmp, "vault"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = eng.Close() }()
+	eng.mcp.SetHTTPClient(mcpSrv.Client())
+
+	cfg := DefaultConfig()
+	cfg.Enabled = true
+	cfg.BaseURL = mockLLM.URL
+	cfg.APIKey = "sk-test"
+	cfg.Routing.Mode = "off"
+	cfg.MCPServers = []MCPServerConfig{{
+		Name:           "gmail",
+		Transport:      "http",
+		URL:            mcpSrv.URL,
+		Enabled:        true,
+		ApprovalPolicy: MCPApprovalPolicyWritesOnly,
+	}}
+	if _, err := eng.UpdateConfig(cfg, false); err != nil {
+		t.Fatal(err)
+	}
+
+	sub := eng.Subscribe()
+	defer eng.Unsubscribe(sub)
+
+	eng.Start(t.Context())
+
+	// 1. Auto-Approve off: read-only search_threads pauses via mcp_elicitation approval card.
+	if _, _, err := eng.EnqueueUserMessage("general", "check my recent emails", ""); err != nil {
+		t.Fatal(err)
+	}
+	var apr Approval
+	deadline := time.After(5 * time.Second)
+	for apr.ID == "" {
+		select {
+		case ev := <-sub:
+			if ev.Type == "approval" {
+				apr, _ = ev.Data.(Approval)
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for mcp_elicitation approval")
+		}
+	}
+	if apr.ToolName != MCPElicitationApprovalTool || apr.RiskLevel != "mcp_elicitation" {
+		t.Fatalf("expected %s approval, got %+v", MCPElicitationApprovalTool, apr)
+	}
+	discordPayload := buildApprovalDiscordPayload(apr, "https://fleet.example/#chat/general")
+	comps, _ := discordPayload["components"].([]map[string]any)
+	btns, _ := comps[0]["components"].([]map[string]any)
+	if len(btns) != 4 || btns[2]["custom_id"] != "fleet_apr:approve:"+apr.ID+":ALLOW_TOOL_ALWAYS" {
+		t.Fatalf("unexpected Discord elicitation buttons: %+v", btns)
+	}
+
+	if _, err := eng.DecideApprovalWithScope(apr.ID, true, "ALLOW_TOOL_ALWAYS", ""); err != nil {
+		t.Fatal(err)
+	}
+	var doneMsg Message
+	deadline2 := time.After(5 * time.Second)
+	for doneMsg.ID == 0 {
+		select {
+		case ev := <-sub:
+			if ev.Type == "message_done" {
+				doneMsg, _ = ev.Data.(Message)
+			}
+		case <-deadline2:
+			t.Fatalf("timed out waiting for resumed assistant reply")
+		}
+	}
+	if !strings.Contains(doneMsg.Content, "Flight Confirmation") {
+		t.Fatalf("expected resumed reply mentioning Flight Confirmation, got %q", doneMsg.Content)
+	}
+
+	// 2. Manual Deny sends DENY_ONCE to MCP server.
+	tctxManual := &toolExecContext{ChannelID: "general", Source: "chat", Config: eng.Config(), BypassHITL: false}
+	_, err = eng.executeTool(t.Context(), ToolCall{
+		ID:       "deny1",
+		Type:     "function",
+		Function: ToolCallFunction{Name: "mcp__gmail__search_threads", Arguments: `{"query":"is:unread"}`},
+	}, tctxManual)
+	aprDenyErr, ok := errors.AsType[*approvalRequiredError](err)
+	if !ok || aprDenyErr.ToolName != MCPElicitationApprovalTool {
+		t.Fatalf("expected approvalRequiredError for manual deny case, got %v", err)
+	}
+	denyApr, err := eng.store.CreateApproval(Approval{
+		ChannelID:  "general",
+		ToolName:   aprDenyErr.ToolName,
+		ServerName: aprDenyErr.ServerName,
+		ArgsJSON:   aprDenyErr.ArgsJSON,
+		Summary:    aprDenyErr.Summary,
+		RiskLevel:  aprDenyErr.RiskLevel,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.DecideApprovalWithScope(denyApr.ID, false, "DENY_ONCE", "user denied"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Auto-Approve on (BypassHITL=true): server elicitation is answered with ALLOW_ONCE automatically.
+	tctxAuto := &toolExecContext{ChannelID: "general", Source: "chat", Config: eng.Config(), BypassHITL: true}
+	autoOut, err := eng.executeTool(t.Context(), ToolCall{
+		ID:       "auto1",
+		Type:     "function",
+		Function: ToolCallFunction{Name: "mcp__gmail__search_threads", Arguments: `{"query":"in:inbox"}`},
+	}, tctxAuto)
+	if err != nil || !strings.Contains(autoOut, "Flight Confirmation") {
+		t.Fatalf("expected AutoApprove to replay ALLOW_ONCE and return threads, got out=%q err=%v", autoOut, err)
+	}
+
+	if gotProto, _ := seenProtocolHeader.Load().(string); gotProto != "2026-07-28" || !seenInitCaps.Load() || !seenMetaCaps.Load() {
+		t.Fatalf("expected 2026-07-28 header (%q) + init caps (%v) + meta caps (%v)", gotProto, seenInitCaps.Load(), seenMetaCaps.Load())
+	}
+	replayMu.Lock()
+	defer replayMu.Unlock()
+	if len(replayChoices) < 2 || replayChoices[0] != "ALLOW_TOOL_ALWAYS" || replayChoices[len(replayChoices)-1] != "ALLOW_ONCE" {
+		t.Fatalf("unexpected replay choices: %+v", replayChoices)
 	}
 }

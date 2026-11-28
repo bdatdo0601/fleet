@@ -292,12 +292,20 @@ function formatApprovalArgs(toolName, argsJSON) {
 
 function renderApprovalCard(apr, onDecided) {
   const isEscalation = apr.tool_name === "frontier_escalation";
+  const isElicitation = apr.tool_name === "mcp_elicitation";
   let escArgs = {};
+  let elicArgs = {};
   if (isEscalation) {
     try {
       escArgs = JSON.parse(apr.args_json || "{}");
     } catch {
       escArgs = {};
+    }
+  } else if (isElicitation) {
+    try {
+      elicArgs = JSON.parse(apr.args_json || "{}");
+    } catch {
+      elicArgs = {};
     }
   }
   let deciding = false;
@@ -324,9 +332,13 @@ function renderApprovalCard(apr, onDecided) {
             ? "Frontier unlocked for this topic"
             : "Running Frontier once"
           : "Using default chat model"
-        : decision === "approve"
-          ? "Approved — resuming"
-          : "Denied";
+        : isElicitation
+          ? decision === "approve"
+            ? "Confirmed — resuming"
+            : "Declined"
+          : decision === "approve"
+            ? "Approved — resuming"
+            : "Denied";
       toast(msg, decision === "approve" ? "ok" : "info");
       if (onDecided) {
         await onDecided();
@@ -337,6 +349,57 @@ function renderApprovalCard(apr, onDecided) {
       toast(err.message, "error");
     }
   };
+  if (isElicitation) {
+    const card = el(
+      "div",
+      { className: "approval-card approval-card-escalation" },
+      el(
+        "div",
+        { className: "approval-head" },
+        badge(elicArgs.server_name || apr.server_name || "mcp", "info"),
+        badge(elicArgs.remote_tool || "confirm", "warn"),
+        el("strong", { text: elicArgs.title || apr.summary || "Confirm MCP action" }),
+      ),
+    );
+    if (elicArgs.message) {
+      card.appendChild(el("div", { className: "small approval-meta" }, renderMarkdownDOM(elicArgs.message)));
+    }
+    if (apr.status !== "pending") {
+      card.appendChild(el("div", { className: "approval-status" }, badge(apr.status, apr.status === "executed" || apr.status === "approved" ? "ok" : "danger")));
+      return card;
+    }
+    const opts = Array.isArray(elicArgs.options) && elicArgs.options.length > 0
+      ? elicArgs.options
+      : [
+          { value: "ALLOW_ONCE", label: "Allow once" },
+          { value: "DENY_ONCE", label: "Don't allow" },
+        ];
+    let allowPrimaryUsed = false;
+    actionsRow = el(
+      "div",
+      { className: "actions-row" },
+      ...opts.map((opt) => {
+        const val = String((opt && opt.value) || "").trim();
+        const label = String((opt && opt.label) || val || "Confirm");
+        const isDeny = /^DENY_/i.test(val);
+        let cls = "btn btn-sm";
+        if (isDeny) {
+          cls = "btn btn-sm btn-danger";
+        } else if (val === "ALLOW_ONCE" || !allowPrimaryUsed) {
+          cls = "btn btn-sm btn-primary";
+          allowPrimaryUsed = true;
+        }
+        return el("button", {
+          type: "button",
+          className: cls,
+          text: label,
+          onclick: () => decide(isDeny ? "deny" : "approve", val),
+        });
+      }),
+    );
+    card.appendChild(actionsRow);
+    return card;
+  }
   if (isEscalation) {
     const shortFrontier = shortModelName(escArgs.frontier_model || "frontier");
     const shortFallback = shortModelName(escArgs.fallback_model || "Haiku");
