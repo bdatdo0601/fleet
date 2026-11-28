@@ -214,6 +214,72 @@ func TestAgentsHTTPEndpointsAndWait(t *testing.T) {
 			t.Fatalf("GET %s failed: %v", path, err)
 		}
 	}
+
+	// Watch routes: POST /v1/agents/watch, GET /v1/agents/watches, POST /v1/agents/watch-wait, DELETE /v1/agents/watch
+	var watchCreate struct {
+		Watch struct {
+			ID string `json:"id"`
+		} `json:"watch"`
+	}
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/agents/watch", map[string]any{
+		"harness": "codex", "session_id": "mini:codex:s2", "target": "mini:claude:s1",
+		"events": []string{"idle", "exited"},
+	}, 5*time.Second, nil, &watchCreate); err != nil || watchCreate.Watch.ID == "" {
+		t.Fatalf("POST /v1/agents/watch failed: err=%v out=%+v", err, watchCreate)
+	}
+	var watchList struct {
+		Watches []map[string]any `json:"watches"`
+	}
+	if err := client.Call(srv.URL, http.MethodGet, "/v1/agents/watches?watcher=mini:codex:s2", nil, 5*time.Second, nil, &watchList); err != nil || len(watchList.Watches) != 1 {
+		t.Fatalf("GET /v1/agents/watches failed: err=%v out=%+v", err, watchList)
+	}
+
+	var wwOut map[string]any
+	var wwErr error
+	var wwWG sync.WaitGroup
+	wwWG.Go(func() {
+		wwErr = client.Call(srv.URL, http.MethodPost, "/v1/agents/watch-wait", map[string]any{
+			"target": "mini:claude:s1", "events": []string{"exited"}, "timeout": 3.0,
+		}, 5*time.Second, nil, &wwOut)
+	})
+	time.Sleep(30 * time.Millisecond)
+
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/agents/deregister", map[string]any{
+		"session_id": "mini:claude:s1",
+	}, 5*time.Second, nil, nil); err != nil {
+		t.Fatalf("POST /v1/agents/deregister failed: %v", err)
+	}
+	wwWG.Wait()
+	if wwErr != nil || wwOut["matched"] != true {
+		t.Fatalf("expected watch-wait matched on deregister, got err=%v out=%+v", wwErr, wwOut)
+	}
+	var inboxOut struct {
+		Messages []struct {
+			Body string `json:"body"`
+		} `json:"messages"`
+	}
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/agents/inbox", map[string]any{
+		"harness": "codex", "session_id": "mini:codex:s2",
+	}, 5*time.Second, nil, &inboxOut); err != nil || len(inboxOut.Messages) != 1 || !strings.Contains(inboxOut.Messages[0].Body, "exited") {
+		t.Fatalf("expected watcher inbox wakeup after deregister, got err=%v out=%+v", err, inboxOut)
+	}
+
+	// Delete watch endpoint
+	var delCreate struct {
+		Watch struct {
+			ID string `json:"id"`
+		} `json:"watch"`
+	}
+	_, _ = f.Agents.Heartbeat(agents.HeartbeatParams{Device: "mini", Harness: "claude", RawID: "s3", CWD: "/c"})
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/agents/watch", map[string]any{
+		"harness": "codex", "session_id": "mini:codex:s2", "target": "mini:claude:s3",
+	}, 5*time.Second, nil, &delCreate); err != nil {
+		t.Fatal(err)
+	}
+	var delResp map[string]any
+	if err := client.Call(srv.URL, http.MethodDelete, "/v1/agents/watch?id="+delCreate.Watch.ID, nil, 5*time.Second, nil, &delResp); err != nil || delResp["removed"] != float64(1) {
+		t.Fatalf("DELETE /v1/agents/watch failed: err=%v out=%+v", err, delResp)
+	}
 }
 
 func TestServeUntilCanceledAbortsLongPollImmediately(t *testing.T) {

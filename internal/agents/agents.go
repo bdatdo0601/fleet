@@ -84,6 +84,22 @@ CREATE TABLE IF NOT EXISTS agent_paths (
 );
 CREATE INDEX IF NOT EXISTS idx_agent_paths_last_seen
   ON agent_paths(last_seen DESC);
+
+CREATE TABLE IF NOT EXISTS agent_watches (
+  id                TEXT PRIMARY KEY,
+  watcher_session   TEXT NOT NULL,
+  watcher_device    TEXT NOT NULL,
+  target_session    TEXT NOT NULL DEFAULT '',
+  target_device     TEXT NOT NULL DEFAULT '',
+  target_name       TEXT NOT NULL DEFAULT '',
+  events_json       TEXT NOT NULL DEFAULT '["idle","waiting_permission","waiting_question","exited"]',
+  once              INTEGER NOT NULL DEFAULT 0,
+  last_notified_key TEXT NOT NULL DEFAULT '',
+  created_at        TEXT NOT NULL,
+  updated_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_watches_lookup
+  ON agent_watches(target_session, target_device, target_name);
 `
 
 var sessionMigrations = []registry.ColumnMigration{
@@ -347,6 +363,8 @@ type Hub struct {
 	sessionSubs        subMap
 	harnessSubs        subMap
 	threadSubs         subMap
+	watchSubs          map[chan StateTransition]struct{}
+	onTransition       func(StateTransition)
 	closed             bool
 	doneCh             chan struct{}
 }
@@ -373,6 +391,7 @@ func Open(path string) (*Hub, error) {
 		sessionSubs:        subMap{},
 		harnessSubs:        subMap{},
 		threadSubs:         subMap{},
+		watchSubs:          map[chan StateTransition]struct{}{},
 		doneCh:             make(chan struct{}),
 	}, nil
 }
@@ -484,6 +503,9 @@ func (h *Hub) pruneLocked(force bool) error {
 		"DELETE FROM agent_reads WHERE read_at < ? OR message_id NOT IN (SELECT id FROM agent_messages)",
 		cutoff,
 	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM agent_watches WHERE updated_at < ?", cutoff); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {

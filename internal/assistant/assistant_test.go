@@ -1115,19 +1115,33 @@ func TestCronTimersDelegationLifecycleAndVaultGit(t *testing.T) {
 
 	// Simulate Slacker launch receipt and agent heartbeat transition working -> waiting_permission.
 	eng.OnSlackerReceipt("job-spawn-1", "laptop", "fix-auth", "", "launched", "")
-	eng.OnAgentHeartbeat("laptop", "claude", "laptop:claude:abc1", "fix-auth", "working", "Editing auth.go", "", nil)
-	eng.OnAgentHeartbeat("laptop", "claude", "laptop:claude:abc1", "fix-auth", "waiting_permission", "Need bash approval", "M auth.go", map[string]string{"tool": "Bash"})
+	eng.OnAgentHeartbeat("laptop", "claude", "laptop:claude:abc1", "fix-auth", "working", "Editing auth.go", "", "", nil)
+	eng.OnAgentHeartbeat("laptop", "claude", "laptop:claude:abc1", "fix-auth", "waiting_permission", "Need bash approval", "M auth.go", "Ready to run tests", map[string]string{"tool": "Bash"})
 
 	var foundDelegationEvent bool
 	for range 10 {
 		ev, err := eng.store.ClaimNextInbox()
 		if err == nil && ev != nil && ev.Source == "delegation" {
-			foundDelegationEvent = true
+			foundDelegationEvent = strings.Contains(ev.PayloadJSON, "Ready to run tests")
 			break
 		}
 	}
 	if !foundDelegationEvent {
-		t.Fatalf("expected delegation inbox event after waiting_permission heartbeat")
+		t.Fatalf("expected delegation inbox event with lastAssistant after waiting_permission heartbeat")
+	}
+
+	// fleet_watch_agent watches an existing session and supports stop=true.
+	watchOut, err := eng.executeTool(t.Context(), ToolCall{
+		ID: "w1", Type: "function", Function: ToolCallFunction{Name: "fleet_watch_agent", Arguments: `{"agent_id":"laptop/auth-worker","note":"report PR status"}`},
+	}, tctx)
+	if err != nil || !strings.Contains(watchOut, `"status":"watching"`) {
+		t.Fatalf("fleet_watch_agent failed: %v (%s)", err, watchOut)
+	}
+	stopOut, err := eng.executeTool(t.Context(), ToolCall{
+		ID: "w2", Type: "function", Function: ToolCallFunction{Name: "fleet_watch_agent", Arguments: `{"agent_id":"laptop/auth-worker","stop":true}`},
+	}, tctx)
+	if err != nil || !strings.Contains(stopOut, `"status":"unwatched"`) {
+		t.Fatalf("fleet_watch_agent stop failed: %v (%s)", err, stopOut)
 	}
 
 	// Vault git history, diff, and rollback.
@@ -2280,24 +2294,24 @@ func TestDelegationLifecycleEdgeCasesAndReconciliation(t *testing.T) {
 		t.Fatal(err)
 	}
 	eng.refreshDelegationsFlag()
-	eng.OnAgentHeartbeat("laptop", "codex", "laptop:codex:s1", "fix-auth", "idle", "All tests passed", "", nil)
+	eng.OnAgentHeartbeat("laptop", "codex", "laptop:codex:s1", "fix-auth", "idle", "All tests passed", "", "", nil)
 	evs := drainDelegationInbox(t, eng)
 	if len(evs) != 1 || !strings.Contains(evs[0].PayloadJSON, `"state":"idle"`) {
 		t.Fatalf("expected 1 idle delegation event for queued->idle with slugified name, got %+v", evs)
 	}
 
 	// 2. Multi-turn follow-up: idle -> working (resets last_notified_state) -> idle wakes again.
-	eng.OnAgentHeartbeat("laptop", "codex", "laptop:codex:s1", "renamed-later", "working", "Follow-up turn", "", nil)
+	eng.OnAgentHeartbeat("laptop", "codex", "laptop:codex:s1", "renamed-later", "working", "Follow-up turn", "", "", nil)
 	if evs = drainDelegationInbox(t, eng); len(evs) != 0 {
 		t.Fatalf("expected no wakeup on working, got %+v", evs)
 	}
-	eng.OnAgentHeartbeat("laptop", "codex", "laptop:codex:s1", "renamed-later", "idle", "Second turn done", "", nil)
+	eng.OnAgentHeartbeat("laptop", "codex", "laptop:codex:s1", "renamed-later", "idle", "Second turn done", "", "", nil)
 	if evs = drainDelegationInbox(t, eng); len(evs) != 1 || !strings.Contains(evs[0].PayloadJSON, `"state":"idle"`) {
 		t.Fatalf("expected second idle wakeup after working reset, got %+v", evs)
 	}
 
 	// 3. Closing an already-idle session (idle -> exited) marks exited silently without waking.
-	eng.OnAgentHeartbeat("laptop", "codex", "laptop:codex:s1", "renamed-later", "exited", "", "", nil)
+	eng.OnAgentHeartbeat("laptop", "codex", "laptop:codex:s1", "renamed-later", "exited", "", "", "", nil)
 	if evs = drainDelegationInbox(t, eng); len(evs) != 0 {
 		t.Fatalf("expected no wakeup on idle->exited, got %+v", evs)
 	}
@@ -2316,8 +2330,8 @@ func TestDelegationLifecycleEdgeCasesAndReconciliation(t *testing.T) {
 	}
 	eng.refreshDelegationsFlag()
 	eng.OnSlackerReceipt("job-2", "office", "ui-agy-abc", "office:antigravity:conv1234", "launched", "")
-	eng.OnAgentHeartbeat("office", "antigravity", "office:antigravity:conv1234", "unrelated-title", "working", "Working", "", nil)
-	eng.OnAgentHeartbeat("office", "antigravity", "office:antigravity:conv1234", "unrelated-title", "exited", "Process exited", "", nil)
+	eng.OnAgentHeartbeat("office", "antigravity", "office:antigravity:conv1234", "unrelated-title", "working", "Working", "", "", nil)
+	eng.OnAgentHeartbeat("office", "antigravity", "office:antigravity:conv1234", "unrelated-title", "exited", "Process exited", "", "", nil)
 	evs = drainDelegationInbox(t, eng)
 	if len(evs) != 1 || !strings.Contains(evs[0].PayloadJSON, `"state":"exited"`) {
 		t.Fatalf("expected 1 exited delegation event after working->exited via bound session_id, got %+v", evs)

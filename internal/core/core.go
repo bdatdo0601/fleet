@@ -231,6 +231,11 @@ func Open(root string) (*Fleet, error) {
 		return nil, err
 	}
 	f.Assistant = astEngine
+	hub.SetOnTransition(func(ev agents.StateTransition) {
+		if f.Assistant != nil {
+			f.Assistant.OnAgentHeartbeat(ev.Device, ev.Harness, ev.SessionID, ev.Name, ev.NewState, ev.Summary, ev.GitStatus, ev.LastAssistant, ev.PendingAction)
+		}
+	})
 	f.backfillPathsOnce()
 	return f, nil
 }

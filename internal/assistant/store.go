@@ -1461,14 +1461,14 @@ func scanDelegation(scanner interface{ Scan(...any) error }) (Delegation, error)
 	return d, err
 }
 
-// ListActiveDelegations returns non-terminal delegations (not exited/failed).
+// ListActiveDelegations returns non-terminal delegations (not exited/failed/unwatched).
 func (s *Store) ListActiveDelegations() ([]Delegation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rows, err := s.db.Query(
 		`SELECT id, job_id, channel_id, target_device, harness, session_name, session_id,
 		        repo_path, prompt, status, last_notified_state, created_at, updated_at
-		 FROM assistant_delegations WHERE status NOT IN ('exited', 'failed') ORDER BY created_at DESC`,
+		 FROM assistant_delegations WHERE status NOT IN ('exited', 'failed', 'unwatched') ORDER BY created_at DESC`,
 	)
 	if err != nil {
 		return nil, err
@@ -1483,6 +1483,66 @@ func (s *Store) ListActiveDelegations() ([]Delegation, error) {
 		out = append(out, d)
 	}
 	return out, rows.Err()
+}
+
+// FindActiveDelegation looks up an active delegation in channelID matching sessionID or (device, sessionName).
+func (s *Store) FindActiveDelegation(channelID, sessionID, device, sessionName string) (*Delegation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(
+		`SELECT id, job_id, channel_id, target_device, harness, session_name, session_id,
+		        repo_path, prompt, status, last_notified_state, created_at, updated_at
+		 FROM assistant_delegations WHERE channel_id = ? AND status NOT IN ('exited', 'failed', 'unwatched') ORDER BY created_at DESC`,
+		channelID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		d, err := scanDelegation(rows)
+		if err != nil {
+			return nil, err
+		}
+		if (sessionID != "" && d.SessionID == sessionID) ||
+			(device != "" && sessionName != "" && d.TargetDevice == device && strings.EqualFold(d.SessionName, sessionName)) {
+			return &d, nil
+		}
+	}
+	return nil, rows.Err()
+}
+
+// CancelDelegation marks matching active delegation(s) in channelID as unwatched.
+func (s *Store) CancelDelegation(channelID, target string) (int64, error) {
+	clean := strings.TrimSpace(target)
+	if clean == "" {
+		return 0, newErr("agent_id is required", http.StatusBadRequest)
+	}
+	devPart, namePart, hasSlash := strings.Cut(clean, "/")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := registry.NowISO()
+	var res sql.Result
+	var err error
+	if hasSlash && !strings.Contains(clean, ":") && namePart != "" {
+		res, err = s.db.Exec(
+			`UPDATE assistant_delegations SET status = 'unwatched', updated_at = ?
+			 WHERE channel_id = ? AND status NOT IN ('exited', 'failed', 'unwatched')
+			   AND (session_id = ? OR (target_device = ? AND LOWER(session_name) = LOWER(?)))`,
+			now, channelID, clean, strings.TrimSpace(devPart), strings.TrimSpace(namePart),
+		)
+	} else {
+		res, err = s.db.Exec(
+			`UPDATE assistant_delegations SET status = 'unwatched', updated_at = ?
+			 WHERE channel_id = ? AND status NOT IN ('exited', 'failed', 'unwatched')
+			   AND (session_id = ? OR LOWER(session_name) = LOWER(?))`,
+			now, channelID, clean, clean,
+		)
+	}
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // ListDelegations returns recent delegations ordered newest first.

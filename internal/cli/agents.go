@@ -48,11 +48,16 @@ Peer Messaging:
   ask      TO [QUESTION...] [--question TEXT] [--stdin] [--session SID] [--timeout S] [--wait-if-idle] [--json]
   rename   [TARGET] NAME [--session SID] [--json]
   listen   [--session SID] [--json]
+  watch    TARGET [--session SID] [--on idle,waiting,exited] [--once] [--device D] [--pending] [--json]
+           TARGET --wait [--on idle,waiting,exited] [--timeout S] [--include-current] [--device D] [--pending] [--json]
+           ls [--session SID] [--all] [--json]
+           rm ID_OR_TARGET [--session SID] [--json]
 
 Lifecycle & Relay:
   spawn    --harness claude|agy|codex [--name NAME] [--device DEV] [--repo PATH]
            [--prompt TEXT | --prompt-file PATH | --stdin] [--policy auto|bypass|safe]
-           [--model MODEL] [--strategy least_agents|round_robin] [--tmux] [--rex] [--local] [--json]
+           [--model MODEL] [--strategy least_agents|round_robin] [--tmux] [--rex] [--local]
+           [--watch] [--watch-on EVENTS] [--watch-once] [--session SID] [--json]
   kill     TARGET [--session SID] [--force] [--json]
   kill-all --yes [--harness claude|agy|codex|all] [--device DEV] [--json]
   wait     --session SID [--harness H] [--timeout S] [--poll-timeout S]
@@ -600,7 +605,48 @@ func cmdAgentsListen(args []string, cio *IO) error {
 	return nil
 }
 
-func runLocalSpawn(harness, name, dir, model, prompt string, pol session.Policy, useRex, useTmux, jsonOut bool, cio *IO) error {
+type spawnWatchOpts struct {
+	Enabled    bool
+	SessionSID string
+	Events     []string
+	Once       bool
+}
+
+func parseWatchEventsFlag(raw string) []string {
+	var out []string
+	for tok := range strings.SplitSeq(raw, ",") {
+		if t := strings.TrimSpace(tok); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func registerAgentWatch(api, callerSID, target, targetDev, targetName string, events []string, once, allowPending bool) (*agents.Watch, error) {
+	sid, harness, cwd := resolveCLICaller(callerSID)
+	body := map[string]any{
+		"harness":       harness,
+		"cwd":           cwd,
+		"target":        target,
+		"target_device": targetDev,
+		"target_name":   targetName,
+		"events":        events,
+		"once":          once,
+		"allow_pending": allowPending,
+	}
+	if sid != "" {
+		body["session_id"] = sid
+	}
+	var resp struct {
+		Watch agents.Watch `json:"watch"`
+	}
+	if err := client.Call(api, http.MethodPost, "/v1/agents/watch", body, 15*time.Second, nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp.Watch, nil
+}
+
+func runLocalSpawn(harness, name, dir, model, prompt string, pol session.Policy, useRex, useTmux, jsonOut bool, watchOpts spawnWatchOpts, cio *IO) error {
 	sessName := strings.TrimSpace(name)
 	if sessName == "" {
 		sessName = "agent-" + harness + "-" + randomAgentHex(4)
@@ -628,19 +674,36 @@ func runLocalSpawn(harness, name, dir, model, prompt string, pol session.Policy,
 	if err != nil {
 		return err
 	}
+	var watch *agents.Watch
+	if watchOpts.Enabled {
+		api, apiErr := client.ResolveAPI("")
+		if apiErr != nil {
+			return fmt.Errorf("started %s session %s, but failed to register watch: %w", harness, sessName, apiErr)
+		}
+		if watch, apiErr = registerAgentWatch(api, watchOpts.SessionSID, "", localDeviceName(), sessName, watchOpts.Events, watchOpts.Once, true); apiErr != nil {
+			return fmt.Errorf("started %s session %s, but failed to register watch: %w", harness, sessName, apiErr)
+		}
+	}
 	if jsonOut {
-		return writeJSONOut(cio.Stdout, map[string]any{
+		payload := map[string]any{
 			"executed_locally": true,
 			"backend":          backend,
 			"session_name":     sessName,
 			"harness":          harness,
 			"directory":        dir,
-		})
+		}
+		if watch != nil {
+			payload["watch"] = watch
+		}
+		return writeJSONOut(cio.Stdout, payload)
 	}
 	if outBuf.Len() > 0 {
 		_, _ = io.WriteString(cio.Stdout, outBuf.String())
 	} else {
 		cio.printf("Started %s session %s (%s) in %s\n", harness, sessName, backend, dir)
+	}
+	if watch != nil {
+		cio.printf("watching %s (id=%s events=%s)\n", sessName, watch.ID, strings.Join(watch.Events, ","))
 	}
 	return nil
 }
@@ -666,7 +729,7 @@ func readSpawnPrompt(promptFlag, promptFile string, fromStdin bool, cio *IO) (st
 	return "", nil
 }
 
-func runLocalSpawnFallback(api string, job slacker.Job, fallbackPol session.Policy, localDev string, jsonOut bool, cio *IO) error {
+func runLocalSpawnFallback(api string, job slacker.Job, fallbackPol session.Policy, localDev string, jsonOut bool, watchOpts spawnWatchOpts, cio *IO) error {
 	dir := expandUserHomePath(job.RepoPath)
 	jobPol, _ := session.ParsePolicy(job.Policy, fallbackPol)
 	var outBuf, errBuf strings.Builder
@@ -686,15 +749,29 @@ func runLocalSpawnFallback(api string, job slacker.Job, fallbackPol session.Poli
 		return lErr
 	}
 	postLocalReceipt(api, job.ID, job.SessionName, backend, "launched", "")
+	var watch *agents.Watch
+	if watchOpts.Enabled {
+		var wErr error
+		if watch, wErr = registerAgentWatch(api, watchOpts.SessionSID, "", job.TargetDevice, job.SessionName, watchOpts.Events, watchOpts.Once, true); wErr != nil {
+			return fmt.Errorf("spawned %s locally, but failed to register watch: %w", job.SessionName, wErr)
+		}
+	}
 	if jsonOut {
-		return writeJSONOut(cio.Stdout, map[string]any{
+		payload := map[string]any{
 			"job":              job,
 			"worker_online":    false,
 			"executed_locally": true,
 			"backend":          backend,
-		})
+		}
+		if watch != nil {
+			payload["watch"] = watch
+		}
+		return writeJSONOut(cio.Stdout, payload)
 	}
 	cio.printf("spawned %s (%s) locally on %s via %s (job=%s)\n", job.SessionName, job.Harness, localDev, backend, job.ID)
+	if watch != nil {
+		cio.printf("watching %s/%s (id=%s events=%s)\n", job.TargetDevice, job.SessionName, watch.ID, strings.Join(watch.Events, ","))
+	}
 	return nil
 }
 
@@ -718,19 +795,48 @@ func validateSpawnInputs(harnessRaw, name, policyRaw string, useRex, useTmux boo
 	return harness, pol, nil
 }
 
-func dispatchSpawnRequest(harness string, pol session.Policy, name, deviceFlag, strategy, model, repoPath, prompt string, useTmux, useRex, localOnly, jsonOut bool, cio *IO) error {
+func renderQueuedSpawn(api string, job slacker.Job, workerOnline, jsonOut bool, watchOpts spawnWatchOpts, cio *IO) error {
+	var watch *agents.Watch
+	if watchOpts.Enabled {
+		var wErr error
+		if watch, wErr = registerAgentWatch(api, watchOpts.SessionSID, "", job.TargetDevice, job.SessionName, watchOpts.Events, watchOpts.Once, true); wErr != nil {
+			return fmt.Errorf("queued spawn job=%s, but failed to register watch: %w", job.ID, wErr)
+		}
+	}
+	if jsonOut {
+		payload := map[string]any{
+			"job":           job,
+			"worker_online": workerOnline,
+		}
+		if watch != nil {
+			payload["watch"] = watch
+		}
+		return writeJSONOut(cio.Stdout, payload)
+	}
+	cio.printf("queued spawn job=%s session=%s harness=%s device=%s worker_online=%v\n",
+		job.ID, job.SessionName, job.Harness, job.TargetDevice, workerOnline)
+	if watch != nil {
+		cio.printf("watching %s/%s (id=%s events=%s)\n", job.TargetDevice, job.SessionName, watch.ID, strings.Join(watch.Events, ","))
+	}
+	if !workerOnline {
+		cio.printf("warning: worker on %s is offline; session will start when `fleet slacker worker` connects\n", job.TargetDevice)
+	}
+	return nil
+}
+
+func dispatchSpawnRequest(harness string, pol session.Policy, name, deviceFlag, strategy, model, repoPath, prompt string, useTmux, useRex, localOnly, jsonOut bool, watchOpts spawnWatchOpts, cio *IO) error {
 	cwd, _ := os.Getwd()
 	devs := parseCommaList(deviceFlag)
 	localDev := localDeviceName()
 	targetsLocal := len(devs) == 0 || (len(devs) == 1 && localDev != "" && devs[0] == localDev)
 
 	if localOnly || useRex {
-		return runLocalSpawn(harness, name, cmp.Or(repoPath, cwd), model, prompt, pol, useRex, useTmux, jsonOut, cio)
+		return runLocalSpawn(harness, name, cmp.Or(repoPath, cwd), model, prompt, pol, useRex, useTmux, jsonOut, watchOpts, cio)
 	}
 	api, apiErr := client.ResolveAPI("")
 	if apiErr != nil {
 		if targetsLocal {
-			return runLocalSpawn(harness, name, cmp.Or(repoPath, cwd), model, prompt, pol, false, useTmux, jsonOut, cio)
+			return runLocalSpawn(harness, name, cmp.Or(repoPath, cwd), model, prompt, pol, false, useTmux, jsonOut, watchOpts, cio)
 		}
 		return apiErr
 	}
@@ -755,22 +861,14 @@ func dispatchSpawnRequest(harness string, pol session.Policy, name, deviceFlag, 
 	if err != nil {
 		var ae *client.APIError
 		if targetsLocal && errors.As(err, &ae) && ae.StatusCode == 0 {
-			return runLocalSpawn(harness, name, cmp.Or(repoPath, cwd), model, prompt, pol, false, useTmux, jsonOut, cio)
+			return runLocalSpawn(harness, name, cmp.Or(repoPath, cwd), model, prompt, pol, false, useTmux, jsonOut, watchOpts, cio)
 		}
 		return err
 	}
 	if !spawnResp.WorkerOnline && localDev != "" && spawnResp.Job.TargetDevice == localDev {
-		return runLocalSpawnFallback(api, spawnResp.Job, pol, localDev, jsonOut, cio)
+		return runLocalSpawnFallback(api, spawnResp.Job, pol, localDev, jsonOut, watchOpts, cio)
 	}
-	if jsonOut {
-		return writeJSONOut(cio.Stdout, spawnResp)
-	}
-	cio.printf("queued spawn job=%s session=%s harness=%s device=%s worker_online=%v\n",
-		spawnResp.Job.ID, spawnResp.Job.SessionName, spawnResp.Job.Harness, spawnResp.Job.TargetDevice, spawnResp.WorkerOnline)
-	if !spawnResp.WorkerOnline {
-		cio.printf("warning: worker on %s is offline; session will start when `fleet slacker worker` connects\n", spawnResp.Job.TargetDevice)
-	}
-	return nil
+	return renderQueuedSpawn(api, spawnResp.Job, spawnResp.WorkerOnline, jsonOut, watchOpts, cio)
 }
 
 func cmdAgentsSpawn(args []string, cio *IO) error {
@@ -789,13 +887,17 @@ func cmdAgentsSpawn(args []string, cio *IO) error {
 	useTmux := fs.Bool("tmux", false, "force tmux backend")
 	useRex := fs.Bool("rex", false, "force Rex backend (local only)")
 	localOnly := fs.Bool("local", false, "launch directly on this machine without queueing")
+	watchFlag := fs.Bool("watch", false, "subscribe caller session to target state transitions")
+	watchOnFlag := fs.String("watch-on", "", "comma-separated states for --watch (default: idle,waiting,exited)")
+	watchOnceFlag := fs.Bool("watch-once", false, "auto-remove --watch after first notification")
+	sessionFlag := fs.String("session", "", "caller session_id for --watch")
 	jsonOut := fs.Bool("json", false, "output JSON")
 	pos, err := parseFlagsInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) > 0 || strings.TrimSpace(*harnessFlag) == "" {
-		return fmt.Errorf("usage: fleet agents spawn --harness claude|agy|codex [--name NAME] [--device DEV] [--repo PATH] [--prompt TEXT] [--policy auto|bypass|safe] [--model MODEL] [--tmux] [--local] [--json]")
+		return fmt.Errorf("usage: fleet agents spawn --harness claude|agy|codex [--name NAME] [--device DEV] [--repo PATH] [--prompt TEXT] [--policy auto|bypass|safe] [--model MODEL] [--tmux] [--local] [--watch] [--json]")
 	}
 	harness, pol, err := validateSpawnInputs(*harnessFlag, *nameFlag, *policyFlag, *useRex, *useTmux)
 	if err != nil {
@@ -805,8 +907,14 @@ func cmdAgentsSpawn(args []string, cio *IO) error {
 	if err != nil {
 		return err
 	}
+	watchOpts := spawnWatchOpts{
+		Enabled:    *watchFlag,
+		SessionSID: *sessionFlag,
+		Events:     parseWatchEventsFlag(*watchOnFlag),
+		Once:       *watchOnceFlag,
+	}
 	repoPath := cmp.Or(strings.TrimSpace(*repoFlag), strings.TrimSpace(*dirFlag))
-	return dispatchSpawnRequest(harness, pol, *nameFlag, *deviceFlag, *strategyFlag, *modelFlag, repoPath, prompt, *useTmux, *useRex, *localOnly, *jsonOut, cio)
+	return dispatchSpawnRequest(harness, pol, *nameFlag, *deviceFlag, *strategyFlag, *modelFlag, repoPath, prompt, *useTmux, *useRex, *localOnly, *jsonOut, watchOpts, cio)
 }
 
 func cmdAgentsKill(args []string, cio *IO) error {
@@ -1099,6 +1207,219 @@ func cmdAgentsRelay(args []string, cio *IO) error {
 	return nil
 }
 
+func cmdAgentsWatchList(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("agents watch ls", flag.ContinueOnError)
+	sessionFlag := fs.String("session", "", "filter by watcher session_id")
+	all := fs.Bool("all", false, "list all watches across sessions")
+	jsonOut := fs.Bool("json", false, "output JSON")
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf("usage: fleet agents watch ls [--session SID] [--all] [--json]")
+	}
+	api, err := client.ResolveAPI("")
+	if err != nil {
+		return err
+	}
+	q := url.Values{}
+	if !*all {
+		sid, _, _ := resolveCLICaller(*sessionFlag)
+		if sid != "" {
+			q.Set("watcher", sid)
+		}
+	}
+	qs := ""
+	if enc := q.Encode(); enc != "" {
+		qs = "?" + enc
+	}
+	var resp struct {
+		Watches []agents.Watch `json:"watches"`
+	}
+	if err := client.Call(api, http.MethodGet, "/v1/agents/watches"+qs, nil, 15*time.Second, nil, &resp); err != nil {
+		return err
+	}
+	if *jsonOut {
+		return writeJSONOut(cio.Stdout, resp)
+	}
+	if len(resp.Watches) == 0 {
+		cio.printf("no active watches\n")
+		return nil
+	}
+	rows := [][]string{{"ID", "WATCHER", "TARGET", "EVENTS", "ONCE"}}
+	for _, w := range resp.Watches {
+		targetLabel := w.TargetSession
+		if targetLabel == "" {
+			targetLabel = strings.TrimPrefix(w.TargetDevice+"/"+w.TargetName, "/") + " (pending)"
+		} else if w.TargetName != "" {
+			targetLabel = fmt.Sprintf("%s (%s)", w.TargetName, w.TargetSession)
+		}
+		rows = append(rows, []string{
+			w.ID, w.WatcherSession, targetLabel, strings.Join(w.Events, ","), fmt.Sprintf("%v", w.Once),
+		})
+	}
+	printTable(cio.Stdout, rows)
+	return nil
+}
+
+func cmdAgentsWatchRemove(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("agents watch rm", flag.ContinueOnError)
+	sessionFlag := fs.String("session", "", "caller session_id")
+	jsonOut := fs.Bool("json", false, "output JSON")
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return fmt.Errorf("usage: fleet agents watch rm ID_OR_TARGET [--session SID] [--json]")
+	}
+	api, err := client.ResolveAPI("")
+	if err != nil {
+		return err
+	}
+	q := url.Values{}
+	if strings.HasPrefix(pos[0], "w-") {
+		q.Set("id", pos[0])
+	} else {
+		q.Set("target", pos[0])
+	}
+	if sid, _, _ := resolveCLICaller(*sessionFlag); sid != "" {
+		q.Set("session_id", sid)
+	}
+	var resp struct {
+		OK      bool `json:"ok"`
+		Removed int  `json:"removed"`
+	}
+	if err := client.Call(api, http.MethodDelete, "/v1/agents/watch?"+q.Encode(), nil, 15*time.Second, nil, &resp); err != nil {
+		return err
+	}
+	if *jsonOut {
+		return writeJSONOut(cio.Stdout, resp)
+	}
+	cio.printf("removed=%d\n", resp.Removed)
+	return nil
+}
+
+func printWatchEvent(cio *IO, ev *agents.StateTransition, jsonOut bool, fullResp agents.WatchWaitResult) error {
+	if jsonOut {
+		return writeJSONOut(cio.Stdout, fullResp)
+	}
+	label := ev.SessionID
+	if ev.Name != "" {
+		label = fmt.Sprintf("%s (%s)", ev.Name, ev.SessionID)
+	}
+	if ev.OldState != "" {
+		cio.printf("%s %s -> %s (%s on %s)\n", label, ev.OldState, ev.NewState, ev.Harness, ev.Device)
+	} else {
+		cio.printf("%s -> %s (%s on %s)\n", label, ev.NewState, ev.Harness, ev.Device)
+	}
+	if len(ev.PendingAction) > 0 {
+		cio.printf("pending: %s %s\n", ev.PendingAction["tool"], ev.PendingAction["detail"])
+	}
+	if ev.LastAssistant != "" {
+		cio.printf("last response: %s\n", agents.TruncateRunes(ev.LastAssistant, 600))
+	}
+	return nil
+}
+
+func cmdAgentsWatchWait(target, device string, events []string, timeoutSec, pollSec float64, includeCur, allowPending, jsonOut bool, cio *IO) error {
+	api, err := client.ResolveAPI("")
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	hasDeadline := timeoutSec > 0
+	var deadline time.Time
+	if hasDeadline {
+		deadline = time.Now().Add(time.Duration(timeoutSec * float64(time.Second)))
+	}
+	if pollSec <= 0 || pollSec > 55.0 {
+		pollSec = 50.0
+	}
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		reqTimeout := pollSec
+		if hasDeadline {
+			rem := time.Until(deadline).Seconds()
+			if rem <= 0 {
+				if jsonOut {
+					_ = writeJSONOut(cio.Stdout, agents.WatchWaitResult{TimedOut: true})
+				}
+				return fmt.Errorf("watch timed out waiting for %s", target)
+			}
+			reqTimeout = min(reqTimeout, rem)
+		}
+		reqTimeout = max(0.05, reqTimeout)
+		var resp agents.WatchWaitResult
+		err := client.CallContext(ctx, api, http.MethodPost, "/v1/agents/watch-wait", map[string]any{
+			"target":          target,
+			"target_device":   device,
+			"events":          events,
+			"timeout":         reqTimeout,
+			"include_current": includeCur,
+			"allow_pending":   allowPending,
+		}, time.Duration((reqTimeout+15.0)*float64(time.Second)), nil, &resp)
+		if err != nil {
+			return err
+		}
+		if resp.Matched && resp.Event != nil {
+			return printWatchEvent(cio, resp.Event, jsonOut, resp)
+		}
+		includeCur = false
+	}
+}
+
+func cmdAgentsWatch(args []string, cio *IO) error {
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		switch args[0] {
+		case "ls":
+			return cmdAgentsWatchList(args[1:], cio)
+		case "rm", "cancel", "delete":
+			return cmdAgentsWatchRemove(args[1:], cio)
+		}
+	}
+	fs := flag.NewFlagSet("agents watch", flag.ContinueOnError)
+	sessionFlag := fs.String("session", "", "watcher session_id")
+	onFlag := fs.String("on", "", "comma-separated states (default: idle,waiting,exited)")
+	onceFlag := fs.Bool("once", false, "auto-remove watch after first notification")
+	waitFlag := fs.Bool("wait", false, "block in CLI until a matching state transition occurs")
+	timeoutFlag := fs.Float64("timeout", 0.0, "max wait seconds for --wait (0 = wait indefinitely)")
+	pollFlag := fs.Float64("poll-timeout", 50.0, "per-request long-poll seconds for --wait")
+	includeCur := fs.Bool("include-current", false, "return immediately if target is already in a matching state (--wait)")
+	deviceFlag := fs.String("device", "", "optional target device filter")
+	pendingFlag := fs.Bool("pending", false, "allow watching a session name that has not registered yet")
+	jsonOut := fs.Bool("json", false, "output JSON")
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return fmt.Errorf("usage: fleet agents watch TARGET [--session SID] [--on idle,waiting,exited] [--once] [--wait] [--timeout S] [--device D] [--pending] [--json]")
+	}
+	events := parseWatchEventsFlag(*onFlag)
+	if *waitFlag {
+		return cmdAgentsWatchWait(pos[0], *deviceFlag, events, *timeoutFlag, *pollFlag, *includeCur, *pendingFlag, *jsonOut, cio)
+	}
+	api, err := client.ResolveAPI("")
+	if err != nil {
+		return err
+	}
+	w, err := registerAgentWatch(api, *sessionFlag, pos[0], *deviceFlag, "", events, *onceFlag, *pendingFlag)
+	if err != nil {
+		return err
+	}
+	if *jsonOut {
+		return writeJSONOut(cio.Stdout, map[string]any{"watch": w})
+	}
+	targetDesc := cmp.Or(w.TargetSession, strings.TrimPrefix(w.TargetDevice+"/"+w.TargetName, "/"))
+	cio.printf("watching %s -> %s (id=%s events=%s once=%v)\n", targetDesc, w.WatcherSession, w.ID, strings.Join(w.Events, ","), w.Once)
+	return nil
+}
+
 func cmdAgents(args []string, cio *IO) error {
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		switch args[0] {
@@ -1121,6 +1442,8 @@ func cmdAgents(args []string, cio *IO) error {
 			return cmdAgentsRename(args[1:], cio)
 		case "listen":
 			return cmdAgentsListen(args[1:], cio)
+		case "watch":
+			return cmdAgentsWatch(args[1:], cio)
 		case "spawn":
 			return cmdAgentsSpawn(args[1:], cio)
 		case "kill":

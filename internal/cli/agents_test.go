@@ -207,3 +207,48 @@ func TestCLIAgentsPaths(t *testing.T) {
 		t.Fatalf("agents paths rm failed: rc=%d out=%q err=%q", rc, out, errStr)
 	}
 }
+
+func TestCLIAgentsWatchAndSpawnWatch(t *testing.T) {
+	f, _, tmp := setupCLIServer(t)
+	origStart := sessionStartFn
+	t.Cleanup(func() { sessionStartFn = origStart })
+	sessionStartFn = func(session.StartOpts) (string, error) { return "tmux", nil }
+
+	_, _ = f.Agents.Heartbeat(agents.HeartbeatParams{Device: "mini", Harness: "claude", RawID: "coord-1", CWD: tmp, Name: new("coord"), ExplicitName: true})
+	_, _ = f.Agents.Heartbeat(agents.HeartbeatParams{Device: "mini", Harness: "codex", RawID: "wrk-1", CWD: tmp, Name: new("wrk"), ExplicitName: true, State: "working"})
+
+	// 1. Push watch create, ls, rm
+	rc, out, errStr := runAgentCLI("agents", "watch", "wrk", "--session", "mini:claude:coord-1", "--on", "idle,waiting", "--once", "--json")
+	if rc != 0 || !strings.Contains(out, `"target_session": "mini:codex:wrk-1"`) {
+		t.Fatalf("agents watch create failed: rc=%d out=%q err=%q", rc, out, errStr)
+	}
+	rc, out, errStr = runAgentCLI("agents", "watch", "ls", "--session", "mini:claude:coord-1", "--json")
+	if rc != 0 || !strings.Contains(out, "mini:codex:wrk-1") {
+		t.Fatalf("agents watch ls failed: rc=%d out=%q err=%q", rc, out, errStr)
+	}
+	rc, out, errStr = runAgentCLI("agents", "watch", "rm", "wrk", "--session", "mini:claude:coord-1", "--json")
+	if rc != 0 || !strings.Contains(out, `"removed": 1`) {
+		t.Fatalf("agents watch rm failed: rc=%d out=%q err=%q", rc, out, errStr)
+	}
+
+	// 2. Blocking watch --wait
+	go func() {
+		time.Sleep(40 * time.Millisecond)
+		_, _ = f.Agents.Heartbeat(agents.HeartbeatParams{
+			Device: "mini", Harness: "codex", RawID: "wrk-1", CWD: tmp, State: "idle",
+			Tail: []agents.TailItem{{Role: "assistant", Text: "Build succeeded"}},
+		})
+	}()
+	rc, out, errStr = runAgentCLI("agents", "watch", "wrk", "--wait", "--timeout", "3", "--json")
+	if rc != 0 || !strings.Contains(out, `"matched": true`) || !strings.Contains(out, "Build succeeded") {
+		t.Fatalf("agents watch --wait failed: rc=%d out=%q err=%q", rc, out, errStr)
+	}
+
+	// 3. Spawn --watch registers pending watch for caller session
+	repoDir := filepath.Join(tmp, "repo-w")
+	_ = os.MkdirAll(repoDir, 0o755)
+	rc, out, errStr = runAgentCLI("agents", "spawn", "--harness", "codex", "--name", "sub-task", "--repo", repoDir, "--prompt", "run", "--watch", "--session", "mini:claude:coord-1", "--json")
+	if rc != 0 || !strings.Contains(out, `"target_name": "sub-task"`) {
+		t.Fatalf("agents spawn --watch failed: rc=%d out=%q err=%q", rc, out, errStr)
+	}
+}

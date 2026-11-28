@@ -134,6 +134,11 @@ func (e *Engine) buildToolSpecs(ctx context.Context) []ToolSpec {
 		makeToolSpec("fleet_kill_agent", "Terminate a Fleet coding agent session (approval-gated).", schemaObj(map[string]any{
 			"session_id": strProp("Session ID or target session"),
 		}, "session_id")),
+		makeToolSpec("fleet_watch_agent", "Watch any Fleet agent session so this channel is automatically woken up when it finishes (idle), requires permission/input, or exits. Set stop=true to stop watching.", schemaObj(map[string]any{
+			"agent_id": strProp("Session name, device/name, title, or session_id"),
+			"note":     strProp("Optional context or follow-up reminder when woken up"),
+			"stop":     boolProp("Set true to stop watching this session"),
+		}, "agent_id")),
 		makeToolSpec("fleet_memory_search", "Search shared cross-device Fleet memories.", schemaObj(map[string]any{
 			"query": strProp("Search keywords"), "scope": strProp("global, repo:<name>, device:<name>, or all"),
 			"kind": strProp("preference|feedback|project|reference"), "tier": strProp("always|searchable"), "limit": intProp("Max results"),
@@ -475,6 +480,8 @@ func (e *Engine) dispatchFleetTool(ctx context.Context, name string, args map[st
 			}
 		}
 		return e.deps.KillAgent(ctx, sid)
+	case "fleet_watch_agent":
+		return e.execFleetWatchTool(args, tctx)
 	case "fleet_memory_search":
 		return e.deps.MemorySearch(strArg(args, "query"), cmp.Or(strArg(args, "scope"), "all"), strArg(args, "kind"), strArg(args, "tier"), intArg(args, "limit", 20))
 	case "fleet_memory_get":
@@ -1017,6 +1024,56 @@ func (e *Engine) execFleetSpawnTool(ctx context.Context, args map[string]any, ra
 		out["hint"] = "Lighthouse worker is currently offline; run `fleet assistant worker-install` on the lighthouse so queued host tasks execute."
 	}
 	return out, nil
+}
+
+func (e *Engine) execFleetWatchTool(args map[string]any, tctx *toolExecContext) (any, error) {
+	agentID := strArg(args, "agent_id")
+	if agentID == "" {
+		return nil, newErr("agent_id is required", http.StatusBadRequest)
+	}
+	if boolArg(args, "stop") {
+		n, err := e.store.CancelDelegation(tctx.ChannelID, agentID)
+		if err != nil {
+			return nil, err
+		}
+		e.refreshDelegationsFlag()
+		return map[string]any{"status": "unwatched", "removed": n}, nil
+	}
+	raw, err := e.deps.InspectAgent(agentID)
+	if err != nil {
+		return nil, err
+	}
+	var insp struct {
+		SessionID string `json:"session_id"`
+		Device    string `json:"device"`
+		Harness   string `json:"harness"`
+		Name      string `json:"name"`
+		State     string `json:"state"`
+		CWD       string `json:"cwd"`
+	}
+	if b, mErr := json.Marshal(raw); mErr == nil {
+		_ = json.Unmarshal(b, &insp)
+	}
+	sessName := cmp.Or(insp.Name, agentID)
+	if existing, fErr := e.store.FindActiveDelegation(tctx.ChannelID, insp.SessionID, insp.Device, sessName); fErr == nil && existing != nil {
+		return map[string]any{"status": "watching", "already_watching": true, "delegation": existing}, nil
+	}
+	del, err := e.store.CreateDelegation(Delegation{
+		ChannelID:    tctx.ChannelID,
+		TargetDevice: insp.Device,
+		Harness:      insp.Harness,
+		SessionName:  sessName,
+		SessionID:    insp.SessionID,
+		RepoPath:     insp.CWD,
+		Prompt:       strArg(args, "note"),
+		Status:       cmp.Or(insp.State, "working"),
+	})
+	if err != nil {
+		return nil, err
+	}
+	e.refreshDelegationsFlag()
+	e.publishEvent(StreamEvent{Type: "delegation", ChannelID: tctx.ChannelID, Data: del})
+	return map[string]any{"status": "watching", "delegation": del}, nil
 }
 
 func strSliceArg(m map[string]any, key string) []string {

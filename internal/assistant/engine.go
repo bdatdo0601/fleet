@@ -1437,7 +1437,7 @@ func shouldNotifyDelegationState(prevStatus, state string) bool {
 }
 
 // OnAgentHeartbeat checks active delegations and wakes the assistant when a delegated agent blocks, idles, or exits.
-func (e *Engine) OnAgentHeartbeat(device, harness, sessionID, name, state, summary, gitStatus string, pendingAction map[string]string) {
+func (e *Engine) OnAgentHeartbeat(device, harness, sessionID, name, state, summary, gitStatus, lastAssistant string, pendingAction map[string]string) {
 	if e == nil {
 		return
 	}
@@ -1469,11 +1469,11 @@ func (e *Engine) OnAgentHeartbeat(device, harness, sessionID, name, state, summa
 		if d.LastNotifiedState == state {
 			continue
 		}
-		e.notifyDelegationStateChange(d, device, harness, sessionID, name, state, summary, gitStatus, pendingAction)
+		e.notifyDelegationStateChange(d, device, harness, sessionID, name, state, summary, gitStatus, lastAssistant, pendingAction)
 	}
 }
 
-func (e *Engine) notifyDelegationStateChange(d Delegation, device, harness, sessionID, name, state, summary, gitStatus string, pendingAction map[string]string) {
+func (e *Engine) notifyDelegationStateChange(d Delegation, device, harness, sessionID, name, state, summary, gitStatus, lastAssistant string, pendingAction map[string]string) {
 	_ = e.store.UpdateDelegationState(d.ID, sessionID, state, state)
 	if state == "exited" {
 		e.refreshDelegationsFlag()
@@ -1486,6 +1486,9 @@ func (e *Engine) notifyDelegationStateChange(d Delegation, device, harness, sess
 		if rawPA, mErr := json.Marshal(pendingAction); mErr == nil {
 			details = append(details, "Pending action: "+string(rawPA))
 		}
+	}
+	if lastAssistant != "" {
+		details = append(details, "Last response: "+truncateText(lastAssistant, 600))
 	}
 	if gitStatus != "" {
 		details = append(details, "Git status: "+truncateText(gitStatus, 250))
@@ -1581,7 +1584,7 @@ func (e *Engine) reconcileOneDelegation(now time.Time, d Delegation, snaps []age
 			d.Status != effState ||
 			(shouldNotifyDelegationState(d.Status, effState) && d.LastNotifiedState != effState)
 		if effState != "" && needsSync {
-			e.OnAgentHeartbeat(s.Device, s.Harness, s.SessionID, s.Name, effState, s.Summary, s.GitStatus, s.PendingAction)
+			e.OnAgentHeartbeat(s.Device, s.Harness, s.SessionID, s.Name, effState, s.Summary, s.GitStatus, "", s.PendingAction)
 		}
 		return
 	}

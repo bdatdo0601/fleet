@@ -427,17 +427,6 @@ func registerAgentRoutes(
 		if err != nil {
 			return err
 		}
-		if fleet.Assistant != nil {
-			summary := ""
-			if req.Summary != nil {
-				summary = *req.Summary
-			}
-			gitSt := ""
-			if req.GitStatus != nil {
-				gitSt = *req.GitStatus
-			}
-			fleet.Assistant.OnAgentHeartbeat(c.Name, req.Harness, res.SessionID, res.Name, req.State, summary, gitSt, req.PendingAction)
-		}
 		if req.IncludeMemory && fleet.Memory != nil {
 			if ctxRes, mErr := fleet.Memory.RenderContext(cmp.Or(req.MemoryRepo, req.Repo), c.Name); mErr == nil {
 				res.MemoryContext = ctxRes.Rendered
@@ -462,24 +451,14 @@ func handleAgentDeregister(fleet *core.Fleet) func(http.ResponseWriter, *http.Re
 			return err
 		}
 		if core.IsAdmin(c) && req.SessionID != nil && *req.SessionID != "" && !strings.HasPrefix(*req.SessionID, c.Name+":") {
-			exited, err := fleet.Agents.DeregisterAnyWithInfo(*req.SessionID)
-			if err != nil {
+			if _, err := fleet.Agents.DeregisterAnyWithInfo(*req.SessionID); err != nil {
 				return err
-			}
-			if fleet.Assistant != nil && exited != nil {
-				fleet.Assistant.OnAgentHeartbeat(exited.Device, exited.Harness, exited.SessionID, exited.Name, "exited", exited.Summary, exited.GitStatus, nil)
 			}
 			writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 			return nil
 		}
-		exitedList, err := fleet.Agents.DeregisterWithInfo(c.Name, req.SessionID, req.Harness, req.PID)
-		if err != nil {
+		if _, err := fleet.Agents.DeregisterWithInfo(c.Name, req.SessionID, req.Harness, req.PID); err != nil {
 			return err
-		}
-		if fleet.Assistant != nil {
-			for _, ex := range exitedList {
-				fleet.Assistant.OnAgentHeartbeat(ex.Device, ex.Harness, ex.SessionID, ex.Name, "exited", ex.Summary, ex.GitStatus, nil)
-			}
 		}
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return nil
@@ -571,6 +550,7 @@ func registerAgentMessageRoutes(
 	mux.HandleFunc("POST /v1/agents/rename", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
 		return handleAgentRename(w, r, fleet, c)
 	}))
+	registerAgentWatchRoutes(mux, fleet, route)
 	mux.HandleFunc("GET /v1/usage", route(false, func(w http.ResponseWriter, _ *http.Request, _ *registry.Device) error {
 		list, err := fleet.Agents.ListUsage()
 		if err != nil {
@@ -581,6 +561,41 @@ func registerAgentMessageRoutes(
 	}))
 	mux.HandleFunc("POST /v1/usage", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
 		return handleUsagePost(w, r, fleet, c)
+	}))
+}
+
+func registerAgentWatchRoutes(
+	mux *http.ServeMux,
+	fleet *core.Fleet,
+	route func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc,
+) {
+	mux.HandleFunc("GET /v1/agents/watches", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
+		q := r.URL.Query()
+		watcherDev := ""
+		if !core.IsAdmin(c) {
+			watcherDev = c.Name
+		}
+		list, err := fleet.Agents.ListWatches(watcherDev, q.Get("watcher"), q.Get("target"))
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"watches": list})
+		return nil
+	}))
+	mux.HandleFunc("POST /v1/agents/watch", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
+		return handleAgentWatchCreate(w, r, fleet, c.Name)
+	}))
+	mux.HandleFunc("DELETE /v1/agents/watch", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
+		q := r.URL.Query()
+		removed, err := fleet.Agents.DeleteWatch(c.Name, core.IsAdmin(c), q.Get("id"), q.Get("session_id"), q.Get("target"))
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "removed": removed})
+		return nil
+	}))
+	mux.HandleFunc("POST /v1/agents/watch-wait", route(false, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		return handleAgentWatchWait(w, r, fleet)
 	}))
 }
 
@@ -741,6 +756,65 @@ func handleAgentWaitHarness(w http.ResponseWriter, r *http.Request, fleet *core.
 		Limit:         optInt(req.Limit, 50),
 		RequireFullID: req.RequireFullID,
 		ExcludeIDs:    req.ExcludeIDs,
+	})
+	if err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, res)
+	return nil
+}
+
+func handleAgentWatchCreate(w http.ResponseWriter, r *http.Request, fleet *core.Fleet, dev string) error {
+	req, watcherSID, err := decodeCaller[struct {
+		callerReq
+		Target       string   `json:"target"`
+		TargetDevice string   `json:"target_device"`
+		TargetName   string   `json:"target_name"`
+		Events       []string `json:"events"`
+		Once         bool     `json:"once"`
+		AllowPending bool     `json:"allow_pending"`
+	}](r, fleet, dev)
+	if err != nil {
+		return err
+	}
+	watch, err := fleet.Agents.CreateWatch(agents.CreateWatchParams{
+		WatcherDevice:  dev,
+		WatcherSession: watcherSID,
+		Target:         req.Target,
+		TargetDevice:   req.TargetDevice,
+		TargetName:     req.TargetName,
+		Events:         req.Events,
+		Once:           req.Once,
+		AllowPending:   req.AllowPending,
+	})
+	if err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"watch": watch})
+	return nil
+}
+
+func handleAgentWatchWait(w http.ResponseWriter, r *http.Request, fleet *core.Fleet) error {
+	var req struct {
+		Target         string   `json:"target"`
+		TargetDevice   string   `json:"target_device"`
+		TargetName     string   `json:"target_name"`
+		Events         []string `json:"events"`
+		Timeout        *float64 `json:"timeout"`
+		IncludeCurrent bool     `json:"include_current"`
+		AllowPending   bool     `json:"allow_pending"`
+	}
+	if err := readJSONBody(r, &req); err != nil {
+		return err
+	}
+	res, err := fleet.Agents.WaitForSessionEvent(r.Context(), agents.WatchWaitParams{
+		Target:         req.Target,
+		TargetDevice:   req.TargetDevice,
+		TargetName:     req.TargetName,
+		Events:         req.Events,
+		Timeout:        optFloat(req.Timeout, 55.0),
+		IncludeCurrent: req.IncludeCurrent,
+		AllowPending:   req.AllowPending,
 	})
 	if err != nil {
 		return err
