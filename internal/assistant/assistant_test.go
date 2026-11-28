@@ -23,6 +23,11 @@ type fakeDeps struct {
 	sentSlack []string
 	spawned   []SpawnAgentRequest
 	killed    []string
+	lhWorker  LighthouseWorkerStatus
+}
+
+func (f *fakeDeps) LighthouseWorkerStatus() LighthouseWorkerStatus {
+	return f.lhWorker
 }
 
 func (f *fakeDeps) ListAgents(_, _, _, _ string, _ bool) (any, error) {
@@ -234,8 +239,23 @@ func TestVaultSafetySkillsAndSearch(t *testing.T) {
 		t.Fatalf("unexpected parsed frontmatter: %+v", sk)
 	}
 	skills, err := v.ListSkills()
-	if err != nil || len(skills) != 1 {
-		t.Fatalf("expected 1 skill, got %d (%v)", len(skills), err)
+	if err != nil || len(skills) != 2 {
+		t.Fatalf("expected 2 skills (scaffolded + morning-briefing), got %d (%v)", len(skills), err)
+	}
+	lhSkill, err := v.GetSkill("lighthouse-self-config")
+	if err != nil || !strings.Contains(lhSkill.Content, "fleet_spawn_agent") {
+		t.Fatalf("expected scaffolded lighthouse-self-config skill, got %+v (%v)", lhSkill, err)
+	}
+	// User edits to scaffolded skills must be preserved across EnsureScaffold.
+	customSkill := lhSkill.Content + "\n- Custom note\n"
+	if _, err := v.SaveSkill("lighthouse-self-config", customSkill); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.EnsureScaffold(); err != nil {
+		t.Fatal(err)
+	}
+	if after, err := v.GetSkill("lighthouse-self-config"); err != nil || !strings.Contains(after.Content, "Custom note") {
+		t.Fatalf("expected user edits to lighthouse-self-config preserved, got %+v (%v)", after, err)
 	}
 	hits, err := v.Search("calendar", 10)
 	if err != nil || len(hits) == 0 {
@@ -1828,5 +1848,106 @@ func TestAutoApproveBypassAndSlashDirectives(t *testing.T) {
 	apr := waitApproval()
 	if apr.ToolName != FrontierEscalationTool {
 		t.Fatalf("expected frontier_escalation approval after one-shot turn, got %+v", apr)
+	}
+}
+
+func TestLighthouseSpawnGuardrailsPromptAndDoctor(t *testing.T) {
+	tmp := t.TempDir()
+	deps := &fakeDeps{lhWorker: LighthouseWorkerStatus{Device: "mini", WorkerOnline: true}}
+	eng, err := Open(filepath.Join(tmp, "assistant.db"), filepath.Join(tmp, "assistant.json"), filepath.Join(tmp, "vault"), deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = eng.Close() }()
+
+	cfg := DefaultConfig()
+	cfg.AutoApprove = true
+	lhArgs := `{"harness":"claude","device":"mini","prompt":"install uv"}`
+
+	// 1. AutoApprove / BypassHITL must NOT bypass HITL for lighthouse spawns.
+	chatCtx := &toolExecContext{ChannelID: "general", Source: "chat", Config: cfg, BypassHITL: true}
+	_, chatErr := eng.executeTool(t.Context(), ToolCall{ID: "lh-1", Type: "function", Function: ToolCallFunction{Name: "fleet_spawn_agent", Arguments: lhArgs}}, chatCtx)
+	aprErr, isApr := errors.AsType[*approvalRequiredError](chatErr)
+	if !isApr || aprErr.RiskLevel != "lighthouse_spawn" {
+		t.Fatalf("expected mandatory lighthouse_spawn approvalRequiredError, got %v", chatErr)
+	}
+
+	// 2. Non-interactive timer/heartbeat runs are forbidden from spawning on the lighthouse.
+	timerCtx := &toolExecContext{ChannelID: "briefing", Source: "timer", Config: cfg, BypassHITL: true}
+	_, timerErr := eng.executeTool(t.Context(), ToolCall{ID: "lh-2", Type: "function", Function: ToolCallFunction{Name: "fleet_spawn_agent", Arguments: lhArgs}}, timerCtx)
+	if ae, ok := errors.AsType[*AssistantError](timerErr); !ok || ae.HTTPStatus() != http.StatusForbidden {
+		t.Fatalf("expected 403 for timer lighthouse spawn, got %v", timerErr)
+	}
+
+	// 3. Explicit approval executes and defaults empty repo_path to "~".
+	aprCtx := &toolExecContext{ChannelID: "general", Source: "approval", Config: cfg, BypassHITL: true}
+	out, err := eng.executeTool(t.Context(), ToolCall{ID: "lh-3", Type: "function", Function: ToolCallFunction{Name: "fleet_spawn_agent", Arguments: lhArgs}}, aprCtx)
+	if err != nil {
+		t.Fatalf("approved lighthouse spawn failed: %v", err)
+	}
+	if len(deps.spawned) != 1 || deps.spawned[0].RepoPath != "~" {
+		t.Fatalf("expected repo_path defaulted to ~, got %+v", deps.spawned)
+	}
+	if strings.Contains(out, `"hint"`) {
+		t.Fatalf("did not expect offline hint when WorkerOnline=true: %s", out)
+	}
+
+	// 4. Prompt includes both lighthouse-self-config skill and Lighthouse Host Worker online/offline guidance.
+	ch, _ := eng.Store().GetChannel("general")
+	msgsOnline := eng.buildPromptMessages(t.Context(), *ch, nil, DefaultAliases())
+	sysOnline := fmt.Sprint(msgsOnline[0].Content)
+	if !strings.Contains(sysOnline, "lighthouse-self-config") || !strings.Contains(sysOnline, "Lighthouse Host Worker (mini, online)") {
+		t.Fatalf("expected lighthouse skill and online worker section in prompt, got: %s", sysOnline)
+	}
+
+	deps.lhWorker.WorkerOnline = false
+	msgsOffline := eng.buildPromptMessages(t.Context(), *ch, nil, DefaultAliases())
+	sysOffline := fmt.Sprint(msgsOffline[0].Content)
+	if !strings.Contains(sysOffline, "Lighthouse Host Worker (mini, offline)") || !strings.Contains(sysOffline, "worker-install") {
+		t.Fatalf("expected offline worker guidance in prompt, got: %s", sysOffline)
+	}
+
+	// 5. Doctor lighthouse_worker check across all 4 states.
+	deps.lhWorker = LighthouseWorkerStatus{Device: "mini", WorkerOnline: true, LastPollAt: "2026-11-28T08:00:00Z"}
+	if dc := eng.checkLighthouseWorkerDoctor(t.Context()); dc.Status != "ok" {
+		t.Fatalf("expected ok, got %+v", dc)
+	}
+	deps.lhWorker.InDefaultDevices = true
+	if dc := eng.checkLighthouseWorkerDoctor(t.Context()); dc.Status != "warn" || !strings.Contains(dc.Detail, "default_devices") {
+		t.Fatalf("expected warn for default_devices, got %+v", dc)
+	}
+	deps.lhWorker = LighthouseWorkerStatus{Device: "mini", WorkerOnline: false, LastPollAt: "2026-11-28T08:00:00Z"}
+	if dc := eng.checkLighthouseWorkerDoctor(t.Context()); dc.Status != "warn" || !strings.Contains(dc.Detail, "offline") {
+		t.Fatalf("expected warn for offline worker with last_poll_at, got %+v", dc)
+	}
+	deps.lhWorker = LighthouseWorkerStatus{Device: "mini"}
+	if dc := eng.checkLighthouseWorkerDoctor(t.Context()); dc.Status != "skip" {
+		t.Fatalf("expected skip when never enabled, got %+v", dc)
+	}
+}
+
+func TestMCPHostPathAndResolveCommand(t *testing.T) {
+	home := t.TempDir()
+	localBin := filepath.Join(home, ".local", "bin")
+	if err := os.MkdirAll(localBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	uvxPath := filepath.Join(localBin, "uvx")
+	if err := os.WriteFile(uvxPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pathEnv := mcpHostPathEnv("", home)
+	if !strings.Contains(pathEnv, localBin) {
+		t.Fatalf("expected %s in mcpHostPathEnv, got %q", localBin, pathEnv)
+	}
+	if got := resolveMCPCommand("uvx", pathEnv); got != uvxPath {
+		t.Fatalf("expected %q, got %q", uvxPath, got)
+	}
+	if got := resolveMCPCommand("/custom/bin/uvx", pathEnv); got != "/custom/bin/uvx" {
+		t.Fatalf("expected explicit path preserved, got %q", got)
+	}
+	env := setEnvVar([]string{"FOO=1", "PATH=/bin"}, "PATH", pathEnv)
+	if !slices.Contains(env, "PATH="+pathEnv) || !slices.Contains(env, "FOO=1") {
+		t.Fatalf("unexpected setEnvVar result: %+v", env)
 	}
 }

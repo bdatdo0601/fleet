@@ -345,6 +345,7 @@ func BuildDaemonPlist(opts DaemonOpts) (string, error) {
 	if opts.User != "" {
 		if h := paths.HomeForUser(opts.User); h != "" {
 			env["HOME"] = h
+			env["PATH"] = paths.MergePathEnv(filepath.Join(h, ".local", "bin"), StandardPathEnv)
 		} else {
 			return "", fmt.Errorf("lookup home for user %q failed", opts.User)
 		}

@@ -133,6 +133,11 @@ func (f *Fleet) SpawnAgent(ctx context.Context, caller *registry.Device, req Spa
 		RepoPath:  strings.TrimSpace(req.RepoPath),
 		UseTmux:   req.UseTmux,
 	}
+	if len(devs) == 1 {
+		if lh, lErr := f.Registry.Lighthouse(); lErr == nil && lh != nil && devs[0] == lh.Name && ch.RepoPath == "" && strings.TrimSpace(cfg.Devices[lh.Name].WorkspaceDir) == "" {
+			ch.RepoPath = "~"
+		}
+	}
 	loadFn := func(context.Context) (map[string]int, error) {
 		counts := map[string]int{}
 		if f.Agents != nil {
@@ -182,7 +187,7 @@ func (f *Fleet) SpawnAgent(ctx context.Context, caller *registry.Device, req Spa
 	}
 	if inserted {
 		_ = f.Slacker.SetLastDevice(scope, targetDevice)
-		if f.Agents != nil && resolvedRepo != "" {
+		if f.Agents != nil && resolvedRepo != "" && resolvedRepo != "~" {
 			_ = f.Agents.RecordPath(targetDevice, resolvedRepo, agents.RepoNameFromPath(resolvedRepo), "spawn", true)
 		}
 	}

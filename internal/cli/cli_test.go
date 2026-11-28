@@ -256,3 +256,18 @@ func TestCLIAssistantAutoApproveFlags(t *testing.T) {
 		t.Fatalf("expected queued inbox payload with auto_approve=true, got %+v (err=%v)", ev, err)
 	}
 }
+
+func TestCLIAssistantWorkerCommands(t *testing.T) {
+	var out, errBuf bytes.Buffer
+	rc := Run([]string{"assistant", "--help"}, &IO{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errBuf})
+	if rc != 0 || !strings.Contains(out.String(), "worker-install") || !strings.Contains(out.String(), "worker-uninstall") {
+		t.Fatalf("expected worker-install and worker-uninstall in assistant help, got rc=%d out=%q err=%q", rc, out.String(), errBuf.String())
+	}
+
+	out.Reset()
+	errBuf.Reset()
+	rc = Run([]string{"assistant", "worker-install", "--policy", "bogus"}, &IO{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errBuf})
+	if rc == 0 || !strings.Contains(errBuf.String(), "invalid policy") {
+		t.Fatalf("expected invalid policy error on worker-install, got rc=%d out=%q err=%q", rc, out.String(), errBuf.String())
+	}
+}

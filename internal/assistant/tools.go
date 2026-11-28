@@ -36,6 +36,14 @@ type SpawnAgentResult struct {
 	WorkerOnline bool   `json:"worker_online"`
 }
 
+// LighthouseWorkerStatus reports whether the lighthouse's own local Fleet worker is online.
+type LighthouseWorkerStatus struct {
+	Device           string `json:"device"`
+	WorkerOnline     bool   `json:"worker_online"`
+	LastPollAt       string `json:"last_poll_at,omitempty"`
+	InDefaultDevices bool   `json:"in_default_devices,omitempty"`
+}
+
 // FleetDeps abstracts Fleet subsystem access so assistant does not import core/slacker/agents directly.
 type FleetDeps interface {
 	ListAgents(device, repo, harness, state string, includeStale bool) (any, error)
@@ -44,6 +52,7 @@ type FleetDeps interface {
 	ListPaths(device, query string, limit int) (any, error)
 	SpawnAgent(ctx context.Context, req SpawnAgentRequest) (SpawnAgentResult, error)
 	KillAgent(ctx context.Context, sessionID string) (any, error)
+	LighthouseWorkerStatus() LighthouseWorkerStatus
 	MemorySearch(query, scope, kind, tier string, limit int) (any, error)
 	MemoryGet(scope, key string) (any, error)
 	MemorySet(scope, key, kind, tier, summary, body string) (any, error)
@@ -114,7 +123,7 @@ func (e *Engine) buildToolSpecs(ctx context.Context) []ToolSpec {
 		makeToolSpec("fleet_list_paths", "List known project directories and repositories tracked across Fleet Macs.", schemaObj(map[string]any{
 			"device": strProp("Optional device filter"), "query": strProp("Optional path/repo substring"), "limit": intProp("Max results"),
 		})),
-		makeToolSpec("fleet_spawn_agent", "Spawn a Claude, Codex, or Antigravity coding session on an awake Mac and watch for blockers/completion (approval-gated).", schemaObj(map[string]any{
+		makeToolSpec("fleet_spawn_agent", "Spawn a Claude, Codex, or Antigravity coding session on an awake Mac and watch for blockers/completion (approval-gated). Can also target the lighthouse device when its host worker is online to self-configure lighthouse dependencies/services (always requires explicit approval; see lighthouse-self-config skill).", schemaObj(map[string]any{
 			"harness": strProp("claude | codex | agy"), "device": strProp("Optional target Mac (e.g. laptop, office)"),
 			"repo_path": strProp("Repo path, ~/path, or workspace subpath"), "prompt": strProp("Task prompt for the spawned coding agent"),
 			"name": strProp("Optional friendly session name"), "model": strProp("Optional model"),
@@ -700,7 +709,27 @@ func (e *Engine) execFleetSpawnTool(ctx context.Context, args map[string]any, ra
 		Policy:   strArg(args, "policy"),
 		UseTmux:  boolArg(args, "use_tmux"),
 	}
-	if !tctx.BypassHITL {
+	lh := e.deps.LighthouseWorkerStatus()
+	isLighthouse := lh.Device != "" && strings.EqualFold(req.Device, lh.Device)
+	if isLighthouse {
+		if tctx.Source != "chat" && tctx.Source != "approval" {
+			return nil, newErr("spawning a worker on the lighthouse is only allowed during direct user chat", http.StatusForbidden)
+		}
+		req.RepoPath = cmp.Or(req.RepoPath, "~")
+		// Lighthouse host spawns always require explicit HITL approval (cannot be bypassed by auto_approve).
+		if tctx.Source != "approval" {
+			summary := fmt.Sprintf("Spawn %s worker on lighthouse %s (%s)", cmp.Or(req.Harness, "agent"), lh.Device, req.RepoPath)
+			if p := truncateText(req.Prompt, 100); p != "" {
+				summary += ": " + p
+			}
+			return nil, &approvalRequiredError{
+				ToolName:  "fleet_spawn_agent",
+				Summary:   summary,
+				RiskLevel: "lighthouse_spawn",
+				ArgsJSON:  cmp.Or(rawArgs, "{}"),
+			}
+		}
+	} else if !tctx.BypassHITL {
 		target := cmp.Or(req.Device, "auto")
 		return nil, &approvalRequiredError{
 			ToolName:  "fleet_spawn_agent",
@@ -727,7 +756,11 @@ func (e *Engine) execFleetSpawnTool(ctx context.Context, args map[string]any, ra
 		e.refreshDelegationsFlag()
 		e.publishEvent(StreamEvent{Type: "delegation", ChannelID: tctx.ChannelID, Data: del})
 	}
-	return map[string]any{"spawn": res, "delegation": del}, nil
+	out := map[string]any{"spawn": res, "delegation": del}
+	if isLighthouse && !res.WorkerOnline {
+		out["hint"] = "Lighthouse worker is currently offline; run `fleet assistant worker-install` on the lighthouse so queued host tasks execute."
+	}
+	return out, nil
 }
 
 func strSliceArg(m map[string]any, key string) []string {

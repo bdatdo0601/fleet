@@ -31,12 +31,13 @@ type DoctorReport struct {
 
 // DoctorProbes allows tests to override local OS/binary checks.
 type DoctorProbes struct {
-	FindOB       func() string
-	OBRunning    func() bool
-	OBRunningFor func(name, vaultPath string) bool
-	CheckOP      func(context.Context, string) (string, bool, string, error)
-	ListVaults   func(context.Context, string) ([]OPVaultMeta, error)
-	SandboxProbe func(context.Context, SandboxConfig) DoctorCheck
+	FindOB                func() string
+	OBRunning             func() bool
+	OBRunningFor          func(name, vaultPath string) bool
+	CheckOP               func(context.Context, string) (string, bool, string, error)
+	ListVaults            func(context.Context, string) ([]OPVaultMeta, error)
+	SandboxProbe          func(context.Context, SandboxConfig) DoctorCheck
+	LighthouseWorkerProbe func(context.Context) DoctorCheck
 }
 
 // FindOBBinary locates `ob` (obsidian-headless) across PATH, Homebrew, npm/nvm/fnm/volta/mise/pnpm, and login shell PATH.
@@ -117,6 +118,7 @@ func (e *Engine) Doctor(ctx context.Context) DoctorReport {
 	checks = append(checks, e.checkNotificationsDoctor(ctx, cfg))
 	checks = append(checks, e.checkDiscordBotDoctor(ctx, cfg))
 	checks = append(checks, e.checkSandboxDoctor(ctx, cfg))
+	checks = append(checks, e.checkLighthouseWorkerDoctor(ctx))
 
 	ok := true
 	for _, c := range checks {
@@ -597,5 +599,47 @@ func (e *Engine) checkSandboxDoctor(ctx context.Context, cfg Config) DoctorCheck
 		Name:   "sandbox",
 		Status: "ok",
 		Detail: fmt.Sprintf("Apple container ready (%s, net=%s, %d CPU, %d MB)", sb.Image, sb.Network, sb.CPUs, sb.MemoryMB),
+	}
+}
+
+func (e *Engine) checkLighthouseWorkerDoctor(ctx context.Context) DoctorCheck {
+	if e.Probes.LighthouseWorkerProbe != nil {
+		return e.Probes.LighthouseWorkerProbe(ctx)
+	}
+	if e.deps == nil {
+		return DoctorCheck{Name: "lighthouse_worker", Status: "skip", Detail: "Fleet dependencies unavailable"}
+	}
+	st := e.deps.LighthouseWorkerStatus()
+	if st.Device == "" {
+		return DoctorCheck{Name: "lighthouse_worker", Status: "skip", Detail: "Lighthouse device not configured"}
+	}
+	if st.WorkerOnline {
+		if st.InDefaultDevices {
+			return DoctorCheck{
+				Name:   "lighthouse_worker",
+				Status: "warn",
+				Detail: fmt.Sprintf("%s worker online, but listed in slacker default_devices", st.Device),
+				Hint:   fmt.Sprintf("Remove %q from slacker default_devices unless normal coding spawns should route to the lighthouse", st.Device),
+			}
+		}
+		return DoctorCheck{
+			Name:   "lighthouse_worker",
+			Status: "ok",
+			Detail: fmt.Sprintf("%s worker online (last_poll=%s, isolated from default_devices)", st.Device, cmp.Or(st.LastPollAt, "just now")),
+		}
+	}
+	if st.LastPollAt != "" {
+		return DoctorCheck{
+			Name:   "lighthouse_worker",
+			Status: "warn",
+			Detail: fmt.Sprintf("%s worker offline (last_poll=%s)", st.Device, st.LastPollAt),
+			Hint:   "Check ~/.fleet/slacker/worker.log or run `fleet assistant worker-install` on the lighthouse",
+		}
+	}
+	return DoctorCheck{
+		Name:   "lighthouse_worker",
+		Status: "skip",
+		Detail: fmt.Sprintf("%s host worker not enabled", st.Device),
+		Hint:   "Run `fleet assistant worker-install` on the lighthouse (with Rex or tmux + claude/codex) to enable approval-gated host self-configuration",
 	}
 }

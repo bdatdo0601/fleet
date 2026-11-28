@@ -173,6 +173,38 @@ _Condensed durable personal context and active projects._
 		"_agent/memory/OBSERVATIONS.md": `# Observations
 _Append-only dated observation log maintained by the background Observer._
 `,
+		"_skills/lighthouse-self-config/SKILL.md": `---
+name: lighthouse-self-config
+description: Self-configure the Fleet lighthouse host (install CLIs/runtimes like uv or brew packages, troubleshoot stdio MCP servers, inspect local services/logs) by delegating to the lighthouse Fleet worker.
+approval: required
+tags: [lighthouse, ops, self-config]
+---
+# Lighthouse Host Self-Configuration
+
+Use the lighthouse's local Fleet worker (` + "`slacker-worker`" + ` running in ` + "`gui/<uid>`" + `) to configure or troubleshoot the machine ` + "`fleet serve`" + ` runs on.
+
+## When to Use (and When Not To)
+- **Use ` + "`fleet_spawn_agent`" + ` targeting the lighthouse device** (shown in the ` + "`Lighthouse Host Worker`" + ` system section, e.g. ` + "`mini`" + `) with ` + "`repo_path: \"~\"`" + ` and ` + "`policy: \"auto\"`" + ` (unless the user requests another policy) when:
+  - Installing missing host CLI dependencies or MCP runtimes (` + "`uv`" + `/` + "`uvx`" + `, ` + "`node`" + `/` + "`npx`" + `, ` + "`brew`" + ` formulae, etc.).
+  - Diagnosing failing stdio MCP server commands or verifying local runtime versions.
+  - Inspecting lighthouse launchd services or logs (` + "`~/.fleet/*.log`" + `).
+- **Do NOT use this for** document/data/file tasks (use ` + "`sandbox_*`" + ` micro-VM tools) or normal software repo coding (target awake Mac workstations such as ` + "`laptop`" + ` or ` + "`office`" + `).
+
+## Pre-Flight & Offline Handling
+- Check the ` + "`Lighthouse Host Worker`" + ` section in the system prompt.
+- If the lighthouse worker is **offline**, tell the user to run ` + "`fleet assistant worker-install`" + ` on the lighthouse (supports Rex automatically or ` + "`--use-tmux`" + `).
+
+## Prompt Guidelines for the Spawned Worker
+- Prefer idempotent, non-interactive commands (` + "`brew install <pkg>`" + ` or official non-interactive installers) and ask the worker to verify with ` + "`which <bin> && <bin> --version`" + `.
+- Explicitly instruct the worker **never** to read, print, or modify secret files (` + "`~/.fleet/op-service-account.token`" + `, ` + "`~/.fleet/assistant.db`" + `, OAuth tokens) and **not** to restart ` + "`fleet serve`" + ` unless explicitly requested.
+- Keep scope minimal and ask for a concise summary of what changed.
+
+## After Completion
+- When the delegation wakes you up on completion (` + "`idle`" + `/` + "`exited`" + `), ` + "`MCPManager`" + ` automatically searches ` + "`/opt/homebrew/bin`" + `, ` + "`~/.local/bin`" + `, and common Node/Python shims — call ` + "`mcp_test`" + ` or ` + "`mcp_configure`" + ` directly to verify without restarting ` + "`fleet serve`" + `.
+
+## Approval Policy
+- Spawning a worker on the lighthouse is only allowed during direct user chat and **always** pauses for explicit user approval (never bypassed by ` + "`auto_approve`" + `).
+`,
 	}
 	for rel, content := range seeds {
 		_, full, err := v.ResolveRel(rel)
@@ -180,6 +212,9 @@ _Append-only dated observation log maintained by the background Observer._
 			return err
 		}
 		if _, statErr := os.Stat(full); errors.Is(statErr, os.ErrNotExist) {
+			if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+				return err
+			}
 			if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
 				return err
 			}

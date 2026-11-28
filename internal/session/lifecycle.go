@@ -174,6 +174,12 @@ func Start(opts StartOpts) (string, error) {
 		}
 	}
 
+	if os.Getenv("FLEET_SKIP_AUTO_TRUST") != "1" {
+		if tErr := EnsureDirectoryTrusted(spec.Name, directory); tErr != nil && opts.Stderr != nil {
+			_, _ = fmt.Fprintf(opts.Stderr, "fleet session %s: warning: could not pre-trust %s: %v\n", spec.Name, directory, tErr)
+		}
+	}
+
 	if useRex {
 		if err := startRexSession(spec, opts, directory, self, pathEnv, pol); err != nil {
 			return "", err

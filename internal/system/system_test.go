@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -74,6 +75,34 @@ func TestNebulaLabelAndPlistValidation(t *testing.T) {
 		if out, err := exec.Command("plutil", "-lint", aFile).CombinedOutput(); err != nil {
 			t.Fatalf("plutil -lint failed on agent plist: %v\n%s\n%s", err, string(out), agentPlist)
 		}
+	}
+
+	if u, err := user.Current(); err == nil && u.Username != "" && u.HomeDir != "" {
+		userDaemonPlist, err := BuildDaemonPlist(DaemonOpts{
+			Label:   paths.ServeLabel,
+			Args:    []string{"/usr/local/libexec/fleet/fleet", "serve"},
+			User:    u.Username,
+			LogPath: filepath.Join(u.HomeDir, ".fleet", "serve.log"),
+			WorkDir: filepath.Join(u.HomeDir, ".fleet"),
+		})
+		if err != nil {
+			t.Fatalf("BuildDaemonPlist with user failed: %v", err)
+		}
+		wantLocalBin := filepath.Join(u.HomeDir, ".local", "bin")
+		if !strings.Contains(userDaemonPlist, wantLocalBin) {
+			t.Fatalf("expected %s in user daemon PATH:\n%s", wantLocalBin, userDaemonPlist)
+		}
+	}
+	rootDaemonPlist, err := BuildDaemonPlist(DaemonOpts{
+		Label:   paths.EdgeLabel,
+		Args:    []string{"/usr/local/libexec/fleet/fleet", "edge"},
+		LogPath: "/var/log/fleet-edge.log",
+	})
+	if err != nil {
+		t.Fatalf("BuildDaemonPlist root failed: %v", err)
+	}
+	if !strings.Contains(rootDaemonPlist, "<string>"+StandardPathEnv+"</string>") {
+		t.Fatalf("expected StandardPathEnv when User is empty:\n%s", rootDaemonPlist)
 	}
 }
 

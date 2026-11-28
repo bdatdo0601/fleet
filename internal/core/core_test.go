@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"os"
@@ -296,5 +297,23 @@ func TestLegacyFleetDBMigrationAndNumericSort(t *testing.T) {
 	}
 	if devs[1].ClientVersion == nil || *devs[1].ClientVersion != "go/abc1234" {
 		t.Fatalf("expected client_version go/abc1234, got %+v", devs[1].ClientVersion)
+	}
+}
+
+func TestSpawnAgentLighthouseDefaultsRepoToHome(t *testing.T) {
+	f, _, _ := newTestFleet(t)
+	res, err := f.SpawnAgent(context.Background(), nil, SpawnAgentRequest{
+		Harness: "claude",
+		Device:  "mini",
+		Prompt:  "install uv",
+	})
+	if err != nil {
+		t.Fatalf("SpawnAgent on lighthouse failed: %v", err)
+	}
+	if res.Job.TargetDevice != "mini" || res.Job.RepoPath != "~" {
+		t.Fatalf("expected TargetDevice=mini RepoPath=~, got %+v", res.Job)
+	}
+	if list, err := f.Agents.ListPaths("mini", ""); err != nil || len(list) != 0 {
+		t.Fatalf("expected ~ not recorded as project repo path, got %+v (err=%v)", list, err)
 	}
 }

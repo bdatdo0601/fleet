@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"flag"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -18,6 +20,8 @@ import (
 	"github.com/bdatdo0601/fleet/internal/assistant"
 	"github.com/bdatdo0601/fleet/internal/client"
 	"github.com/bdatdo0601/fleet/internal/paths"
+	"github.com/bdatdo0601/fleet/internal/session"
+	"github.com/bdatdo0601/fleet/internal/slacker"
 	"github.com/bdatdo0601/fleet/internal/system"
 )
 
@@ -42,6 +46,8 @@ Subcommands:
   sandbox-uninstall (lighthouse) stop & remove sandbox LaunchAgent bridge
   sandbox-build   build the sandbox OCI image and offline network on lighthouse
   sandbox-reset   stop/remove a channel's sandbox micro-VM (optionally clearing /work/out)
+  worker-install  (lighthouse) install & start gui/<uid> host worker for self-configuration
+  worker-uninstall (lighthouse) stop & remove the lighthouse host worker LaunchAgent
   mcp-auth        authorize or revoke OAuth 2.0/2.1 for an HTTP MCP server (e.g. Google Workspace)
 `
 }
@@ -70,6 +76,8 @@ func cmdAssistant(args []string, cio *IO) error {
 		"sandbox-agent":     cmdAssistantSandboxAgent,
 		"sandbox-build":     cmdAssistantSandboxBuild,
 		"sandbox-reset":     cmdAssistantSandboxReset,
+		"worker-install":    cmdAssistantWorkerInstall,
+		"worker-uninstall":  cmdAssistantWorkerUninstall,
 		"mcp-auth":          cmdAssistantMCPAuth,
 	}
 	sub, rest := args[0], args[1:]
@@ -806,4 +814,157 @@ func cmdAssistantSandboxAgent(args []string, _ *IO) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return assistant.RunSandboxAgent(ctx, *sock, nil)
+}
+
+func binExistsInPathEnv(name, pathEnv string) bool {
+	for dir := range strings.SplitSeq(pathEnv, string(os.PathListSeparator)) {
+		if dir == "" {
+			continue
+		}
+		cand := filepath.Join(dir, name)
+		if fi, err := os.Stat(cand); err == nil && !fi.IsDir() && fi.Mode()&0o111 != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func detectLighthouseDeviceName(api string) string {
+	var devs struct {
+		Devices []struct {
+			Name string `json:"name"`
+			Kind string `json:"kind"`
+		} `json:"devices"`
+	}
+	if err := client.Call(api, http.MethodGet, "/v1/devices", nil, 5*time.Second, nil, &devs); err == nil {
+		for _, d := range devs.Devices {
+			if d.Kind == "lighthouse" && d.Name != "" {
+				return d.Name
+			}
+		}
+	}
+	return ""
+}
+
+func cmdAssistantWorkerInstall(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("assistant worker-install", flag.ContinueOnError)
+	useTmux := fs.Bool("use-tmux", false, "force tmux instead of Rex for spawned sessions")
+	policyFlag := fs.String("policy", "", "fallback permission policy when job policy is unset (auto|bypass|safe)")
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf("usage: fleet assistant worker-install [--use-tmux] [--policy auto|bypass|safe]")
+	}
+	var pol session.Policy
+	if strings.TrimSpace(*policyFlag) != "" {
+		pol, err = session.ParsePolicy(*policyFlag, "")
+		if err != nil {
+			return err
+		}
+	}
+	if err := requireNotRoot("assistant worker-install"); err != nil {
+		return err
+	}
+	instBin, err := ensureInstalledSelf()
+	if err != nil {
+		return err
+	}
+	workerArgs := []string{instBin, "slacker", "worker"}
+	if *useTmux {
+		workerArgs = append(workerArgs, "--use-tmux")
+	}
+	if pol != "" {
+		workerArgs = append(workerArgs, "--policy", string(pol))
+	}
+	home, _ := os.UserHomeDir()
+	if err := system.InstallUserAgent(system.AgentOpts{
+		Label:     paths.SlackerWorkerLabel,
+		Args:      workerArgs,
+		LogPath:   slackerWorkerLogPath(),
+		WorkDir:   home,
+		KeepAlive: true,
+	}); err != nil {
+		return err
+	}
+	cio.info(fmt.Sprintf("installed and started %s (logged-in user agent)", paths.SlackerWorkerLabel))
+
+	if api, aErr := client.ResolveAPI(""); aErr == nil {
+		lhName := detectLighthouseDeviceName(api)
+		var connected bool
+		var inDefault bool
+		deadline := time.Now().Add(4 * time.Second)
+		for time.Now().Before(deadline) {
+			var stRes struct {
+				Config   slacker.ConfigView      `json:"config"`
+				Runtimes []slacker.RuntimeStatus `json:"runtimes"`
+			}
+			if callErr := client.Call(api, http.MethodGet, "/v1/slacker/status", nil, 3*time.Second, nil, &stRes); callErr == nil {
+				if lhName != "" {
+					inDefault = slices.Contains(stRes.Config.DefaultDevices, lhName)
+				}
+				for _, rt := range stRes.Runtimes {
+					if (lhName != "" && rt.Role == "worker:"+lhName && rt.Connected) ||
+						(lhName == "" && strings.HasPrefix(rt.Role, "worker:") && rt.Connected) {
+						connected = true
+						break
+					}
+				}
+				if connected {
+					break
+				}
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		if connected {
+			cio.info(fmt.Sprintf("lighthouse worker online (%s)", cmp.Or(lhName, "lighthouse")))
+		} else {
+			cio.info(fmt.Sprintf("worker LaunchAgent loaded; not polling yet (check %s)", slackerWorkerLogPath()))
+		}
+		if inDefault {
+			cio.info(fmt.Sprintf("note: %s is in slacker default_devices; remove it if normal coding spawns should stay on laptops", lhName))
+		} else {
+			cio.info("isolated from slacker default_devices (only explicit lighthouse spawns run here)")
+		}
+	}
+
+	pathEnv := session.AugmentedPath(os.Getenv("PATH"), home)
+	backend := "tmux"
+	if !*useTmux && binExistsInPathEnv("rex", pathEnv) {
+		backend = "rex"
+	} else if !*useTmux && !binExistsInPathEnv("tmux", pathEnv) {
+		backend = "none (install rex or tmux)"
+	}
+	var harnesses []string
+	for _, h := range []string{"claude", "codex", "agy"} {
+		if binExistsInPathEnv(h, pathEnv) {
+			harnesses = append(harnesses, h)
+		}
+	}
+	harnessSummary := "none found in PATH"
+	if len(harnesses) > 0 {
+		harnessSummary = strings.Join(harnesses, ", ")
+	}
+	cio.info(fmt.Sprintf("readiness: backend=%s · harnesses=%s", backend, harnessSummary))
+	return nil
+}
+
+func cmdAssistantWorkerUninstall(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("assistant worker-uninstall", flag.ContinueOnError)
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf("usage: fleet assistant worker-uninstall")
+	}
+	if err := requireNotRoot("assistant worker-uninstall"); err != nil {
+		return err
+	}
+	if err := system.UninstallUserAgent(paths.SlackerWorkerLabel); err != nil {
+		return err
+	}
+	cio.info("uninstalled " + paths.SlackerWorkerLabel)
+	return nil
 }

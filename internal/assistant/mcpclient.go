@@ -12,11 +12,15 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/bdatdo0601/fleet/internal/paths"
 )
 
 const mcpMaxHTTPResponseBytes = 4 * 1024 * 1024
@@ -366,21 +370,83 @@ func (c *mcpClientConn) ensureStarted(ctx context.Context, opReader OPReaderFunc
 	return nil
 }
 
+func mcpHostPathEnv(basePath, home string) string {
+	var extra []string
+	if home != "" {
+		extra = append(extra,
+			filepath.Join(home, ".local", "bin"),
+			"/opt/homebrew/bin",
+			"/usr/local/bin",
+			filepath.Join(home, ".volta", "bin"),
+			filepath.Join(home, ".local", "share", "mise", "shims"),
+			filepath.Join(home, ".asdf", "shims"),
+			filepath.Join(home, "Library", "pnpm"),
+			filepath.Join(home, ".npm-global", "bin"),
+		)
+		for _, glob := range []string{
+			filepath.Join(home, ".nvm", "versions", "node", "*", "bin"),
+			filepath.Join(home, ".local", "share", "fnm", "node-versions", "*", "installation", "bin"),
+		} {
+			if matches, err := filepath.Glob(glob); err == nil && len(matches) > 0 {
+				sort.Strings(matches)
+				extra = append(extra, matches[len(matches)-1])
+			}
+		}
+	}
+	return paths.MergePathEnv(basePath, strings.Join(extra, string(os.PathListSeparator)), paths.StandardPathEnv)
+}
+
+func resolveMCPCommand(command, pathEnv string) string {
+	if strings.ContainsRune(command, os.PathSeparator) {
+		return command
+	}
+	for dir := range strings.SplitSeq(pathEnv, string(os.PathListSeparator)) {
+		if dir == "" {
+			continue
+		}
+		cand := filepath.Join(dir, command)
+		if fi, err := os.Stat(cand); err == nil && !fi.IsDir() && fi.Mode()&0o111 != 0 {
+			return cand
+		}
+	}
+	return command
+}
+
+func setEnvVar(env []string, key, value string) []string {
+	prefix := key + "="
+	for i, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			env[i] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
+}
+
 func (c *mcpClientConn) startStdioLocked(ctx context.Context, opReader OPReaderFunc) error {
 	if strings.TrimSpace(c.cfg.Command) == "" {
 		return errors.New("MCP command is empty")
 	}
-	cmd := exec.Command(c.cfg.Command, c.cfg.Args...)
-	env := os.Environ()
+	home, _ := os.UserHomeDir()
+	effectivePath := mcpHostPathEnv(os.Getenv("PATH"), home)
+	if customPath := strings.TrimSpace(c.cfg.Env["PATH"]); customPath != "" {
+		effectivePath = paths.MergePathEnv(customPath, effectivePath)
+	}
+	resolvedCmd := resolveMCPCommand(c.cfg.Command, effectivePath)
+	cmd := exec.Command(resolvedCmd, c.cfg.Args...)
+	env := setEnvVar(os.Environ(), "PATH", effectivePath)
 	for k, v := range c.cfg.Env {
-		env = append(env, k+"="+v)
+		if k == "PATH" {
+			continue
+		}
+		env = setEnvVar(env, k, v)
 	}
 	for k, ref := range c.cfg.EnvRefs {
 		val, err := opReader(ctx, ref)
 		if err != nil {
 			return fmt.Errorf("resolve %s for MCP %s: %w", k, c.cfg.Name, err)
 		}
-		env = append(env, k+"="+val)
+		env = setEnvVar(env, k, val)
 	}
 	cmd.Env = env
 

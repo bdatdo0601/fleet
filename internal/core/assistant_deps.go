@@ -5,7 +5,9 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/bdatdo0601/fleet/internal/assistant"
 	"github.com/bdatdo0601/fleet/internal/memory"
@@ -70,6 +72,31 @@ func (d *assistantDeps) SpawnAgent(ctx context.Context, req assistant.SpawnAgent
 
 func (d *assistantDeps) KillAgent(_ context.Context, sessionID string) (any, error) {
 	return d.fleet.KillAgent(nil, sessionID)
+}
+
+func (d *assistantDeps) LighthouseWorkerStatus() assistant.LighthouseWorkerStatus {
+	lh, err := d.fleet.Registry.Lighthouse()
+	if err != nil || lh == nil || lh.Name == "" {
+		return assistant.LighthouseWorkerStatus{}
+	}
+	st := assistant.LighthouseWorkerStatus{Device: lh.Name}
+	if d.fleet.Slacker != nil {
+		online, _ := d.fleet.Slacker.OnlineWorkers(time.Now(), slacker.WorkerOnlineWindow)
+		st.WorkerOnline = online[lh.Name]
+		if rts, rErr := d.fleet.Slacker.ListRuntimes(); rErr == nil {
+			role := "worker:" + lh.Name
+			for _, r := range rts {
+				if r.Role == role {
+					st.LastPollAt = r.LastPollAt
+					break
+				}
+			}
+		}
+	}
+	if cfg, cErr := slacker.LoadConfig(d.fleet.SlackerConfigPath); cErr == nil {
+		st.InDefaultDevices = slices.Contains(cfg.DefaultDevices, lh.Name)
+	}
+	return st
 }
 
 func (d *assistantDeps) MemorySearch(query, scope, kind, tier string, limit int) (any, error) {

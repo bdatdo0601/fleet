@@ -1438,6 +1438,9 @@ func (e *Engine) buildPromptMessages(ctx context.Context, ch Channel, tail []Mes
 	if sbSection := buildSandboxPromptSection(e.Config()); sbSection != "" {
 		sysStatic.WriteString(sbSection)
 	}
+	if lhSection := e.buildLighthouseWorkerPromptSection(); lhSection != "" {
+		sysStatic.WriteString(lhSection)
+	}
 	sysStatic.WriteString(buildGenerativeUIPromptSection())
 
 	var memPrefix strings.Builder
@@ -1555,6 +1558,26 @@ func (e *Engine) buildOPPromptSection(ctx context.Context) string {
 	}
 	b.WriteString("Use `onepassword_list_items`, `onepassword_get_item_meta`, `http_request_with_credential`, and `onepassword_store_item` to inspect item metadata/op:// references and inject credentials at runtime without ever requesting or displaying plaintext secrets.\n")
 	b.WriteString("For external or internal MCP setup, use `mcp_list`, `mcp_configure` (approval-gated; pass secrets via `op://` in `env_refs`, `header_refs`, or `oauth.client_secret_op_ref`, never plaintext; for official Google Workspace MCPs set `oauth: {\"enabled\":true,\"provider\":\"google\",\"client_id\":\"...\",\"client_secret_op_ref\":\"op://...\",\"scopes\":[...]}`), `mcp_oauth_connect` (attaches an interactive sign-in card in `#chat` whenever OAuth sign-in or re-authorization is needed), and `mcp_test`.\n")
+	return b.String()
+}
+
+func (e *Engine) buildLighthouseWorkerPromptSection() string {
+	if e.deps == nil {
+		return ""
+	}
+	lh := e.deps.LighthouseWorkerStatus()
+	if lh.Device == "" {
+		return ""
+	}
+	var b strings.Builder
+	if lh.WorkerOnline {
+		fmt.Fprintf(&b, "\n## Lighthouse Host Worker (%s, online)\n", lh.Device)
+		fmt.Fprintf(&b, "- `%s` has a local Fleet worker online for lighthouse host self-configuration (e.g. installing `uv`, `node`, `brew` packages, or troubleshooting stdio MCP servers) via `fleet_spawn_agent(device=%q, repo_path=\"~\", ...)` — call `skill_read(\"lighthouse-self-config\")` before spawning for the playbook. Always requires explicit user approval.\n", lh.Device, lh.Device)
+		b.WriteString("- Keep using `sandbox_*` for document/data/file tasks and other awake Macs (`laptop`/`office`) for normal software repo coding.\n")
+	} else {
+		fmt.Fprintf(&b, "\n## Lighthouse Host Worker (%s, offline)\n", lh.Device)
+		fmt.Fprintf(&b, "- `%s`'s host worker is currently offline; if host self-configuration is needed, tell the user they can enable it once with `fleet assistant worker-install` on `%s` (using Rex or tmux).\n", lh.Device, lh.Device)
+	}
 	return b.String()
 }
 

@@ -1002,3 +1002,126 @@ func TestKillAgentArchivesAgyAppByRawID(t *testing.T) {
 		t.Fatalf("expected KillAgent to archive %s, archived=%v out=%q", convID, archived, out.String())
 	}
 }
+
+func TestEnsureDirectoryTrusted(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("CODEX_HOME", "")
+
+	targetDir := filepath.Join(home, "workspace", "demo")
+
+	// 1. Claude: creates ~/.claude.json, preserves existing keys, idempotent, rejects malformed JSON.
+	claudePath := filepath.Join(home, ".claude.json")
+	seedClaude := map[string]any{
+		"oauthAccount": map[string]any{"email": "dev@example.com"},
+		"projects": map[string]any{
+			"/existing/repo": map[string]any{"hasTrustDialogAccepted": true, "allowedTools": []string{"Read"}},
+		},
+	}
+	seedBytes, _ := json.MarshalIndent(seedClaude, "", "  ")
+	if err := os.WriteFile(claudePath, seedBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureDirectoryTrusted("claude", targetDir); err != nil {
+		t.Fatalf("EnsureDirectoryTrusted(claude) failed: %v", err)
+	}
+	// Repeat call is a clean no-op.
+	if err := EnsureDirectoryTrusted("claude", targetDir); err != nil {
+		t.Fatalf("repeat EnsureDirectoryTrusted(claude) failed: %v", err)
+	}
+	rawClaude, err := os.ReadFile(claudePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotClaude map[string]any
+	if err := json.Unmarshal(rawClaude, &gotClaude); err != nil {
+		t.Fatal(err)
+	}
+	if gotClaude["oauthAccount"].(map[string]any)["email"] != "dev@example.com" {
+		t.Fatalf("expected oauthAccount preserved, got %+v", gotClaude)
+	}
+	projects := gotClaude["projects"].(map[string]any)
+	if projects[targetDir].(map[string]any)["hasTrustDialogAccepted"] != true {
+		t.Fatalf("expected %s trusted in .claude.json, got %+v", targetDir, projects)
+	}
+	if len(projects["/existing/repo"].(map[string]any)["allowedTools"].([]any)) != 1 {
+		t.Fatalf("expected existing project keys preserved, got %+v", projects["/existing/repo"])
+	}
+
+	// Custom CLAUDE_CONFIG_DIR creates file when missing, and malformed JSON returns error without overwriting.
+	customClaudeDir := filepath.Join(home, "custom-claude")
+	t.Setenv("CLAUDE_CONFIG_DIR", customClaudeDir)
+	if err := EnsureDirectoryTrusted("claude", targetDir); err != nil {
+		t.Fatalf("EnsureDirectoryTrusted(claude custom dir) failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(customClaudeDir, ".claude.json")); err != nil {
+		t.Fatalf("expected custom .claude.json created: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(customClaudeDir, ".claude.json"), []byte("{not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureDirectoryTrusted("claude", targetDir); err == nil {
+		t.Fatalf("expected error on malformed .claude.json")
+	}
+	if corrupt, _ := os.ReadFile(filepath.Join(customClaudeDir, ".claude.json")); string(corrupt) != "{not-json" {
+		t.Fatalf("malformed .claude.json should not be overwritten, got %q", string(corrupt))
+	}
+
+	// 2. Codex: appends project trust section, preserves hooks/other sections, upgrades untrusted -> trusted.
+	codexDir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(codexDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	codexPath := filepath.Join(codexDir, "config.toml")
+	untrustedDir := filepath.Join(home, "workspace", "untrusted")
+	initialTOML := fmt.Sprintf(`[hooks.state."/tmp/hooks.json:session_start:0:0"]
+enabled = true
+trusted_hash = "sha256:abc"
+
+[projects.%q]
+trust_level = "untrusted"
+
+[projects."/other/repo"]
+trust_level = "trusted"
+`, untrustedDir)
+	if err := os.WriteFile(codexPath, []byte(initialTOML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureDirectoryTrusted("codex", targetDir); err != nil {
+		t.Fatalf("EnsureDirectoryTrusted(codex append) failed: %v", err)
+	}
+	if err := EnsureDirectoryTrusted("codex", untrustedDir); err != nil {
+		t.Fatalf("EnsureDirectoryTrusted(codex upgrade) failed: %v", err)
+	}
+	// Idempotent repeat call.
+	if err := EnsureDirectoryTrusted("codex", targetDir); err != nil {
+		t.Fatalf("EnsureDirectoryTrusted(codex repeat) failed: %v", err)
+	}
+	gotTOMLBytes, err := os.ReadFile(codexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotTOML := string(gotTOMLBytes)
+	if !strings.Contains(gotTOML, `trusted_hash = "sha256:abc"`) ||
+		!strings.Contains(gotTOML, fmt.Sprintf("[projects.%q]\ntrust_level = \"trusted\"", targetDir)) ||
+		!strings.Contains(gotTOML, fmt.Sprintf("[projects.%q]\ntrust_level = \"trusted\"", untrustedDir)) ||
+		strings.Contains(gotTOML, `trust_level = "untrusted"`) {
+		t.Fatalf("unexpected codex config.toml:\n%s", gotTOML)
+	}
+
+	// Custom CODEX_HOME creates config.toml from scratch.
+	customCodexHome := filepath.Join(home, "custom-codex")
+	t.Setenv("CODEX_HOME", customCodexHome)
+	if err := EnsureDirectoryTrusted("codex", targetDir); err != nil {
+		t.Fatalf("EnsureDirectoryTrusted(codex custom home) failed: %v", err)
+	}
+	if raw, err := os.ReadFile(filepath.Join(customCodexHome, "config.toml")); err != nil || !strings.Contains(string(raw), `trust_level = "trusted"`) {
+		t.Fatalf("expected custom codex config.toml created, got %q (%v)", string(raw), err)
+	}
+
+	// 3. Agy is a no-op.
+	if err := EnsureDirectoryTrusted("agy", targetDir); err != nil {
+		t.Fatalf("expected agy no-op, got %v", err)
+	}
+}
