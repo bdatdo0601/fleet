@@ -156,6 +156,7 @@ type DiscordConfig struct {
 	AutoSyncChannels *bool             `json:"auto_sync_channels,omitempty"`
 	Channels         map[string]string `json:"channels,omitempty"`
 	AllowApprovals   *bool             `json:"allow_approvals,omitempty"`
+	AutoApprove      bool              `json:"auto_approve,omitempty"`
 	MirrorWebTurns   *bool             `json:"mirror_web_turns,omitempty"`
 	FleetBaseURL     string            `json:"fleet_base_url,omitempty"`
 }
@@ -215,6 +216,7 @@ type Config struct {
 	APIKey                   string              `json:"api_key,omitempty"`
 	APIKeyOPRef              string              `json:"api_key_op_ref,omitempty"`
 	ZDR                      bool                `json:"zdr"`
+	AutoApprove              bool                `json:"auto_approve"`
 	DataCollection           string              `json:"data_collection,omitempty"`
 	VaultPath                string              `json:"vault_path,omitempty"`
 	AutoWriteDirs            []string            `json:"auto_write_dirs,omitempty"`
@@ -251,6 +253,7 @@ type ConfigView struct {
 	APIKeyHint               string              `json:"api_key_hint"`
 	APIKeyOPRef              string              `json:"api_key_op_ref,omitempty"`
 	ZDR                      bool                `json:"zdr"`
+	AutoApprove              bool                `json:"auto_approve"`
 	DataCollection           string              `json:"data_collection"`
 	VaultPath                string              `json:"vault_path"`
 	EffectiveVaultPath       string              `json:"effective_vault_path"`
@@ -958,6 +961,7 @@ func (c Config) View(effectiveVault string) ConfigView {
 		APIKeyHint:               maskSecret(c.APIKey),
 		APIKeyOPRef:              c.APIKeyOPRef,
 		ZDR:                      c.ZDR,
+		AutoApprove:              c.AutoApprove,
 		DataCollection:           c.DataCollection,
 		VaultPath:                c.VaultPath,
 		EffectiveVaultPath:       effectiveVault,

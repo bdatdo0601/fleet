@@ -199,3 +199,60 @@ func TestCLIUsageAndStatusLine(t *testing.T) {
 		t.Fatalf("expected compact usage footer in fleet agents, got rc=%d out=%q", rc, out.String())
 	}
 }
+
+func TestCLIAssistantAutoApproveFlags(t *testing.T) {
+	f, _, _ := setupCLIServer(t)
+
+	var out, errBuf bytes.Buffer
+	// Enable global auto-approve via CLI.
+	rc := Run([]string{"assistant", "setup", "--auto-approve", "--no-test"}, &IO{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errBuf})
+	if rc != 0 || !strings.Contains(out.String(), "auto_approve=true") {
+		t.Fatalf("assistant setup --auto-approve failed: rc=%d out=%q err=%q", rc, out.String(), errBuf.String())
+	}
+	if !f.Assistant.Config().AutoApprove {
+		t.Fatalf("expected Config.AutoApprove=true after CLI setup")
+	}
+
+	// Verify status reports both flags.
+	out.Reset()
+	errBuf.Reset()
+	rc = Run([]string{"assistant", "status"}, &IO{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errBuf})
+	if rc != 0 || !strings.Contains(out.String(), "auto_approve=true") || !strings.Contains(out.String(), "discord_auto_approve=false") {
+		t.Fatalf("assistant status unexpected: rc=%d out=%q err=%q", rc, out.String(), errBuf.String())
+	}
+
+	// Enable Discord auto-approve without clobbering global auto-approve, then disable both explicitly.
+	out.Reset()
+	rc = Run([]string{"assistant", "setup", "--discord-auto-approve", "--no-test"}, &IO{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errBuf})
+	if rc != 0 || !f.Assistant.Config().AutoApprove || !f.Assistant.Config().Discord.AutoApprove {
+		t.Fatalf("assistant setup --discord-auto-approve failed: rc=%d cfg=%+v err=%q", rc, f.Assistant.Config(), errBuf.String())
+	}
+
+	out.Reset()
+	rc = Run([]string{"assistant", "setup", "--no-auto-approve", "--discord-no-auto-approve", "--no-test"}, &IO{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errBuf})
+	if rc != 0 || f.Assistant.Config().AutoApprove || f.Assistant.Config().Discord.AutoApprove {
+		t.Fatalf("assistant setup --no-auto-approve/--discord-no-auto-approve failed: rc=%d cfg=%+v err=%q", rc, f.Assistant.Config(), errBuf.String())
+	}
+
+	// Conflicting flags must fail cleanly.
+	errBuf.Reset()
+	if rc := Run([]string{"assistant", "setup", "--auto-approve", "--no-auto-approve", "--no-test"}, &IO{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errBuf}); rc == 0 {
+		t.Fatalf("expected conflicting --auto-approve/--no-auto-approve to fail")
+	}
+	errBuf.Reset()
+	if rc := Run([]string{"assistant", "setup", "--discord-auto-approve", "--discord-no-auto-approve", "--no-test"}, &IO{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errBuf}); rc == 0 {
+		t.Fatalf("expected conflicting --discord-auto-approve/--discord-no-auto-approve to fail")
+	}
+
+	// `fleet assistant ask --auto-approve` enqueues inbox event with auto_approve=true.
+	out.Reset()
+	errBuf.Reset()
+	rc = Run([]string{"assistant", "ask", "--auto-approve", "write", "report"}, &IO{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errBuf})
+	if rc != 0 || !strings.Contains(out.String(), "queued message") {
+		t.Fatalf("assistant ask --auto-approve failed: rc=%d out=%q err=%q", rc, out.String(), errBuf.String())
+	}
+	ev, err := f.Assistant.Store().ClaimNextInbox()
+	if err != nil || ev == nil || !strings.Contains(ev.PayloadJSON, `"auto_approve":true`) {
+		t.Fatalf("expected queued inbox payload with auto_approve=true, got %+v (err=%v)", ev, err)
+	}
+}

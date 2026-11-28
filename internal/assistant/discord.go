@@ -725,12 +725,7 @@ func (e *Engine) handleDiscordMessageCreate(ctx context.Context, tok string, cfg
 	if content == "" && len(msg.Attachments) == 0 {
 		return
 	}
-	if len(msg.Attachments) == 0 && (strings.EqualFold(content, "/new") || strings.EqualFold(content, "/reset")) {
-		if ch, err := e.resetChannelInternal(ctx, fleetCh, false, "discord"); err == nil {
-			if msgID, pErr := e.discordClient().CreateMessage(ctx, tok, msg.ChannelID, buildContextClearedDiscordPayload(ch, "discord", false)); pErr == nil && msgID != "" {
-				_ = e.store.SetDiscordCursor(ch.ID, msg.ChannelID, msgID)
-			}
-		}
+	if len(msg.Attachments) == 0 && e.handleDiscordSlashCommand(ctx, tok, fleetCh, msg.ChannelID, content) {
 		return
 	}
 	if msg.ID != "" && e.store.HasExternalMessage("discord", msg.ID) {
@@ -1286,6 +1281,132 @@ func (e *Engine) sendOutboxToDiscord(ctx context.Context, cfg Config, item Outbo
 		_ = e.store.SetDiscordCursor(item.ChannelID, discChannelID, msgID)
 	}
 	return true
+}
+
+func (e *Engine) handleDiscordSlashCommand(ctx context.Context, tok, fleetCh, discChannelID, content string) bool {
+	if strings.EqualFold(content, "/new") || strings.EqualFold(content, "/reset") {
+		if ch, err := e.resetChannelInternal(ctx, fleetCh, false, "discord"); err == nil {
+			if msgID, pErr := e.discordClient().CreateMessage(ctx, tok, discChannelID, buildContextClearedDiscordPayload(ch, "discord", false)); pErr == nil && msgID != "" {
+				_ = e.store.SetDiscordCursor(ch.ID, discChannelID, msgID)
+			}
+		}
+		return true
+	}
+	if action, scope, matched := parseDiscordAutoApproveCmd(content); matched {
+		e.handleDiscordAutoApproveCmd(ctx, tok, fleetCh, discChannelID, action, scope)
+		return true
+	}
+	return false
+}
+
+func parseDiscordAutoApproveCmd(content string) (action, scope string, matched bool) {
+	fields := strings.Fields(strings.TrimSpace(content))
+	if len(fields) == 0 || !isAutoApproveDirective(strings.ToLower(strings.TrimPrefix(fields[0], "/"))) || !strings.HasPrefix(fields[0], "/") {
+		return "", "", false
+	}
+	rest := fields[1:]
+	switch len(rest) {
+	case 0:
+		return "status", "all", true
+	case 1:
+		switch strings.ToLower(rest[0]) {
+		case "status":
+			return "status", "all", true
+		case "on", "true", "enable":
+			return "on", "global", true
+		case "off", "false", "disable":
+			return "off", "all", true
+		case "discord":
+			return "status", "discord", true
+		}
+	case 2:
+		if strings.ToLower(rest[0]) == "discord" {
+			switch strings.ToLower(rest[1]) {
+			case "status":
+				return "status", "discord", true
+			case "on", "true", "enable":
+				return "on", "discord", true
+			case "off", "false", "disable":
+				return "off", "discord", true
+			}
+		}
+	}
+	return "", "", false
+}
+
+func boolOnOff(v bool) string {
+	if v {
+		return "ON (HITL bypassed)"
+	}
+	return "OFF (HITL required)"
+}
+
+func buildAutoApproveDiscordPayload(chID, action, scope string, view ConfigView) map[string]any {
+	title := "🛡️ Auto-Approve Status"
+	color := 0x0284c7
+	desc := "Current Human-in-the-Loop (HITL) bypass settings."
+	switch action {
+	case "on":
+		title = "⚡ Auto-Approve Enabled"
+		color = 0xf59e0b
+		if scope == "discord" {
+			desc = "Discord turns now **bypass HITL approvals** automatically (Web Console turns keep existing policy)."
+		} else {
+			desc = "All assistant turns (Web & Discord) now **bypass HITL tool and frontier escalation approvals** automatically."
+		}
+	case "off":
+		title = "🛡️ Auto-Approve Disabled"
+		color = 0x22c55e
+		if scope == "discord" {
+			desc = "Discord auto-approve disabled; Discord turns follow global policy."
+		} else {
+			desc = "Global and Discord auto-approve disabled; sensitive tools and frontier escalations require HITL approval."
+		}
+	}
+	desc += "\n\nCommands: `/auto-approve on|off|status`, `/auto-approve discord on|off`, or prefix a message with `/auto-approve <prompt>` (alias `/yolo`) for a single turn."
+	return map[string]any{
+		"embeds": []map[string]any{{
+			"title":       title,
+			"description": desc,
+			"color":       color,
+			"fields": []map[string]any{
+				{"name": "Global Auto-Approve", "value": boolOnOff(view.AutoApprove), "inline": true},
+				{"name": "Discord Auto-Approve", "value": boolOnOff(view.Discord.AutoApprove), "inline": true},
+			},
+			"footer":    map[string]string{"text": "Fleet Assistant · #" + chID},
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+		}},
+	}
+}
+
+func (e *Engine) handleDiscordAutoApproveCmd(ctx context.Context, tok, fleetCh, discChannelID, action, scope string) {
+	var view ConfigView
+	var err error
+	switch action {
+	case "on":
+		val := true
+		if scope == "discord" {
+			view, err = e.SetAutoApprove(nil, &val)
+		} else {
+			view, err = e.SetAutoApprove(&val, nil)
+		}
+	case "off":
+		val := false
+		if scope == "discord" {
+			view, err = e.SetAutoApprove(nil, &val)
+		} else {
+			view, err = e.SetAutoApprove(&val, &val)
+		}
+	default:
+		view = e.ConfigView()
+	}
+	if err != nil {
+		return
+	}
+	payload := buildAutoApproveDiscordPayload(fleetCh, action, scope, view)
+	if msgID, pErr := e.discordClient().CreateMessage(ctx, tok, discChannelID, payload); pErr == nil && msgID != "" {
+		_ = e.store.SetDiscordCursor(fleetCh, discChannelID, msgID)
+	}
 }
 
 func buildContextClearedDiscordPayload(ch Channel, origin string, clearHistory bool) map[string]any {

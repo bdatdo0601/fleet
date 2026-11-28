@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -476,5 +477,81 @@ func TestAssistantMCPOAuthRoutes(t *testing.T) {
 	}
 	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/mcp", http.MethodGet, "", nil, ""); st != http.StatusOK || strings.Contains(string(b), `"oauth_authorized":true`) {
 		t.Fatalf("GET /v1/assistant/mcp after revoke unexpected: %d %s", st, string(b))
+	}
+}
+
+func TestAssistantAutoApproveRoutes(t *testing.T) {
+	var step atomic.Int32
+	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/alpha/decisions":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"answers":{"needs_frontier":{"type":"noul","noul":0.95}}}`))
+		case "/chat/completions":
+			w.Header().Set("Content-Type", "text/event-stream")
+			if step.Add(1) == 1 {
+				_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tc_srv\",\"type\":\"function\",\"function\":{\"name\":\"vault_write\",\"arguments\":\"{\\\"path\\\":\\\"Projects/ServerAuto.md\\\",\\\"content\\\":\\\"ok\\\"}\"}}]}}]}\n\n"))
+				_, _ = w.Write([]byte("data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n"))
+			} else {
+				_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"server auto-approve done\"}}]}\n\n"))
+				_, _ = w.Write([]byte("data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n"))
+			}
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		}
+	}))
+	defer mockLLM.Close()
+
+	f, srv, _ := setupTestServer(t)
+	f.Assistant.Start(t.Context())
+	defer f.Assistant.Stop()
+
+	// Persist auto_approve via POST /v1/assistant/config and verify /v1/overview reflects it.
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/config", http.MethodPost, `{"enabled":true,"base_url":"`+mockLLM.URL+`","api_key":"sk-or-test","auto_approve":true,"discord":{"auto_approve":true}}`, nil, ""); st != http.StatusOK || !strings.Contains(string(b), `"auto_approve":true`) {
+		t.Fatalf("POST /v1/assistant/config failed: %d (%s)", st, string(b))
+	}
+	var ov map[string]any
+	if err := client.Call(srv.URL, http.MethodGet, "/v1/overview", nil, 5*time.Second, nil, &ov); err != nil {
+		t.Fatal(err)
+	}
+	asstMap := ov["assistant"].(map[string]any)
+	if asstMap["auto_approve"] != true {
+		t.Fatalf("expected overview assistant.auto_approve=true, got %+v", asstMap)
+	}
+
+	// Disable global auto_approve, then verify per-message auto_approve:true bypasses HITL once.
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/config", http.MethodPost, `{"enabled":true,"base_url":"`+mockLLM.URL+`","api_key":"sk-or-test","auto_approve":false,"discord":{"auto_approve":false}}`, nil, ""); st != http.StatusOK || !strings.Contains(string(b), `"auto_approve":false`) {
+		t.Fatalf("POST /v1/assistant/config disable failed: %d (%s)", st, string(b))
+	}
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/messages", http.MethodPost, `{"channel":"general","content":"write Projects/ServerAuto.md","auto_approve":true}`, nil, ""); st != http.StatusAccepted {
+		t.Fatalf("POST /v1/assistant/messages expected 202, got %d (%s)", st, string(b))
+	}
+
+	dl := time.Now().Add(4 * time.Second)
+	var done bool
+	for time.Now().Before(dl) && !done {
+		var msgRes struct {
+			Messages []assistant.Message `json:"messages"`
+		}
+		if err := client.Call(srv.URL, http.MethodGet, "/v1/assistant/messages?channel=general", nil, 3*time.Second, nil, &msgRes); err == nil {
+			for _, m := range msgRes.Messages {
+				if m.Role == "assistant" && strings.Contains(m.Content, "server auto-approve done") {
+					done = true
+					break
+				}
+			}
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	if !done {
+		t.Fatalf("expected per-message auto_approve=true turn to complete without HITL")
+	}
+	var aprRes struct {
+		Approvals []assistant.Approval `json:"approvals"`
+	}
+	if err := client.Call(srv.URL, http.MethodGet, "/v1/assistant/approvals?status=pending", nil, 3*time.Second, nil, &aprRes); err != nil {
+		t.Fatal(err)
+	}
+	if len(aprRes.Approvals) != 0 {
+		t.Fatalf("expected 0 pending approvals for auto_approve:true message, got %+v", aprRes.Approvals)
 	}
 }

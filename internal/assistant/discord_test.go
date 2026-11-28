@@ -1485,3 +1485,172 @@ func TestDiscordInboundAttachments(t *testing.T) {
 		t.Fatalf("missing user message for Discord attachment")
 	}
 }
+
+func TestDiscordAutoApproveFlagAndCommands(t *testing.T) {
+	disc := newMockDiscordServer(t)
+	defer disc.Close()
+
+	var step atomic.Int32
+	eng, _ := setupDiscordTestEngine(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			http.NotFound(w, r)
+			return
+		}
+		var req struct {
+			Stream bool `json:"stream"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if !req.Stream {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":""}}]}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch step.Add(1) {
+		case 1, 3:
+			// Protected vault_write outside auto_write_dirs.
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tc_d1\",\"type\":\"function\",\"function\":{\"name\":\"vault_write\",\"arguments\":\"{\\\"path\\\":\\\"Projects/DiscordNote.md\\\",\\\"content\\\":\\\"from discord\\\"}\"}}]}}]}\n\n")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n")
+		default:
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Discord write completed.\"}}]}\n\n")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n")
+		}
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}, disc)
+
+	eng.Start(t.Context())
+	select {
+	case <-disc.identified:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for Discord Gateway Identify")
+	}
+
+	// 1. Unauthorized user cannot toggle /auto-approve.
+	_ = disc.SendGatewayJSON(map[string]any{
+		"op": 0, "t": "MESSAGE_CREATE", "s": 2,
+		"d": map[string]any{
+			"id": "100000000000000701", "channel_id": "555555555555555555",
+			"content": "/auto-approve on", "author": map[string]any{"id": "111111111111111111", "bot": false},
+		},
+	})
+	time.Sleep(80 * time.Millisecond)
+	if eng.Config().AutoApprove {
+		t.Fatalf("unauthorized user must not toggle auto_approve")
+	}
+
+	// 2. `/auto-approve discord on` enables Discord-only bypass without enabling global AutoApprove.
+	_ = disc.SendGatewayJSON(map[string]any{
+		"op": 0, "t": "MESSAGE_CREATE", "s": 3,
+		"d": map[string]any{
+			"id": "100000000000000702", "channel_id": "555555555555555555",
+			"content": "/auto-approve discord on", "author": map[string]any{"id": "222222222222222222", "bot": false},
+		},
+	})
+	embPost := waitForPost(t, disc.postCh, 5*time.Second, func(p recordedDiscordPost) bool {
+		embeds, _ := p.Payload["embeds"].([]any)
+		return len(embeds) > 0
+	})
+	if embTitle, _ := embPost.Payload["embeds"].([]any)[0].(map[string]any)["title"].(string); !strings.Contains(embTitle, "Auto-Approve Enabled") {
+		t.Fatalf("unexpected embed title: %q", embTitle)
+	}
+	if cfg := eng.Config(); cfg.AutoApprove || !cfg.Discord.AutoApprove {
+		t.Fatalf("expected Discord.AutoApprove=true and global AutoApprove=false, got %+v", cfg)
+	}
+
+	// 3. Discord message now bypasses HITL for protected vault_write.
+	_ = disc.SendGatewayJSON(map[string]any{
+		"op": 0, "t": "MESSAGE_CREATE", "s": 4,
+		"d": map[string]any{
+			"id": "100000000000000703", "channel_id": "555555555555555555",
+			"content": "write Projects/DiscordNote.md", "author": map[string]any{"id": "222222222222222222", "bot": false},
+		},
+	})
+	reply := waitForPost(t, disc.postCh, 5*time.Second, func(p recordedDiscordPost) bool {
+		c, _ := p.Payload["content"].(string)
+		return strings.Contains(c, "Discord write completed.")
+	})
+	if reply.ChannelID != "555555555555555555" {
+		t.Fatalf("unexpected reply channel %s", reply.ChannelID)
+	}
+	v, _ := eng.Vault()
+	if got, rErr := v.ReadFile("Projects/DiscordNote.md"); rErr != nil || got != "from discord" {
+		t.Fatalf("expected Projects/DiscordNote.md written via Discord auto-approve, got %q (%v)", got, rErr)
+	}
+
+	// 4. Web turn still requires HITL when only Discord.AutoApprove=true.
+	sub := eng.Subscribe()
+	defer eng.Unsubscribe(sub)
+	if _, _, err := eng.EnqueueUserMessage("general", "web write protected note", ""); err != nil {
+		t.Fatal(err)
+	}
+	var gotWebApproval bool
+	dl := time.After(5 * time.Second)
+	for !gotWebApproval {
+		select {
+		case ev := <-sub:
+			if ev.Type == "approval" {
+				apr, _ := ev.Data.(Approval)
+				if apr.ToolName == "vault_write" {
+					gotWebApproval = true
+				}
+			}
+		case <-dl:
+			t.Fatalf("timed out waiting for HITL approval on Web turn while only Discord.AutoApprove=true")
+		}
+	}
+
+	// 5. `/auto-approve on` enables global, `/auto-approve off` disables both global and Discord.
+	_ = disc.SendGatewayJSON(map[string]any{
+		"op": 0, "t": "MESSAGE_CREATE", "s": 5,
+		"d": map[string]any{
+			"id": "100000000000000704", "channel_id": "555555555555555555",
+			"content": "/auto-approve on", "author": map[string]any{"id": "222222222222222222", "bot": false},
+		},
+	})
+	_ = waitForPost(t, disc.postCh, 5*time.Second, func(p recordedDiscordPost) bool {
+		embeds, _ := p.Payload["embeds"].([]any)
+		if len(embeds) == 0 {
+			return false
+		}
+		title, _ := embeds[0].(map[string]any)["title"].(string)
+		return strings.Contains(title, "Auto-Approve Enabled")
+	})
+	if !eng.Config().AutoApprove {
+		t.Fatalf("expected global AutoApprove=true after /auto-approve on")
+	}
+
+	_ = disc.SendGatewayJSON(map[string]any{
+		"op": 0, "t": "MESSAGE_CREATE", "s": 6,
+		"d": map[string]any{
+			"id": "100000000000000705", "channel_id": "555555555555555555",
+			"content": "/auto-approve off", "author": map[string]any{"id": "222222222222222222", "bot": false},
+		},
+	})
+	_ = waitForPost(t, disc.postCh, 5*time.Second, func(p recordedDiscordPost) bool {
+		embeds, _ := p.Payload["embeds"].([]any)
+		if len(embeds) == 0 {
+			return false
+		}
+		title, _ := embeds[0].(map[string]any)["title"].(string)
+		return strings.Contains(title, "Auto-Approve Disabled")
+	})
+	if cfg := eng.Config(); cfg.AutoApprove || cfg.Discord.AutoApprove {
+		t.Fatalf("expected both global and Discord AutoApprove=false after /auto-approve off, got %+v", cfg)
+	}
+
+	// 6. One-shot `/yolo <prompt>` in Discord runs without HITL while keeping AutoApprove=false.
+	_ = disc.SendGatewayJSON(map[string]any{
+		"op": 0, "t": "MESSAGE_CREATE", "s": 7,
+		"d": map[string]any{
+			"id": "100000000000000706", "channel_id": "555555555555555555",
+			"content": "/yolo write Projects/YoloDiscord.md", "author": map[string]any{"id": "222222222222222222", "bot": false},
+		},
+	})
+	_ = waitForPost(t, disc.postCh, 5*time.Second, func(p recordedDiscordPost) bool {
+		c, _ := p.Payload["content"].(string)
+		return strings.Contains(c, "Discord write completed.")
+	})
+	if cfg := eng.Config(); cfg.AutoApprove || cfg.Discord.AutoApprove {
+		t.Fatalf("one-shot /yolo must not persist AutoApprove, got %+v", cfg)
+	}
+}

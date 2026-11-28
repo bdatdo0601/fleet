@@ -148,7 +148,7 @@ func checkConfigDoctor(cfg Config, view ConfigView) DoctorCheck {
 	return DoctorCheck{
 		Name:   "config",
 		Status: "ok",
-		Detail: fmt.Sprintf("enabled=%v, zdr=%v, auth=%s, model=%s", cfg.Enabled, cfg.ZDR, authMode, cfg.Models.DefaultChat),
+		Detail: fmt.Sprintf("enabled=%v, zdr=%v, auto_approve=%v, auth=%s, model=%s", cfg.Enabled, cfg.ZDR, cfg.AutoApprove, authMode, cfg.Models.DefaultChat),
 	}
 }
 

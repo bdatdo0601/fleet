@@ -659,6 +659,7 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
   const routing = cfg.routing || {};
   const enabledChk = el("input", { type: "checkbox", checked: Boolean(cfg.enabled) });
   const zdrChk = el("input", { type: "checkbox", checked: cfg.zdr !== false });
+  const autoApproveChk = el("input", { type: "checkbox", checked: Boolean(cfg.auto_approve) });
   const apiKeyIn = el("input", { type: "password", placeholder: cfg.api_key_hint ? `Current: ${cfg.api_key_hint}` : "sk-or-v1-..." });
   const vaultIn = el("input", { type: "text", value: cfg.vault_path || "", placeholder: cfg.effective_vault_path || "" });
   const defaultChatIn = el("input", { type: "text", value: models.default_chat || "" });
@@ -806,6 +807,7 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
   const discEnabledChk = el("input", { type: "checkbox", checked: Boolean(discCfg.enabled) });
   const discAutoSyncChk = el("input", { type: "checkbox", checked: discCfg.auto_sync_channels !== false });
   const discAllowApprovalsChk = el("input", { type: "checkbox", checked: discCfg.allow_approvals !== false });
+  const discAutoApproveChk = el("input", { type: "checkbox", checked: Boolean(discCfg.auto_approve) });
   const discMirrorWebChk = el("input", { type: "checkbox", checked: discCfg.mirror_web_turns !== false });
   const discTokenRefIn = el("input", { type: "text", value: discCfg.bot_token_op_ref || "", placeholder: "op://Fleet-Agent/Discord/bot_token" });
   const discUserIDIn = el("input", { type: "text", value: discCfg.authorized_user_id || "", placeholder: "18-digit Discord User ID" });
@@ -851,6 +853,7 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
     { className: "stack" },
     el("label", { className: "check-row" }, enabledChk, el("span", { text: "Enable always-on scheduler & heartbeat" })),
     el("label", { className: "check-row" }, zdrChk, el("span", { text: "Enforce OpenRouter Zero Data Retention (ZDR)" })),
+    el("label", { className: "check-row" }, autoApproveChk, el("span", { text: "Auto-approve all tool calls & frontier escalations (bypass HITL)" })),
     field("OpenRouter API Key (leave blank to keep current)", apiKeyIn),
     field("Obsidian Vault Path on Lighthouse", vaultIn, el("div", { className: "small muted", text: `Active: ${cfg.effective_vault_path || ""}` })),
     field(
@@ -897,6 +900,7 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
     el("label", { className: "check-row" }, discEnabledChk, el("span", { text: "Enable outbound Discord Gateway bot (two-way chat)" })),
     el("label", { className: "check-row" }, discAutoSyncChk, el("span", { text: "Auto-manage Discord channels under category (requires Manage Channels)" })),
     el("label", { className: "check-row" }, discAllowApprovalsChk, el("span", { text: "Allow interactive Approve / Deny buttons in Discord" })),
+    el("label", { className: "check-row" }, discAutoApproveChk, el("span", { text: "Auto-approve Discord turns (bypass HITL for Discord messages)" })),
     el("label", { className: "check-row" }, discMirrorWebChk, el("span", { text: "Mirror Fleet Console & timer turns to Discord (non-spoofed blockquote)" })),
     el(
       "div",
@@ -1036,6 +1040,7 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
           const payload = {
             enabled: enabledChk.checked,
             zdr: zdrChk.checked,
+            auto_approve: autoApproveChk.checked,
             base_url: cfg.base_url,
             data_collection: cfg.data_collection,
             vault_path: vaultIn.value.trim(),
@@ -1079,6 +1084,7 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
               auto_sync_channels: discAutoSyncChk.checked,
               channels: discordChannels,
               allow_approvals: discAllowApprovalsChk.checked,
+              auto_approve: discAutoApproveChk.checked,
               mirror_web_turns: discMirrorWebChk.checked,
               fleet_base_url: discBaseURLIn.value.trim(),
             },
@@ -1263,6 +1269,13 @@ export async function renderChat(main, ctx, sub) {
   const msgInnerEl = el("div", { className: "chat-messages-inner" }, emptyBox, msgItemsEl, approvalsBox, streamBox);
   const msgListEl = el("div", { className: "chat-messages" }, msgInnerEl);
   const statusPill = badge("connecting", "neutral");
+  const autoApprovePill = el("button", {
+    type: "button",
+    className: `badge badge-warn auto-approve-pill${cfgView.auto_approve ? "" : " hidden"}`,
+    text: "Auto-Approve",
+    title: "HITL approvals are bypassed — click to configure",
+    onclick: () => openAssistantSettingsModal(() => ctx.refresh(), (h) => ctx.navigate(h)),
+  });
   const grantPill = el("button", {
     type: "button",
     className: "badge badge-info grant-pill hidden",
@@ -1333,7 +1346,7 @@ export async function renderChat(main, ctx, sub) {
   const inputEl = el("textarea", {
     className: "chat-input",
     rows: "1",
-    placeholder: "Message assistant… (/haiku, /mini, /sol, /sonnet, /neon)",
+    placeholder: "Message assistant… (/haiku, /sol, /auto-approve)",
   });
   const fileInput = el("input", { type: "file", multiple: true, className: "hidden" });
   const attachBtn = el("button", { type: "button", className: "btn btn-sm", text: "📎", title: "Attach file(s) for sandbox", "aria-label": "Attach files" });
@@ -1574,6 +1587,7 @@ export async function renderChat(main, ctx, sub) {
       }),
       channelSelect,
       statusPill,
+      autoApprovePill,
       grantPill,
     ),
     el(
@@ -1596,6 +1610,7 @@ export async function renderChat(main, ctx, sub) {
           }
         },
       }),
+      modelSelect,
       el("button", {
         type: "button",
         className: "btn btn-sm",
@@ -1612,12 +1627,12 @@ export async function renderChat(main, ctx, sub) {
       "div",
       { className: "chat-composer-inner" },
       attachListEl,
-      inputEl,
       fileInput,
       el(
         "div",
-        { className: "chat-composer-bar" },
-        el("div", { className: "chat-composer-left" }, attachBtn, modelSelect),
+        { className: "chat-composer-row" },
+        attachBtn,
+        inputEl,
         sendBtn,
       ),
     ),
@@ -1728,6 +1743,11 @@ export async function renderChat(main, ctx, sub) {
       clear(streamBody);
       streamBody.appendChild(renderMarkdownDOM(streamText));
       scrollMessagesToBottom();
+      return;
+    }
+    if (type === "config_updated") {
+      const enabled = Boolean(d.data && d.data.auto_approve);
+      autoApprovePill.classList.toggle("hidden", !enabled);
       return;
     }
     if (type === "channels_updated") {

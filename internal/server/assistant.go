@@ -149,6 +149,7 @@ func buildAssistantSummary(fleet *core.Fleet) map[string]any {
 		"default_model":     view.Models.DefaultChat,
 		"routing_mode":      view.Routing.Mode,
 		"zdr":               view.ZDR,
+		"auto_approve":      view.AutoApprove,
 		"channels":          sc.Channels,
 		"pending_approvals": sc.PendingApprovals,
 		"enabled_timers":    sc.EnabledTimers,
@@ -365,15 +366,16 @@ func registerAssistantChatRoutes(
 	}))
 	mux.HandleFunc("POST /v1/assistant/messages", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
 		var req struct {
-			Channel string   `json:"channel"`
-			Content string   `json:"content"`
-			Model   string   `json:"model"`
-			FileIDs []string `json:"file_ids"`
+			Channel     string   `json:"channel"`
+			Content     string   `json:"content"`
+			Model       string   `json:"model"`
+			FileIDs     []string `json:"file_ids"`
+			AutoApprove bool     `json:"auto_approve"`
 		}
 		if err := readJSONBody(r, &req); err != nil {
 			return err
 		}
-		msg, ev, err := fleet.Assistant.EnqueueUserMessageWithFiles(req.Channel, req.Content, req.Model, req.FileIDs)
+		msg, ev, err := fleet.Assistant.EnqueueUserMessageWithOptions(req.Channel, req.Content, req.Model, req.FileIDs, req.AutoApprove)
 		if err != nil {
 			return err
 		}

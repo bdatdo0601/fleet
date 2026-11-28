@@ -398,6 +398,7 @@ const SSE_EVENT_TYPES = [
   "approval",
   "approval_decided",
   "channel_reset",
+  "config_updated",
   "grant_updated",
   "outbox",
   "delegation",

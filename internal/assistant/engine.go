@@ -44,6 +44,7 @@ type ephemeralToolResult struct {
 type turnOptions struct {
 	RetryReplaceMsgID   int64
 	TrackGrant          bool
+	AutoApprove         bool
 	TriggerSource       string
 	TriggerUserText     string
 	ReplyToExternalID   string
@@ -54,6 +55,7 @@ type turnOptions struct {
 type turnRoute struct {
 	Model          string
 	CleanText      string
+	BypassHITL     bool
 	Escalate       *frontierEscalationArgs
 	BorderlineProb float64
 	UsedGrant      *FrontierGrant
@@ -326,7 +328,7 @@ func isZeroNotificationsConfig(n NotificationsConfig) bool {
 
 func isZeroDiscordConfig(d DiscordConfig) bool {
 	return d.AllowApprovals == nil && d.MirrorWebTurns == nil && d.AutoSyncChannels == nil &&
-		!d.Enabled && d.BotTokenOPRef == "" && d.AuthorizedUserID == "" &&
+		!d.Enabled && !d.AutoApprove && d.BotTokenOPRef == "" && d.AuthorizedUserID == "" &&
 		d.GuildID == "" && d.CategoryName == "" && len(d.Channels) == 0 && d.FleetBaseURL == ""
 }
 
@@ -395,7 +397,44 @@ func (e *Engine) UpdateConfig(next Config, clearAPIKey bool) (ConfigView, error)
 	}
 	e.notifyDiscordReload()
 	e.notify()
-	return next.View(vaultRoot), nil
+	view := next.View(vaultRoot)
+	e.publishEvent(StreamEvent{
+		Type: "config_updated",
+		Data: map[string]any{
+			"auto_approve":         view.AutoApprove,
+			"discord_auto_approve": view.Discord.AutoApprove,
+		},
+	})
+	return view, nil
+}
+
+// SetAutoApprove updates global and/or Discord HITL bypass flags without reloading the Discord Gateway socket.
+func (e *Engine) SetAutoApprove(global, discord *bool) (ConfigView, error) {
+	e.cfgMu.Lock()
+	next := e.cfg
+	if global != nil {
+		next.AutoApprove = *global
+	}
+	if discord != nil {
+		next.Discord.AutoApprove = *discord
+	}
+	next = NormalizeConfig(next)
+	if err := SaveConfig(e.configPath, next); err != nil {
+		e.cfgMu.Unlock()
+		return ConfigView{}, err
+	}
+	e.cfg = next
+	e.cfgMu.Unlock()
+
+	view := next.View(ResolveVaultRoot(next.VaultPath, e.vaultDir))
+	e.publishEvent(StreamEvent{
+		Type: "config_updated",
+		Data: map[string]any{
+			"auto_approve":         view.AutoApprove,
+			"discord_auto_approve": view.Discord.AutoApprove,
+		},
+	})
+	return view, nil
 }
 
 // SaveOPServiceAccountToken persists or clears the 1Password service account token on disk (0600).
@@ -679,21 +718,26 @@ func (e *Engine) ResetSandbox(ctx context.Context, channelID string, clearOutput
 
 // EnqueueUserMessage stores a user message, queues a wakeup, and wakes the worker.
 func (e *Engine) EnqueueUserMessage(channelID, content, modelOverride string) (Message, InboxEvent, error) {
-	return e.EnqueueUserMessageWithFiles(channelID, content, modelOverride, nil)
+	return e.EnqueueUserMessageWithOptions(channelID, content, modelOverride, nil, false)
 }
 
 // EnqueueExternalMessage idempotently ingests a user message from an external bridge (e.g. Discord).
 func (e *Engine) EnqueueExternalMessage(channelID, content, source, externalID string, fileIDs []string) (Message, InboxEvent, bool, error) {
-	return e.enqueueMessageInternal(channelID, content, "", fileIDs, source, externalID)
+	return e.enqueueMessageInternal(channelID, content, "", fileIDs, source, externalID, false)
 }
 
 // EnqueueUserMessageWithFiles stores a user message with optional uploaded file attachments and wakes the worker.
 func (e *Engine) EnqueueUserMessageWithFiles(channelID, content, modelOverride string, fileIDs []string) (Message, InboxEvent, error) {
-	msg, ev, _, err := e.enqueueMessageInternal(channelID, content, modelOverride, fileIDs, "web", "")
+	return e.EnqueueUserMessageWithOptions(channelID, content, modelOverride, fileIDs, false)
+}
+
+// EnqueueUserMessageWithOptions stores a user message with optional attachments and per-turn auto-approve override.
+func (e *Engine) EnqueueUserMessageWithOptions(channelID, content, modelOverride string, fileIDs []string, autoApprove bool) (Message, InboxEvent, error) {
+	msg, ev, _, err := e.enqueueMessageInternal(channelID, content, modelOverride, fileIDs, "web", "", autoApprove)
 	return msg, ev, err
 }
 
-func (e *Engine) enqueueMessageInternal(channelID, content, modelOverride string, fileIDs []string, source, externalID string) (Message, InboxEvent, bool, error) {
+func (e *Engine) enqueueMessageInternal(channelID, content, modelOverride string, fileIDs []string, source, externalID string, autoApprove bool) (Message, InboxEvent, bool, error) {
 	channelID = cmp.Or(strings.TrimSpace(channelID), "general")
 	content = strings.TrimSpace(content)
 	cleanIDs := normalizeStringListOrdered(fileIDs)
@@ -760,6 +804,9 @@ func (e *Engine) enqueueMessageInternal(channelID, content, modelOverride string
 	}
 	if len(cleanIDs) > 0 {
 		payload["file_ids"] = cleanIDs
+	}
+	if autoApprove {
+		payload["auto_approve"] = true
 	}
 	ev, _, err := e.store.EnqueueInbox(channelID, "chat", dedupe, payload, modelOverride)
 	if err != nil {
@@ -1055,11 +1102,13 @@ func (e *Engine) processInboxEvent(ctx context.Context, ev InboxEvent) error {
 		retryReplaceID = int64(rawID)
 	}
 	useGrant, _ := payload["use_grant"].(bool)
+	autoApprove, _ := payload["auto_approve"].(bool)
 	trigSource := cmp.Or(strArg(payload, "source"), ev.Source)
 	replyToExt := strArg(payload, "external_id")
 	return e.runAgentTurn(ctx, cfg, *ch, ev.Source, userText, ev.ModelOverride, turnOptions{
 		RetryReplaceMsgID: retryReplaceID,
 		TrackGrant:        useGrant,
+		AutoApprove:       autoApprove,
 		TriggerSource:     trigSource,
 		TriggerUserText:   userText,
 		ReplyToExternalID: replyToExt,
@@ -1143,21 +1192,46 @@ func (e *Engine) handleFrontierEscalationResume(ctx context.Context, cfg Config,
 	return e.runAgentTurn(ctx, cfg, ch, "chat", args.OriginalPrompt, frontierModel, turnOptions{TrackGrant: isTopic, TriggerSource: "approval"})
 }
 
-func parseSlashModelOverride(text string, aliases map[string]string) (model string, cleaned string) {
-	trimmed := strings.TrimSpace(text)
-	if !strings.HasPrefix(trimmed, "/") {
-		return "", text
-	}
-	first, rest, hasRest := strings.Cut(trimmed, " ")
-	key := strings.ToLower(strings.TrimPrefix(first, "/"))
-	if resolved, ok := aliases[key]; ok && hasRest && strings.TrimSpace(rest) != "" {
-		return resolved, strings.TrimSpace(rest)
-	}
-	return "", text
+func isAutoApproveDirective(key string) bool {
+	return key == "auto-approve" || key == "autoapprove" || key == "yolo"
 }
 
-func (e *Engine) resolveTurnRoute(ctx context.Context, cfg Config, ch Channel, source, userText, explicit string, tail []Message, skills []Skill) turnRoute {
-	slashModel, cleanText := parseSlashModelOverride(userText, cfg.Models.Aliases)
+func parseTurnDirectives(text string, aliases map[string]string) (model string, autoApprove bool, cleaned string) {
+	cur := strings.TrimSpace(text)
+	matched := false
+	for range 2 {
+		if !strings.HasPrefix(cur, "/") {
+			break
+		}
+		first, rest, hasRest := strings.Cut(cur, " ")
+		rest = strings.TrimSpace(rest)
+		if !hasRest || rest == "" {
+			break
+		}
+		key := strings.ToLower(strings.TrimPrefix(first, "/"))
+		if isAutoApproveDirective(key) && !autoApprove {
+			autoApprove = true
+			cur = rest
+			matched = true
+			continue
+		}
+		if resolved, ok := aliases[key]; ok && model == "" {
+			model = resolved
+			cur = rest
+			matched = true
+			continue
+		}
+		break
+	}
+	if !matched {
+		return "", false, text
+	}
+	return model, autoApprove, cur
+}
+
+func (e *Engine) resolveTurnRoute(ctx context.Context, cfg Config, ch Channel, source, userText, explicit string, tail []Message, skills []Skill, opts turnOptions) turnRoute {
+	slashModel, slashAutoApprove, cleanText := parseTurnDirectives(userText, cfg.Models.Aliases)
+	bypassHITL := cfg.AutoApprove || opts.AutoApprove || slashAutoApprove || (opts.TriggerSource == "discord" && cfg.Discord.AutoApprove)
 	chosen := cmp.Or(slashModel, strings.TrimSpace(explicit))
 	if chosen == "" {
 		for _, sk := range skills {
@@ -1184,12 +1258,12 @@ func (e *Engine) resolveTurnRoute(ctx context.Context, cfg Config, ch Channel, s
 		chosen = alias
 	}
 	if !strings.EqualFold(chosen, "auto") {
-		return turnRoute{Model: chosen, CleanText: cleanText}
+		return turnRoute{Model: chosen, CleanText: cleanText, BypassHITL: bypassHITL}
 	}
 	if source != "chat" {
-		return turnRoute{Model: e.decideLegacyTier(ctx, cfg, cleanText), CleanText: cleanText}
+		return turnRoute{Model: e.decideLegacyTier(ctx, cfg, cleanText), CleanText: cleanText, BypassHITL: bypassHITL}
 	}
-	return e.routeInteractiveChat(ctx, cfg, ch, cleanText, userText, tail)
+	return e.routeInteractiveChat(ctx, cfg, ch, cleanText, userText, tail, bypassHITL)
 }
 
 func (e *Engine) decideLegacyTier(ctx context.Context, cfg Config, cleanText string) string {
@@ -1251,7 +1325,7 @@ func buildRoutingState(chID, cleanText, rawUserText string, tail []Message, acti
 	return state
 }
 
-func (e *Engine) routeInteractiveChat(ctx context.Context, cfg Config, ch Channel, cleanText, rawUserText string, tail []Message) turnRoute {
+func (e *Engine) routeInteractiveChat(ctx context.Context, cfg Config, ch Channel, cleanText, rawUserText string, tail []Message, bypassHITL bool) turnRoute {
 	fallback := concreteDefaultChat(cfg)
 	routing := normalizeRoutingConfig(cfg.Routing)
 	effMode := routing.Mode
@@ -1284,7 +1358,7 @@ func (e *Engine) routeInteractiveChat(ctx context.Context, cfg Config, ch Channe
 	state := buildRoutingState(ch.ID, cleanText, rawUserText, tail, activeGrant)
 	ans, err := e.llm.DecideState(ctx, cfg, state, questions)
 	if err != nil {
-		return turnRoute{Model: fallback, CleanText: cleanText}
+		return turnRoute{Model: fallback, CleanText: cleanText, BypassHITL: bypassHITL}
 	}
 	pFrontier := ans["needs_frontier"].Prob("true")
 	if _, hasNF := ans["needs_frontier"]; !hasNF {
@@ -1300,16 +1374,17 @@ func (e *Engine) routeInteractiveChat(ctx context.Context, cfg Config, ch Channe
 		}
 	}
 	if pFrontier >= routing.GateProb {
-		if effMode == RoutingModeAuto {
-			return turnRoute{Model: cfg.Models.Frontier, CleanText: cleanText}
+		if bypassHITL || effMode == RoutingModeAuto {
+			return turnRoute{Model: cfg.Models.Frontier, CleanText: cleanText, BypassHITL: bypassHITL}
 		}
 		todayStart := now.Format("2006-01-02") + "T00:00:00+00:00"
 		dailySpend := e.store.DailySpendUSD(todayStart)
 		if activeGrant != nil && (routing.DailySoftCapUSD <= 0 || dailySpend < routing.DailySoftCapUSD) {
-			return turnRoute{Model: cfg.Models.Frontier, CleanText: cleanText, UsedGrant: activeGrant}
+			return turnRoute{Model: cfg.Models.Frontier, CleanText: cleanText, BypassHITL: bypassHITL, UsedGrant: activeGrant}
 		}
 		return turnRoute{
-			CleanText: cleanText,
+			CleanText:  cleanText,
+			BypassHITL: bypassHITL,
 			Escalate: &frontierEscalationArgs{
 				OriginalPrompt: cleanText,
 				FrontierModel:  cfg.Models.Frontier,
@@ -1323,9 +1398,9 @@ func (e *Engine) routeInteractiveChat(ctx context.Context, cfg Config, ch Channe
 		}
 	}
 	if effMode == RoutingModeHybrid && pFrontier >= routing.BorderlineProb {
-		return turnRoute{Model: fallback, CleanText: cleanText, BorderlineProb: pFrontier}
+		return turnRoute{Model: fallback, CleanText: cleanText, BypassHITL: bypassHITL, BorderlineProb: pFrontier}
 	}
-	return turnRoute{Model: fallback, CleanText: cleanText}
+	return turnRoute{Model: fallback, CleanText: cleanText, BypassHITL: bypassHITL}
 }
 
 func (e *Engine) buildPromptMessages(ctx context.Context, ch Channel, tail []Message, slashAliases map[string]string) []ChatMessage {
@@ -1390,7 +1465,7 @@ func (e *Engine) buildPromptMessages(ctx context.Context, ch Channel, tail []Mes
 		}
 		txt := m.Content
 		if m.Role == "user" {
-			_, txt = parseSlashModelOverride(txt, slashAliases)
+			_, _, txt = parseTurnDirectives(txt, slashAliases)
 			if hint := formatAttachedFilesHint(m.Widgets); hint != "" {
 				txt += "\n" + hint
 			}
@@ -1540,7 +1615,7 @@ func (e *Engine) runAgentTurn(ctx context.Context, cfg Config, ch Channel, sourc
 	if err != nil {
 		return err
 	}
-	route := e.resolveTurnRoute(ctx, cfg, ch, source, userText, explicitModel, tail, skills)
+	route := e.resolveTurnRoute(ctx, cfg, ch, source, userText, explicitModel, tail, skills, opts)
 	if route.Escalate != nil {
 		return e.pauseForFrontierEscalation(ch, route.Escalate)
 	}
@@ -1573,7 +1648,7 @@ func (e *Engine) runAgentTurn(ctx context.Context, cfg Config, ch Channel, sourc
 
 	e.publishEvent(StreamEvent{Type: "run_start", ChannelID: ch.ID, Data: e.buildRunStartData(ch.ID, model, route, opts)})
 	widgets := append([]WidgetPayload(nil), opts.InitialWidgets...)
-	tctx := &toolExecContext{ChannelID: ch.ID, Source: source, Config: cfg, Widgets: &widgets}
+	tctx := &toolExecContext{ChannelID: ch.ID, Source: source, Config: cfg, BypassHITL: route.BypassHITL, Widgets: &widgets}
 
 	var totalUsage StreamUsage
 	for range maxToolRounds {

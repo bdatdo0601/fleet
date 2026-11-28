@@ -1659,3 +1659,174 @@ func TestDecisionModelZDRMigrationAndDoctorHint(t *testing.T) {
 		t.Fatalf("expected decisions doctor warn with ZDR hint mentioning %s, got %+v", DefaultDecisionModel, check)
 	}
 }
+
+func TestAutoApproveBypassAndSlashDirectives(t *testing.T) {
+	var step atomic.Int32
+	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/alpha/decisions":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"answers":{"needs_frontier":{"type":"noul","noul":0.96}}}`))
+		case "/chat/completions":
+			var req struct {
+				Model    string        `json:"model"`
+				Messages []ChatMessage `json:"messages"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			w.Header().Set("Content-Type", "text/event-stream")
+			switch step.Add(1) {
+			case 1:
+				_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tc_1\",\"type\":\"function\",\"function\":{\"name\":\"vault_write\",\"arguments\":\"{\\\"path\\\":\\\"Projects/Bypass.md\\\",\\\"content\\\":\\\"# Bypassed\\\"}\"}}]}}]}\n\n"))
+				_, _ = w.Write([]byte("data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n"))
+			case 2:
+				_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tc_2\",\"type\":\"function\",\"function\":{\"name\":\"fleet_spawn_agent\",\"arguments\":\"{\\\"harness\\\":\\\"claude\\\",\\\"device\\\":\\\"laptop\\\",\\\"prompt\\\":\\\"check\\\"}\"}}]}}]}\n\n"))
+				_, _ = w.Write([]byte("data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n"))
+			case 3:
+				_, _ = fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":\"done-global:%s\"}}]}\n\n", req.Model)
+				_, _ = w.Write([]byte("data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n"))
+			case 4:
+				// One-shot /yolo /sol -> should write without approval and use frontier model.
+				_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tc_3\",\"type\":\"function\",\"function\":{\"name\":\"vault_write\",\"arguments\":\"{\\\"path\\\":\\\"Projects/OneShot.md\\\",\\\"content\\\":\\\"# OneShot\\\"}\"}}]}}]}\n\n"))
+				_, _ = w.Write([]byte("data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n"))
+			default:
+				lastUser := ""
+				for _, m := range slices.Backward(req.Messages) {
+					if m.Role == "user" {
+						if s, ok := m.Content.(string); ok {
+							lastUser = s
+							break
+						}
+					}
+				}
+				_, _ = fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":\"reply:%s:%s\"}}]}\n\n", req.Model, lastUser)
+				_, _ = w.Write([]byte("data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n"))
+			}
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		}
+	}))
+	defer mockLLM.Close()
+
+	// Verify directive parser edge cases.
+	if m, aa, cl := parseTurnDirectives("/auto-approve /sol write this", DefaultAliases()); m != DefaultFrontierModel || !aa || cl != "write this" {
+		t.Fatalf("unexpected parseTurnDirectives(/auto-approve /sol): model=%q aa=%v clean=%q", m, aa, cl)
+	}
+	if m, aa, cl := parseTurnDirectives("/sol /yolo write this", DefaultAliases()); m != DefaultFrontierModel || !aa || cl != "write this" {
+		t.Fatalf("unexpected parseTurnDirectives(/sol /yolo): model=%q aa=%v clean=%q", m, aa, cl)
+	}
+	if m, aa, cl := parseTurnDirectives("/auto-approve", DefaultAliases()); m != "" || aa || cl != "/auto-approve" {
+		t.Fatalf("expected bare /auto-approve not to consume empty prompt, got model=%q aa=%v clean=%q", m, aa, cl)
+	}
+
+	tmp := t.TempDir()
+	eng, err := Open(filepath.Join(tmp, "assistant.db"), filepath.Join(tmp, "assistant.json"), filepath.Join(tmp, "vault"), &fakeDeps{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = eng.Close() }()
+
+	roDir := filepath.Join(tmp, "readonly-vault")
+	if err := os.MkdirAll(roDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := DefaultConfig()
+	cfg.Enabled = true
+	cfg.BaseURL = mockLLM.URL
+	cfg.APIKey = "sk-or-test"
+	cfg.AutoApprove = true
+	cfg.ExtraVaults = []VaultMount{{Name: "ref", Path: roDir, ReadOnly: true}}
+	if _, err := eng.UpdateConfig(cfg, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read-only vault invariant must remain enforced even with BypassHITL=true.
+	if _, roErr := eng.execVaultWriteTool("vault_write", map[string]any{"vault": "ref", "path": "Note.md", "content": "x"}, "{}", &toolExecContext{ChannelID: "general", Source: "chat", Config: cfg, BypassHITL: true}); roErr == nil {
+		t.Fatalf("expected read-only vault write to stay forbidden even under BypassHITL")
+	}
+
+	eng.Start(t.Context())
+	sub := eng.Subscribe()
+	defer eng.Unsubscribe(sub)
+
+	waitDone := func() Message {
+		t.Helper()
+		dl := time.After(5 * time.Second)
+		for {
+			select {
+			case ev := <-sub:
+				if ev.Type == "message_done" {
+					m, _ := ev.Data.(Message)
+					return m
+				}
+			case <-dl:
+				t.Fatalf("timed out waiting for message_done")
+			}
+		}
+	}
+	waitApproval := func() Approval {
+		t.Helper()
+		dl := time.After(5 * time.Second)
+		for {
+			select {
+			case ev := <-sub:
+				if ev.Type == "approval" {
+					a, _ := ev.Data.(Approval)
+					return a
+				}
+			case <-dl:
+				t.Fatalf("timed out waiting for approval")
+			}
+		}
+	}
+
+	// 1. Global AutoApprove=true bypasses frontier escalation, protected vault_write, and fleet_spawn_agent.
+	if _, _, err := eng.EnqueueUserMessage("general", "write Projects/Bypass.md and spawn agent", ""); err != nil {
+		t.Fatal(err)
+	}
+	m1 := waitDone()
+	if m1.Model != DefaultFrontierModel || !strings.Contains(m1.Content, "done-global:"+DefaultFrontierModel) {
+		t.Fatalf("expected direct frontier completion without HITL, got %+v", m1)
+	}
+	pending, err := eng.Store().ListApprovals("pending", 10)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("expected 0 pending approvals with AutoApprove=true, got %+v (err=%v)", pending, err)
+	}
+	v, _ := eng.Vault()
+	if got, rErr := v.ReadFile("Projects/Bypass.md"); rErr != nil || got != "# Bypassed" {
+		t.Fatalf("expected Projects/Bypass.md written directly, got %q (%v)", got, rErr)
+	}
+
+	// 2. SetAutoApprove(false) restores HITL while preserving ExtraVaults/APIKey.
+	fVal := false
+	view, err := eng.SetAutoApprove(&fVal, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.AutoApprove || len(view.ExtraVaults) != 1 || !view.Configured {
+		t.Fatalf("unexpected view after SetAutoApprove(false): %+v", view)
+	}
+
+	// 3. One-shot /yolo /sol bypasses HITL for that turn only without persisting AutoApprove.
+	if _, _, err := eng.EnqueueUserMessage("general", "/yolo /sol write Projects/OneShot.md", ""); err != nil {
+		t.Fatal(err)
+	}
+	m2 := waitDone()
+	if m2.Model != DefaultFrontierModel || !strings.Contains(m2.Content, "write Projects/OneShot.md") {
+		t.Fatalf("expected /yolo /sol turn completion with stripped directive, got %+v", m2)
+	}
+	if got, rErr := v.ReadFile("Projects/OneShot.md"); rErr != nil || got != "# OneShot" {
+		t.Fatalf("expected Projects/OneShot.md written, got %q (%v)", got, rErr)
+	}
+	if eng.Config().AutoApprove {
+		t.Fatalf("one-shot /yolo must not mutate persistent Config.AutoApprove")
+	}
+
+	// 4. Subsequent normal turn still triggers HITL frontier escalation.
+	if _, _, err := eng.EnqueueUserMessage("general", "complex prompt requiring approval", ""); err != nil {
+		t.Fatal(err)
+	}
+	apr := waitApproval()
+	if apr.ToolName != FrontierEscalationTool {
+		t.Fatalf("expected frontier_escalation approval after one-shot turn, got %+v", apr)
+	}
+}

@@ -81,31 +81,89 @@ func cmdAssistant(args []string, cio *IO) error {
 }
 
 type assistantSetupFlags struct {
-	opRef             string
-	apiKeyOPRef       string
-	apiKey            string
-	vaultPath         string
-	model             string
-	routingMode       string
-	decisionModel     string
-	observerModel     string
-	zdr               bool
-	enable            bool
-	discordRef        string
-	fleetURL          string
-	discordBotRef     string
-	discordUserID     string
-	discordGuildID    string
-	discordCategory   string
-	discordNoAutoSync bool
-	discordChPairs    []string
-	sandboxEnable     bool
-	sandboxDisable    bool
+	opRef                 string
+	apiKeyOPRef           string
+	apiKey                string
+	vaultPath             string
+	model                 string
+	routingMode           string
+	decisionModel         string
+	observerModel         string
+	zdr                   bool
+	enable                bool
+	autoApprove           bool
+	autoApproveSet        bool
+	noAutoApprove         bool
+	discordAutoApprove    bool
+	discordAutoApproveSet bool
+	discordNoAutoApprove  bool
+	discordRef            string
+	fleetURL              string
+	discordBotRef         string
+	discordUserID         string
+	discordGuildID        string
+	discordCategory       string
+	discordNoAutoSync     bool
+	discordChPairs        []string
+	sandboxEnable         bool
+	sandboxDisable        bool
+}
+
+func applyAutoApproveSetupFlags(cfg *assistant.Config, opts assistantSetupFlags) error {
+	if opts.autoApproveSet && opts.noAutoApprove {
+		return errors.New("--auto-approve and --no-auto-approve cannot be combined")
+	}
+	if opts.discordAutoApproveSet && opts.discordNoAutoApprove {
+		return errors.New("--discord-auto-approve and --discord-no-auto-approve cannot be combined")
+	}
+	if opts.noAutoApprove {
+		cfg.AutoApprove = false
+	} else if opts.autoApproveSet {
+		cfg.AutoApprove = opts.autoApprove
+	}
+	if opts.discordNoAutoApprove {
+		cfg.Discord.AutoApprove = false
+	} else if opts.discordAutoApproveSet {
+		cfg.Discord.AutoApprove = opts.discordAutoApprove
+	}
+	return nil
+}
+
+func applyDiscordSetupFlags(cfg *assistant.Config, opts assistantSetupFlags) error {
+	if opts.discordRef != "" {
+		cfg.Notifications.DiscordWebhookOPRef = strings.TrimSpace(opts.discordRef)
+		cfg.Notifications.Enabled = true
+	}
+	if opts.fleetURL != "" {
+		cfg.Notifications.FleetBaseURL = strings.TrimSpace(opts.fleetURL)
+		cfg.Discord.FleetBaseURL = strings.TrimSpace(opts.fleetURL)
+	}
+	if opts.discordBotRef != "" {
+		cfg.Discord.BotTokenOPRef = strings.TrimSpace(opts.discordBotRef)
+		cfg.Discord.Enabled = true
+	}
+	if opts.discordUserID != "" {
+		cfg.Discord.AuthorizedUserID = strings.TrimSpace(opts.discordUserID)
+	}
+	if opts.discordGuildID != "" {
+		cfg.Discord.GuildID = strings.TrimSpace(opts.discordGuildID)
+	}
+	if opts.discordCategory != "" {
+		cfg.Discord.CategoryName = strings.TrimSpace(opts.discordCategory)
+	}
+	if opts.discordNoAutoSync {
+		f := false
+		cfg.Discord.AutoSyncChannels = &f
+	}
+	return applyDiscordChannelPairs(cfg, opts.discordChPairs)
 }
 
 func applyAssistantSetupFlags(cfg *assistant.Config, opts assistantSetupFlags, cio *IO) error {
 	cfg.Enabled = opts.enable
 	cfg.ZDR = opts.zdr
+	if err := applyAutoApproveSetupFlags(cfg, opts); err != nil {
+		return err
+	}
 	switch {
 	case opts.apiKeyOPRef != "":
 		cfg.APIKeyOPRef = strings.TrimSpace(opts.apiKeyOPRef)
@@ -143,32 +201,7 @@ func applyAssistantSetupFlags(cfg *assistant.Config, opts assistantSetupFlags, c
 		cfg.Models.Observer = opts.observerModel
 		cfg.Models.Reflector = opts.observerModel
 	}
-	if opts.discordRef != "" {
-		cfg.Notifications.DiscordWebhookOPRef = strings.TrimSpace(opts.discordRef)
-		cfg.Notifications.Enabled = true
-	}
-	if opts.fleetURL != "" {
-		cfg.Notifications.FleetBaseURL = strings.TrimSpace(opts.fleetURL)
-		cfg.Discord.FleetBaseURL = strings.TrimSpace(opts.fleetURL)
-	}
-	if opts.discordBotRef != "" {
-		cfg.Discord.BotTokenOPRef = strings.TrimSpace(opts.discordBotRef)
-		cfg.Discord.Enabled = true
-	}
-	if opts.discordUserID != "" {
-		cfg.Discord.AuthorizedUserID = strings.TrimSpace(opts.discordUserID)
-	}
-	if opts.discordGuildID != "" {
-		cfg.Discord.GuildID = strings.TrimSpace(opts.discordGuildID)
-	}
-	if opts.discordCategory != "" {
-		cfg.Discord.CategoryName = strings.TrimSpace(opts.discordCategory)
-	}
-	if opts.discordNoAutoSync {
-		f := false
-		cfg.Discord.AutoSyncChannels = &f
-	}
-	if err := applyDiscordChannelPairs(cfg, opts.discordChPairs); err != nil {
+	if err := applyDiscordSetupFlags(cfg, opts); err != nil {
 		return err
 	}
 	if opts.sandboxEnable {
@@ -211,6 +244,10 @@ func cmdAssistantSetup(args []string, cio *IO) error {
 	fs.StringVar(&opts.observerModel, "observer-model", "", "observer/reflector model slug")
 	fs.BoolVar(&opts.zdr, "zdr", true, "enforce OpenRouter Zero Data Retention")
 	fs.BoolVar(&opts.enable, "enable", true, "enable assistant background scheduler")
+	fs.BoolVar(&opts.autoApprove, "auto-approve", false, "bypass HITL approvals for all tools and frontier escalations")
+	fs.BoolVar(&opts.noAutoApprove, "no-auto-approve", false, "require HITL approvals (disable global auto-approve)")
+	fs.BoolVar(&opts.discordAutoApprove, "discord-auto-approve", false, "bypass HITL approvals for Discord turns")
+	fs.BoolVar(&opts.discordNoAutoApprove, "discord-no-auto-approve", false, "disable Discord-specific auto-approve")
 	fs.StringVar(&opts.discordRef, "discord-webhook-op-ref", "", "1Password op:// ref for outbound Discord webhook notifications")
 	fs.StringVar(&opts.fleetURL, "fleet-url", "", "Fleet Console base URL used in Discord deep links")
 	fs.StringVar(&opts.discordBotRef, "discord-bot-token-op-ref", "", "1Password op:// ref for two-way Discord Gateway bot token")
@@ -227,6 +264,14 @@ func cmdAssistantSetup(args []string, cio *IO) error {
 	if _, err := parseFlagsInterspersed(fs, args); err != nil {
 		return err
 	}
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "auto-approve":
+			opts.autoApproveSet = true
+		case "discord-auto-approve":
+			opts.discordAutoApproveSet = true
+		}
+	})
 	if *checkOnly {
 		return cmdAssistantDoctor(nil, cio)
 	}
@@ -251,6 +296,7 @@ func cmdAssistantSetup(args []string, cio *IO) error {
 		"api_key_op_ref":             cfg.APIKeyOPRef,
 		"clear_api_key":              cfg.APIKey == "" && cfg.APIKeyOPRef != "",
 		"zdr":                        cfg.ZDR,
+		"auto_approve":               cfg.AutoApprove,
 		"data_collection":            cfg.DataCollection,
 		"vault_path":                 cfg.VaultPath,
 		"auto_write_dirs":            cfg.AutoWriteDirs,
@@ -271,7 +317,7 @@ func cmdAssistantSetup(args []string, cio *IO) error {
 	if err := client.Call(api, http.MethodPost, "/v1/assistant/config", req, 30*time.Second, nil, &out); err != nil {
 		return err
 	}
-	cio.info(fmt.Sprintf("assistant configured (enabled=%v model=%s vault=%s zdr=%v)", out.Config.Enabled, out.Config.Models.DefaultChat, out.Config.EffectiveVaultPath, out.Config.ZDR))
+	cio.info(fmt.Sprintf("assistant configured (enabled=%v model=%s vault=%s zdr=%v auto_approve=%v)", out.Config.Enabled, out.Config.Models.DefaultChat, out.Config.EffectiveVaultPath, out.Config.ZDR, out.Config.AutoApprove))
 	if out.Config.Discord.Enabled && (out.Config.Discord.AutoSyncChannels == nil || *out.Config.Discord.AutoSyncChannels) {
 		var syncOut struct {
 			OK   bool                        `json:"ok"`
@@ -489,7 +535,7 @@ func cmdAssistantStatus(args []string, cio *IO) error {
 	if *jsonOut {
 		return writeJSONOut(cio.Stdout, res)
 	}
-	cio.printf("enabled:           %v (configured=%v, zdr=%v)\n", res.Config.Enabled, res.Config.Configured, res.Config.ZDR)
+	cio.printf("enabled:           %v (configured=%v, zdr=%v, auto_approve=%v, discord_auto_approve=%v)\n", res.Config.Enabled, res.Config.Configured, res.Config.ZDR, res.Config.AutoApprove, res.Config.Discord.AutoApprove)
 	cio.printf("vault:             %s\n", res.Config.EffectiveVaultPath)
 	for _, m := range res.Config.ExtraVaults {
 		mode := "approval-writes"
@@ -511,13 +557,14 @@ func cmdAssistantAsk(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("assistant ask", flag.ContinueOnError)
 	ch := fs.String("channel", "general", "target channel")
 	model := fs.String("model", "", "optional model override")
+	autoApprove := fs.Bool("auto-approve", false, "bypass HITL approvals for this prompt")
 	pos, err := parseFlagsInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
 	prompt := strings.TrimSpace(strings.Join(pos, " "))
 	if prompt == "" {
-		return fmt.Errorf("usage: fleet assistant ask [--channel CH] [--model M] PROMPT")
+		return fmt.Errorf("usage: fleet assistant ask [--channel CH] [--model M] [--auto-approve] PROMPT")
 	}
 	api, err := client.ResolveAPI("")
 	if err != nil {
@@ -526,10 +573,11 @@ func cmdAssistantAsk(args []string, cio *IO) error {
 	var out struct {
 		Message assistant.Message `json:"message"`
 	}
-	if err := client.Call(api, http.MethodPost, "/v1/assistant/messages", map[string]string{
-		"channel": *ch,
-		"content": prompt,
-		"model":   *model,
+	if err := client.Call(api, http.MethodPost, "/v1/assistant/messages", map[string]any{
+		"channel":      *ch,
+		"content":      prompt,
+		"model":        *model,
+		"auto_approve": *autoApprove,
 	}, 15*time.Second, nil, &out); err != nil {
 		return err
 	}
