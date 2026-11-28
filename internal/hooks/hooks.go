@@ -359,11 +359,15 @@ func syncClaudeMessagingSocket(event, sessionID string, claudePID int) {
 	}
 }
 
+func isSubagentHook(in *hookInput) bool {
+	return in.AgentID != "" || in.AgentIDCamel != "" || in.ParentConvID != "" || in.ParentConvSnake != "" || in.IsSubagent
+}
+
 func maybeRecordSessionHook(harness string, in *hookInput, rawID, cwd, transcriptPath string) {
 	if os.Getenv("FLEET_SESSION_TARGET") == "" {
 		return
 	}
-	if in.AgentID != "" || in.AgentIDCamel != "" || in.ParentConvID != "" || in.ParentConvSnake != "" || in.IsSubagent {
+	if isSubagentHook(in) {
 		return
 	}
 	if rawID == "" || rawID == "agy" || strings.HasPrefix(rawID, "pid-") {
@@ -411,7 +415,7 @@ func EnvSessionName(harness string) string {
 	return ""
 }
 
-func resolveHeartbeatIdentity(harness, rawID, title string, isExplicitName bool) (titlePtr, namePtr *string, explicitName bool) {
+func resolveHeartbeatIdentity(harness, rawID, title string, isExplicitName, isSubagent bool) (titlePtr, namePtr *string, explicitName bool) {
 	explicitName = isExplicitName
 	if title != "" {
 		titlePtr = &title
@@ -419,7 +423,7 @@ func resolveHeartbeatIdentity(harness, rawID, title string, isExplicitName bool)
 			namePtr = &title
 		}
 	}
-	if namePtr == nil {
+	if namePtr == nil && !isSubagent {
 		fallback := EnvSessionName(harness)
 		if fallback == "" && harness == "antigravity" && rawID != "" {
 			fallback = session.LookupAppSessionName(harness, rawID)
@@ -483,7 +487,7 @@ func RunHook(harness string, stdin io.Reader, stdout io.Writer, apiURL string) (
 		case "codex":
 			pidPtr = new(os.Getppid())
 		}
-		titlePtr, namePtr, explicitName := resolveHeartbeatIdentity(harness, rawID, title, isExplicitName)
+		titlePtr, namePtr, explicitName := resolveHeartbeatIdentity(harness, rawID, title, isExplicitName, isSubagentHook(&in))
 		var sumPtr *string
 		if summary != "" {
 			sumPtr = &summary

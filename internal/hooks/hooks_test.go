@@ -546,4 +546,17 @@ func TestRunHookEnvAndAppSessionNamePropagation(t *testing.T) {
 	if err != nil || s4.Name != "custom-claude-title" {
 		t.Fatalf("expected explicit transcript title custom-claude-title, got %+v (err=%v)", s4, err)
 	}
+
+	// 5. Subagent hook does NOT inherit parent FLEET_SESSION_NAME.
+	t.Setenv("FLEET_SESSION_NAME", "parent-session-name")
+	fire("claude", map[string]any{
+		"hook_event_name": "SessionStart",
+		"session_id":      "cl-sub-1",
+		"agent_id":        "sub-9",
+		"cwd":             tmp,
+	})
+	s5, err := f.Agents.GetSession("cl-sub-1")
+	if err != nil || s5.Name == "parent-session-name" {
+		t.Fatalf("expected subagent hook not to inherit FLEET_SESSION_NAME, got %+v (err=%v)", s5, err)
+	}
 }
