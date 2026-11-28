@@ -1,4 +1,4 @@
-import { api, badge, clear, closeModal, el, field, openModal, section, toast } from "./lib.js";
+import { api, badge, clear, closeModal, confirmDialog, el, field, openModal, section, toast } from "./lib.js";
 
 const DEFAULT_SKILL_TEMPLATE = `---
 name: my-skill
@@ -103,6 +103,7 @@ export async function renderSkills(main, ctx, sub) {
     el("a", { href: "#skills/agent", className: `subtab${tab === "agent" ? " active" : ""}`, text: "SOUL & Heartbeat" }),
     el("a", { href: "#skills/memory", className: `subtab${tab === "memory" ? " active" : ""}`, text: "Observational Memory" }),
     el("a", { href: "#skills/vault", className: `subtab${tab === "vault" ? " active" : ""}`, text: "Vault Search" }),
+    el("a", { href: "#skills/history", className: `subtab${tab === "history" ? " active" : ""}`, text: "History" }),
   );
 
   const actions = el(
@@ -244,6 +245,71 @@ export async function renderSkills(main, ctx, sub) {
     return;
   }
 
+  if (tab === "history") {
+    let commits = [];
+    try {
+      const res = await api("GET", "/v1/assistant/vault/history?vault=agent&limit=25");
+      commits = res.commits || [];
+    } catch (err) {
+      body.appendChild(el("div", { className: "alert-banner alert-danger", text: err.message }));
+      return;
+    }
+    if (commits.length === 0) {
+      body.appendChild(el("div", { className: "card" }, el("div", { className: "small muted", text: "No git commit history found in the primary agent vault." })));
+      return;
+    }
+    for (const c of commits) {
+      body.appendChild(
+        el(
+          "article",
+          { className: "card" },
+          el(
+            "div",
+            { className: "card-header" },
+            el("div", { className: "actions-row" }, badge(c.short_sha, "info"), el("strong", { text: c.message })),
+            el("span", { className: "mono small muted", text: c.date }),
+          ),
+          el(
+            "div",
+            { className: "actions-row" },
+            el("button", {
+              type: "button",
+              className: "btn btn-sm",
+              text: "View Diff",
+              onclick: async () => {
+                try {
+                  const res = await api("GET", `/v1/assistant/vault/diff?vault=agent&sha=${encodeURIComponent(c.sha)}`);
+                  openModal(`Commit ${c.short_sha}`, el("pre", { className: "code-block" }, el("code", { text: res.diff || "(empty diff)" })));
+                } catch (err) {
+                  toast(err.message, "error");
+                }
+              },
+            }),
+            el("button", {
+              type: "button",
+              className: "btn btn-sm btn-danger",
+              text: "Rollback",
+              onclick: async () => {
+                const ok = await confirmDialog("Rollback Vault", `Restore agent vault files to commit ${c.short_sha} (${c.message})?`, "Rollback", true);
+                if (!ok) {
+                  return;
+                }
+                try {
+                  await api("POST", "/v1/assistant/vault/rollback", { vault: "agent", sha: c.sha });
+                  toast(`Rolled back vault to ${c.short_sha}`, "ok");
+                  ctx.refresh();
+                } catch (err) {
+                  toast(err.message, "error");
+                }
+              },
+            }),
+          ),
+        ),
+      );
+    }
+    return;
+  }
+
   let skills = [];
   try {
     const res = await api("GET", "/v1/assistant/skills");
@@ -268,7 +334,7 @@ export async function renderSkills(main, ctx, sub) {
           "div",
           { className: "card-header" },
           el("h3", { className: "card-title", text: sk.name }),
-          el("div", { className: "actions-row" }, sk.model ? badge(sk.model, "info") : null, ...(sk.tags || []).map((t) => badge(t, "neutral"))),
+          el("div", { className: "actions-row" }, sk.sync_to_fleet ? badge("sync_to_fleet", "ok") : null, sk.model ? badge(sk.model, "info") : null, ...(sk.tags || []).map((t) => badge(t, "neutral"))),
         ),
         el("div", { className: "small muted mb-2", text: sk.description || "(no description)" }),
         el(

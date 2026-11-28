@@ -37,6 +37,7 @@ import (
 	"github.com/bdatdo0601/fleet/internal/registry"
 	"github.com/bdatdo0601/fleet/internal/render"
 	"github.com/bdatdo0601/fleet/internal/server"
+	"github.com/bdatdo0601/fleet/internal/skills"
 	"github.com/bdatdo0601/fleet/internal/system"
 	"github.com/bdatdo0601/fleet/internal/usage"
 	"github.com/bdatdo0601/fleet/internal/version"
@@ -1056,6 +1057,21 @@ func syncOwnerPre(cio *IO, stamp string, node client.NodeConfig) {
 	}
 }
 
+func syncOwnerDynamicSkills(cio *IO, stamp string, node client.NodeConfig, synced []core.SyncedSkill) {
+	if node.Owner == "" {
+		return
+	}
+	dyn := make([]skills.Skill, 0, len(synced))
+	for _, s := range synced {
+		dyn = append(dyn, skills.Skill{Name: s.Name, Content: []byte(s.Content)})
+	}
+	if changed, err := mcpinstall.SyncDynamicSkills(node.Owner, dyn); err != nil {
+		cio.printf("%s synced skills warning: %v\n", stamp, err)
+	} else if len(changed) > 0 {
+		cio.printf("%s synced %d vault skill update(s)\n", stamp, len(changed))
+	}
+}
+
 func syncOwnerPost(cio *IO, stamp string, node client.NodeConfig) {
 	if node.Owner == "" {
 		return
@@ -1166,6 +1182,7 @@ func cmdSync(args []string, cio *IO) error {
 	if err := applySyncedFiles(cio, stamp, payload); err != nil {
 		return err
 	}
+	syncOwnerDynamicSkills(cio, stamp, node, payload.SyncedSkills)
 	syncMacResolverForPayload(cio, stamp, payload)
 	harvestSyncedOwnerMemories(cio, stamp, node)
 	syncOwnerPost(cio, stamp, node)

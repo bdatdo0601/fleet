@@ -690,3 +690,71 @@ func SyncOwnerConfigs(owner string) ([]string, error) {
 	}
 	return Install(InstallOpts{Home: home, UID: &uid, GID: &gid})
 }
+
+const dynamicSkillManifest = ".fleet-synced-skills.json"
+
+// SyncDynamicSkills installs vault skills marked sync_to_fleet into owner's Claude/Codex/Antigravity
+// skill folders and prunes previously synced dynamic skills that are no longer present.
+func SyncDynamicSkills(owner string, dynamic []skills.Skill) ([]string, error) {
+	if owner == "" || owner == "root" {
+		return nil, nil
+	}
+	home := paths.HomeForUser(owner)
+	if home == "" {
+		return nil, fmt.Errorf("lookup user %q failed", owner)
+	}
+	uid, gid, err := paths.LookupUIDGID(owner)
+	if err != nil {
+		return nil, err
+	}
+	return syncDynamicSkillsInHome(home, &uid, &gid, dynamic)
+}
+
+func syncDynamicSkillsInHome(home string, uid, gid *int, dynamic []skills.Skill) ([]string, error) {
+	dirs := skillDirsForHarnesses(home, paths.Harnesses)
+	want := make(map[string][]byte, len(dynamic))
+	var wantNames []string
+	for _, sk := range dynamic {
+		slug := strings.TrimSpace(sk.Name)
+		if slug == "" || slices.Contains(skills.Names, slug) || strings.Contains(slug, "/") || strings.Contains(slug, "..") {
+			continue
+		}
+		want[slug] = sk.Content
+		wantNames = append(wantNames, slug)
+	}
+	slices.Sort(wantNames)
+
+	var changed []string
+	for _, base := range dirs {
+		manifestPath := filepath.Join(base, dynamicSkillManifest)
+		var prev []string
+		if raw, rErr := os.ReadFile(manifestPath); rErr == nil {
+			_ = json.Unmarshal(raw, &prev)
+		}
+		for _, oldName := range prev {
+			if _, keep := want[oldName]; !keep && !slices.Contains(skills.Names, oldName) && oldName != "" && !strings.Contains(oldName, "/") {
+				dir := filepath.Join(base, oldName)
+				if pathExists(dir) && os.RemoveAll(dir) == nil {
+					changed = append(changed, dir)
+				}
+			}
+		}
+		for _, name := range wantNames {
+			p := filepath.Join(base, name, "SKILL.md")
+			wrote, err := paths.WriteFileAtomic(p, want[name], 0o644, uid, gid)
+			if err != nil {
+				return nil, err
+			}
+			if wrote {
+				changed = append(changed, p)
+			}
+		}
+		if len(prev) > 0 || len(wantNames) > 0 {
+			raw, _ := json.Marshal(wantNames)
+			if _, wErr := paths.WriteFileAtomic(manifestPath, append(raw, '\n'), 0o644, uid, gid); wErr != nil {
+				return nil, wErr
+			}
+		}
+	}
+	return changed, nil
+}

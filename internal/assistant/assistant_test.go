@@ -2,6 +2,7 @@ package assistant
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -18,6 +20,8 @@ import (
 
 type fakeDeps struct {
 	sentSlack []string
+	spawned   []SpawnAgentRequest
+	killed    []string
 }
 
 func (f *fakeDeps) ListAgents(_, _, _, _ string, _ bool) (any, error) {
@@ -30,6 +34,28 @@ func (f *fakeDeps) InspectAgent(target string) (any, error) {
 
 func (f *fakeDeps) SendAgentMessage(fromDevice, to, body string) (any, error) {
 	return map[string]any{"from": fromDevice, "to": to, "body": body}, nil
+}
+
+func (f *fakeDeps) ListPaths(device, query string, _ int) (any, error) {
+	return []map[string]any{{"device": cmp.Or(device, "laptop"), "repo": "fleet", "path": "/Users/datdo/workspace/fleet", "query": query}}, nil
+}
+
+func (f *fakeDeps) SpawnAgent(_ context.Context, req SpawnAgentRequest) (SpawnAgentResult, error) {
+	f.spawned = append(f.spawned, req)
+	return SpawnAgentResult{
+		JobID:        "job-spawn-1",
+		TargetDevice: cmp.Or(req.Device, "laptop"),
+		Harness:      req.Harness,
+		SessionName:  cmp.Or(req.Name, "task-1"),
+		RepoPath:     cmp.Or(req.RepoPath, "/Users/datdo/workspace/fleet"),
+		Status:       "queued",
+		WorkerOnline: true,
+	}, nil
+}
+
+func (f *fakeDeps) KillAgent(_ context.Context, sessionID string) (any, error) {
+	f.killed = append(f.killed, sessionID)
+	return map[string]any{"ok": true, "session_id": sessionID}, nil
 }
 
 func (f *fakeDeps) MemorySearch(query, scope, _, _ string, _ int) (any, error) {
@@ -791,5 +817,374 @@ func TestMultiVaultToolsPolicyAndDoctor(t *testing.T) {
 	}
 	if byName["vault:ref"].Status != "ok" || byName["obsidian_sync:ref"].Status != "warn" {
 		t.Fatalf("expected ref vault ok and sync warn, got %+v", byName)
+	}
+}
+
+func TestGenerativeUIPromptAndValidation(t *testing.T) {
+	tmp := t.TempDir()
+	eng, err := Open(filepath.Join(tmp, "assistant.db"), filepath.Join(tmp, "assistant.json"), filepath.Join(tmp, "vault"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = eng.Close() }()
+
+	msgs := eng.buildPromptMessages(t.Context(), Channel{ID: "general"}, nil, DefaultAliases())
+	rawPrompt, _ := json.Marshal(msgs[0])
+	prompt := string(rawPrompt)
+	for _, want := range []string{"render_card", "render_widget", "data-fleet-action", "--accent"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("expected %q in system prompt, got %s", want, prompt)
+		}
+	}
+
+	var widgets []WidgetPayload
+	tctx := &toolExecContext{ChannelID: "general", Source: "chat", Config: eng.Config(), Widgets: &widgets}
+
+	// render_card(kind="markdown") normalizes string data to {"markdown": ...}.
+	if _, err := eng.executeTool(t.Context(), ToolCall{
+		ID:       "ui1",
+		Type:     "function",
+		Function: ToolCallFunction{Name: "render_card", Arguments: `{"kind":"markdown","title":"Summary","data":"**Done**"}`},
+	}, tctx); err != nil {
+		t.Fatalf("render_card markdown failed: %v", err)
+	}
+	if len(widgets) != 1 || widgets[0].Kind != "markdown" {
+		t.Fatalf("expected 1 markdown widget, got %+v", widgets)
+	}
+	dataMap, ok := widgets[0].Data.(map[string]any)
+	if !ok || dataMap["markdown"] != "**Done**" {
+		t.Fatalf("expected normalized markdown map, got %+v", widgets[0].Data)
+	}
+
+	// Unsupported render_card kind fails validation.
+	if _, err := eng.executeTool(t.Context(), ToolCall{
+		ID:       "ui2",
+		Type:     "function",
+		Function: ToolCallFunction{Name: "render_card", Arguments: `{"kind":"unknown_card","data":{}}`},
+	}, tctx); err == nil {
+		t.Fatalf("expected unsupported render_card kind to fail")
+	}
+
+	// Empty render_widget html fails validation.
+	if _, err := eng.executeTool(t.Context(), ToolCall{
+		ID:       "ui3",
+		Type:     "function",
+		Function: ToolCallFunction{Name: "render_widget", Arguments: `{"title":"Empty","html":"   "}`},
+	}, tctx); err == nil {
+		t.Fatalf("expected empty widget html to fail")
+	}
+}
+
+func TestHTTPMCPTransportAndSelfSetupTools(t *testing.T) {
+	secret := "http-mcp-secret-999"
+	mcpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+secret {
+			http.Error(w, "unauthorized got="+r.Header.Get("Authorization"), http.StatusUnauthorized)
+			return
+		}
+		var req struct {
+			ID     int64          `json:"id"`
+			Method string         `json:"method"`
+			Params map[string]any `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch req.Method {
+		case "initialize":
+			w.Header().Set("Mcp-Session-Id", "sess-http-1")
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{"protocolVersion": "2024-11-05"}})
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/list":
+			if r.Header.Get("Mcp-Session-Id") != "sess-http-1" {
+				http.Error(w, "missing Mcp-Session-Id", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprintf(w, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"tools\":[{\"name\":\"list_events\",\"description\":\"List calendar events\"}]}}\n\n", req.ID)
+		case "tools/call":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{"events": []string{"Standup"}}})
+		}
+	}))
+	defer mcpSrv.Close()
+
+	tmp := t.TempDir()
+	eng, err := Open(filepath.Join(tmp, "assistant.db"), filepath.Join(tmp, "assistant.json"), filepath.Join(tmp, "vault"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = eng.Close() }()
+
+	eng.SetOPReader(func(_ context.Context, ref string) (string, error) {
+		if ref == "op://Fleet-Agent/GCal/token" {
+			return "Bearer " + secret, nil
+		}
+		return "", fmt.Errorf("unexpected ref %q", ref)
+	})
+
+	tctx := &toolExecContext{ChannelID: "general", Source: "chat", Config: eng.Config()}
+	// Rejects shell interpreter during self-setup.
+	if _, err := eng.executeTool(t.Context(), ToolCall{
+		ID:       "m1",
+		Type:     "function",
+		Function: ToolCallFunction{Name: "mcp_configure", Arguments: `{"name":"bad","transport":"stdio","command":"/bin/sh","args":["-c","id"]}`},
+	}, tctx); err == nil {
+		t.Fatalf("expected shell command to be rejected by mcp_configure")
+	}
+	// Rejects plaintext secret in headers during self-setup.
+	if _, err := eng.executeTool(t.Context(), ToolCall{
+		ID:       "m2",
+		Type:     "function",
+		Function: ToolCallFunction{Name: "mcp_configure", Arguments: fmt.Sprintf(`{"name":"gcal","transport":"http","url":%q,"headers":{"Authorization":"Bearer raw"}}`, mcpSrv.URL)},
+	}, tctx); err == nil {
+		t.Fatalf("expected plaintext Authorization header to be rejected by mcp_configure")
+	}
+
+	// Valid mcp_configure pauses for HITL approval.
+	cfgArgs := fmt.Sprintf(`{"name":"gcal","transport":"http","url":%q,"header_refs":{"Authorization":"op://Fleet-Agent/GCal/token"}}`, mcpSrv.URL)
+	_, err = eng.executeTool(t.Context(), ToolCall{
+		ID:       "m3",
+		Type:     "function",
+		Function: ToolCallFunction{Name: "mcp_configure", Arguments: cfgArgs},
+	}, tctx)
+	aprErr, ok := errors.AsType[*approvalRequiredError](err)
+	if !ok || aprErr.RiskLevel != "mcp_config" {
+		t.Fatalf("expected approvalRequiredError for mcp_configure, got %v", err)
+	}
+
+	// Approving saves config, defaults require_approval_tools=["*"] and tests HTTP+SSE handshake.
+	tctxApproved := &toolExecContext{ChannelID: "general", Source: "approval", Config: eng.Config(), BypassHITL: true}
+	outStr, err := eng.executeTool(t.Context(), ToolCall{
+		ID:       "m3-ok",
+		Type:     "function",
+		Function: ToolCallFunction{Name: "mcp_configure", Arguments: aprErr.ArgsJSON},
+	}, tctxApproved)
+	if err != nil {
+		t.Fatalf("approved mcp_configure failed: %v", err)
+	}
+	if !strings.Contains(outStr, "list_events") {
+		t.Fatalf("expected discovered tool list_events in output, got %s", outStr)
+	}
+	if len(eng.Config().MCPServers) != 1 || len(eng.Config().MCPServers[0].RequireApprovalTools) != 1 || eng.Config().MCPServers[0].RequireApprovalTools[0] != "*" {
+		t.Fatalf("expected default require_approval_tools=[\"*\"], got %+v", eng.Config().MCPServers)
+	}
+
+	// mcp_list and mcp_test inspect live server; calling mcp__gcal__list_events requires approval due to ["*"].
+	listOut, err := eng.executeTool(t.Context(), ToolCall{ID: "ml", Type: "function", Function: ToolCallFunction{Name: "mcp_list", Arguments: `{}`}}, tctx)
+	if err != nil || !strings.Contains(listOut, "list_events") {
+		t.Fatalf("mcp_list failed: %v (%s)", err, listOut)
+	}
+	testOut, err := eng.executeTool(t.Context(), ToolCall{ID: "mt", Type: "function", Function: ToolCallFunction{Name: "mcp_test", Arguments: `{"name":"gcal"}`}}, tctx)
+	if err != nil || !strings.Contains(testOut, `"tool_count":1`) {
+		t.Fatalf("mcp_test failed: %v (%s)", err, testOut)
+	}
+	_, callErr := eng.executeTool(t.Context(), ToolCall{ID: "mc", Type: "function", Function: ToolCallFunction{Name: "mcp__gcal__list_events", Arguments: `{}`}}, tctx)
+	if _, isApr := errors.AsType[*approvalRequiredError](callErr); !isApr {
+		t.Fatalf("expected approvalRequiredError for newly configured MCP tool, got %v", callErr)
+	}
+	resOut, err := eng.executeTool(t.Context(), ToolCall{ID: "mc-ok", Type: "function", Function: ToolCallFunction{Name: "mcp__gcal__list_events", Arguments: `{}`}}, tctxApproved)
+	if err != nil || !strings.Contains(resOut, "Standup") {
+		t.Fatalf("approved mcp__gcal__list_events failed: %v (%s)", err, resOut)
+	}
+
+	// Verify HTTP errors scrub resolved secret values.
+	eng.SetOPReader(func(context.Context, string) (string, error) { return "Bearer wrong-" + secret, nil })
+	if _, err := eng.mcp.TestServer(t.Context(), MCPServerConfig{
+		Name: "gcal", Transport: "http", URL: mcpSrv.URL,
+		HeaderRefs: map[string]string{"Authorization": "op://Fleet-Agent/GCal/token"},
+	}); err == nil || strings.Contains(err.Error(), secret) {
+		t.Fatalf("expected secret scrubbed from HTTP MCP error, got %v", err)
+	}
+
+	// mcp_remove cleans up server after approval.
+	if _, err := eng.executeTool(t.Context(), ToolCall{ID: "mr", Type: "function", Function: ToolCallFunction{Name: "mcp_remove", Arguments: `{"name":"gcal"}`}}, tctxApproved); err != nil {
+		t.Fatalf("mcp_remove failed: %v", err)
+	}
+	if len(eng.Config().MCPServers) != 0 {
+		t.Fatalf("expected mcp_servers empty after remove, got %+v", eng.Config().MCPServers)
+	}
+}
+
+func TestCronTimersDelegationLifecycleAndVaultGit(t *testing.T) {
+	tmp := t.TempDir()
+	deps := &fakeDeps{}
+	vaultDir := filepath.Join(tmp, "vault")
+	eng, err := Open(filepath.Join(tmp, "assistant.db"), filepath.Join(tmp, "assistant.json"), vaultDir, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = eng.Close() }()
+
+	// Cron evaluation for 8:00 AM weekdays: Friday 2026-11-27 09:00 -> Monday 2026-11-30 08:00.
+	loc := time.UTC
+	fri := time.Date(2026, 11, 27, 9, 0, 0, 0, loc)
+	next, err := NextCronRun("0 8 * * 1-5", fri)
+	if err != nil {
+		t.Fatalf("NextCronRun failed: %v", err)
+	}
+	if next.Weekday() != time.Monday || next.Day() != 30 || next.Hour() != 8 || next.Minute() != 0 {
+		t.Fatalf("unexpected next weekday run: %v", next)
+	}
+	if _, err := eng.store.UpsertTimer(Timer{
+		ChannelID: "briefing", Name: "weekday-brief", Prompt: "Summarize", ScheduleKind: "cron", CronExpr: "0 8 * * 1-5", Enabled: true,
+	}); err != nil {
+		t.Fatalf("UpsertTimer cron failed: %v", err)
+	}
+
+	// Phase 3: fleet_list_paths, fleet_spawn_agent (approval -> delegation), OnAgentHeartbeat wakeup, fleet_kill_agent.
+	tctx := &toolExecContext{ChannelID: "fleet-ops", Source: "chat", Config: eng.Config()}
+	pathsOut, err := eng.executeTool(t.Context(), ToolCall{ID: "p1", Type: "function", Function: ToolCallFunction{Name: "fleet_list_paths", Arguments: `{"device":"laptop"}`}}, tctx)
+	if err != nil || !strings.Contains(pathsOut, "/Users/datdo/workspace/fleet") {
+		t.Fatalf("fleet_list_paths failed: %v (%s)", err, pathsOut)
+	}
+	spawnArgs := `{"harness":"claude","device":"laptop","name":"fix-auth","repo_path":"~/workspace/fleet","prompt":"Fix auth bug"}`
+	_, spawnErr := eng.executeTool(t.Context(), ToolCall{ID: "sp1", Type: "function", Function: ToolCallFunction{Name: "fleet_spawn_agent", Arguments: spawnArgs}}, tctx)
+	if _, isApr := errors.AsType[*approvalRequiredError](spawnErr); !isApr {
+		t.Fatalf("expected approvalRequiredError for fleet_spawn_agent, got %v", spawnErr)
+	}
+	tctxApproved := &toolExecContext{ChannelID: "fleet-ops", Source: "approval", Config: eng.Config(), BypassHITL: true}
+	spawnOut, err := eng.executeTool(t.Context(), ToolCall{ID: "sp1-ok", Type: "function", Function: ToolCallFunction{Name: "fleet_spawn_agent", Arguments: spawnArgs}}, tctxApproved)
+	if err != nil || !strings.Contains(spawnOut, "job-spawn-1") {
+		t.Fatalf("approved fleet_spawn_agent failed: %v (%s)", err, spawnOut)
+	}
+
+	// Simulate Slacker launch receipt and agent heartbeat transition working -> waiting_permission.
+	eng.OnSlackerReceipt("job-spawn-1", "laptop", "fix-auth", "launched", "")
+	eng.OnAgentHeartbeat("laptop", "claude", "laptop:claude:abc1", "fix-auth", "working", "Editing auth.go", "", nil)
+	eng.OnAgentHeartbeat("laptop", "claude", "laptop:claude:abc1", "fix-auth", "waiting_permission", "Need bash approval", "M auth.go", map[string]string{"tool": "Bash"})
+
+	var foundDelegationEvent bool
+	for range 10 {
+		ev, err := eng.store.ClaimNextInbox()
+		if err == nil && ev != nil && ev.Source == "delegation" {
+			foundDelegationEvent = true
+			break
+		}
+	}
+	if !foundDelegationEvent {
+		t.Fatalf("expected delegation inbox event after waiting_permission heartbeat")
+	}
+
+	// Vault git history, diff, and rollback.
+	for _, args := range [][]string{
+		{"-C", vaultDir, "init"},
+		{"-C", vaultDir, "config", "user.email", "test@fleet.local"},
+		{"-C", vaultDir, "config", "user.name", "Fleet Test"},
+		{"-C", vaultDir, "add", "-A"},
+		{"-C", vaultDir, "commit", "-m", "initial scaffold"},
+	} {
+		if out, gErr := exec.Command("git", args...).CombinedOutput(); gErr != nil {
+			t.Fatalf("git %v failed: %v (%s)", args, gErr, string(out))
+		}
+	}
+	v, _ := eng.vault()
+	if _, err := v.WriteFile("Inbox/note.md", "v1\n"); err != nil {
+		t.Fatal(err)
+	}
+	v.MaybeGitCommit(true, "add note v1")
+	if _, err := v.WriteFile("Inbox/note.md", "v2\n"); err != nil {
+		t.Fatal(err)
+	}
+	v.MaybeGitCommit(true, "update note v2")
+
+	hist, err := v.GitHistory(10)
+	if err != nil || len(hist) < 3 {
+		t.Fatalf("expected >= 3 git commits, got %+v (%v)", hist, err)
+	}
+	diff, err := v.GitDiff(hist[0].SHA)
+	if err != nil || !strings.Contains(diff, "v2") {
+		t.Fatalf("expected v2 in GitDiff, got %q (%v)", diff, err)
+	}
+	// Roll back to the "add note v1" commit (index 1).
+	if _, err := v.GitRollback(hist[1].SHA); err != nil {
+		t.Fatalf("GitRollback failed: %v", err)
+	}
+	gotNote, err := v.ReadFile("Inbox/note.md")
+	if err != nil || strings.TrimSpace(gotNote) != "v1" {
+		t.Fatalf("expected Inbox/note.md rolled back to v1, got %q (%v)", gotNote, err)
+	}
+}
+
+func TestDiscordWebhookNotifierAndDoctor(t *testing.T) {
+	var received []map[string]any
+	discordSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		received = append(received, body)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer discordSrv.Close()
+
+	tmp := t.TempDir()
+	eng, err := Open(filepath.Join(tmp, "assistant.db"), filepath.Join(tmp, "assistant.json"), filepath.Join(tmp, "vault"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = eng.Close() }()
+
+	cfg := DefaultConfig()
+	cfg.Notifications = NotificationsConfig{
+		Enabled:             true,
+		FleetBaseURL:        "https://fleet.example.com",
+		DiscordWebhookOPRef: "op://Fleet-Agent/Discord/webhook",
+		DiscordChannelOPRefs: map[string]string{
+			"approvals": "op://Fleet-Agent/Discord-Approvals/webhook",
+		},
+		MinPriority: "normal",
+	}
+	if _, err := eng.UpdateConfig(cfg, false); err != nil {
+		t.Fatal(err)
+	}
+	reader := func(_ context.Context, ref string) (string, error) {
+		switch ref {
+		case "op://Fleet-Agent/Discord/webhook", "op://Fleet-Agent/Discord-Approvals/webhook":
+			return discordSrv.URL + "/api/webhooks/123/secret-tok", nil
+		default:
+			return "", fmt.Errorf("unknown ref %q", ref)
+		}
+	}
+	eng.SetOPReader(reader)
+	notifier := NewDiscordWebhookNotifier(cfg.Notifications, reader, nil)
+	notifier.allowInsecureTestURL = true
+	eng.delMu.Lock()
+	eng.notifier = notifier
+	eng.delMu.Unlock()
+
+	if err := eng.TestNotification(t.Context()); err != nil {
+		t.Fatalf("TestNotification failed: %v", err)
+	}
+	if len(received) != 1 {
+		t.Fatalf("expected 1 Discord embed delivered, got %d", len(received))
+	}
+	rawEmbed, _ := json.Marshal(received[0])
+	if !strings.Contains(string(rawEmbed), "https://fleet.example.com/#chat/general") || strings.Contains(string(rawEmbed), "secret-tok") {
+		t.Fatalf("unexpected Discord embed payload: %s", rawEmbed)
+	}
+
+	// Verify URL validation rejects non-Discord webhook hosts and scrubs webhook URL from errors.
+	if err := validateDiscordWebhookURL("https://evil.example.com/hook", false); err == nil {
+		t.Fatalf("expected non-Discord host to be rejected")
+	}
+	dc := eng.checkNotificationsDoctor(t.Context(), Config{Notifications: NotificationsConfig{
+		Enabled:             true,
+		DiscordWebhookOPRef: "op://Fleet-Agent/Discord/webhook",
+	}})
+	// Mock reader returns http://127.0.0.1..., so production validator flags non-https discord.com without leaking secret-tok.
+	if dc.Status != "fail" || strings.Contains(dc.Detail, "secret-tok") {
+		t.Fatalf("expected doctor fail with scrubbed webhook token, got %+v", dc)
+	}
+	dcOK := eng.checkNotificationsDoctor(t.Context(), Config{Notifications: NotificationsConfig{
+		Enabled:             true,
+		DiscordWebhookOPRef: "op://Fleet-Agent/Discord/valid",
+	}})
+	_ = dcOK
+	eng.SetOPReader(func(context.Context, string) (string, error) { return "https://discord.com/api/webhooks/999/tok", nil })
+	dcPass := eng.checkNotificationsDoctor(t.Context(), Config{Notifications: NotificationsConfig{
+		Enabled:             true,
+		DiscordWebhookOPRef: "op://Fleet-Agent/Discord/valid",
+	}})
+	if dcPass.Status != "ok" {
+		t.Fatalf("expected notifications doctor ok for valid https://discord.com/api/webhooks/ URL, got %+v", dcPass)
 	}
 }

@@ -96,6 +96,7 @@ function applySavedTheme() {
     document.documentElement.removeAttribute("data-theme");
     updateThemeUI("auto");
   }
+  window.dispatchEvent(new CustomEvent("fleet-theme-change"));
 }
 
 function toggleTheme() {
@@ -245,6 +246,8 @@ function renderTopbar(ov, activeSection) {
   if (callerBadge && ov && ov.caller) {
     callerBadge.textContent = `${ov.caller.name} · ${ov.caller.ip} · ${ov.caller.group}`;
   }
+  updateAppBadgeCount(aprCount + waitingCount);
+  updateAlertsUI();
   const drawerCaller = document.getElementById("drawer-caller");
   if (drawerCaller && ov && ov.caller) {
     drawerCaller.textContent = `${ov.caller.name} · ${ov.caller.ip} · ${ov.caller.group}`;
@@ -300,6 +303,7 @@ async function refresh() {
     state.overview = ov;
     state.caller = ov.caller;
     state.isAdmin = Boolean(ov.caller && ov.caller.is_admin);
+    ensureAssistantSSE();
   } catch (err) {
     updateOfflineBanner(err.status === 503 || navigator.onLine === false);
     const main = document.getElementById("app-main");
@@ -382,6 +386,165 @@ async function renderCurrentRoute(seq) {
 }
 
 let refreshTimer = null;
+let assistantES = null;
+const SSE_EVENT_TYPES = [
+  "ready",
+  "run_start",
+  "tool_start",
+  "tool_done",
+  "delta",
+  "message_created",
+  "message_done",
+  "approval",
+  "approval_decided",
+  "channel_reset",
+  "outbox",
+  "delegation",
+  "error",
+];
+
+function alertsEnabled() {
+  return localStorage.getItem("fleet_alerts") === "1" && typeof Notification !== "undefined" && Notification.permission === "granted";
+}
+
+function updateAlertsUI() {
+  const active = alertsEnabled();
+  const label = active ? "Alerts: On" : "Alerts: Off";
+  for (const id of ["notify-btn", "drawer-notify"]) {
+    const btn = document.getElementById(id);
+    if (!btn) {
+      continue;
+    }
+    btn.classList.toggle("hidden", !state.isAdmin);
+    btn.textContent = label;
+  }
+}
+
+function updateAppBadgeCount(count) {
+  if (typeof navigator === "undefined") {
+    return;
+  }
+  try {
+    if (count > 0 && typeof navigator.setAppBadge === "function") {
+      navigator.setAppBadge(count).catch(() => {});
+    } else if (count <= 0 && typeof navigator.clearAppBadge === "function") {
+      navigator.clearAppBadge().catch(() => {});
+    }
+  } catch {
+    // ignore unsupported badge API
+  }
+}
+
+async function toggleAlerts() {
+  if (!window.isSecureContext || typeof Notification === "undefined") {
+    toast("Browser notifications require HTTPS (configure `fleet tls`)", "warn");
+    return;
+  }
+  if (alertsEnabled()) {
+    localStorage.setItem("fleet_alerts", "0");
+    updateAlertsUI();
+    toast("Desktop PWA alerts muted", "info");
+    return;
+  }
+  let perm = Notification.permission;
+  if (perm === "default") {
+    perm = await Notification.requestPermission();
+  }
+  if (perm !== "granted") {
+    toast("Notification permission was denied by browser", "warn");
+    updateAlertsUI();
+    return;
+  }
+  localStorage.setItem("fleet_alerts", "1");
+  updateAlertsUI();
+  toast("Desktop PWA alerts enabled", "ok");
+}
+
+function showBrowserAlert(title, body, channelID) {
+  if (!document.hidden || !alertsEnabled()) {
+    return;
+  }
+  try {
+    const n = new Notification(title || "Fleet Assistant", {
+      body: body || "",
+      tag: `fleet-${channelID || "general"}`,
+    });
+    n.onclick = () => {
+      try {
+        window.focus();
+      } catch {
+        // ignore focus restriction
+      }
+      navigate(`#chat/${channelID || "general"}`);
+      n.close();
+    };
+  } catch {
+    // ignore notification failure
+  }
+}
+
+function dispatchSSE(type, payload) {
+  window.dispatchEvent(new CustomEvent("fleet-sse", { detail: { type, payload } }));
+}
+
+function ensureAssistantSSE() {
+  if (!state.isAdmin) {
+    if (assistantES) {
+      assistantES.close();
+      assistantES = null;
+    }
+    state.sseStatus = "disconnected";
+    return;
+  }
+  if (assistantES) {
+    return;
+  }
+  state.sseStatus = "connecting";
+  assistantES = new EventSource("/v1/assistant/stream");
+  assistantES.onerror = () => {
+    state.sseStatus = "reconnecting";
+    dispatchSSE("status", { status: "reconnecting" });
+  };
+  for (const evType of SSE_EVENT_TYPES) {
+    assistantES.addEventListener(evType, (ev) => {
+      let payload = {};
+      if (ev.data) {
+        try {
+          payload = JSON.parse(ev.data);
+        } catch {
+          payload = {};
+        }
+      }
+      if (evType === "ready") {
+        state.sseStatus = "live";
+        dispatchSSE("status", { status: "live" });
+      } else if (evType === "outbox") {
+        const it = payload.data || {};
+        const ch = payload.channel_id || it.channel_id || "briefing";
+        const title = it.title || `Assistant (#${ch})`;
+        if (!document.hidden) {
+          toast(`${title}: ${it.body || ""}`, it.priority === "urgent" ? "warn" : "info");
+        } else {
+          showBrowserAlert(title, it.body || "", ch);
+        }
+      } else if (evType === "approval") {
+        const apr = payload.data || {};
+        const ch = payload.channel_id || apr.channel_id || "general";
+        const curApr = (state.overview && state.overview.assistant && state.overview.assistant.pending_approvals) || 0;
+        if (state.overview && state.overview.assistant) {
+          state.overview.assistant.pending_approvals = curApr + 1;
+        }
+        updateAppBadgeCount(curApr + 1);
+        if (!document.hidden) {
+          toast(`Approval needed (#${ch}): ${apr.summary || apr.tool_name || "tool"}`, "warn");
+        } else {
+          showBrowserAlert(`Approval needed (#${ch})`, apr.summary || apr.tool_name || "", ch);
+        }
+      }
+      dispatchSSE(evType, payload);
+    });
+  }
+}
 
 function setAutoRefresh(ms) {
   if (refreshTimer) {
@@ -485,6 +648,15 @@ function init() {
   const drawerTheme = document.getElementById("drawer-theme");
   if (drawerTheme) {
     drawerTheme.addEventListener("click", toggleTheme);
+  }
+  for (const id of ["notify-btn", "drawer-notify"]) {
+    const btn = document.getElementById(id);
+    if (btn) {
+      btn.addEventListener("click", () => {
+        setDrawerOpen(false);
+        toggleAlerts();
+      });
+    }
   }
 
   const drawerClose = document.getElementById("drawer-close");

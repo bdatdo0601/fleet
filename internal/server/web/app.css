@@ -1582,13 +1582,25 @@ html.view-chat .main-content {
   padding: 12px max(12px, env(safe-area-inset-right)) 14px max(12px, env(safe-area-inset-left));
 }
 
-.chat-messages-inner {
+.chat-messages-inner,
+.chat-msg-group {
   max-width: 900px;
   width: 100%;
   margin: 0 auto;
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.chat-h {
+  margin: 6px 0 4px;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.chat-h:first-child {
+  margin-top: 0;
 }
 
 .chat-empty {

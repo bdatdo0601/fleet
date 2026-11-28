@@ -80,6 +80,10 @@ function renderMarkdownDOM(raw) {
         continue;
       }
       const lines = trimmed.split("\n");
+      if (lines.length === 1 && /^#{1,3}\s+/.test(lines[0])) {
+        wrap.appendChild(el("h4", { className: "chat-h" }, renderInlineDOM(lines[0].replace(/^#{1,3}\s+/, ""))));
+        continue;
+      }
       const allBullets = lines.every((l) => /^\s*[-*]\s+/.test(l));
       if (allBullets) {
         const ul = el("ul", { className: "chat-list" });
@@ -114,16 +118,30 @@ function renderWidgetNode(w, sendPromptFn) {
       title: w.title || "Interactive widget",
       loading: "lazy",
     });
+    let rendered = false;
     const sendPayload = () => {
+      if (rendered) {
+        return;
+      }
       try {
         if (frame.contentWindow) {
+          rendered = true;
           frame.contentWindow.postMessage({ type: "render", html: w.html || "", theme: currentTheme() }, "*");
         }
       } catch {
-        // ignore frame load race
+        rendered = false;
       }
     };
     frame._fleetRender = sendPayload;
+    frame._fleetSetTheme = (theme) => {
+      try {
+        if (frame.contentWindow) {
+          frame.contentWindow.postMessage({ type: "theme", theme }, "*");
+        }
+      } catch {
+        // ignore detached frame
+      }
+    };
     frame.addEventListener("load", sendPayload);
     return el(
       "div",
@@ -134,6 +152,11 @@ function renderWidgetNode(w, sendPromptFn) {
   }
   const data = w.data || {};
   const card = el("div", { className: "gen-native-card" }, w.title ? el("div", { className: "gen-widget-title", text: w.title }) : null);
+  if (w.kind === "markdown") {
+    const md = typeof data === "string" ? data : data.markdown || data.content || data.text || "";
+    card.appendChild(renderMarkdownDOM(md));
+    return card;
+  }
   if (w.kind === "choices" && Array.isArray(data.choices)) {
     const row = el("div", { className: "actions-row" });
     for (const c of data.choices) {
@@ -276,6 +299,22 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
     className: "mono",
     placeholder: `[{"alias":"linear","op_ref":"op://Fleet-Agent/Linear/token","allowed_hosts":["api.linear.app"],"require_approval":true}]`,
   });
+  const notifCfg = cfg.notifications || {};
+  const notifEnabledChk = el("input", { type: "checkbox", checked: Boolean(notifCfg.enabled) });
+  const notifApprovalsChk = el("input", { type: "checkbox", checked: notifCfg.notify_approvals !== false });
+  const notifBaseURLIn = el("input", { type: "text", value: notifCfg.fleet_base_url || "", placeholder: "https://fleet.example.com" });
+  const notifWebhookRefIn = el("input", { type: "text", value: notifCfg.discord_webhook_op_ref || "", placeholder: "op://Fleet-Agent/Discord/webhook" });
+  const notifMinPrioSel = el(
+    "select",
+    null,
+    ...["low", "normal", "urgent"].map((p) => el("option", { value: p, text: p, selected: (notifCfg.min_priority || "normal") === p })),
+  );
+  const notifChannelRefsIn = el("textarea", {
+    rows: "3",
+    className: "mono",
+    value: JSON.stringify(notifCfg.discord_channel_op_refs || {}, null, 2),
+    placeholder: `{"approvals":"op://Fleet-Agent/Discord-Approvals/webhook"}`,
+  });
   const doctorBox = el("div", { className: "stack-sm mt-2" });
 
   const renderDoctorResults = (rep) => {
@@ -316,8 +355,19 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
       field("Observer / Reflector Model", observerIn),
       field("Heartbeat Interval (mins, 0=off)", hbIn),
     ),
-    field("External stdio MCP Servers (JSON)", mcpIn),
+    field("External stdio / HTTP MCP Servers (JSON)", mcpIn),
     field("Replace 1Password Credential Aliases (optional JSON)", credsIn),
+    el("h4", { className: "mt-2", text: "Outbound Discord Notifications (Read-Only Alerts)" }),
+    el("label", { className: "check-row" }, notifEnabledChk, el("span", { text: "Enable outbound Discord webhook alerts" })),
+    el("label", { className: "check-row" }, notifApprovalsChk, el("span", { text: "Notify immediately on pending HITL approvals" })),
+    el(
+      "div",
+      { className: "grid-2" },
+      field("Discord Webhook 1Password Ref", notifWebhookRefIn),
+      field("Fleet Console Base URL (deep links)", notifBaseURLIn),
+      field("Minimum Outbox Priority", notifMinPrioSel),
+    ),
+    field("Per-Category / Channel Webhook Refs (optional JSON)", notifChannelRefsIn),
     el(
       "div",
       { className: "actions-row" },
@@ -343,6 +393,15 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
             toast("Invalid extra vaults JSON", "error");
             return;
           }
+          let discordChannelOPRefs = {};
+          if (notifChannelRefsIn.value.trim()) {
+            try {
+              discordChannelOPRefs = JSON.parse(notifChannelRefsIn.value);
+            } catch {
+              toast("Invalid Discord channel refs JSON", "error");
+              return;
+            }
+          }
           const payload = {
             enabled: enabledChk.checked,
             zdr: zdrChk.checked,
@@ -364,6 +423,14 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
               reflector: observerIn.value.trim(),
             },
             mcp_servers: mcpServers,
+            notifications: {
+              enabled: notifEnabledChk.checked,
+              fleet_base_url: notifBaseURLIn.value.trim(),
+              discord_webhook_op_ref: notifWebhookRefIn.value.trim(),
+              discord_channel_op_refs: discordChannelOPRefs,
+              notify_approvals: notifApprovalsChk.checked,
+              min_priority: notifMinPrioSel.value,
+            },
             test: Boolean(apiKeyIn.value.trim()),
           };
           if (apiKeyIn.value.trim()) {
@@ -418,6 +485,19 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
       el("button", {
         type: "button",
         className: "btn",
+        text: "Test Discord Alert",
+        onclick: async () => {
+          try {
+            await api("POST", "/v1/assistant/notifications/test");
+            toast("Test Discord alert sent", "ok");
+          } catch (err) {
+            toast(err.message, "error");
+          }
+        },
+      }),
+      el("button", {
+        type: "button",
+        className: "btn",
         text: "Long-Term Memory",
         onclick: () => {
           closeModal();
@@ -430,7 +510,32 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
       }),
     ),
     doctorBox,
-    el("h4", { className: "mt-3", text: `Timers (${(timersData.timers || []).length})` }),
+    el(
+      "div",
+      { className: "gen-mini-row mt-3" },
+      el("h4", { className: "m-0", text: `Timers (${(timersData.timers || []).length})` }),
+      el("button", {
+        type: "button",
+        className: "btn btn-sm",
+        text: "+ Weekday Morning Briefing (8am)",
+        onclick: async () => {
+          try {
+            await api("POST", "/v1/assistant/timers", {
+              channel_id: "briefing",
+              name: "morning-briefing",
+              schedule_kind: "cron",
+              cron_expr: "0 8 * * 1-5",
+              prompt: "Morning briefing: check waiting Fleet agents, unread Slack channels, and today's calendar/vault tasks, then send a concise summary.",
+            });
+            toast("Added 8:00 AM weekday briefing timer", "ok");
+            closeModal();
+            openAssistantSettingsModal(onSaved, onNavigate);
+          } catch (err) {
+            toast(err.message, "error");
+          }
+        },
+      }),
+    ),
     (timersData.timers || []).length === 0
       ? el("div", { className: "small muted", text: "No timers scheduled yet." })
       : el(
@@ -481,13 +586,21 @@ export async function renderChat(main, ctx, sub) {
   }
   localStorage.setItem("fleet_chat_channel", activeChannel);
 
-  const msgInnerEl = el("div", { className: "chat-messages-inner" });
-  const msgListEl = el("div", { className: "chat-messages" }, msgInnerEl);
-  const statusPill = badge("connecting", "neutral");
+  const emptyBox = el("div", {
+    className: "chat-empty muted small hidden",
+    text: cfgView.configured
+      ? `Short-term thread in #${activeChannel} is empty. New Chat clears this thread while keeping long-term Observations, Reflections, and Fleet Memory.`
+      : "Configure your OpenRouter API key in Settings to start chatting.",
+  });
+  const msgItemsEl = el("div", { className: "chat-msg-group" });
+  const approvalsBox = el("div", { className: "chat-msg-group hidden" });
   const streamBox = el("div", { className: "chat-msg chat-msg-assistant hidden" });
   const streamMeta = el("div", { className: "small muted mb-1" });
   const streamBody = el("div", { className: "chat-md" });
   streamBox.append(streamMeta, streamBody);
+  const msgInnerEl = el("div", { className: "chat-messages-inner" }, emptyBox, msgItemsEl, approvalsBox, streamBox);
+  const msgListEl = el("div", { className: "chat-messages" }, msgInnerEl);
+  const statusPill = badge("connecting", "neutral");
 
   const channelSelect = el(
     "select",
@@ -586,40 +699,72 @@ export async function renderChat(main, ctx, sub) {
     }
   };
 
-  const renderMessages = (messages) => {
-    clear(msgInnerEl);
-    if (messages.length === 0 && pendingApprovals.length === 0) {
-      msgInnerEl.appendChild(
-        el("div", {
-          className: "chat-empty muted small",
-          text: cfgView.configured
-            ? `Short-term thread in #${activeChannel} is empty. New Chat clears this thread while keeping long-term Observations, Reflections, and Fleet Memory.`
-            : "Configure your OpenRouter API key in Settings to start chatting.",
-        }),
-      );
-    }
-    for (const m of messages) {
-      const isUser = m.role === "user";
-      const bubble = el("div", { className: `chat-msg ${isUser ? "chat-msg-user" : "chat-msg-assistant"}` });
-      bubble.appendChild(renderMarkdownDOM(m.content));
-      if (Array.isArray(m.widgets)) {
-        for (const w of m.widgets) {
-          const wNode = renderWidgetNode(w, (act) => sendMessage(act));
-          if (wNode) {
-            bubble.appendChild(wNode);
-          }
+  const renderedMsgs = new Map();
+  const buildMessageBubble = (m) => {
+    const isUser = m.role === "user";
+    const bubble = el("div", { className: `chat-msg ${isUser ? "chat-msg-user" : "chat-msg-assistant"}` });
+    bubble.appendChild(renderMarkdownDOM(m.content));
+    if (Array.isArray(m.widgets)) {
+      for (const w of m.widgets) {
+        const wNode = renderWidgetNode(w, (act) => sendMessage(act));
+        if (wNode) {
+          bubble.appendChild(wNode);
         }
       }
-      const footer = formatMessageFooter(m);
-      if (footer) {
-        bubble.appendChild(el("div", { className: "chat-msg-footer mono", text: footer }));
+    }
+    const footer = formatMessageFooter(m);
+    if (footer) {
+      bubble.appendChild(el("div", { className: "chat-msg-footer mono", text: footer }));
+    }
+    return bubble;
+  };
+  const messageRenderKey = (m) =>
+    JSON.stringify([
+      m.role || "",
+      m.content || "",
+      m.model || "",
+      m.prompt_tokens || 0,
+      m.cached_tokens || 0,
+      m.completion_tokens || 0,
+      m.cost_usd || 0,
+      m.widgets || null,
+    ]);
+
+  const renderMessages = (messages) => {
+    const isEmpty = messages.length === 0 && pendingApprovals.length === 0;
+    emptyBox.classList.toggle("hidden", !isEmpty);
+    msgItemsEl.classList.toggle("hidden", messages.length === 0);
+
+    const nextIds = new Set();
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
+      const id = m.id !== undefined && m.id !== null ? `id:${m.id}` : `idx:${i}`;
+      nextIds.add(id);
+      const key = messageRenderKey(m);
+      const existing = renderedMsgs.get(id);
+      if (existing && existing.key === key) {
+        continue;
       }
-      msgInnerEl.appendChild(bubble);
+      const bubble = buildMessageBubble(m);
+      if (existing) {
+        msgItemsEl.replaceChild(bubble, existing.node);
+      } else {
+        msgItemsEl.appendChild(bubble);
+      }
+      renderedMsgs.set(id, { node: bubble, key });
     }
+    for (const [id, entry] of renderedMsgs) {
+      if (!nextIds.has(id)) {
+        entry.node.remove();
+        renderedMsgs.delete(id);
+      }
+    }
+
+    clear(approvalsBox);
+    approvalsBox.classList.toggle("hidden", pendingApprovals.length === 0);
     for (const apr of pendingApprovals) {
-      msgInnerEl.appendChild(renderApprovalCard(apr, loadChannelData));
+      approvalsBox.appendChild(renderApprovalCard(apr, loadChannelData));
     }
-    msgInnerEl.appendChild(streamBox);
     scrollMessagesToBottom();
   };
 
@@ -733,63 +878,68 @@ export async function renderChat(main, ctx, sub) {
   }
 
   let streamText = "";
-  const es = new EventSource("/v1/assistant/stream");
   const setStatus = (txt, variant) => {
     statusPill.textContent = txt;
     statusPill.className = `badge badge-${variant}`;
   };
-  es.addEventListener("ready", () => setStatus("live", "ok"));
-  es.onerror = () => setStatus("reconnecting", "warn");
-  es.addEventListener("run_start", (ev) => {
-    const d = JSON.parse(ev.data || "{}");
-    if (d.channel_id !== activeChannel) {
+  if (state.sseStatus === "live") {
+    setStatus("live", "ok");
+  } else if (state.sseStatus === "reconnecting") {
+    setStatus("reconnecting", "warn");
+  }
+  const onFleetSSE = (ev) => {
+    const detail = ev.detail || {};
+    const type = detail.type;
+    const d = detail.payload || {};
+    if (type === "status") {
+      setStatus(d.status || "live", d.status === "live" ? "ok" : "warn");
       return;
     }
-    streamText = "";
-    streamMeta.textContent = `Running (${(d.data && d.data.model) || ""})…`;
-    clear(streamBody);
-    streamBox.classList.remove("hidden");
-    scrollMessagesToBottom();
-  });
-  es.addEventListener("tool_start", (ev) => {
-    const d = JSON.parse(ev.data || "{}");
-    if (d.channel_id === activeChannel) {
-      streamMeta.textContent = `Calling ${(d.data && d.data.name) || "tool"}…`;
-    }
-  });
-  es.addEventListener("delta", (ev) => {
-    const d = JSON.parse(ev.data || "{}");
-    if (d.channel_id !== activeChannel) {
+    if (type === "ready") {
+      setStatus("live", "ok");
       return;
     }
-    streamText += (d.data && d.data.delta) || "";
-    clear(streamBody);
-    streamBody.appendChild(renderMarkdownDOM(streamText));
-    scrollMessagesToBottom();
-  });
-  const onReloadEvent = (ev) => {
-    const d = JSON.parse(ev.data || "{}");
-    if (d.channel_id === activeChannel) {
-      streamBox.classList.add("hidden");
+    if (type === "run_start") {
+      if (d.channel_id !== activeChannel) {
+        return;
+      }
       streamText = "";
-      loadChannelData();
-    }
-  };
-  es.addEventListener("message_created", onReloadEvent);
-  es.addEventListener("message_done", onReloadEvent);
-  es.addEventListener("approval", onReloadEvent);
-  es.addEventListener("approval_decided", onReloadEvent);
-  es.addEventListener("channel_reset", onReloadEvent);
-  es.addEventListener("error", (ev) => {
-    if (!ev.data) {
+      streamMeta.textContent = `Running (${(d.data && d.data.model) || ""})…`;
+      clear(streamBody);
+      streamBox.classList.remove("hidden");
+      scrollMessagesToBottom();
       return;
     }
-    const d = JSON.parse(ev.data || "{}");
-    if (d.channel_id === activeChannel && d.data && d.data.error) {
+    if (type === "tool_start") {
+      if (d.channel_id === activeChannel) {
+        streamMeta.textContent = `Calling ${(d.data && d.data.name) || "tool"}…`;
+      }
+      return;
+    }
+    if (type === "delta") {
+      if (d.channel_id !== activeChannel) {
+        return;
+      }
+      streamText += (d.data && d.data.delta) || "";
+      clear(streamBody);
+      streamBody.appendChild(renderMarkdownDOM(streamText));
+      scrollMessagesToBottom();
+      return;
+    }
+    if (type === "message_created" || type === "message_done" || type === "approval" || type === "approval_decided" || type === "channel_reset") {
+      if (d.channel_id === activeChannel) {
+        streamBox.classList.add("hidden");
+        streamText = "";
+        loadChannelData();
+      }
+      return;
+    }
+    if (type === "error" && d.channel_id === activeChannel && d.data && d.data.error) {
       streamBox.classList.add("hidden");
       toast(d.data.error, "error");
     }
-  });
+  };
+  window.addEventListener("fleet-sse", onFleetSSE);
 
   const onWindowMsg = (ev) => {
     if (!ev.data || typeof ev.data !== "object") {
@@ -804,7 +954,7 @@ export async function renderChat(main, ctx, sub) {
     } else if (ev.data.type === "fleet-widget-resize" && typeof ev.data.height === "number") {
       for (const fr of msgListEl.querySelectorAll("iframe.gen-widget-frame")) {
         if (fr.contentWindow === ev.source) {
-          fr.style.height = `${Math.min(Math.max(ev.data.height, 64), 520)}px`;
+          fr.style.height = `${Math.min(Math.max(ev.data.height, 48), 640)}px`;
         }
       }
     } else if (ev.data.type === "fleet-widget-action" && ev.data.action) {
@@ -813,9 +963,27 @@ export async function renderChat(main, ctx, sub) {
   };
   window.addEventListener("message", onWindowMsg);
 
+  const syncWidgetThemes = () => {
+    const theme = currentTheme();
+    for (const fr of msgListEl.querySelectorAll("iframe.gen-widget-frame")) {
+      if (typeof fr._fleetSetTheme === "function") {
+        fr._fleetSetTheme(theme);
+      }
+    }
+  };
+  window.addEventListener("fleet-theme-change", syncWidgetThemes);
+  const darkMedia = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
+  if (darkMedia && typeof darkMedia.addEventListener === "function") {
+    darkMedia.addEventListener("change", syncWidgetThemes);
+  }
+
   state.routeCleanup = () => {
-    es.close();
+    window.removeEventListener("fleet-sse", onFleetSSE);
     window.removeEventListener("message", onWindowMsg);
+    window.removeEventListener("fleet-theme-change", syncWidgetThemes);
+    if (darkMedia && typeof darkMedia.removeEventListener === "function") {
+      darkMedia.removeEventListener("change", syncWidgetThemes);
+    }
     window.removeEventListener("resize", syncViewport);
     inputEl.removeEventListener("focus", onFocusInput);
     if (window.visualViewport) {

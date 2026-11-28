@@ -7,14 +7,42 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
+	"time"
 )
+
+// SpawnAgentRequest describes an assistant-initiated remote coding session launch.
+type SpawnAgentRequest struct {
+	Harness  string `json:"harness"`
+	Name     string `json:"name,omitempty"`
+	Device   string `json:"device,omitempty"`
+	RepoPath string `json:"repo_path,omitempty"`
+	Prompt   string `json:"prompt,omitempty"`
+	Model    string `json:"model,omitempty"`
+	Policy   string `json:"policy,omitempty"`
+	UseTmux  bool   `json:"use_tmux,omitempty"`
+}
+
+// SpawnAgentResult reports the queued Slacker job and target Mac worker availability.
+type SpawnAgentResult struct {
+	JobID        string `json:"job_id"`
+	TargetDevice string `json:"target_device"`
+	Harness      string `json:"harness"`
+	SessionName  string `json:"session_name"`
+	RepoPath     string `json:"repo_path"`
+	Status       string `json:"status"`
+	WorkerOnline bool   `json:"worker_online"`
+}
 
 // FleetDeps abstracts Fleet subsystem access so assistant does not import core/slacker/agents directly.
 type FleetDeps interface {
 	ListAgents(device, repo, harness, state string, includeStale bool) (any, error)
 	InspectAgent(target string) (any, error)
 	SendAgentMessage(fromDevice, to, body string) (any, error)
+	ListPaths(device, query string, limit int) (any, error)
+	SpawnAgent(ctx context.Context, req SpawnAgentRequest) (SpawnAgentResult, error)
+	KillAgent(ctx context.Context, sessionID string) (any, error)
 	MemorySearch(query, scope, kind, tier string, limit int) (any, error)
 	MemoryGet(scope, key string) (any, error)
 	MemorySet(scope, key, kind, tier, summary, body string) (any, error)
@@ -82,6 +110,18 @@ func (e *Engine) buildToolSpecs(ctx context.Context) []ToolSpec {
 		makeToolSpec("fleet_send_message", "Send a message to a peer Fleet agent session or device.", schemaObj(map[string]any{
 			"to": strProp("Target session name, device/name, repo:name, or *"), "message": strProp("Message text"),
 		}, "to", "message")),
+		makeToolSpec("fleet_list_paths", "List known project directories and repositories tracked across Fleet Macs.", schemaObj(map[string]any{
+			"device": strProp("Optional device filter"), "query": strProp("Optional path/repo substring"), "limit": intProp("Max results"),
+		})),
+		makeToolSpec("fleet_spawn_agent", "Spawn a Claude, Codex, or Antigravity coding session on an awake Mac and watch for blockers/completion (approval-gated).", schemaObj(map[string]any{
+			"harness": strProp("claude | codex | agy"), "device": strProp("Optional target Mac (e.g. laptop, office)"),
+			"repo_path": strProp("Repo path, ~/path, or workspace subpath"), "prompt": strProp("Task prompt for the spawned coding agent"),
+			"name": strProp("Optional friendly session name"), "model": strProp("Optional model"),
+			"policy": strProp("Optional policy (auto|bypass|safe)"), "use_tmux": boolProp("Run inside tmux"),
+		}, "harness", "prompt")),
+		makeToolSpec("fleet_kill_agent", "Terminate a Fleet coding agent session (approval-gated).", schemaObj(map[string]any{
+			"session_id": strProp("Session ID or target session"),
+		}, "session_id")),
 		makeToolSpec("fleet_memory_search", "Search shared cross-device Fleet memories.", schemaObj(map[string]any{
 			"query": strProp("Search keywords"), "scope": strProp("global, repo:<name>, device:<name>, or all"),
 			"kind": strProp("preference|feedback|project|reference"), "tier": strProp("always|searchable"), "limit": intProp("Max results"),
@@ -127,23 +167,27 @@ func (e *Engine) buildToolSpecs(ctx context.Context) []ToolSpec {
 			"path": strProp("Relative path inside vault"), "content": strProp("Full Markdown content"),
 			"vault": strProp("Optional vault name (default \"agent\")"),
 		}, "path", "content")),
-		makeToolSpec("timer_schedule", "Create a one-shot or recurring timer wakeup for the assistant.", schemaObj(map[string]any{
+		makeToolSpec("timer_schedule", "Create a one-shot, interval, or 5-field cron timer wakeup for the assistant.", schemaObj(map[string]any{
 			"name": strProp("Short timer name"), "channel_id": strProp("Target channel (default briefing)"),
-			"prompt": strProp("Prompt to execute when timer fires"), "schedule_kind": strProp("once or interval"),
+			"prompt": strProp("Prompt to execute when timer fires"), "schedule_kind": strProp("once, interval, or cron"),
 			"fire_at": strProp("RFC3339 UTC timestamp for once"), "interval_seconds": intProp("Repeat interval in seconds"),
-			"model": strProp("Optional model override"),
+			"cron_expr": strProp("5-field cron expression (e.g. '0 8 * * 1-5' for 8am weekdays)"), "model": strProp("Optional model override"),
 		}, "name", "prompt")),
 		makeToolSpec("timer_list", "List scheduled assistant timers.", schemaObj(map[string]any{})),
 		makeToolSpec("timer_cancel", "Delete a scheduled timer by id.", schemaObj(map[string]any{"id": strProp("Timer ID")}, "id")),
 		makeToolSpec("outbox_notify", "Queue a proactive notification card/outbox item.", schemaObj(map[string]any{
 			"title": strProp("Short title"), "body": strProp("Notification body"), "priority": strProp("low|normal|urgent"),
 		}, "body")),
-		makeToolSpec("render_card", "Attach a typed native UI card (agents, agenda, choices, key_value, markdown) to this reply.", schemaObj(map[string]any{
-			"kind": strProp("agents|agenda|choices|key_value|markdown"), "title": strProp("Card title"),
-			"data": map[string]any{"type": "object", "description": "Structured card payload"},
+		makeToolSpec("render_card", "Attach a typed native UI card to this reply. Prefer this over render_widget for structured mobile cards.", schemaObj(map[string]any{
+			"kind":  strProp("choices | key_value | agents | agenda | markdown"),
+			"title": strProp("Card title"),
+			"data": map[string]any{
+				"type":        "object",
+				"description": "Payload matching kind: choices={choices:[{label,value}]}, key_value={key:val}, agents={agents:[{name,device,state}]}, agenda={items:[{time,title}]}, markdown={markdown}",
+			},
 		}, "kind", "data")),
-		makeToolSpec("render_widget", "Attach an interactive sandboxed HTML/CSS/SVG Generative UI widget to this reply.", schemaObj(map[string]any{
-			"title": strProp("Widget title"), "html": strProp("Self-contained HTML snippet (inline <style>/<script> allowed; no external URLs)"),
+		makeToolSpec("render_widget", "Attach an interactive sandboxed HTML/CSS/SVG Generative UI widget to this reply (no external URLs; use CSS vars --text/--muted/--border/--accent/--surface and data-fleet-action=\"...\" for clickable prompts).", schemaObj(map[string]any{
+			"title": strProp("Widget title"), "html": strProp("Self-contained HTML snippet (inline <style>/<script>/<svg> only; no external URLs)"),
 		}, "title", "html")),
 		makeToolSpec("credential_list_aliases", "List configured 1Password credential aliases and allowlisted hosts (no secrets returned).", schemaObj(map[string]any{})),
 		makeToolSpec("onepassword_list_vaults", "List 1Password vaults accessible to the assistant Service Account.", schemaObj(map[string]any{})),
@@ -164,6 +208,26 @@ func (e *Engine) buildToolSpecs(ctx context.Context) []ToolSpec {
 			"method": strProp("HTTP method"), "url": strProp("Target URL"),
 			"body": strProp("Optional request body"),
 		}, "url")),
+		makeToolSpec("mcp_list", "List configured external/internal MCP servers and their discovered tools.", schemaObj(map[string]any{})),
+		makeToolSpec("mcp_test", "Run an initialize + tools/list handshake test on a configured MCP server.", schemaObj(map[string]any{
+			"name": strProp("Configured MCP server name"),
+		}, "name")),
+		makeToolSpec("mcp_configure", "Add or update an external/internal stdio or HTTP/SSE MCP server in assistant.json (approval-gated; use op:// in env_refs/header_refs for secrets).", schemaObj(map[string]any{
+			"name":                   strProp("Server slug ([a-z0-9][a-z0-9_-]*)"),
+			"transport":              strProp("stdio or http"),
+			"command":                strProp("Executable command for stdio transport"),
+			"args":                   map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Command arguments"},
+			"env":                    map[string]any{"type": "object", "description": "Non-secret environment variables"},
+			"env_refs":               map[string]any{"type": "object", "description": "Secret env var -> op://Vault/Item/field mapping"},
+			"url":                    strProp("Endpoint URL for http/sse transport"),
+			"headers":                map[string]any{"type": "object", "description": "Non-secret HTTP headers"},
+			"header_refs":            map[string]any{"type": "object", "description": "Secret HTTP header -> op://Vault/Item/field mapping"},
+			"enabled":                boolProp("Enable server (default true)"),
+			"require_approval_tools": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Tool names requiring HITL approval (defaults to [\"*\"] for new servers)"},
+		}, "name")),
+		makeToolSpec("mcp_remove", "Remove a configured MCP server from assistant.json (approval-gated).", schemaObj(map[string]any{
+			"name": strProp("MCP server name to remove"),
+		}, "name")),
 	}
 	if e.mcp != nil {
 		for _, ext := range e.mcp.ListTools(ctx) {
@@ -237,6 +301,9 @@ func (e *Engine) dispatchTool(ctx context.Context, name string, args map[string]
 	if name == "credential_list_aliases" || name == "http_request_with_credential" || strings.HasPrefix(name, "onepassword_") {
 		return e.dispatchCredentialTool(ctx, name, args, rawArgs, tctx)
 	}
+	if name == "mcp_list" || name == "mcp_test" || name == "mcp_configure" || name == "mcp_remove" {
+		return e.dispatchMCPManageTool(ctx, name, args, rawArgs, tctx)
+	}
 	if strings.HasPrefix(name, "mcp__") && e.mcp != nil {
 		ext, ok := e.mcp.FindTool(ctx, name)
 		if !ok {
@@ -267,6 +334,21 @@ func (e *Engine) dispatchFleetTool(ctx context.Context, name string, args map[st
 		return e.deps.InspectAgent(strArg(args, "agent_id"))
 	case "fleet_send_message":
 		return e.deps.SendAgentMessage("assistant", strArg(args, "to"), strArg(args, "message"))
+	case "fleet_list_paths":
+		return e.deps.ListPaths(strArg(args, "device"), strArg(args, "query"), intArg(args, "limit", 30))
+	case "fleet_spawn_agent":
+		return e.execFleetSpawnTool(ctx, args, rawArgs, tctx)
+	case "fleet_kill_agent":
+		sid := strArg(args, "session_id")
+		if !tctx.BypassHITL {
+			return nil, &approvalRequiredError{
+				ToolName:  name,
+				Summary:   fmt.Sprintf("Terminate Fleet agent session %s", sid),
+				RiskLevel: "agent_kill",
+				ArgsJSON:  cmp.Or(rawArgs, "{}"),
+			}
+		}
+		return e.deps.KillAgent(ctx, sid)
 	case "fleet_memory_search":
 		return e.deps.MemorySearch(strArg(args, "query"), cmp.Or(strArg(args, "scope"), "all"), strArg(args, "kind"), strArg(args, "tier"), intArg(args, "limit", 20))
 	case "fleet_memory_get":
@@ -382,6 +464,7 @@ func (e *Engine) dispatchAutomationTool(name string, args map[string]any, tctx *
 			ScheduleKind:    cmp.Or(strArg(args, "schedule_kind"), "interval"),
 			FireAt:          strArg(args, "fire_at"),
 			IntervalSeconds: intArg(args, "interval_seconds", 0),
+			CronExpr:        strArg(args, "cron_expr"),
 			Enabled:         true,
 		})
 	case "timer_list":
@@ -397,6 +480,9 @@ func (e *Engine) dispatchAutomationTool(name string, args map[string]any, tctx *
 			return nil, err
 		}
 		e.publishEvent(StreamEvent{Type: "outbox", ChannelID: tctx.ChannelID, Data: item})
+		if tctx.Config.Notifications.Enabled && priorityMeetsMin(item.Priority, tctx.Config.Notifications.MinPriority) {
+			go e.dispatchOutboxNotification(item)
+		}
 		return item, nil
 	default:
 		return nil, newErr("unknown automation tool "+name, http.StatusBadRequest)
@@ -406,16 +492,32 @@ func (e *Engine) dispatchAutomationTool(name string, args map[string]any, tctx *
 func dispatchUITool(name string, args map[string]any, tctx *toolExecContext) (any, error) {
 	var wp WidgetPayload
 	if name == "render_card" {
+		kind := strings.ToLower(cmp.Or(strArg(args, "kind"), "markdown"))
+		switch kind {
+		case "agents", "agenda", "choices", "key_value", "markdown":
+		default:
+			return nil, newErr(fmt.Sprintf("unsupported render_card kind %q", kind), http.StatusBadRequest)
+		}
+		data := args["data"]
+		if kind == "markdown" {
+			if s, ok := data.(string); ok {
+				data = map[string]any{"markdown": s}
+			}
+		}
 		wp = WidgetPayload{
-			Kind:  cmp.Or(strArg(args, "kind"), "markdown"),
+			Kind:  kind,
 			Title: strArg(args, "title"),
-			Data:  args["data"],
+			Data:  data,
 		}
 	} else {
+		html := strings.TrimSpace(strArg(args, "html"))
+		if html == "" {
+			return nil, newErr("widget html is required", http.StatusBadRequest)
+		}
 		wp = WidgetPayload{
 			Kind:  "html",
 			Title: strArg(args, "title"),
-			HTML:  strArg(args, "html"),
+			HTML:  html,
 		}
 	}
 	if tctx.Widgets != nil {
@@ -512,4 +614,230 @@ func (e *Engine) execCredentialHTTPTool(ctx context.Context, args map[string]any
 		URL:    strArg(args, "url"),
 		Body:   strArg(args, "body"),
 	})
+}
+
+func (e *Engine) execFleetSpawnTool(ctx context.Context, args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {
+	req := SpawnAgentRequest{
+		Harness:  strArg(args, "harness"),
+		Name:     strArg(args, "name"),
+		Device:   strArg(args, "device"),
+		RepoPath: strArg(args, "repo_path"),
+		Prompt:   strArg(args, "prompt"),
+		Model:    strArg(args, "model"),
+		Policy:   strArg(args, "policy"),
+		UseTmux:  boolArg(args, "use_tmux"),
+	}
+	if !tctx.BypassHITL {
+		target := cmp.Or(req.Device, "auto")
+		return nil, &approvalRequiredError{
+			ToolName:  "fleet_spawn_agent",
+			Summary:   fmt.Sprintf("Spawn %s session on %s (%s)", cmp.Or(req.Harness, "agent"), target, cmp.Or(req.RepoPath, "workspace")),
+			RiskLevel: "agent_spawn",
+			ArgsJSON:  cmp.Or(rawArgs, "{}"),
+		}
+	}
+	res, err := e.deps.SpawnAgent(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	del, dErr := e.store.CreateDelegation(Delegation{
+		JobID:        res.JobID,
+		ChannelID:    tctx.ChannelID,
+		TargetDevice: res.TargetDevice,
+		Harness:      res.Harness,
+		SessionName:  res.SessionName,
+		RepoPath:     res.RepoPath,
+		Prompt:       req.Prompt,
+		Status:       "queued",
+	})
+	if dErr == nil {
+		e.refreshDelegationsFlag()
+		e.publishEvent(StreamEvent{Type: "delegation", ChannelID: tctx.ChannelID, Data: del})
+	}
+	return map[string]any{"spawn": res, "delegation": del}, nil
+}
+
+func strSliceArg(m map[string]any, key string) []string {
+	raw, ok := m[key].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, it := range raw {
+		if s, ok := it.(string); ok && strings.TrimSpace(s) != "" {
+			out = append(out, strings.TrimSpace(s))
+		}
+	}
+	return out
+}
+
+func strMapArg(m map[string]any, key string) map[string]string {
+	raw, ok := m[key].(map[string]any)
+	if !ok {
+		return nil
+	}
+	out := make(map[string]string, len(raw))
+	for k, v := range raw {
+		if strings.TrimSpace(k) != "" {
+			out[strings.TrimSpace(k)] = fmt.Sprint(v)
+		}
+	}
+	return out
+}
+
+func parseMCPServerFromArgs(args map[string]any, existing *MCPServerConfig) MCPServerConfig {
+	srv := MCPServerConfig{
+		Name:                 strArg(args, "name"),
+		Transport:            strArg(args, "transport"),
+		Command:              strArg(args, "command"),
+		Args:                 strSliceArg(args, "args"),
+		Env:                  strMapArg(args, "env"),
+		EnvRefs:              strMapArg(args, "env_refs"),
+		URL:                  strArg(args, "url"),
+		Headers:              strMapArg(args, "headers"),
+		HeaderRefs:           strMapArg(args, "header_refs"),
+		Enabled:              true,
+		RequireApprovalTools: strSliceArg(args, "require_approval_tools"),
+	}
+	if en, ok := args["enabled"].(bool); ok {
+		srv.Enabled = en
+	}
+	if _, hasTools := args["require_approval_tools"]; !hasTools {
+		if existing != nil {
+			srv.RequireApprovalTools = append([]string(nil), existing.RequireApprovalTools...)
+		} else {
+			srv.RequireApprovalTools = []string{"*"}
+		}
+	}
+	return NormalizeMCPServerConfig(srv)
+}
+
+func (e *Engine) dispatchMCPManageTool(ctx context.Context, name string, args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {
+	cfg := e.Config()
+	switch name {
+	case "mcp_list":
+		view := cfg.View("")
+		var statuses []MCPServerStatus
+		if e.mcp != nil {
+			statuses = e.mcp.ListServerStatuses(ctx, cfg.MCPServers)
+		}
+		return map[string]any{"servers": view.MCPServers, "statuses": statuses}, nil
+	case "mcp_test":
+		srvName := strings.ToLower(strArg(args, "name"))
+		for _, srv := range cfg.MCPServers {
+			if srv.Name == srvName {
+				if e.mcp == nil {
+					return nil, newErr("MCP manager unavailable", http.StatusServiceUnavailable)
+				}
+				tools, err := e.mcp.TestServer(ctx, srv)
+				if err != nil {
+					return nil, err
+				}
+				names := make([]string, 0, len(tools))
+				for _, t := range tools {
+					names = append(names, t.RemoteName)
+				}
+				return map[string]any{"name": srv.Name, "transport": srv.Transport, "tool_count": len(tools), "tools": names}, nil
+			}
+		}
+		return nil, newErr(fmt.Sprintf("MCP server %q not found", srvName), http.StatusNotFound)
+	case "mcp_configure":
+		return e.execMCPConfigureTool(ctx, args, rawArgs, tctx)
+	case "mcp_remove":
+		return e.execMCPRemoveTool(args, rawArgs, tctx)
+	default:
+		return nil, newErr("unknown MCP tool "+name, http.StatusBadRequest)
+	}
+}
+
+func (e *Engine) execMCPConfigureTool(ctx context.Context, args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {
+	if tctx.Source != "chat" && tctx.Source != "approval" && !tctx.BypassHITL {
+		return nil, newErr("mcp_configure is only allowed during direct user chat", http.StatusForbidden)
+	}
+	cur := e.Config()
+	name := strings.ToLower(strArg(args, "name"))
+	var existing *MCPServerConfig
+	for i := range cur.MCPServers {
+		if cur.MCPServers[i].Name == name {
+			existing = &cur.MCPServers[i]
+			break
+		}
+	}
+	srv := parseMCPServerFromArgs(args, existing)
+	if err := ValidateMCPServerConfig(srv, true); err != nil {
+		return nil, err
+	}
+	if !tctx.BypassHITL {
+		target := cmp.Or(srv.URL, strings.TrimSpace(srv.Command+" "+strings.Join(srv.Args, " ")))
+		return nil, &approvalRequiredError{
+			ToolName:   "mcp_configure",
+			ServerName: srv.Name,
+			Summary:    fmt.Sprintf("Configure %s MCP server %q (%s)", srv.Transport, srv.Name, target),
+			RiskLevel:  "mcp_config",
+			ArgsJSON:   cmp.Or(rawArgs, "{}"),
+		}
+	}
+	nextServers := make([]MCPServerConfig, 0, len(cur.MCPServers)+1)
+	replaced := false
+	for _, s := range cur.MCPServers {
+		if s.Name == srv.Name {
+			nextServers = append(nextServers, srv)
+			replaced = true
+		} else {
+			nextServers = append(nextServers, s)
+		}
+	}
+	if !replaced {
+		nextServers = append(nextServers, srv)
+	}
+	cur.MCPServers = nextServers
+	if _, err := e.UpdateConfig(cur, false); err != nil {
+		return nil, err
+	}
+	tctx.Config = e.Config()
+	res := map[string]any{"status": "saved", "server": redactMCPServers([]MCPServerConfig{srv})[0]}
+	if srv.Enabled && e.mcp != nil {
+		tCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		if tools, tErr := e.mcp.TestServer(tCtx, srv); tErr != nil {
+			res["test_error"] = tErr.Error()
+		} else {
+			names := make([]string, 0, len(tools))
+			for _, t := range tools {
+				names = append(names, t.RemoteName)
+			}
+			res["discovered_tools"] = names
+		}
+	}
+	return res, nil
+}
+
+func (e *Engine) execMCPRemoveTool(args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {
+	if tctx.Source != "chat" && tctx.Source != "approval" && !tctx.BypassHITL {
+		return nil, newErr("mcp_remove is only allowed during direct user chat", http.StatusForbidden)
+	}
+	name := strings.ToLower(strArg(args, "name"))
+	if name == "" {
+		return nil, newErr("MCP server name is required", http.StatusBadRequest)
+	}
+	if !tctx.BypassHITL {
+		return nil, &approvalRequiredError{
+			ToolName:   "mcp_remove",
+			ServerName: name,
+			Summary:    fmt.Sprintf("Remove MCP server %q", name),
+			RiskLevel:  "mcp_config",
+			ArgsJSON:   cmp.Or(rawArgs, "{}"),
+		}
+	}
+	cur := e.Config()
+	idx := slices.IndexFunc(cur.MCPServers, func(s MCPServerConfig) bool { return s.Name == name })
+	if idx < 0 {
+		return nil, newErr(fmt.Sprintf("MCP server %q not found", name), http.StatusNotFound)
+	}
+	cur.MCPServers = slices.Delete(cur.MCPServers, idx, idx+1)
+	if _, err := e.UpdateConfig(cur, false); err != nil {
+		return nil, err
+	}
+	tctx.Config = e.Config()
+	return map[string]any{"status": "removed", "name": name}, nil
 }

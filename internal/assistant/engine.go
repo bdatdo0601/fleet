@@ -45,6 +45,10 @@ type Engine struct {
 	subMu       sync.Mutex
 	subscribers map[chan StreamEvent]struct{}
 
+	delMu                sync.RWMutex
+	hasActiveDelegations bool
+	notifier             Notifier
+
 	notifyCh chan struct{}
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
@@ -84,6 +88,7 @@ func Open(dbPath, configPath, defaultVaultDir string, deps FleetDeps) (*Engine, 
 		subscribers: make(map[chan StreamEvent]struct{}),
 		notifyCh:    make(chan struct{}, 1),
 	}
+	e.refreshDelegationsFlag()
 	return e, nil
 }
 
@@ -259,7 +264,15 @@ func (e *Engine) UpdateConfig(next Config, clearAPIKey bool) (ConfigView, error)
 	if next.ExtraVaults == nil {
 		next.ExtraVaults = append([]VaultMount(nil), cur.ExtraVaults...)
 	}
+	if next.Notifications.NotifyApprovals == nil && !next.Notifications.Enabled && next.Notifications.DiscordWebhookOPRef == "" && len(next.Notifications.DiscordChannelOPRefs) == 0 && next.Notifications.FleetBaseURL == "" && next.Notifications.MinPriority == "" {
+		next.Notifications = cur.Notifications
+	}
 	next = NormalizeConfig(next)
+	for _, srv := range next.MCPServers {
+		if err := ValidateMCPServerConfig(srv, false); err != nil {
+			return ConfigView{}, err
+		}
+	}
 	if err := validateExtraVaults(next.ExtraVaults); err != nil {
 		return ConfigView{}, err
 	}
@@ -369,6 +382,17 @@ func preserveMaskedMCPEnv(prev, next []MCPServerConfig) []MCPServerConfig {
 				}
 			}
 			srv.Env = restored
+		}
+		if ok && len(srv.Headers) > 0 && len(ps.Headers) > 0 {
+			restoredH := make(map[string]string, len(srv.Headers))
+			for k, v := range srv.Headers {
+				if oldVal, exists := ps.Headers[k]; exists && v == maskSecret(oldVal) {
+					restoredH[k] = oldVal
+				} else {
+					restoredH[k] = v
+				}
+			}
+			srv.Headers = restoredH
 		}
 		out = append(out, srv)
 	}
@@ -573,11 +597,15 @@ func (e *Engine) processInboxEvent(ctx context.Context, ev InboxEvent) error {
 		userText, _ = payload["prompt"].(string)
 	}
 	if ev.Source != "chat" && userText != "" {
+		prefix := ev.Source
+		if ev.Source == "delegation" {
+			prefix = "delegation_update"
+		}
 		_, _ = e.store.AppendMessage(Message{
 			ChannelID:    ch.ID,
 			ContextEpoch: ch.ContextEpoch,
 			Role:         "user",
-			Content:      fmt.Sprintf("[%s] %s", ev.Source, userText),
+			Content:      fmt.Sprintf("[%s] %s", prefix, userText),
 		})
 	}
 	return e.runAgentTurn(ctx, cfg, *ch, ev.Source, userText, ev.ModelOverride)
@@ -708,6 +736,7 @@ func (e *Engine) buildPromptMessages(ctx context.Context, ch Channel, tail []Mes
 	if opSection := e.buildOPPromptSection(ctx); opSection != "" {
 		sysStatic.WriteString(opSection)
 	}
+	sysStatic.WriteString(buildGenerativeUIPromptSection())
 
 	var memPrefix strings.Builder
 	if reflections != "" {
@@ -781,7 +810,25 @@ func (e *Engine) buildOPPromptSection(ctx context.Context) string {
 		b.WriteString("Accessible vaults: " + strings.Join(names, ", ") + "\n")
 	}
 	b.WriteString("Use `onepassword_list_items`, `onepassword_get_item_meta`, `http_request_with_credential`, and `onepassword_store_item` to inspect item metadata/op:// references and inject credentials at runtime without ever requesting or displaying plaintext secrets.\n")
+	b.WriteString("For external or internal MCP setup, use `mcp_list`, `mcp_configure` (approval-gated; pass secrets via `op://` in `env_refs`/`header_refs`, never plaintext), and `mcp_test`.\n")
 	return b.String()
+}
+
+func buildGenerativeUIPromptSection() string {
+	return `
+## Generative UI (` + "`render_card`" + ` & ` + "`render_widget`" + `)
+- Prefer ` + "`render_card`" + ` for structured mobile-friendly UI and quick follow-ups; use ` + "`render_widget`" + ` only when bespoke interactive HTML/SVG/JS adds clear value.
+- ` + "`render_card`" + ` ` + "`data`" + ` schemas by ` + "`kind`" + `:
+  - ` + "`choices`" + `: ` + "`{\"choices\":[{\"label\":\"Button label\",\"value\":\"Prompt sent on tap\"}]}`" + `
+  - ` + "`key_value`" + `: ` + "`{\"Field\":\"Value\"}`" + `
+  - ` + "`agents`" + `: ` + "`{\"agents\":[{\"name\":\"...\",\"device\":\"...\",\"state\":\"...\"}]}`" + `
+  - ` + "`agenda`" + `: ` + "`{\"items\":[{\"time\":\"09:00\",\"title\":\"...\"}]}`" + `
+  - ` + "`markdown`" + `: ` + "`{\"markdown\":\"...\"}`" + `
+- ` + "`render_widget`" + ` rules (sandboxed iframe, strict CSP ` + "`default-src 'none'`" + `):
+  - Self-contained HTML with inline ` + "`<style>`" + `, ` + "`<svg>`" + `, and ` + "`<script>`" + ` only; external URLs/CDNs/fonts are blocked (only ` + "`data:`" + ` images work).
+  - Style with host CSS variables (` + "`--text`" + `, ` + "`--muted`" + `, ` + "`--border`" + `, ` + "`--accent`" + `, ` + "`--surface`" + `) so light and dark themes adapt cleanly.
+  - Add ` + "`data-fleet-action=\"<prompt text>\"`" + ` to clickable elements to send follow-up prompts into ` + "`#chat`" + `; keep layouts mobile-friendly and compact (<= 480px tall).
+`
 }
 
 func (e *Engine) runAgentTurn(ctx context.Context, cfg Config, ch Channel, source, userText, explicitModel string) error {
@@ -886,6 +933,24 @@ func (e *Engine) pauseForApproval(ch Channel, model string, usage StreamUsage, w
 	}
 	e.publishEvent(StreamEvent{Type: "message_done", ChannelID: ch.ID, Data: msg})
 	e.publishEvent(StreamEvent{Type: "approval", ChannelID: ch.ID, Data: apr})
+	cfg := e.Config()
+	if cfg.Notifications.Enabled && (cfg.Notifications.NotifyApprovals == nil || *cfg.Notifications.NotifyApprovals) {
+		go func() {
+			nCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_ = e.dispatchNotification(nCtx, Notification{
+				Category:  "approvals",
+				ChannelID: ch.ID,
+				Priority:  "urgent",
+				Title:     "Approval needed: " + apr.ToolName,
+				Summary:   apr.Summary,
+				Fields: []NotificationField{
+					{Name: "Channel", Value: "#" + ch.ID, Inline: true},
+					{Name: "Risk", Value: apr.RiskLevel, Inline: true},
+				},
+			})
+		}()
+	}
 	return nil
 }
 
@@ -999,4 +1064,167 @@ func (e *Engine) SetOPReader(fn OPReaderFunc) {
 	if e.mcp != nil {
 		e.mcp.reader = fn
 	}
+}
+
+func (e *Engine) refreshDelegationsFlag() {
+	active, err := e.store.ListActiveDelegations()
+	e.delMu.Lock()
+	e.hasActiveDelegations = err == nil && len(active) > 0
+	e.delMu.Unlock()
+}
+
+// OnSlackerReceipt updates assistant delegation state when a Slacker spawn job launches or fails.
+func (e *Engine) OnSlackerReceipt(jobID, device, sessionName, status, errMsg string) {
+	if e == nil || strings.TrimSpace(jobID) == "" {
+		return
+	}
+	e.delMu.RLock()
+	activeFlag := e.hasActiveDelegations
+	e.delMu.RUnlock()
+	if !activeFlag {
+		return
+	}
+	dels, err := e.store.ListActiveDelegations()
+	if err != nil {
+		return
+	}
+	for _, d := range dels {
+		matched := (d.JobID != "" && d.JobID == jobID) || (d.TargetDevice == device && d.SessionName != "" && d.SessionName == sessionName)
+		if !matched {
+			continue
+		}
+		if status == "failed" {
+			_ = e.store.UpdateDelegationState(d.ID, "", "failed", "failed")
+			e.refreshDelegationsFlag()
+			prompt := fmt.Sprintf("Delegated %s task %q on %s failed to launch: %s", d.Harness, d.SessionName, d.TargetDevice, cmp.Or(errMsg, "unknown error"))
+			dedupe := fmt.Sprintf("del:%s:failed", d.ID)
+			if _, ins, qErr := e.store.EnqueueInbox(d.ChannelID, "delegation", dedupe, map[string]any{"delegation_id": d.ID, "prompt": prompt}, ""); qErr == nil && ins {
+				e.publishEvent(StreamEvent{Type: "delegation", ChannelID: d.ChannelID, Data: map[string]any{"id": d.ID, "status": "failed", "error": errMsg}})
+				e.notify()
+			}
+			return
+		}
+		if status == "launched" && d.Status == "queued" {
+			_ = e.store.UpdateDelegationState(d.ID, "", "launched", "")
+			e.publishEvent(StreamEvent{Type: "delegation", ChannelID: d.ChannelID, Data: map[string]any{"id": d.ID, "status": "launched"}})
+		}
+		return
+	}
+}
+
+func shouldNotifyDelegationState(prevStatus, state string) bool {
+	switch state {
+	case "waiting_permission", "waiting_question", "exited":
+		return true
+	case "idle":
+		return prevStatus == "working" || prevStatus == "launched" || prevStatus == "waiting_permission" || prevStatus == "waiting_question"
+	default:
+		return false
+	}
+}
+
+// OnAgentHeartbeat checks active delegations and wakes the assistant when a delegated agent blocks, idles, or exits.
+func (e *Engine) OnAgentHeartbeat(device, harness, sessionID, name, state, summary, gitStatus string, pendingAction map[string]string) {
+	if e == nil {
+		return
+	}
+	e.delMu.RLock()
+	activeFlag := e.hasActiveDelegations
+	e.delMu.RUnlock()
+	if !activeFlag {
+		return
+	}
+	dels, err := e.store.ListActiveDelegations()
+	if err != nil {
+		return
+	}
+	for _, d := range dels {
+		matched := (d.SessionID != "" && d.SessionID == sessionID) ||
+			(d.TargetDevice == device && d.SessionName != "" && d.SessionName == name)
+		if !matched {
+			continue
+		}
+		if !shouldNotifyDelegationState(d.Status, state) {
+			if d.SessionID == "" || d.Status != state {
+				_ = e.store.UpdateDelegationState(d.ID, sessionID, state, "")
+			}
+			continue
+		}
+		if d.LastNotifiedState == state {
+			continue
+		}
+		_ = e.store.UpdateDelegationState(d.ID, sessionID, state, state)
+		if state == "exited" {
+			e.refreshDelegationsFlag()
+		}
+		var details []string
+		if summary != "" {
+			details = append(details, "Summary: "+truncateText(summary, 300))
+		}
+		if len(pendingAction) > 0 {
+			if rawPA, mErr := json.Marshal(pendingAction); mErr == nil {
+				details = append(details, "Pending action: "+string(rawPA))
+			}
+		}
+		if gitStatus != "" {
+			details = append(details, "Git status: "+truncateText(gitStatus, 250))
+		}
+		prompt := fmt.Sprintf("Delegated %s session %s (%s on %s) transitioned to %s. Inspect the session if needed and give a concise update in #%s.",
+			harness, cmp.Or(name, sessionID), sessionID, device, state, d.ChannelID)
+		if len(details) > 0 {
+			prompt += "\n" + strings.Join(details, "\n")
+		}
+		dedupe := fmt.Sprintf("del:%s:%s:%s", d.ID, state, time.Now().UTC().Format("2006-01-02T15:04"))
+		if _, ins, qErr := e.store.EnqueueInbox(d.ChannelID, "delegation", dedupe, map[string]any{"delegation_id": d.ID, "session_id": sessionID, "state": state, "prompt": prompt}, ""); qErr == nil && ins {
+			e.publishEvent(StreamEvent{Type: "delegation", ChannelID: d.ChannelID, Data: map[string]any{"id": d.ID, "session_id": sessionID, "status": state}})
+			e.notify()
+		}
+	}
+}
+
+func (e *Engine) activeNotifier(cfg NotificationsConfig) Notifier {
+	e.delMu.RLock()
+	custom := e.notifier
+	e.delMu.RUnlock()
+	if custom != nil {
+		return custom
+	}
+	return NewDiscordWebhookNotifier(cfg, e.opReader, nil)
+}
+
+func (e *Engine) dispatchNotification(ctx context.Context, n Notification) error {
+	cfg := e.Config()
+	if !cfg.Notifications.Enabled {
+		return nil
+	}
+	return e.activeNotifier(cfg.Notifications).Send(ctx, n)
+}
+
+func (e *Engine) dispatchOutboxNotification(item OutboxItem) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := e.dispatchNotification(ctx, Notification{
+		Category:  "outbox",
+		ChannelID: item.ChannelID,
+		Priority:  item.Priority,
+		Title:     cmp.Or(item.Title, "Assistant Notification"),
+		Summary:   item.Body,
+	}); err == nil {
+		_ = e.store.MarkOutboxDelivered(item.ID)
+	}
+}
+
+// TestNotification verifies that configured Discord Webhook notifications resolve and deliver cleanly.
+func (e *Engine) TestNotification(ctx context.Context) error {
+	cfg := e.Config()
+	return e.activeNotifier(cfg.Notifications).Send(ctx, Notification{
+		Category:  "test",
+		ChannelID: "general",
+		Priority:  "normal",
+		Title:     "Fleet Assistant Test Alert",
+		Summary:   "Outbound-only Discord webhook notifications are connected and working.",
+		Fields: []NotificationField{
+			{Name: "Status", Value: "OK", Inline: true},
+		},
+	})
 }

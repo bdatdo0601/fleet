@@ -58,15 +58,29 @@ type ModelConfig struct {
 	Aliases     map[string]string `json:"aliases,omitempty"`
 }
 
-// MCPServerConfig describes one external stdio MCP server managed by the assistant.
+// MCPServerConfig describes one external stdio or Streamable HTTP/SSE MCP server managed by the assistant.
 type MCPServerConfig struct {
 	Name                 string            `json:"name"`
-	Command              string            `json:"command"`
+	Transport            string            `json:"transport,omitempty"`
+	Command              string            `json:"command,omitempty"`
 	Args                 []string          `json:"args,omitempty"`
 	Env                  map[string]string `json:"env,omitempty"`
 	EnvRefs              map[string]string `json:"env_refs,omitempty"`
+	URL                  string            `json:"url,omitempty"`
+	Headers              map[string]string `json:"headers,omitempty"`
+	HeaderRefs           map[string]string `json:"header_refs,omitempty"`
 	Enabled              bool              `json:"enabled"`
 	RequireApprovalTools []string          `json:"require_approval_tools,omitempty"`
+}
+
+// NotificationsConfig configures outbound-only notifications (e.g. Discord Webhook into read-only alert channels).
+type NotificationsConfig struct {
+	Enabled              bool              `json:"enabled"`
+	FleetBaseURL         string            `json:"fleet_base_url,omitempty"`
+	DiscordWebhookOPRef  string            `json:"discord_webhook_op_ref,omitempty"`
+	DiscordChannelOPRefs map[string]string `json:"discord_channel_op_refs,omitempty"`
+	NotifyApprovals      *bool             `json:"notify_approvals,omitempty"`
+	MinPriority          string            `json:"min_priority,omitempty"`
 }
 
 // CredentialPolicy defines a zero-exposure 1Password HTTP credential alias.
@@ -113,10 +127,11 @@ type Config struct {
 	HeartbeatIntervalMinutes int                `json:"heartbeat_interval_minutes"`
 	ObserverThresholdTokens  int                `json:"observer_threshold_tokens"`
 	ReflectorThresholdBytes  int                `json:"reflector_threshold_bytes"`
-	Models                   ModelConfig        `json:"models"`
-	MCPServers               []MCPServerConfig  `json:"mcp_servers,omitempty"`
-	Credentials              []CredentialPolicy `json:"credentials,omitempty"`
-	UpdatedAt                string             `json:"updated_at,omitempty"`
+	Models                   ModelConfig         `json:"models"`
+	MCPServers               []MCPServerConfig   `json:"mcp_servers,omitempty"`
+	Credentials              []CredentialPolicy  `json:"credentials,omitempty"`
+	Notifications            NotificationsConfig `json:"notifications"`
+	UpdatedAt                string              `json:"updated_at,omitempty"`
 }
 
 // CredentialView is the secret-free view of a CredentialPolicy returned to API callers.
@@ -146,10 +161,11 @@ type ConfigView struct {
 	HeartbeatIntervalMinutes int               `json:"heartbeat_interval_minutes"`
 	ObserverThresholdTokens  int               `json:"observer_threshold_tokens"`
 	ReflectorThresholdBytes  int               `json:"reflector_threshold_bytes"`
-	Models                   ModelConfig       `json:"models"`
-	MCPServers               []MCPServerConfig `json:"mcp_servers"`
-	Credentials              []CredentialView  `json:"credentials"`
-	UpdatedAt                string            `json:"updated_at,omitempty"`
+	Models                   ModelConfig         `json:"models"`
+	MCPServers               []MCPServerConfig   `json:"mcp_servers"`
+	Credentials              []CredentialView    `json:"credentials"`
+	Notifications            NotificationsConfig `json:"notifications"`
+	UpdatedAt                string              `json:"updated_at,omitempty"`
 }
 
 // DefaultAliases returns built-in model shortcuts selectable in chat or via /alias.
@@ -247,6 +263,8 @@ func NormalizeConfig(cfg Config) Config {
 	}
 	cfg.Models.Aliases = aliases
 	cfg.ExtraVaults = normalizeVaultMounts(cfg.ExtraVaults)
+	cfg.MCPServers = normalizeMCPServers(cfg.MCPServers)
+	cfg.Notifications = normalizeNotificationsConfig(cfg.Notifications)
 	return cfg
 }
 
@@ -361,9 +379,125 @@ func redactMCPServers(servers []MCPServerConfig) []MCPServerConfig {
 				copySrv.Env[k] = maskSecret(v)
 			}
 		}
+		if len(srv.Headers) > 0 {
+			copySrv.Headers = make(map[string]string, len(srv.Headers))
+			for k, v := range srv.Headers {
+				copySrv.Headers[k] = maskSecret(v)
+			}
+		}
 		out = append(out, copySrv)
 	}
 	return out
+}
+
+// NormalizeMCPServerConfig cleans fields and defaults transport on an MCPServerConfig.
+func NormalizeMCPServerConfig(srv MCPServerConfig) MCPServerConfig {
+	srv.Name = strings.ToLower(strings.TrimSpace(srv.Name))
+	srv.Command = strings.TrimSpace(srv.Command)
+	srv.URL = strings.TrimSpace(srv.URL)
+	tr := strings.ToLower(strings.TrimSpace(srv.Transport))
+	if tr == "sse" || tr == "http" || (tr == "" && srv.URL != "") {
+		srv.Transport = "http"
+	} else {
+		srv.Transport = "stdio"
+	}
+	return srv
+}
+
+func normalizeMCPServers(servers []MCPServerConfig) []MCPServerConfig {
+	if servers == nil {
+		return nil
+	}
+	out := make([]MCPServerConfig, 0, len(servers))
+	for _, s := range servers {
+		out = append(out, NormalizeMCPServerConfig(s))
+	}
+	return out
+}
+
+func normalizeNotificationsConfig(n NotificationsConfig) NotificationsConfig {
+	n.FleetBaseURL = strings.TrimRight(strings.TrimSpace(n.FleetBaseURL), "/")
+	n.DiscordWebhookOPRef = strings.TrimSpace(n.DiscordWebhookOPRef)
+	if n.NotifyApprovals == nil {
+		t := true
+		n.NotifyApprovals = &t
+	}
+	switch strings.ToLower(strings.TrimSpace(n.MinPriority)) {
+	case "low", "normal", "urgent":
+		n.MinPriority = strings.ToLower(strings.TrimSpace(n.MinPriority))
+	default:
+		n.MinPriority = "normal"
+	}
+	if len(n.DiscordChannelOPRefs) > 0 {
+		clean := make(map[string]string, len(n.DiscordChannelOPRefs))
+		for k, v := range n.DiscordChannelOPRefs {
+			ck := strings.ToLower(strings.TrimSpace(k))
+			cv := strings.TrimSpace(v)
+			if ck != "" && cv != "" {
+				clean[ck] = cv
+			}
+		}
+		n.DiscordChannelOPRefs = clean
+	}
+	return n
+}
+
+var blockedSelfSetupShells = map[string]bool{
+	"sh": true, "bash": true, "zsh": true, "dash": true, "fish": true,
+	"csh": true, "tcsh": true, "ksh": true, "osascript": true,
+}
+
+func looksLikeSecretKey(k string) bool {
+	up := strings.ToUpper(strings.TrimSpace(k))
+	for _, marker := range []string{"TOKEN", "SECRET", "KEY", "PASSWORD", "AUTH", "CREDENTIAL", "COOKIE", "BEARER"} {
+		if strings.Contains(up, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateMCPServerConfig checks MCPServerConfig fields and enforces self-setup safety rules when selfSetup is true.
+func ValidateMCPServerConfig(srv MCPServerConfig, selfSetup bool) error {
+	srv = NormalizeMCPServerConfig(srv)
+	if !vaultNameRE.MatchString(srv.Name) {
+		return newErr(fmt.Sprintf("invalid MCP server name %q (must match [a-z0-9][a-z0-9_-]*)", srv.Name), http.StatusBadRequest)
+	}
+	if srv.Transport == "http" {
+		if srv.URL == "" || (!strings.HasPrefix(srv.URL, "http://") && !strings.HasPrefix(srv.URL, "https://")) {
+			return newErr(fmt.Sprintf("MCP server %q requires an http:// or https:// url", srv.Name), http.StatusBadRequest)
+		}
+	} else {
+		if srv.Command == "" {
+			return newErr(fmt.Sprintf("MCP server %q requires a command", srv.Name), http.StatusBadRequest)
+		}
+		if selfSetup && blockedSelfSetupShells[strings.ToLower(filepath.Base(srv.Command))] {
+			return newErr(fmt.Sprintf("MCP server %q cannot invoke shell %q directly during self-setup", srv.Name, srv.Command), http.StatusBadRequest)
+		}
+	}
+	for k, ref := range srv.EnvRefs {
+		if !strings.HasPrefix(strings.TrimSpace(ref), "op://") {
+			return newErr(fmt.Sprintf("MCP %q env_refs[%q] must be an op:// reference", srv.Name, k), http.StatusBadRequest)
+		}
+	}
+	for k, ref := range srv.HeaderRefs {
+		if !strings.HasPrefix(strings.TrimSpace(ref), "op://") {
+			return newErr(fmt.Sprintf("MCP %q header_refs[%q] must be an op:// reference", srv.Name, k), http.StatusBadRequest)
+		}
+	}
+	if selfSetup {
+		for k := range srv.Env {
+			if looksLikeSecretKey(k) {
+				return newErr(fmt.Sprintf("plain env[%q] rejected during self-setup: store secret in 1Password and use env_refs", k), http.StatusBadRequest)
+			}
+		}
+		for k := range srv.Headers {
+			if looksLikeSecretKey(k) {
+				return newErr(fmt.Sprintf("plain headers[%q] rejected during self-setup: store secret in 1Password and use header_refs", k), http.StatusBadRequest)
+			}
+		}
+	}
+	return nil
 }
 
 // View converts Config into a safe non-secret ConfigView.
@@ -398,6 +532,7 @@ func (c Config) View(effectiveVault string) ConfigView {
 		Models:                   c.Models,
 		MCPServers:               redactMCPServers(c.MCPServers),
 		Credentials:              creds,
+		Notifications:            normalizeNotificationsConfig(c.Notifications),
 		UpdatedAt:                c.UpdatedAt,
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,26 +28,51 @@ button { font: inherit; cursor: pointer; border-radius: 6px; border: 1px solid v
 button:hover { border-color: var(--accent); }
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--border); }
+.widget-err { color: #ef4444; font-size: 12px; padding: 6px 8px; border: 1px solid #ef4444; border-radius: 6px; }
 </style>
 </head>
 <body>
 <div id="root"></div>
 <script>
 const root = document.getElementById("root");
-function sendHeight() {
-  parent.postMessage({ type: "fleet-widget-resize", height: Math.max(48, document.documentElement.scrollHeight) }, "*");
-}
-window.addEventListener("message", (ev) => {
-  if (!ev.data || ev.data.type !== "render") return;
-  if (ev.data.theme === "dark") document.documentElement.setAttribute("data-theme", "dark");
+function applyTheme(theme) {
+  if (theme === "dark") document.documentElement.setAttribute("data-theme", "dark");
   else document.documentElement.removeAttribute("data-theme");
+}
+function sendHeight() {
+  const h = Math.max(48, Math.ceil(root.scrollHeight));
+  parent.postMessage({ type: "fleet-widget-resize", height: h }, "*");
+}
+function showWidgetError(msg) {
+  const box = document.createElement("div");
+  box.className = "widget-err";
+  box.textContent = "Widget error: " + String(msg || "unknown error");
+  root.appendChild(box);
+  sendHeight();
+}
+window.addEventListener("error", (ev) => {
+  showWidgetError(ev.message || "script error");
+});
+window.addEventListener("message", (ev) => {
+  if (!ev.data) return;
+  if (ev.data.type === "theme") {
+    applyTheme(ev.data.theme);
+    return;
+  }
+  if (ev.data.type !== "render") return;
+  applyTheme(ev.data.theme);
   root.innerHTML = String(ev.data.html || "");
   for (const sc of root.querySelectorAll("script")) {
-    const s = document.createElement("script");
-    s.textContent = sc.textContent;
-    sc.replaceWith(s);
+    try {
+      const s = document.createElement("script");
+      s.textContent = sc.textContent;
+      sc.replaceWith(s);
+    } catch (err) {
+      showWidgetError(err && err.message ? err.message : err);
+    }
   }
   sendHeight();
+  requestAnimationFrame(sendHeight);
 });
 root.addEventListener("click", (ev) => {
   const btn = ev.target && ev.target.closest("[data-fleet-action]");
@@ -399,6 +425,40 @@ func registerAssistantActionRoutes(
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return nil
 	}))
+	mux.HandleFunc("GET /v1/assistant/outbox", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		items, err := fleet.Assistant.Store().ListOutbox(queryInt(r, "limit"), queryBool(r, "undelivered"))
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": items})
+		return nil
+	}))
+	mux.HandleFunc("POST /v1/assistant/outbox/{id}/ack", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+		if err != nil || id <= 0 {
+			return &core.FleetError{Msg: "invalid outbox id", Status: http.StatusBadRequest}
+		}
+		if err := fleet.Assistant.Store().MarkOutboxDelivered(id); err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return nil
+	}))
+	mux.HandleFunc("GET /v1/assistant/delegations", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		list, err := fleet.Assistant.Store().ListDelegations(queryInt(r, "limit"))
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"delegations": list})
+		return nil
+	}))
+	mux.HandleFunc("POST /v1/assistant/notifications/test", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		if err := fleet.Assistant.TestNotification(r.Context()); err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return nil
+	}))
 }
 
 func registerAssistantSkillRoutes(
@@ -534,6 +594,53 @@ func registerAssistantVaultRoutes(
 			return err
 		}
 		writeJSON(w, http.StatusOK, res)
+		return nil
+	}))
+	mux.HandleFunc("GET /v1/assistant/vault/history", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		v, mount, err := fleet.Assistant.ResolveVault(r.URL.Query().Get("vault"))
+		if err != nil {
+			return err
+		}
+		commits, err := v.GitHistory(queryInt(r, "limit"))
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"vault": mount.Name, "commits": commits})
+		return nil
+	}))
+	mux.HandleFunc("GET /v1/assistant/vault/diff", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		v, mount, err := fleet.Assistant.ResolveVault(r.URL.Query().Get("vault"))
+		if err != nil {
+			return err
+		}
+		sha := r.URL.Query().Get("sha")
+		diff, err := v.GitDiff(sha)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"vault": mount.Name, "sha": sha, "diff": diff})
+		return nil
+	}))
+	mux.HandleFunc("POST /v1/assistant/vault/rollback", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		var req struct {
+			Vault string `json:"vault"`
+			SHA   string `json:"sha"`
+		}
+		if err := readJSONBody(r, &req); err != nil {
+			return err
+		}
+		v, mount, err := fleet.Assistant.ResolveVault(req.Vault)
+		if err != nil {
+			return err
+		}
+		if mount.ReadOnly {
+			return &core.FleetError{Msg: fmt.Sprintf("vault %q is read-only", mount.Name), Status: http.StatusForbidden}
+		}
+		commit, err := v.GitRollback(req.SHA)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"vault": mount.Name, "commit": commit})
 		return nil
 	}))
 }

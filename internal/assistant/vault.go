@@ -471,6 +471,98 @@ func truncateText(s string, maxLen int) string {
 	return strings.TrimSpace(s[:maxLen]) + "..."
 }
 
+// VaultCommit describes one git commit inside a git-backed Obsidian vault.
+type VaultCommit struct {
+	SHA      string `json:"sha"`
+	ShortSHA string `json:"short_sha"`
+	Date     string `json:"date"`
+	Message  string `json:"message"`
+}
+
+var gitSHARE = regexp.MustCompile(`^[0-9a-fA-F]{4,40}$`)
+
+func validateGitSHA(sha string) (string, error) {
+	clean := strings.TrimSpace(sha)
+	if !gitSHARE.MatchString(clean) {
+		return "", newErr("invalid git commit SHA", http.StatusBadRequest)
+	}
+	return clean, nil
+}
+
+// GitHistory returns recent commits in the vault git repo (or empty slice if not git-backed).
+func (v *Vault) GitHistory(limit int) ([]VaultCommit, error) {
+	if _, err := os.Stat(filepath.Join(v.Root, ".git")); errors.Is(err, os.ErrNotExist) {
+		return []VaultCommit{}, nil
+	} else if err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	out, err := exec.Command("git", "-C", v.Root, "log", fmt.Sprintf("-n%d", limit), "--format=%H\t%h\t%cI\t%s").Output()
+	if err != nil {
+		return []VaultCommit{}, err
+	}
+	var commits []VaultCommit
+	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 4)
+		if len(parts) < 4 {
+			continue
+		}
+		commits = append(commits, VaultCommit{SHA: parts[0], ShortSHA: parts[1], Date: parts[2], Message: parts[3]})
+	}
+	return commits, nil
+}
+
+// GitDiff returns the stat + patch diff for a specific vault commit SHA.
+func (v *Vault) GitDiff(sha string) (string, error) {
+	clean, err := validateGitSHA(sha)
+	if err != nil {
+		return "", err
+	}
+	if _, err := os.Stat(filepath.Join(v.Root, ".git")); err != nil {
+		return "", newErr("vault is not a git repository", http.StatusBadRequest)
+	}
+	out, err := exec.Command("git", "-C", v.Root, "show", "--stat", "--patch", clean).CombinedOutput()
+	if err != nil {
+		return "", newErr(fmt.Sprintf("git show %s failed: %s", clean, strings.TrimSpace(string(out))), http.StatusNotFound)
+	}
+	const maxDiff = 64 * 1024
+	if len(out) > maxDiff {
+		return string(out[:maxDiff]) + "\n... (diff truncated)\n", nil
+	}
+	return string(out), nil
+}
+
+// GitRollback restores the vault working tree to commit sha and records a forward rollback commit.
+func (v *Vault) GitRollback(sha string) (VaultCommit, error) {
+	clean, err := validateGitSHA(sha)
+	if err != nil {
+		return VaultCommit{}, err
+	}
+	if _, err := os.Stat(filepath.Join(v.Root, ".git")); err != nil {
+		return VaultCommit{}, newErr("vault is not a git repository", http.StatusBadRequest)
+	}
+	if out, err := exec.Command("git", "-C", v.Root, "checkout", clean, "--", ".").CombinedOutput(); err != nil {
+		return VaultCommit{}, newErr(fmt.Sprintf("git checkout %s failed: %s", clean, strings.TrimSpace(string(out))), http.StatusBadRequest)
+	}
+	short := clean
+	if len(short) > 7 {
+		short = short[:7]
+	}
+	msg := "ui: rollback vault to " + short
+	_ = exec.Command("git", "-C", v.Root, "add", "-A").Run()
+	_ = exec.Command("git", "-C", v.Root, "commit", "--allow-empty", "-m", msg, "--quiet").Run()
+	hist, _ := v.GitHistory(1)
+	if len(hist) > 0 {
+		return hist[0], nil
+	}
+	return VaultCommit{SHA: clean, ShortSHA: short, Message: msg}, nil
+}
+
 // MaybeGitCommit stages and commits changes if the vault is already a git repository.
 func (v *Vault) MaybeGitCommit(enabled bool, msg string) {
 	if !enabled {

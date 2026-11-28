@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/bdatdo0601/fleet/internal/assistant"
 	"github.com/bdatdo0601/fleet/internal/memory"
 	"github.com/bdatdo0601/fleet/internal/slacker"
 )
@@ -29,6 +30,46 @@ func (d *assistantDeps) SendAgentMessage(fromDevice, to, body string) (any, erro
 		return nil, err
 	}
 	return d.fleet.Agents.SendMessageWithReport(fromDevice, "", to, body, nil, nil, known)
+}
+
+func (d *assistantDeps) ListPaths(device, query string, limit int) (any, error) {
+	list, err := d.fleet.Agents.ListPaths(device, query)
+	if err != nil {
+		return nil, err
+	}
+	if limit > 0 && len(list) > limit {
+		list = list[:limit]
+	}
+	return list, nil
+}
+
+func (d *assistantDeps) SpawnAgent(ctx context.Context, req assistant.SpawnAgentRequest) (assistant.SpawnAgentResult, error) {
+	res, err := d.fleet.SpawnAgent(ctx, nil, SpawnAgentRequest{
+		Harness:  req.Harness,
+		Name:     req.Name,
+		Device:   req.Device,
+		RepoPath: req.RepoPath,
+		Prompt:   req.Prompt,
+		Model:    req.Model,
+		Policy:   req.Policy,
+		UseTmux:  req.UseTmux,
+	})
+	if err != nil {
+		return assistant.SpawnAgentResult{}, err
+	}
+	return assistant.SpawnAgentResult{
+		JobID:        res.Job.ID,
+		TargetDevice: res.Job.TargetDevice,
+		Harness:      res.Job.Harness,
+		SessionName:  res.Job.SessionName,
+		RepoPath:     res.Job.RepoPath,
+		Status:       res.Job.Status,
+		WorkerOnline: res.WorkerOnline,
+	}, nil
+}
+
+func (d *assistantDeps) KillAgent(_ context.Context, sessionID string) (any, error) {
+	return d.fleet.KillAgent(nil, sessionID)
 }
 
 func (d *assistantDeps) MemorySearch(query, scope, kind, tier string, limit int) (any, error) {

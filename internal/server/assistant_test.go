@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -57,8 +58,11 @@ func TestAssistantRoutesSecurityAndFlow(t *testing.T) {
 	}
 
 	// Admin can load skills, create skill, schedule timer, and chat.
-	if st, _, _ := doRawReq(t, srv.URL+"/v1/assistant/skills/daily-check", http.MethodPut, `{"content":"---\nname: daily-check\ndescription: Check waiting agents\n---\nRun check.\n"}`, nil, ""); st != http.StatusOK {
+	if st, _, _ := doRawReq(t, srv.URL+"/v1/assistant/skills/daily-check", http.MethodPut, `{"content":"---\nname: daily-check\ndescription: Check waiting agents\nsync_to_fleet: true\n---\nRun check.\n"}`, nil, ""); st != http.StatusOK {
 		t.Fatalf("PUT skill expected 200, got %d", st)
+	}
+	if syncRes, sErr := f.Sync(office, "test", "", ""); sErr != nil || len(syncRes.SyncedSkills) != 1 || syncRes.SyncedSkills[0].Name != "daily-check" {
+		t.Fatalf("expected SyncResult.SyncedSkills to include daily-check, got %+v (err=%v)", syncRes.SyncedSkills, sErr)
 	}
 	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/vault/search?vault=all&q=Kyoto", http.MethodGet, "", nil, ""); st != http.StatusOK || !strings.Contains(string(b), `"vault":"personal"`) {
 		t.Fatalf("GET /v1/assistant/vault/search?vault=all expected personal hit, got %d (%s)", st, string(b))
@@ -75,14 +79,34 @@ func TestAssistantRoutesSecurityAndFlow(t *testing.T) {
 	if st, _, _ := doRawReq(t, srv.URL+"/v1/assistant/vault/file?path=../bad.md", http.MethodGet, "", nil, ""); st != http.StatusBadRequest {
 		t.Fatalf("vault traversal expected 400, got %d", st)
 	}
-	if st, hdr, _ := doRawReq(t, srv.URL+"/assistant-widget", http.MethodGet, "", nil, ""); st != http.StatusOK || hdr.Get("X-Frame-Options") != "SAMEORIGIN" {
-		t.Fatalf("widget frame expected 200 + SAMEORIGIN, got %d %+v", st, hdr)
+	if st, hdr, wb := doRawReq(t, srv.URL+"/assistant-widget", http.MethodGet, "", nil, ""); st != http.StatusOK || hdr.Get("X-Frame-Options") != "SAMEORIGIN" || !strings.Contains(hdr.Get("Content-Security-Policy"), "default-src 'none'") || !strings.Contains(string(wb), `"theme"`) || !strings.Contains(string(wb), "root.scrollHeight") {
+		t.Fatalf("widget frame expected 200 + SAMEORIGIN + strict CSP + theme/root.scrollHeight, got %d %+v (%s)", st, hdr, string(wb))
 	}
 	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/doctor", http.MethodGet, "", nil, ""); st != http.StatusOK || !strings.Contains(string(b), `"checks"`) {
 		t.Fatalf("GET /v1/assistant/doctor expected 200 with checks, got %d (%s)", st, string(b))
 	}
 	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/op-token", http.MethodPost, `{"token":"ops_test_token"}`, nil, ""); st != http.StatusOK || !strings.Contains(string(b), `"check"`) {
 		t.Fatalf("POST /v1/assistant/op-token expected 200, got %d (%s)", st, string(b))
+	}
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/outbox", http.MethodGet, "", nil, ""); st != http.StatusOK || !strings.Contains(string(b), `"items"`) {
+		t.Fatalf("GET /v1/assistant/outbox expected 200, got %d (%s)", st, string(b))
+	}
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/delegations", http.MethodGet, "", nil, ""); st != http.StatusOK || !strings.Contains(string(b), `"delegations"`) {
+		t.Fatalf("GET /v1/assistant/delegations expected 200, got %d (%s)", st, string(b))
+	}
+	if v, vErr := f.Assistant.Vault(); vErr == nil {
+		for _, args := range [][]string{
+			{"-C", v.Root, "init"},
+			{"-C", v.Root, "config", "user.email", "test@fleet.local"},
+			{"-C", v.Root, "config", "user.name", "Fleet Test"},
+			{"-C", v.Root, "add", "-A"},
+			{"-C", v.Root, "commit", "-m", "seed"},
+		} {
+			_ = exec.Command("git", args...).Run()
+		}
+		if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/vault/history?vault=agent", http.MethodGet, "", nil, ""); st != http.StatusOK || !strings.Contains(string(b), `"commits"`) {
+			t.Fatalf("GET /v1/assistant/vault/history expected 200, got %d (%s)", st, string(b))
+		}
 	}
 
 	// Post message and wait until worker persists reply.

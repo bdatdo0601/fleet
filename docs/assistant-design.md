@@ -68,8 +68,9 @@ Managed in `internal/assistant/store.go`:
 5. `openRouterClient.StreamChat` sends the cache-ordered prompt (`SOUL.md` + skill catalog + Fleet standing memory → `REFLECTIONS.md` + `OBSERVATIONS.md` with `cache_control: ephemeral` → active tail) with `zdr: true`, streaming `delta`, `tool_start`, `tool_done`, `approval`, and `message_done` SSE events.
 
 ### B. Generative UI & Sandboxed Widgets
+- **Prompt Contract (`buildPromptMessages`):** Injects a compact Generative UI contract describing the exact `render_card` payload schemas, `data-fleet-action` callbacks, host theme CSS variables (`--text`, `--muted`, `--border`, `--accent`, `--surface`), and strict no-external-URL CSP constraints.
 - **Typed Native Cards (`render_card`):** `agents`, `agenda`, `choices`, `key_value`, and `markdown` rendered directly via DOM helpers in `internal/server/web/chat.js` (e.g. tappable choice buttons send follow-up prompts on mobile).
-- **Interactive HTML Widgets (`render_widget`):** Rendered inside `<iframe sandbox="allow-scripts" src="/assistant-widget">` (omitting `allow-same-origin` so scripts run in an opaque `null` origin). `/assistant-widget` sets `X-Frame-Options: SAMEORIGIN` and `Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; frame-ancestors 'self'`, communicating height and `[data-fleet-action]` clicks back to `#chat` via `postMessage`.
+- **Interactive HTML Widgets (`render_widget`):** Rendered inside `<iframe sandbox="allow-scripts" src="/assistant-widget">` (omitting `allow-same-origin` so scripts run in an opaque `null` origin). `/assistant-widget` sets `X-Frame-Options: SAMEORIGIN` and `Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; frame-ancestors 'self'`, communicating `#root` height and `[data-fleet-action]` clicks back to `#chat` via `postMessage`, and supporting live theme updates via `{ type: "theme" }` without reloading widget state. `#chat` reconciles messages incrementally so mounted interactive widgets remain live across turns.
 
 ### C. Observational Memory & Obsidian Second Brain
 - **File layout (`internal/assistant/vault.go`):** Strict path jailing rejects `..`, absolute paths, NUL bytes, and symlink escapes.
@@ -132,11 +133,17 @@ Managed in `internal/assistant/store.go`:
 ### Immediate Setup (Day 1)
 - Run `fleet sync` on the Mac mini, connect `obsidian-headless` + 1Password Service Account (`op-setup`, `sync-install`), run `fleet assistant setup` + `fleet assistant doctor`, and pin `http://10.213.0.1:7443/#chat` to your iPhone Home Screen.
 
-### Phase 2 — Proactive Mobility & Google Connectors
-- **External MCP servers:** Add Google Calendar (`gcal`) + search (Brave/Exa) MCPs under `mcp_servers` with read tools auto-approved and writes (`gcal_create_event`, `gmail_send`) listed in `require_approval_tools`.
-- **Proactive mobile wake pings:** Dispatch `urgent` `assistant_outbox` items and `assistant_approvals` via a lightweight wake ping (Slack DM via `fleet slacker`, Pushover/ntfy, or HTTPS Let's Encrypt DNS-01 Web Push on `fleet serve`) linking directly to `#chat`.
-- **Automated `HEARTBEAT.md` + morning briefing:** Enable daily weekday briefing timer in `#briefing` combining waiting Fleet agents, Slack threads, and today's calendar.
+### Phase 2 — Self-Service MCPs, Automations & Simple PWA Alerts
+- **Agent self-setup for external & internal MCPs:** Extend `MCPServerConfig` / `MCPManager` with Streamable HTTP/SSE transport (`transport: "stdio" | "http"`, `url`, `header_refs`) alongside `stdio` (`env_refs`) so both SaaS MCPs (Google Calendar, Brave/Exa, etc.) and internal Nebula MCPs work cleanly. Add `mcp_list`, `mcp_test`, and HITL-approved `mcp_configure` / `mcp_remove` tools (direct user chat only) so the assistant can discover 1Password `op://` references via `onepassword_list_items` / `onepassword_get_item_meta`, store non-secret JSON config in `~/.fleet/assistant.json` (never raw secrets, never auto-executing vault-synced commands), and default new servers to `require_approval_tools: ["*"]` until narrowed.
+- **Simple PWA notifications (desktop / open tab):** Wire `outbox` and `approval` SSE events globally in `app.js` to in-app banners/toasts, browser `Notification` API (when hidden over HTTPS via `fleet tls`), and `navigator.setAppBadge`. Exclude phone wake pings / VAPID Web Push here — mobile push is deferred to Phase 4.
+- **Automated `HEARTBEAT.md` + morning briefing:** Enable daily weekday briefing timer in `#briefing` combining waiting Fleet agents, Slack threads, and calendar/notes.
 
-### Phase 3 — Full Dots / Duet Delegation
-- **Coding task delegation (`fleet_spawn_task`):** Wire a new in-process assistant tool into `fleet slacker`'s existing pull-worker job queue (`slacker.db`) so the lighthouse coordinator can spawn Claude Code, Codex, or Antigravity tasks on awake `laptop`/`office` Macs, watch for `waiting_permission` / completion, and summarize PRs back in `#chat`.
+### Phase 3 — Full Dots / Duet Delegation (Extending Fleet Spawn)
+- **Unified Fleet spawn + assistant tools:** Extract the existing `POST /v1/agents/spawn` & `/kill` orchestration (`slacker-worker` + `session.Start`) into shared `internal/core` methods and expose `fleet_list_paths`, `fleet_spawn_agent` (approval-gated by default, surfacing `worker_online`), and `fleet_kill_agent` via `FleetDeps`.
+- **Event-driven delegation lifecycle:** Track assistant-spawned tasks (`assistant_delegations` mapping `job_id` + `session_name` → `channel_id`) and push state transitions (launch failure, `waiting_permission`, `waiting_question`, `idle` after working, `exited`) into `assistant_inbox` so the assistant sleeps at 0 tokens while the coding agent runs, then wakes automatically to summarize blockers or PRs back in `#chat`.
 - **Vault diff & revision browser:** Surface recent `.git` commits and diffs in `#skills` for one-click audit/rollback of agent self-edits, plus `sync_to_fleet: true` skill distribution via `fleet sync`.
+
+### Phase 4 — Outbound-Only Discord Webhook Integration
+- **Outbound-only Discord Webhook:** Add a pluggable `Notifier` interface implemented first for Discord Webhooks (`op://Fleet-Agent/...` webhook URL in 1Password) — requiring zero public inbound ports, zero gateway bots, and zero sidecar processes on the Mac mini.
+- **Dedicated read-only notification channel(s):** Post rich colored Discord embeds (for `urgent`/`normal` `assistant_outbox` items, pending HITL approvals, briefings, and delegated-agent updates) into dedicated read-only Discord notification channel(s) with deep links back to `#chat/<channel>`, preserving clean, meaningful alert history without mirroring or spoofing interactive Discord conversations.
+- **Privacy boundary:** Keep outbound payloads to concise summaries + Fleet Console deep links (never raw secrets, vault note contents, or sensitive tool arguments).

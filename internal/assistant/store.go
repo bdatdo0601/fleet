@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -109,6 +110,24 @@ CREATE TABLE IF NOT EXISTS assistant_outbox (
   created_at   TEXT NOT NULL,
   delivered_at TEXT NOT NULL DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS assistant_delegations (
+  id                  TEXT PRIMARY KEY,
+  job_id              TEXT NOT NULL DEFAULT '',
+  channel_id          TEXT NOT NULL,
+  target_device       TEXT NOT NULL,
+  harness             TEXT NOT NULL,
+  session_name        TEXT NOT NULL,
+  session_id          TEXT NOT NULL DEFAULT '',
+  repo_path           TEXT NOT NULL DEFAULT '',
+  prompt              TEXT NOT NULL DEFAULT '',
+  status              TEXT NOT NULL DEFAULT 'queued',
+  last_notified_state TEXT NOT NULL DEFAULT '',
+  created_at          TEXT NOT NULL,
+  updated_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_assistant_delegations_active
+  ON assistant_delegations(status, target_device, session_name);
 `
 
 // Channel represents one persistent assistant conversation stream.
@@ -208,6 +227,23 @@ type OutboxItem struct {
 	Delivered   bool   `json:"delivered"`
 	CreatedAt   string `json:"created_at"`
 	DeliveredAt string `json:"delivered_at,omitempty"`
+}
+
+// Delegation tracks a coding agent session spawned by the assistant for event-driven follow-ups.
+type Delegation struct {
+	ID                string `json:"id"`
+	JobID             string `json:"job_id,omitempty"`
+	ChannelID         string `json:"channel_id"`
+	TargetDevice      string `json:"target_device"`
+	Harness           string `json:"harness"`
+	SessionName       string `json:"session_name"`
+	SessionID         string `json:"session_id,omitempty"`
+	RepoPath          string `json:"repo_path,omitempty"`
+	Prompt            string `json:"prompt,omitempty"`
+	Status            string `json:"status"`
+	LastNotifiedState string `json:"last_notified_state,omitempty"`
+	CreatedAt         string `json:"created_at"`
+	UpdatedAt         string `json:"updated_at"`
 }
 
 // SummaryCounts reports live assistant queue/approval counts for overview UI.
@@ -650,6 +686,97 @@ func (s *Store) FinishInbox(id int64, status, errMsg string) error {
 	return err
 }
 
+func parseCronField(field string, minVal, maxVal int, wrapSeven bool) (map[int]bool, error) {
+	allowed := make(map[int]bool)
+	for part := range strings.SplitSeq(strings.TrimSpace(field), ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, fmt.Errorf("empty cron segment in %q", field)
+		}
+		base, stepStr, hasStep := strings.Cut(part, "/")
+		step := 1
+		if hasStep {
+			n, err := strconv.Atoi(strings.TrimSpace(stepStr))
+			if err != nil || n <= 0 {
+				return nil, fmt.Errorf("invalid cron step %q", part)
+			}
+			step = n
+		}
+		lo, hi, err := parseCronRange(base, minVal, maxVal, wrapSeven)
+		if err != nil {
+			return nil, err
+		}
+		for v := lo; v <= hi; v += step {
+			val := v
+			if wrapSeven && val == 7 {
+				val = 0
+			}
+			allowed[val] = true
+		}
+	}
+	return allowed, nil
+}
+
+func parseCronRange(base string, minVal, maxVal int, wrapSeven bool) (int, int, error) {
+	if base == "*" {
+		return minVal, maxVal, nil
+	}
+	hiMax := maxVal
+	if wrapSeven && maxVal < 7 {
+		hiMax = 7
+	}
+	loStr, hiStr, isRange := strings.Cut(base, "-")
+	lo, err := strconv.Atoi(strings.TrimSpace(loStr))
+	if err != nil || lo < minVal || lo > hiMax {
+		return 0, 0, fmt.Errorf("invalid cron value %q", base)
+	}
+	if !isRange {
+		return lo, lo, nil
+	}
+	hi, err := strconv.Atoi(strings.TrimSpace(hiStr))
+	if err != nil || hi < lo || hi > hiMax {
+		return 0, 0, fmt.Errorf("invalid cron range %q", base)
+	}
+	return lo, hi, nil
+}
+
+// NextCronRun computes the next matching timestamp strictly after `after` (in after's location) for a 5-field cron expression.
+func NextCronRun(expr string, after time.Time) (time.Time, error) {
+	fields := strings.Fields(strings.TrimSpace(expr))
+	if len(fields) != 5 {
+		return time.Time{}, newErr("cron_expr must have 5 space-separated fields (min hour dom mon dow)", http.StatusBadRequest)
+	}
+	mins, err := parseCronField(fields[0], 0, 59, false)
+	if err != nil {
+		return time.Time{}, newErr(err.Error(), http.StatusBadRequest)
+	}
+	hrs, err := parseCronField(fields[1], 0, 23, false)
+	if err != nil {
+		return time.Time{}, newErr(err.Error(), http.StatusBadRequest)
+	}
+	doms, err := parseCronField(fields[2], 1, 31, false)
+	if err != nil {
+		return time.Time{}, newErr(err.Error(), http.StatusBadRequest)
+	}
+	mons, err := parseCronField(fields[3], 1, 12, false)
+	if err != nil {
+		return time.Time{}, newErr(err.Error(), http.StatusBadRequest)
+	}
+	dows, err := parseCronField(fields[4], 0, 6, true)
+	if err != nil {
+		return time.Time{}, newErr(err.Error(), http.StatusBadRequest)
+	}
+	cand := after.Truncate(time.Minute).Add(time.Minute)
+	limit := cand.Add(366 * 24 * time.Hour)
+	for !cand.After(limit) {
+		if mons[int(cand.Month())] && doms[cand.Day()] && dows[int(cand.Weekday())] && hrs[cand.Hour()] && mins[cand.Minute()] {
+			return cand.UTC(), nil
+		}
+		cand = cand.Add(time.Minute)
+	}
+	return time.Time{}, newErr("cron_expr did not match any date within 366 days", http.StatusBadRequest)
+}
+
 // UpsertTimer creates or updates a scheduled timer.
 func (s *Store) UpsertTimer(t Timer) (Timer, error) {
 	s.mu.Lock()
@@ -660,7 +787,13 @@ func (s *Store) UpsertTimer(t Timer) (Timer, error) {
 	}
 	t.ChannelID = cmp.Or(strings.TrimSpace(t.ChannelID), "briefing")
 	t.ScheduleKind = cmp.Or(strings.TrimSpace(t.ScheduleKind), "interval")
-	if t.NextRunAt == "" {
+	if t.ScheduleKind == "cron" {
+		next, err := NextCronRun(t.CronExpr, time.Now())
+		if err != nil {
+			return Timer{}, err
+		}
+		t.NextRunAt = next.Format("2006-01-02T15:04:05+00:00")
+	} else if t.NextRunAt == "" {
 		switch {
 		case t.ScheduleKind == "once" && t.FireAt != "":
 			t.NextRunAt = t.FireAt
@@ -767,9 +900,17 @@ func (s *Store) MarkTimerRun(t Timer, now time.Time) error {
 	nowISO := now.UTC().Truncate(time.Second).Format("2006-01-02T15:04:05+00:00")
 	enabled := 1
 	nextRun := ""
-	if t.ScheduleKind == "once" || t.IntervalSeconds <= 0 {
+	switch {
+	case t.ScheduleKind == "cron":
+		next, err := NextCronRun(t.CronExpr, now.Local())
+		if err != nil {
+			enabled = 0
+		} else {
+			nextRun = next.Format("2006-01-02T15:04:05+00:00")
+		}
+	case t.ScheduleKind == "once" || t.IntervalSeconds <= 0:
 		enabled = 0
-	} else {
+	default:
 		nextRun = now.UTC().Add(time.Duration(t.IntervalSeconds) * time.Second).Truncate(time.Second).Format("2006-01-02T15:04:05+00:00")
 	}
 	_, err := s.db.Exec(
@@ -939,6 +1080,149 @@ func (s *Store) AddOutbox(channelID, priority, title, body string) (OutboxItem, 
 		Body:      body,
 		CreatedAt: now,
 	}, nil
+}
+
+// ListOutbox returns recent proactive notifications.
+func (s *Store) ListOutbox(limit int, undeliveredOnly bool) ([]OutboxItem, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	query := `SELECT id, channel_id, priority, title, body, delivered, created_at, delivered_at FROM assistant_outbox`
+	if undeliveredOnly {
+		query += ` WHERE delivered = 0`
+	}
+	query += ` ORDER BY id DESC LIMIT ?`
+	rows, err := s.db.Query(query, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []OutboxItem
+	for rows.Next() {
+		var it OutboxItem
+		var del int
+		if err := rows.Scan(&it.ID, &it.ChannelID, &it.Priority, &it.Title, &it.Body, &del, &it.CreatedAt, &it.DeliveredAt); err != nil {
+			return nil, err
+		}
+		it.Delivered = del != 0
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+// MarkOutboxDelivered marks an outbox notification as delivered.
+func (s *Store) MarkOutboxDelivered(id int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(`UPDATE assistant_outbox SET delivered = 1, delivered_at = ? WHERE id = ?`, registry.NowISO(), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return newErr(fmt.Sprintf("outbox item %d not found", id), http.StatusNotFound)
+	}
+	return nil
+}
+
+// CreateDelegation persists a newly spawned coding agent delegation.
+func (s *Store) CreateDelegation(d Delegation) (Delegation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := registry.NowISO()
+	if d.ID == "" {
+		d.ID = randomHexID("del")
+	}
+	d.ChannelID = cmp.Or(strings.TrimSpace(d.ChannelID), "general")
+	d.Status = cmp.Or(strings.TrimSpace(d.Status), "queued")
+	d.CreatedAt = cmp.Or(d.CreatedAt, now)
+	d.UpdatedAt = now
+	_, err := s.db.Exec(
+		`INSERT INTO assistant_delegations(
+			id, job_id, channel_id, target_device, harness, session_name, session_id,
+			repo_path, prompt, status, last_notified_state, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		d.ID, d.JobID, d.ChannelID, d.TargetDevice, d.Harness, d.SessionName, d.SessionID,
+		d.RepoPath, d.Prompt, d.Status, d.LastNotifiedState, d.CreatedAt, d.UpdatedAt,
+	)
+	return d, err
+}
+
+func scanDelegation(scanner interface{ Scan(...any) error }) (Delegation, error) {
+	var d Delegation
+	err := scanner.Scan(
+		&d.ID, &d.JobID, &d.ChannelID, &d.TargetDevice, &d.Harness, &d.SessionName, &d.SessionID,
+		&d.RepoPath, &d.Prompt, &d.Status, &d.LastNotifiedState, &d.CreatedAt, &d.UpdatedAt,
+	)
+	return d, err
+}
+
+// ListActiveDelegations returns non-terminal delegations (not exited/failed).
+func (s *Store) ListActiveDelegations() ([]Delegation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(
+		`SELECT id, job_id, channel_id, target_device, harness, session_name, session_id,
+		        repo_path, prompt, status, last_notified_state, created_at, updated_at
+		 FROM assistant_delegations WHERE status NOT IN ('exited', 'failed') ORDER BY created_at DESC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []Delegation
+	for rows.Next() {
+		d, err := scanDelegation(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// ListDelegations returns recent delegations ordered newest first.
+func (s *Store) ListDelegations(limit int) ([]Delegation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	rows, err := s.db.Query(
+		`SELECT id, job_id, channel_id, target_device, harness, session_name, session_id,
+		        repo_path, prompt, status, last_notified_state, created_at, updated_at
+		 FROM assistant_delegations ORDER BY created_at DESC LIMIT ?`, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []Delegation
+	for rows.Next() {
+		d, err := scanDelegation(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// UpdateDelegationState updates session_id, status, and last_notified_state on a delegation.
+func (s *Store) UpdateDelegationState(id, sessionID, status, lastNotified string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(
+		`UPDATE assistant_delegations
+		 SET session_id = CASE WHEN ? != '' THEN ? ELSE session_id END,
+		     status = CASE WHEN ? != '' THEN ? ELSE status END,
+		     last_notified_state = CASE WHEN ? != '' THEN ? ELSE last_notified_state END,
+		     updated_at = ?
+		 WHERE id = ?`,
+		sessionID, sessionID, status, status, lastNotified, lastNotified, registry.NowISO(), id,
+	)
+	return err
 }
 
 // Summary returns aggregate counts for Fleet overview.

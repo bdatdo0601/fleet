@@ -33,6 +33,7 @@ Subcommands:
   approve         authorize a pending tool call by ID
   deny            reject a pending tool call by ID
   timers          list scheduled timers
+  notify-test     send a test Discord webhook notification via 1Password ref
 `
 }
 
@@ -65,6 +66,8 @@ func cmdAssistant(args []string, cio *IO) error {
 		return cmdAssistantDecide(rest, false, cio)
 	case "timers":
 		return cmdAssistantTimers(rest, cio)
+	case "notify-test":
+		return cmdAssistantNotifyTest(rest, cio)
 	default:
 		return fmt.Errorf("unknown assistant subcommand %q\n\n%s", sub, assistantUsageText())
 	}
@@ -83,6 +86,8 @@ func cmdAssistantSetup(args []string, cio *IO) error {
 	zdr := fs.Bool("zdr", true, "enforce OpenRouter Zero Data Retention")
 	enable := fs.Bool("enable", true, "enable assistant background scheduler")
 	noTest := fs.Bool("no-test", false, "skip live connection test")
+	discordRef := fs.String("discord-webhook-op-ref", "", "1Password op:// ref for outbound Discord webhook notifications")
+	fleetURL := fs.String("fleet-url", "", "Fleet Console base URL used in Discord deep links")
 	if _, err := parseFlagsInterspersed(fs, args); err != nil {
 		return err
 	}
@@ -129,6 +134,13 @@ func cmdAssistantSetup(args []string, cio *IO) error {
 		cfg.Models.Observer = *observerModel
 		cfg.Models.Reflector = *observerModel
 	}
+	if *discordRef != "" {
+		cfg.Notifications.DiscordWebhookOPRef = strings.TrimSpace(*discordRef)
+		cfg.Notifications.Enabled = true
+	}
+	if *fleetURL != "" {
+		cfg.Notifications.FleetBaseURL = strings.TrimSpace(*fleetURL)
+	}
 	req := map[string]any{
 		"enabled":                    cfg.Enabled,
 		"base_url":                   cfg.BaseURL,
@@ -144,6 +156,7 @@ func cmdAssistantSetup(args []string, cio *IO) error {
 		"observer_threshold_tokens":  cfg.ObserverThresholdTokens,
 		"reflector_threshold_bytes":  cfg.ReflectorThresholdBytes,
 		"models":                     cfg.Models,
+		"notifications":              cfg.Notifications,
 		"test":                       !*noTest && (cfg.APIKey != "" || cfg.APIKeyOPRef != ""),
 	}
 	var out struct {
@@ -484,5 +497,21 @@ func cmdAssistantTimers(args []string, cio *IO) error {
 	for _, t := range out.Timers {
 		cio.printf("%s  enabled=%v  #%s  next=%s  %s\n", t.ID, t.Enabled, t.ChannelID, t.NextRunAt, t.Name)
 	}
+	return nil
+}
+
+func cmdAssistantNotifyTest(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("assistant notify-test", flag.ContinueOnError)
+	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+		return err
+	}
+	api, err := client.ResolveAPI("")
+	if err != nil {
+		return err
+	}
+	if err := client.Call(api, http.MethodPost, "/v1/assistant/notifications/test", map[string]any{}, 15*time.Second, nil, nil); err != nil {
+		return err
+	}
+	cio.info("sent test Discord webhook notification")
 	return nil
 }

@@ -410,6 +410,17 @@ func registerAgentRoutes(
 		if err != nil {
 			return err
 		}
+		if fleet.Assistant != nil {
+			summary := ""
+			if req.Summary != nil {
+				summary = *req.Summary
+			}
+			gitSt := ""
+			if req.GitStatus != nil {
+				gitSt = *req.GitStatus
+			}
+			fleet.Assistant.OnAgentHeartbeat(c.Name, req.Harness, res.SessionID, res.Name, req.State, summary, gitSt, req.PendingAction)
+		}
 		if req.IncludeMemory && fleet.Memory != nil {
 			if ctxRes, mErr := fleet.Memory.RenderContext(cmp.Or(req.MemoryRepo, req.Repo), c.Name); mErr == nil {
 				res.MemoryContext = ctxRes.Rendered

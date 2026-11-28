@@ -113,6 +113,7 @@ func (e *Engine) Doctor(ctx context.Context) DoctorReport {
 	}
 	checks = append(checks, opCheck)
 	checks = append(checks, e.checkMCPDoctor(ctx, cfg))
+	checks = append(checks, e.checkNotificationsDoctor(ctx, cfg))
 
 	ok := true
 	for _, c := range checks {
@@ -309,8 +310,11 @@ func opRequiredByConfig(cfg Config) bool {
 	if strings.TrimSpace(cfg.APIKeyOPRef) != "" || len(cfg.Credentials) > 0 {
 		return true
 	}
+	if cfg.Notifications.Enabled && (strings.TrimSpace(cfg.Notifications.DiscordWebhookOPRef) != "" || len(cfg.Notifications.DiscordChannelOPRefs) > 0) {
+		return true
+	}
 	for _, s := range cfg.MCPServers {
-		if s.Enabled && len(s.EnvRefs) > 0 {
+		if s.Enabled && (len(s.EnvRefs) > 0 || len(s.HeaderRefs) > 0) {
 			return true
 		}
 	}
@@ -370,5 +374,54 @@ func (e *Engine) checkMCPDoctor(ctx context.Context, cfg Config) DoctorCheck {
 		Name:   "mcp_servers",
 		Status: "ok",
 		Detail: fmt.Sprintf("%d external MCP server(s) enabled, %d tool(s) ready", enabled, len(tools)),
+	}
+}
+
+func (e *Engine) checkNotificationsDoctor(ctx context.Context, cfg Config) DoctorCheck {
+	n := normalizeNotificationsConfig(cfg.Notifications)
+	if !n.Enabled {
+		return DoctorCheck{Name: "notifications", Status: "skip", Detail: "Outbound Discord webhook notifications disabled"}
+	}
+	if n.DiscordWebhookOPRef == "" && len(n.DiscordChannelOPRefs) == 0 {
+		return DoctorCheck{
+			Name:   "notifications",
+			Status: "fail",
+			Detail: "notifications.enabled=true but no discord_webhook_op_ref configured",
+			Hint:   "Set discord_webhook_op_ref (e.g. op://Fleet-Agent/Discord/webhook) in Settings or `fleet assistant setup`",
+		}
+	}
+	reader := e.opReader
+	if reader == nil {
+		reader = defaultOPReader
+	}
+	refs := make([]string, 0, 1+len(n.DiscordChannelOPRefs))
+	if n.DiscordWebhookOPRef != "" {
+		refs = append(refs, n.DiscordWebhookOPRef)
+	}
+	for _, r := range n.DiscordChannelOPRefs {
+		refs = append(refs, r)
+	}
+	for _, ref := range refs {
+		val, err := reader(ctx, ref)
+		if err != nil {
+			return DoctorCheck{
+				Name:   "notifications",
+				Status: "fail",
+				Detail: fmt.Sprintf("Failed to resolve %s: %v", ref, err),
+				Hint:   "Verify 1Password Service Account access to the Discord webhook item",
+			}
+		}
+		if err := validateDiscordWebhookURL(val, false); err != nil {
+			return DoctorCheck{
+				Name:   "notifications",
+				Status: "fail",
+				Detail: fmt.Sprintf("%s: %s", ref, scrubSecret(err.Error(), val)),
+			}
+		}
+	}
+	return DoctorCheck{
+		Name:   "notifications",
+		Status: "ok",
+		Detail: fmt.Sprintf("Discord webhook ready (%d ref(s), min_priority=%s)", len(refs), n.MinPriority),
 	}
 }

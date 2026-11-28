@@ -62,17 +62,24 @@ type BinaryManifest struct {
 	Binaries map[string]BinaryEntry `json:"binaries"`
 }
 
+// SyncedSkill represents a vault SKILL.md marked sync_to_fleet: true distributed via `fleet sync`.
+type SyncedSkill struct {
+	Name    string `json:"name"`
+	Content string `json:"content"`
+}
+
 // SyncResult is returned by GET /v1/sync.
 type SyncResult struct {
-	Name          string  `json:"name"`
-	IP            string  `json:"ip"`
-	Kind          string  `json:"kind"`
-	CA            string  `json:"ca"`
-	Cert          string  `json:"cert"`
-	Config        *string `json:"config"`
-	DNSDomain     string  `json:"dns_domain,omitempty"`
-	BinarySHA256  string  `json:"binary_sha256,omitempty"`
-	BinaryVersion string  `json:"binary_version,omitempty"`
+	Name          string        `json:"name"`
+	IP            string        `json:"ip"`
+	Kind          string        `json:"kind"`
+	CA            string        `json:"ca"`
+	Cert          string        `json:"cert"`
+	Config        *string       `json:"config"`
+	DNSDomain     string        `json:"dns_domain,omitempty"`
+	BinarySHA256  string        `json:"binary_sha256,omitempty"`
+	BinaryVersion string        `json:"binary_version,omitempty"`
+	SyncedSkills  []SyncedSkill `json:"synced_skills,omitempty"`
 }
 
 // LighthouseInfo describes the lighthouse endpoint for mobile devices.
@@ -163,6 +170,7 @@ type Fleet struct {
 	Assistant         *assistant.Engine
 	EdgeToken         string
 	approveMu         sync.Mutex
+	spawnMu           sync.Mutex
 	IdentifyOverride  func(peerIP string) *registry.Device // optional hook for tests
 }
 
@@ -758,6 +766,20 @@ func (f *Fleet) Sync(dev *registry.Device, clientVersion, osName, archName strin
 		if _, sha, ver, err := f.BinaryForPlatform(osName, archName); err == nil {
 			res.BinarySHA256 = sha
 			res.BinaryVersion = ver
+		}
+	}
+	if f.Assistant != nil {
+		if v, vErr := f.Assistant.Vault(); vErr == nil {
+			if list, lErr := v.ListSkills(); lErr == nil {
+				for _, sk := range list {
+					if !sk.SyncToFleet {
+						continue
+					}
+					if full, gErr := v.GetSkill(sk.Name); gErr == nil && strings.TrimSpace(full.Content) != "" {
+						res.SyncedSkills = append(res.SyncedSkills, SyncedSkill{Name: full.Name, Content: full.Content})
+					}
+				}
+			}
 		}
 	}
 	return res, nil

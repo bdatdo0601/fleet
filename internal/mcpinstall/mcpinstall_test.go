@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/bdatdo0601/fleet/internal/skills"
 )
 
 func TestInstallPreservesExistingHandlesEmptyJSONAndUninstalls(t *testing.T) {
@@ -190,5 +192,41 @@ func TestParsePSMCPServers(t *testing.T) {
 	}
 	if w := FormatStaleWarning(got[0]); !strings.Contains(w, "pid 58623") || !strings.Contains(w, "legacy Python fleetctl") || !strings.Contains(w, "antigravity") {
 		t.Fatalf("unexpected warning string: %q", w)
+	}
+}
+
+func TestSyncDynamicSkillsWritesAndPrunes(t *testing.T) {
+	home := t.TempDir()
+	// Install baseline skills first.
+	if _, err := Install(InstallOpts{Home: home, BinPath: "/opt/homebrew/bin/fleet"}); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := syncDynamicSkillsInHome(home, nil, nil, []skills.Skill{
+		{Name: "daily-brief", Content: []byte("---\nname: daily-brief\n---\nHello\n")},
+		{Name: "fleet-agents", Content: []byte("should not overwrite builtin")},
+	})
+	if err != nil || len(changed) == 0 {
+		t.Fatalf("syncDynamicSkillsInHome failed: changed=%v err=%v", changed, err)
+	}
+	for _, p := range []string{
+		filepath.Join(home, ".claude", "skills", "daily-brief", "SKILL.md"),
+		filepath.Join(home, ".codex", "skills", "daily-brief", "SKILL.md"),
+		filepath.Join(home, ".gemini", "config", "skills", "daily-brief", "SKILL.md"),
+	} {
+		if b, rErr := os.ReadFile(p); rErr != nil || !strings.Contains(string(b), "Hello") {
+			t.Fatalf("expected synced skill at %s, got %q (%v)", p, string(b), rErr)
+		}
+	}
+	// Built-in fleet-agents skill must not be overwritten.
+	if b, _ := os.ReadFile(filepath.Join(home, ".claude", "skills", "fleet-agents", "SKILL.md")); strings.Contains(string(b), "should not overwrite") {
+		t.Fatalf("builtin fleet-agents skill was overwritten")
+	}
+
+	// Removing daily-brief from dynamic list prunes it cleanly.
+	if _, err := syncDynamicSkillsInHome(home, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".claude", "skills", "daily-brief")); !os.IsNotExist(err) {
+		t.Fatalf("expected pruned daily-brief skill dir, err=%v", err)
 	}
 }
