@@ -1082,6 +1082,7 @@ func syncOwnerPost(cio *IO, stamp string, node client.NodeConfig) {
 	}{
 		{paths.SlackerWorkerLabel, "slacker-worker"},
 		{paths.AgentRelayLabel, "agent-relay"},
+		{paths.SandboxAgentLabel, "sandbox-agent"},
 	} {
 		if restarted, rErr := system.RestartStaleUserAgent(node.Owner, item.label, paths.InstalledBinaryPath()); rErr != nil {
 			cio.printf("%s %s restart warning: %v\n", stamp, item.name, rErr)
@@ -1227,19 +1228,14 @@ func cmdStatus(args []string, cio *IO) error {
 			}
 		}
 	}
-	if _, err := os.Stat(system.LaunchAgentPath(paths.SlackerWorkerLabel)); err == nil {
-		st := "NOT loaded"
-		if system.UserAgentLoaded(paths.SlackerWorkerLabel) {
-			st = "loaded"
+	for _, label := range []string{paths.SlackerWorkerLabel, paths.AgentRelayLabel, paths.SandboxAgentLabel} {
+		if _, err := os.Stat(system.LaunchAgentPath(label)); err == nil {
+			st := "NOT loaded"
+			if system.UserAgentLoaded(label) {
+				st = "loaded"
+			}
+			cio.printf("%-44s %s\n", label+":", st)
 		}
-		cio.printf("%-44s %s\n", paths.SlackerWorkerLabel+":", st)
-	}
-	if _, err := os.Stat(system.LaunchAgentPath(paths.AgentRelayLabel)); err == nil {
-		st := "NOT loaded"
-		if system.UserAgentLoaded(paths.AgentRelayLabel) {
-			st = "loaded"
-		}
-		cio.printf("%-44s %s\n", paths.AgentRelayLabel+":", st)
 	}
 	var syncRes core.SyncResult
 	if err := client.Call(node.API, "GET", "/v1/sync", nil, 10*time.Second, nil, &syncRes); err != nil {
