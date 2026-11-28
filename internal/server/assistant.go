@@ -177,6 +177,14 @@ func registerAssistantAdminRoutes(
 		writeJSON(w, http.StatusOK, fleet.Assistant.Doctor(r.Context()))
 		return nil
 	}))
+	mux.HandleFunc("POST /v1/assistant/discord/sync", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		res, err := fleet.Assistant.SyncDiscordChannels(r.Context())
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "sync": res})
+		return nil
+	}))
 	mux.HandleFunc("POST /v1/assistant/op-token", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
 		var req struct {
 			Token string `json:"token"`
@@ -239,7 +247,7 @@ func registerAssistantChatRoutes(
 		if err := readJSONBody(r, &req); err != nil {
 			return err
 		}
-		ch, err := fleet.Assistant.Store().UpsertChannel(req.ID, req.Title, req.Description, req.Model)
+		ch, err := fleet.Assistant.UpsertChannel(r.Context(), req.ID, req.Title, req.Description, req.Model)
 		if err != nil {
 			return err
 		}

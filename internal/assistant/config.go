@@ -119,11 +119,17 @@ type NotificationsConfig struct {
 	MinPriority          string            `json:"min_priority,omitempty"`
 }
 
+// DefaultDiscordCategoryName is the Discord server category used to group auto-synced Fleet channels.
+const DefaultDiscordCategoryName = "Fleet Assistant"
+
 // DiscordConfig configures the outbound Discord Gateway bot for two-way 1-to-1 channel sync & approvals.
 type DiscordConfig struct {
 	Enabled          bool              `json:"enabled"`
 	BotTokenOPRef    string            `json:"bot_token_op_ref,omitempty"`
 	AuthorizedUserID string            `json:"authorized_user_id,omitempty"`
+	GuildID          string            `json:"guild_id,omitempty"`
+	CategoryName     string            `json:"category_name,omitempty"`
+	AutoSyncChannels *bool             `json:"auto_sync_channels,omitempty"`
 	Channels         map[string]string `json:"channels,omitempty"`
 	AllowApprovals   *bool             `json:"allow_approvals,omitempty"`
 	MirrorWebTurns   *bool             `json:"mirror_web_turns,omitempty"`
@@ -660,7 +666,13 @@ func normalizeNotificationsConfig(n NotificationsConfig) NotificationsConfig {
 func normalizeDiscordConfig(d DiscordConfig) DiscordConfig {
 	d.BotTokenOPRef = strings.TrimSpace(d.BotTokenOPRef)
 	d.AuthorizedUserID = strings.TrimSpace(d.AuthorizedUserID)
+	d.GuildID = strings.TrimSpace(d.GuildID)
+	d.CategoryName = cmp.Or(strings.TrimSpace(d.CategoryName), DefaultDiscordCategoryName)
 	d.FleetBaseURL = strings.TrimRight(strings.TrimSpace(d.FleetBaseURL), "/")
+	if d.AutoSyncChannels == nil {
+		t := true
+		d.AutoSyncChannels = &t
+	}
 	if d.AllowApprovals == nil {
 		t := true
 		d.AllowApprovals = &t
@@ -694,6 +706,9 @@ func ValidateDiscordConfig(d DiscordConfig) error {
 	}
 	if !discordSnowflakeRE.MatchString(d.AuthorizedUserID) {
 		return newErr("discord.authorized_user_id must be a numeric Discord user ID (15-22 digits)", http.StatusBadRequest)
+	}
+	if d.GuildID != "" && !discordSnowflakeRE.MatchString(d.GuildID) {
+		return newErr("discord.guild_id must be a numeric Discord server ID (15-22 digits)", http.StatusBadRequest)
 	}
 	for ch, id := range d.Channels {
 		if !discordSnowflakeRE.MatchString(id) {

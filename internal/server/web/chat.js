@@ -487,10 +487,13 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
   });
   const discCfg = cfg.discord || {};
   const discEnabledChk = el("input", { type: "checkbox", checked: Boolean(discCfg.enabled) });
+  const discAutoSyncChk = el("input", { type: "checkbox", checked: discCfg.auto_sync_channels !== false });
   const discAllowApprovalsChk = el("input", { type: "checkbox", checked: discCfg.allow_approvals !== false });
   const discMirrorWebChk = el("input", { type: "checkbox", checked: discCfg.mirror_web_turns !== false });
   const discTokenRefIn = el("input", { type: "text", value: discCfg.bot_token_op_ref || "", placeholder: "op://Fleet-Agent/Discord/bot_token" });
   const discUserIDIn = el("input", { type: "text", value: discCfg.authorized_user_id || "", placeholder: "18-digit Discord User ID" });
+  const discGuildIDIn = el("input", { type: "text", value: discCfg.guild_id || "", placeholder: "Auto-detected if in 1 server" });
+  const discCategoryIn = el("input", { type: "text", value: discCfg.category_name || "Fleet Assistant", placeholder: "Fleet Assistant" });
   const discBaseURLIn = el("input", { type: "text", value: discCfg.fleet_base_url || "", placeholder: "https://fleet.example.com" });
   const discChannelsIn = el("textarea", {
     rows: "4",
@@ -573,6 +576,7 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
     field("Per-Category / Channel Webhook Refs (optional JSON)", notifChannelRefsIn),
     el("h4", { className: "mt-2", text: "Discord Bot (Two-Way 1-to-1 Sync & Approvals)" }),
     el("label", { className: "check-row" }, discEnabledChk, el("span", { text: "Enable outbound Discord Gateway bot (two-way chat)" })),
+    el("label", { className: "check-row" }, discAutoSyncChk, el("span", { text: "Auto-manage Discord channels under category (requires Manage Channels)" })),
     el("label", { className: "check-row" }, discAllowApprovalsChk, el("span", { text: "Allow interactive Approve / Deny buttons in Discord" })),
     el("label", { className: "check-row" }, discMirrorWebChk, el("span", { text: "Mirror Fleet Console & timer turns to Discord (non-spoofed blockquote)" })),
     el(
@@ -580,9 +584,44 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
       { className: "grid-2" },
       field("Bot Token 1Password Ref", discTokenRefIn),
       field("Authorized Discord User ID", discUserIDIn),
+      field("Discord Server ID (optional if 1 server)", discGuildIDIn),
+      field("Category Name", discCategoryIn),
       field("Fleet Console Base URL (deep links)", discBaseURLIn),
     ),
-    field("1-to-1 Channel Map (JSON: fleet_channel -> discord_channel_id)", discChannelsIn),
+    field("1-to-1 Channel Map (auto-populated or JSON override)", discChannelsIn),
+    el(
+      "div",
+      { className: "actions-row" },
+      el("button", {
+        type: "button",
+        className: "btn",
+        text: "Sync Discord Channels",
+        onclick: async (ev) => {
+          const btn = ev.currentTarget;
+          btn.disabled = true;
+          btn.textContent = "Syncing…";
+          try {
+            const res = await api("POST", "/v1/assistant/discord/sync");
+            const s = res.sync || {};
+            if (s.guild_id) {
+              discGuildIDIn.value = s.guild_id;
+            }
+            if (s.channels) {
+              discChannelsIn.value = JSON.stringify(s.channels, null, 2);
+            }
+            toast(
+              `Synced ${Object.keys(s.channels || {}).length} Discord channel(s) (created: ${(s.created_in_discord || []).length}, adopted: ${(s.adopted_in_discord || []).length})`,
+              "ok",
+            );
+          } catch (err) {
+            toast(err.message, "error");
+          } finally {
+            btn.disabled = false;
+            btn.textContent = "Sync Discord Channels";
+          }
+        },
+      }),
+    ),
     el("h4", { className: "mt-2", text: "Sandboxed Computer (Apple Container)" }),
     el("label", { className: "check-row" }, sbEnabledChk, el("span", { text: "Enable isolated micro-VM sandbox for file reading & generation" })),
     el(
@@ -716,6 +755,9 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
               enabled: discEnabledChk.checked,
               bot_token_op_ref: discTokenRefIn.value.trim(),
               authorized_user_id: discUserIDIn.value.trim(),
+              guild_id: discGuildIDIn.value.trim(),
+              category_name: discCategoryIn.value.trim(),
+              auto_sync_channels: discAutoSyncChk.checked,
               channels: discordChannels,
               allow_approvals: discAllowApprovalsChk.checked,
               mirror_web_turns: discMirrorWebChk.checked,
@@ -1364,6 +1406,20 @@ export async function renderChat(main, ctx, sub) {
       clear(streamBody);
       streamBody.appendChild(renderMarkdownDOM(streamText));
       scrollMessagesToBottom();
+      return;
+    }
+    if (type === "channels_updated") {
+      api("GET", "/v1/assistant/channels")
+        .then((res) => {
+          const list = res.channels || [];
+          clear(channelSelect);
+          for (const ch of list) {
+            channelSelect.appendChild(el("option", { value: ch.id, text: ch.title || `#${ch.id}` }));
+          }
+          channelSelect.appendChild(el("option", { value: "__new__", text: "+ New Channel…" }));
+          channelSelect.value = activeChannel;
+        })
+        .catch(() => {});
       return;
     }
     if (type === "message_created" || type === "message_done" || type === "approval" || type === "approval_decided" || type === "channel_reset" || type === "grant_updated") {

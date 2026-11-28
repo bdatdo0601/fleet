@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -84,8 +85,10 @@ type Engine struct {
 	notifier             Notifier
 
 	discordMu         sync.RWMutex
+	discordSyncMu     sync.Mutex
 	discordConnected  bool
 	discordBotUserID  string
+	discordCategoryID string
 	discordAPIBase    string
 	discordGatewayURL string
 	discordReloadCh   chan struct{}
@@ -327,7 +330,7 @@ func mergePreservedConfig(cur, next Config, clearAPIKey bool) Config {
 	if isZeroSandboxConfig(next.Sandbox) {
 		next.Sandbox = cur.Sandbox
 	}
-	if next.Discord.AllowApprovals == nil && next.Discord.MirrorWebTurns == nil && !next.Discord.Enabled && next.Discord.BotTokenOPRef == "" && next.Discord.AuthorizedUserID == "" && len(next.Discord.Channels) == 0 && next.Discord.FleetBaseURL == "" {
+	if next.Discord.AllowApprovals == nil && next.Discord.MirrorWebTurns == nil && next.Discord.AutoSyncChannels == nil && !next.Discord.Enabled && next.Discord.BotTokenOPRef == "" && next.Discord.AuthorizedUserID == "" && next.Discord.GuildID == "" && next.Discord.CategoryName == "" && len(next.Discord.Channels) == 0 && next.Discord.FleetBaseURL == "" {
 		next.Discord = cur.Discord
 	}
 	return NormalizeConfig(next)
@@ -753,6 +756,44 @@ func (e *Engine) RetryWithFrontier(channelID string, replaceMsgID int64, prompt 
 	}
 	e.notify()
 	return ev, nil
+}
+
+func (e *Engine) persistDiscordMapping(guildID string, channels map[string]string) error {
+	e.cfgMu.Lock()
+	defer e.cfgMu.Unlock()
+	next := e.cfg
+	if guildID != "" {
+		next.Discord.GuildID = guildID
+	}
+	next.Discord.Channels = maps.Clone(channels)
+	next = NormalizeConfig(next)
+	if err := SaveConfig(e.configPath, next); err != nil {
+		return err
+	}
+	e.cfg = next
+	return nil
+}
+
+// UpsertChannel creates or updates a Fleet channel and triggers Discord auto-sync if needed.
+func (e *Engine) UpsertChannel(ctx context.Context, id, title, description, model string) (Channel, error) {
+	ch, err := e.store.UpsertChannel(id, title, description, model)
+	if err != nil {
+		return Channel{}, err
+	}
+	e.publishEvent(StreamEvent{
+		Type:      "channels_updated",
+		ChannelID: ch.ID,
+		Data:      map[string]any{"channel": ch},
+	})
+	d := e.Config().Discord
+	if d.Enabled && (d.AutoSyncChannels == nil || *d.AutoSyncChannels) && d.Channels[ch.ID] == "" {
+		syncCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		go func() {
+			defer cancel()
+			_, _ = e.SyncDiscordChannels(syncCtx)
+		}()
+	}
+	return ch, nil
 }
 
 // ResetChannel starts a fresh context epoch and optionally clears channel message history,

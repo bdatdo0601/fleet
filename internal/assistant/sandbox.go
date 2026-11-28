@@ -225,7 +225,7 @@ func (r *AppleContainerRunner) FindBinary() string {
 func (r *AppleContainerRunner) SystemStatus(ctx context.Context) error {
 	bin := r.binary()
 	if bin == "" {
-		return newErr("Apple `container` CLI not found (install with `brew install --cask container`)", http.StatusServiceUnavailable)
+		return newErr("Apple `container` CLI not found (install with `brew install container`)", http.StatusServiceUnavailable)
 	}
 	out, err := exec.CommandContext(ctx, bin, "system", "status").CombinedOutput()
 	if err != nil {

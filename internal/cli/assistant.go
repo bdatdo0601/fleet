@@ -34,6 +34,7 @@ Subcommands:
   deny            reject a pending tool call by ID
   timers          list scheduled timers
   notify-test     send a test Discord webhook notification via 1Password ref
+  discord-sync    auto-create/adopt Discord channels under Fleet Assistant and save mappings
   sandbox-build   build the sandbox OCI image and offline network on lighthouse
   sandbox-reset   stop/remove a channel's sandbox micro-VM (optionally clearing /work/out)
 `
@@ -70,6 +71,8 @@ func cmdAssistant(args []string, cio *IO) error {
 		return cmdAssistantTimers(rest, cio)
 	case "notify-test":
 		return cmdAssistantNotifyTest(rest, cio)
+	case "discord-sync":
+		return cmdAssistantDiscordSync(rest, cio)
 	case "sandbox-build":
 		return cmdAssistantSandboxBuild(rest, cio)
 	case "sandbox-reset":
@@ -92,11 +95,14 @@ type assistantSetupFlags struct {
 	enable         bool
 	discordRef     string
 	fleetURL       string
-	discordBotRef  string
-	discordUserID  string
-	discordChPairs []string
-	sandboxEnable  bool
-	sandboxDisable bool
+	discordBotRef     string
+	discordUserID     string
+	discordGuildID    string
+	discordCategory   string
+	discordNoAutoSync bool
+	discordChPairs    []string
+	sandboxEnable     bool
+	sandboxDisable    bool
 }
 
 func applyAssistantSetupFlags(cfg *assistant.Config, opts assistantSetupFlags, cio *IO) error {
@@ -154,6 +160,16 @@ func applyAssistantSetupFlags(cfg *assistant.Config, opts assistantSetupFlags, c
 	if opts.discordUserID != "" {
 		cfg.Discord.AuthorizedUserID = strings.TrimSpace(opts.discordUserID)
 	}
+	if opts.discordGuildID != "" {
+		cfg.Discord.GuildID = strings.TrimSpace(opts.discordGuildID)
+	}
+	if opts.discordCategory != "" {
+		cfg.Discord.CategoryName = strings.TrimSpace(opts.discordCategory)
+	}
+	if opts.discordNoAutoSync {
+		f := false
+		cfg.Discord.AutoSyncChannels = &f
+	}
 	if err := applyDiscordChannelPairs(cfg, opts.discordChPairs); err != nil {
 		return err
 	}
@@ -201,6 +217,9 @@ func cmdAssistantSetup(args []string, cio *IO) error {
 	fs.StringVar(&opts.fleetURL, "fleet-url", "", "Fleet Console base URL used in Discord deep links")
 	fs.StringVar(&opts.discordBotRef, "discord-bot-token-op-ref", "", "1Password op:// ref for two-way Discord Gateway bot token")
 	fs.StringVar(&opts.discordUserID, "discord-user-id", "", "authorized Discord user snowflake ID for two-way bot")
+	fs.StringVar(&opts.discordGuildID, "discord-guild-id", "", "optional Discord server ID (auto-detected if bot is in one server)")
+	fs.StringVar(&opts.discordCategory, "discord-category", "", "Discord category name for auto-synced channels (default: Fleet Assistant)")
+	fs.BoolVar(&opts.discordNoAutoSync, "discord-no-auto-sync", false, "disable automatic Discord channel creation/sync")
 	fs.Func("discord-channel", "map fleet channel to Discord channel ID (fleet_ch=discord_id, repeatable)", func(v string) error {
 		opts.discordChPairs = append(opts.discordChPairs, v)
 		return nil
@@ -255,6 +274,17 @@ func cmdAssistantSetup(args []string, cio *IO) error {
 		return err
 	}
 	cio.info(fmt.Sprintf("assistant configured (enabled=%v model=%s vault=%s zdr=%v)", out.Config.Enabled, out.Config.Models.DefaultChat, out.Config.EffectiveVaultPath, out.Config.ZDR))
+	if out.Config.Discord.Enabled && (out.Config.Discord.AutoSyncChannels == nil || *out.Config.Discord.AutoSyncChannels) {
+		var syncOut struct {
+			OK   bool                        `json:"ok"`
+			Sync assistant.DiscordSyncResult `json:"sync"`
+		}
+		if sErr := client.Call(api, http.MethodPost, "/v1/assistant/discord/sync", map[string]any{}, 20*time.Second, nil, &syncOut); sErr != nil {
+			cio.printf("warning: discord channel auto-sync skipped: %v\n", sErr)
+		} else {
+			cio.info(fmt.Sprintf("discord channels synced (guild=%s category=%q mapped=%d created=%d adopted=%d)", syncOut.Sync.GuildID, syncOut.Sync.CategoryName, len(syncOut.Sync.Channels), len(syncOut.Sync.CreatedInDiscord), len(syncOut.Sync.AdoptedInDiscord)))
+		}
+	}
 	return nil
 }
 
@@ -606,6 +636,27 @@ func cmdAssistantNotifyTest(args []string, cio *IO) error {
 		return err
 	}
 	cio.info("sent test Discord webhook notification")
+	return nil
+}
+
+func cmdAssistantDiscordSync(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("assistant discord-sync", flag.ContinueOnError)
+	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+		return err
+	}
+	api, err := client.ResolveAPI("")
+	if err != nil {
+		return err
+	}
+	var out struct {
+		OK   bool                        `json:"ok"`
+		Sync assistant.DiscordSyncResult `json:"sync"`
+	}
+	if err := client.Call(api, http.MethodPost, "/v1/assistant/discord/sync", map[string]any{}, 30*time.Second, nil, &out); err != nil {
+		return err
+	}
+	s := out.Sync
+	cio.info(fmt.Sprintf("synced Discord server %s (category=%q mapped=%d created_discord=%v adopted=%v created_fleet=%v)", s.GuildID, s.CategoryName, len(s.Channels), s.CreatedInDiscord, s.AdoptedInDiscord, s.CreatedInFleet))
 	return nil
 }
 

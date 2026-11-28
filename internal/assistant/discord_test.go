@@ -46,6 +46,9 @@ type mockDiscordServer struct {
 	meBody       string
 	botUserID    string
 	msgSeq       atomic.Int64
+	guilds       []discordGuild
+	channels     []discordChannel
+	nextChID     atomic.Int64
 }
 
 func newMockDiscordServer(t *testing.T) *mockDiscordServer {
@@ -95,6 +98,46 @@ func (m *mockDiscordServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(st)
 		_, _ = io.WriteString(w, body)
+	case path == "/users/@me/guilds" && r.Method == http.MethodGet:
+		m.mu.Lock()
+		guilds := append([]discordGuild(nil), m.guilds...)
+		m.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(guilds)
+	case strings.HasPrefix(path, "/guilds/") && strings.HasSuffix(path, "/channels") && r.Method == http.MethodGet:
+		guildID := strings.TrimSuffix(strings.TrimPrefix(path, "/guilds/"), "/channels")
+		m.mu.Lock()
+		var out []discordChannel
+		for _, ch := range m.channels {
+			if ch.GuildID == "" || ch.GuildID == guildID {
+				out = append(out, ch)
+			}
+		}
+		m.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(out)
+	case strings.HasPrefix(path, "/guilds/") && strings.HasSuffix(path, "/channels") && r.Method == http.MethodPost:
+		guildID := strings.TrimSuffix(strings.TrimPrefix(path, "/guilds/"), "/channels")
+		var req struct {
+			Name     string `json:"name"`
+			Type     int    `json:"type"`
+			ParentID string `json:"parent_id"`
+			Topic    string `json:"topic"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		created := discordChannel{
+			ID:       fmt.Sprintf("7700000000000000%02d", m.nextChID.Add(1)),
+			GuildID:  guildID,
+			Type:     req.Type,
+			Name:     req.Name,
+			ParentID: req.ParentID,
+			Topic:    req.Topic,
+		}
+		m.mu.Lock()
+		m.channels = append(m.channels, created)
+		m.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(created)
 	case path == "/gateway/bot" && r.Method == http.MethodGet:
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintf(w, `{"url":%q,"shards":1}`, m.WSURL())
@@ -332,10 +375,12 @@ func setupDiscordTestEngine(t *testing.T, llmHandler http.HandlerFunc, mockDisc 
 	cfg.Enabled = true
 	cfg.BaseURL = llmSrv.URL
 	cfg.APIKey = "sk-or-test"
+	noAutoSync := false
 	cfg.Discord = DiscordConfig{
 		Enabled:          true,
 		BotTokenOPRef:    "op://Fleet-Agent/DiscordBot/token",
 		AuthorizedUserID: "222222222222222222",
+		AutoSyncChannels: &noAutoSync,
 		FleetBaseURL:     "http://127.0.0.1:4771",
 		Channels: map[string]string{
 			"general":   "555555555555555555",
@@ -697,5 +742,231 @@ func TestDiscordDoctorAndTokenScrubbing(t *testing.T) {
 	}
 	if strings.Contains(discCheck2.Detail, "disc-secret-bot-tok-xyz") {
 		t.Fatalf("expected bot token scrubbed from Doctor detail, got %q", discCheck2.Detail)
+	}
+}
+
+func TestDiscordAutoSyncChannelsZeroConfig(t *testing.T) {
+	disc := newMockDiscordServer(t)
+	defer disc.Close()
+
+	// Single private guild with pre-existing category and #general channel.
+	disc.guilds = []discordGuild{{ID: "333333333333333333", Name: "My Private Fleet"}}
+	disc.channels = []discordChannel{
+		{ID: "440000000000000001", GuildID: "333333333333333333", Type: 4, Name: "Fleet Assistant"},
+		{ID: "440000000000000002", GuildID: "333333333333333333", Type: 0, Name: "general", ParentID: "440000000000000001"},
+	}
+
+	llmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			http.NotFound(w, r)
+			return
+		}
+		var req struct {
+			Stream bool `json:"stream"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if !req.Stream {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":""}}]}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Synced reply from fleet-ops!\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer llmSrv.Close()
+
+	tmp := t.TempDir()
+	eng, err := Open(filepath.Join(tmp, "assistant.db"), filepath.Join(tmp, "assistant.json"), filepath.Join(tmp, "vault"), &fakeDeps{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = eng.Close() }()
+	eng.discordAPIBase = disc.APIURL()
+	eng.discordGatewayURL = disc.WSURL()
+	eng.SetOPReader(func(_ context.Context, _ string) (string, error) {
+		return "disc-secret-bot-tok-xyz", nil
+	})
+
+	// Configure ONLY bot_token_op_ref + authorized_user_id (no guild_id, no channels).
+	cfg := DefaultConfig()
+	cfg.Enabled = true
+	cfg.BaseURL = llmSrv.URL
+	cfg.APIKey = "sk-or-test"
+	cfg.Discord = DiscordConfig{
+		Enabled:          true,
+		BotTokenOPRef:    "op://Fleet-Agent/DiscordBot/token",
+		AuthorizedUserID: "222222222222222222",
+	}
+	if _, err := eng.UpdateConfig(cfg, false); err != nil {
+		t.Fatal(err)
+	}
+
+	eng.Start(t.Context())
+	select {
+	case <-disc.identified:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for Discord Identify")
+	}
+
+	// Poll until READY auto-sync persists guild_id and all 3 default channels.
+	deadline := time.Now().Add(5 * time.Second)
+	var syncedCfg DiscordConfig
+	for time.Now().Before(deadline) {
+		syncedCfg = eng.Config().Discord
+		if syncedCfg.GuildID == "333333333333333333" && len(syncedCfg.Channels) >= 3 {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if syncedCfg.Channels["general"] != "440000000000000002" {
+		t.Fatalf("expected existing #general adopted cleanly, got %+v", syncedCfg.Channels)
+	}
+	opsDiscID := syncedCfg.Channels["fleet-ops"]
+	if opsDiscID == "" || syncedCfg.Channels["briefing"] == "" {
+		t.Fatalf("expected #fleet-ops and #briefing auto-created in Discord, got %+v", syncedCfg.Channels)
+	}
+
+	// Verify persistence across reload from disk.
+	reloaded, err := LoadConfig(filepath.Join(tmp, "assistant.json"))
+	if err != nil || reloaded.Discord.Channels["fleet-ops"] != opsDiscID {
+		t.Fatalf("expected synced channels saved to assistant.json, got %+v (%v)", reloaded.Discord, err)
+	}
+
+	// Immediately message the newly auto-created #fleet-ops Discord channel without Gateway reconnect.
+	_ = disc.SendGatewayJSON(map[string]any{
+		"op": 0, "t": "MESSAGE_CREATE", "s": 2,
+		"d": map[string]any{
+			"id": "100000000000000099", "channel_id": opsDiscID,
+			"content": "ping auto synced channel", "author": map[string]any{"id": "222222222222222222", "bot": false},
+		},
+	})
+	reply := waitForPost(t, disc.postCh, 5*time.Second, func(p recordedDiscordPost) bool {
+		c, _ := p.Payload["content"].(string)
+		return strings.Contains(c, "Synced reply from fleet-ops!")
+	})
+	if reply.ChannelID != opsDiscID {
+		t.Fatalf("expected reply on %s, got %s", opsDiscID, reply.ChannelID)
+	}
+}
+
+func TestDiscordTwoWayChannelCreation(t *testing.T) {
+	disc := newMockDiscordServer(t)
+	defer disc.Close()
+
+	disc.guilds = []discordGuild{{ID: "333333333333333333", Name: "My Private Fleet"}}
+
+	tmp := t.TempDir()
+	eng, err := Open(filepath.Join(tmp, "assistant.db"), filepath.Join(tmp, "assistant.json"), filepath.Join(tmp, "vault"), &fakeDeps{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = eng.Close() }()
+	eng.discordAPIBase = disc.APIURL()
+	eng.discordGatewayURL = disc.WSURL()
+	eng.SetOPReader(func(_ context.Context, _ string) (string, error) {
+		return "disc-secret-bot-tok-xyz", nil
+	})
+
+	cfg := DefaultConfig()
+	cfg.Enabled = true
+	cfg.APIKey = "sk-or-test"
+	cfg.Discord = DiscordConfig{
+		Enabled:          true,
+		BotTokenOPRef:    "op://Fleet-Agent/DiscordBot/token",
+		AuthorizedUserID: "222222222222222222",
+	}
+	if _, err := eng.UpdateConfig(cfg, false); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := t.Context()
+	eng.Start(ctx)
+	select {
+	case <-disc.identified:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for Discord Identify")
+	}
+
+	// Wait for initial READY category & default channels creation.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && len(eng.Config().Discord.Channels) < 3 {
+		time.Sleep(25 * time.Millisecond)
+	}
+	disc.mu.Lock()
+	var catID string
+	for _, c := range disc.channels {
+		if c.Type == 4 && c.Name == DefaultDiscordCategoryName {
+			catID = c.ID
+			break
+		}
+	}
+	disc.mu.Unlock()
+	if catID == "" {
+		t.Fatalf("expected %q category created in Discord", DefaultDiscordCategoryName)
+	}
+
+	sub := eng.Subscribe()
+	defer eng.Unsubscribe(sub)
+
+	// 1. Fleet -> Discord: creating #research in Fleet auto-creates #research in Discord.
+	if _, err := eng.UpsertChannel(ctx, "research", "#research", "Deep dives", ""); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && eng.Config().Discord.Channels["research"] == "" {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if eng.Config().Discord.Channels["research"] == "" {
+		t.Fatalf("expected #research mapped after UpsertChannel, got %+v", eng.Config().Discord.Channels)
+	}
+
+	// 2. Discord -> Fleet: adding a channel inside category adopts it into Fleet + ignores outside channel.
+	outsideCh := discordChannel{ID: "990000000000000001", GuildID: "333333333333333333", Type: 0, Name: "random-outside", ParentID: ""}
+	financeCh := discordChannel{ID: "990000000000000002", GuildID: "333333333333333333", Type: 0, Name: "Finance & Tax", ParentID: catID, Topic: "Tax docs"}
+	disc.mu.Lock()
+	disc.channels = append(disc.channels, outsideCh, financeCh)
+	disc.mu.Unlock()
+
+	_ = disc.SendGatewayJSON(map[string]any{"op": 0, "t": "CHANNEL_CREATE", "s": 2, "d": outsideCh})
+	_ = disc.SendGatewayJSON(map[string]any{"op": 0, "t": "CHANNEL_CREATE", "s": 3, "d": financeCh})
+
+	var sawSSE bool
+	dl := time.After(5 * time.Second)
+	for !sawSSE || eng.Config().Discord.Channels["finance-tax"] != financeCh.ID {
+		select {
+		case ev := <-sub:
+			if ev.Type == "channels_updated" {
+				sawSSE = true
+			}
+		case <-time.After(25 * time.Millisecond):
+		case <-dl:
+			t.Fatalf("timed out waiting for finance-tax sync/SSE (sawSSE=%v, channels=%+v)", sawSSE, eng.Config().Discord.Channels)
+		}
+	}
+	if _, err := eng.store.GetChannel("finance-tax"); err != nil {
+		t.Fatalf("expected finance-tax created in assistant_channels: %v", err)
+	}
+	if eng.Config().Discord.Channels["random-outside"] != "" {
+		t.Fatalf("outside channel should not be synced into Fleet")
+	}
+}
+
+func TestDiscordAutoSyncMultipleGuildsRequiresID(t *testing.T) {
+	disc := newMockDiscordServer(t)
+	defer disc.Close()
+
+	disc.guilds = []discordGuild{
+		{ID: "111111111111111111", Name: "Server A"},
+		{ID: "222222222222222222", Name: "Server B"},
+	}
+
+	eng, _ := setupDiscordTestEngine(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}, disc)
+
+	if _, err := eng.SyncDiscordChannels(context.Background()); err == nil || !strings.Contains(err.Error(), "multiple servers") {
+		t.Fatalf("expected multiple servers error when guild_id is omitted, got %v", err)
 	}
 }

@@ -449,7 +449,8 @@ func (e *Engine) checkDiscordBotDoctor(ctx context.Context, cfg Config) DoctorCh
 			Hint:   "Verify 1Password Service Account access to the Discord bot token item",
 		}
 	}
-	user, err := e.discordClient().GetMe(ctx, tok)
+	api := e.discordClient()
+	user, err := api.GetMe(ctx, tok)
 	if err != nil {
 		return DoctorCheck{
 			Name:   "discord_bot",
@@ -458,13 +459,38 @@ func (e *Engine) checkDiscordBotDoctor(ctx context.Context, cfg Config) DoctorCh
 			Hint:   "Verify the Discord bot token and Gateway Message Content Intent",
 		}
 	}
+	autoSync := d.AutoSyncChannels == nil || *d.AutoSyncChannels
+	guildID := d.GuildID
+	if autoSync && guildID == "" {
+		guilds, gErr := api.GetCurrentUserGuilds(ctx, tok)
+		if gErr == nil {
+			switch len(guilds) {
+			case 0:
+				return DoctorCheck{
+					Name:   "discord_bot",
+					Status: "warn",
+					Detail: fmt.Sprintf("@%s verified, but bot is in 0 Discord servers yet", cmp.Or(user.Username, user.ID)),
+					Hint:   "Invite the bot to your Discord server with Manage Channels permission, then run `fleet assistant discord-sync`",
+				}
+			case 1:
+				guildID = guilds[0].ID
+			default:
+				return DoctorCheck{
+					Name:   "discord_bot",
+					Status: "warn",
+					Detail: fmt.Sprintf("@%s is in %d servers; set discord.guild_id for auto-sync", cmp.Or(user.Username, user.ID), len(guilds)),
+					Hint:   "Pass `--discord-guild-id <ID>` to `fleet assistant setup` or set Server ID in Settings",
+				}
+			}
+		}
+	}
 	e.discordMu.RLock()
 	connected := e.discordConnected
 	e.discordMu.RUnlock()
 	return DoctorCheck{
 		Name:   "discord_bot",
 		Status: "ok",
-		Detail: fmt.Sprintf("@%s (%s, %d channel(s), gateway_connected=%v)", cmp.Or(user.Username, user.ID), d.AuthorizedUserID, len(d.Channels), connected),
+		Detail: fmt.Sprintf("@%s (user=%s, guild=%s, %d channel(s), auto_sync=%v, gateway_connected=%v)", cmp.Or(user.Username, user.ID), d.AuthorizedUserID, cmp.Or(guildID, "auto"), len(d.Channels), autoSync, connected),
 	}
 }
 
@@ -487,7 +513,7 @@ func (e *Engine) checkSandboxDoctor(ctx context.Context, cfg Config) DoctorCheck
 			Name:   "sandbox",
 			Status: "fail",
 			Detail: "Apple `container` CLI not found",
-			Hint:   "Install with `brew install --cask container` on macOS 26+",
+			Hint:   "Install with `brew install container` on macOS 26+",
 		}
 	}
 	if err := runner.SystemStatus(ctx); err != nil {
@@ -495,7 +521,7 @@ func (e *Engine) checkSandboxDoctor(ctx context.Context, cfg Config) DoctorCheck
 			Name:   "sandbox",
 			Status: "fail",
 			Detail: err.Error(),
-			Hint:   "Start container service on lighthouse: `container system start`",
+			Hint:   "Run `container system kernel set --recommended && brew services start container` (or `container system start`) on the lighthouse",
 		}
 	}
 	if !runner.NetworkExists(ctx, sb.Network) {

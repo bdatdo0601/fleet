@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"strings"
@@ -32,6 +33,31 @@ type discordUser struct {
 	ID       string `json:"id"`
 	Username string `json:"username"`
 	Bot      bool   `json:"bot"`
+}
+
+type discordGuild struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+type discordChannel struct {
+	ID       string `json:"id"`
+	GuildID  string `json:"guild_id"`
+	Type     int    `json:"type"`
+	Name     string `json:"name"`
+	ParentID string `json:"parent_id"`
+	Topic    string `json:"topic"`
+}
+
+// DiscordSyncResult summarizes automatic Fleet <-> Discord channel provisioning.
+type DiscordSyncResult struct {
+	GuildID          string            `json:"guild_id"`
+	CategoryID       string            `json:"category_id,omitempty"`
+	CategoryName     string            `json:"category_name,omitempty"`
+	CreatedInDiscord []string          `json:"created_in_discord,omitempty"`
+	AdoptedInDiscord []string          `json:"adopted_in_discord,omitempty"`
+	CreatedInFleet   []string          `json:"created_in_fleet,omitempty"`
+	Channels         map[string]string `json:"channels"`
 }
 
 type discordMessage struct {
@@ -164,6 +190,24 @@ func (d *discordAPI) RespondInteraction(ctx context.Context, token, interactionI
 	return d.doJSON(ctx, token, http.MethodPost, path, payload, nil)
 }
 
+func (d *discordAPI) GetCurrentUserGuilds(ctx context.Context, token string) ([]discordGuild, error) {
+	var guilds []discordGuild
+	err := d.doJSON(ctx, token, http.MethodGet, "/users/@me/guilds", nil, &guilds)
+	return guilds, err
+}
+
+func (d *discordAPI) GetGuildChannels(ctx context.Context, token, guildID string) ([]discordChannel, error) {
+	var channels []discordChannel
+	err := d.doJSON(ctx, token, http.MethodGet, "/guilds/"+url.PathEscape(guildID)+"/channels", nil, &channels)
+	return channels, err
+}
+
+func (d *discordAPI) CreateGuildChannel(ctx context.Context, token, guildID string, payload map[string]any) (discordChannel, error) {
+	var ch discordChannel
+	err := d.doJSON(ctx, token, http.MethodPost, "/guilds/"+url.PathEscape(guildID)+"/channels", payload, &ch)
+	return ch, err
+}
+
 func (e *Engine) discordClient() *discordAPI {
 	return newDiscordAPI(e.discordAPIBase)
 }
@@ -205,6 +249,12 @@ func (e *Engine) runDiscordGateway(ctx context.Context) {
 	for {
 		if ctx.Err() != nil {
 			return
+		}
+		// Drain reload signals emitted before reading the snapshot below so a
+		// pre-dial UpdateConfig does not tear down the freshly dialed session.
+		select {
+		case <-e.discordReloadCh:
+		default:
 		}
 		cfg := e.Config()
 		if !cfg.Discord.Enabled || ValidateDiscordConfig(cfg.Discord) != nil {
@@ -263,6 +313,7 @@ func (e *Engine) runDiscordSession(ctx context.Context, cfg DiscordConfig) error
 	go func() {
 		select {
 		case <-sessCtx.Done():
+			_ = conn.Close()
 		case <-e.discordReloadCh:
 			_ = conn.Close()
 		}
@@ -378,7 +429,8 @@ func runDiscordHeartbeat(ctx context.Context, conn *ws.WSConn, interval time.Dur
 	}
 }
 
-func (e *Engine) handleDiscordDispatch(ctx context.Context, tok string, cfg DiscordConfig, eventType string, raw json.RawMessage) {
+func (e *Engine) handleDiscordDispatch(ctx context.Context, tok string, _ DiscordConfig, eventType string, raw json.RawMessage) {
+	liveCfg := normalizeDiscordConfig(e.Config().Discord)
 	switch eventType {
 	case "READY":
 		var ready struct {
@@ -386,19 +438,56 @@ func (e *Engine) handleDiscordDispatch(ctx context.Context, tok string, cfg Disc
 		}
 		if json.Unmarshal(raw, &ready) == nil {
 			e.setDiscordState(true, ready.User.ID)
-			go e.catchupDiscordChannels(ctx, cfg, tok)
+			go e.handleDiscordReady(ctx, liveCfg, tok)
+		}
+	case "CHANNEL_CREATE":
+		var dc discordChannel
+		if json.Unmarshal(raw, &dc) == nil {
+			e.handleDiscordChannelCreate(ctx, liveCfg, dc)
 		}
 	case "MESSAGE_CREATE":
 		var msg discordMessage
 		if json.Unmarshal(raw, &msg) == nil {
-			e.handleDiscordMessageCreate(ctx, tok, cfg, msg)
+			e.handleDiscordMessageCreate(ctx, tok, liveCfg, msg)
 		}
 	case "INTERACTION_CREATE":
 		var inter discordInteraction
 		if json.Unmarshal(raw, &inter) == nil {
-			e.handleDiscordInteraction(ctx, tok, cfg, inter)
+			e.handleDiscordInteraction(ctx, tok, liveCfg, inter)
 		}
 	}
+}
+
+func (e *Engine) handleDiscordReady(ctx context.Context, cfg DiscordConfig, tok string) {
+	if cfg.AutoSyncChannels == nil || *cfg.AutoSyncChannels {
+		syncCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		_, _ = e.SyncDiscordChannels(syncCtx)
+		cancel()
+		cfg = normalizeDiscordConfig(e.Config().Discord)
+	}
+	e.catchupDiscordChannels(ctx, cfg, tok)
+}
+
+func (e *Engine) handleDiscordChannelCreate(ctx context.Context, cfg DiscordConfig, dc discordChannel) {
+	if dc.Type != 0 || dc.ParentID == "" || (cfg.AutoSyncChannels != nil && !*cfg.AutoSyncChannels) {
+		return
+	}
+	for _, mappedID := range cfg.Channels {
+		if mappedID == dc.ID {
+			return
+		}
+	}
+	e.discordMu.RLock()
+	catID := e.discordCategoryID
+	e.discordMu.RUnlock()
+	if catID != "" && dc.ParentID != catID {
+		return
+	}
+	syncCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	go func() {
+		defer cancel()
+		_, _ = e.SyncDiscordChannels(syncCtx)
+	}()
 }
 
 func findFleetChannelForDiscord(cfg DiscordConfig, discordChannelID string) (string, bool) {
@@ -755,5 +844,209 @@ func (e *Engine) postDiscordDivider(ctx context.Context, cfg Config, channelID, 
 	}
 	if msgID, pErr := e.discordClient().CreateMessage(ctx, tok, discChannelID, map[string]any{"content": text}); pErr == nil && msgID != "" {
 		_ = e.store.SetDiscordCursor(channelID, discChannelID, msgID)
+	}
+}
+
+func sanitizeFleetChannelID(name string) string {
+	raw := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(name, "#")))
+	var b strings.Builder
+	prevDash := false
+	for _, r := range raw {
+		valid := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_'
+		if valid {
+			b.WriteRune(r)
+			prevDash = false
+			continue
+		}
+		if !prevDash && b.Len() > 0 {
+			b.WriteByte('-')
+			prevDash = true
+		}
+	}
+	return strings.Trim(b.String(), "-_")
+}
+
+func resolveDiscordGuildID(ctx context.Context, api *discordAPI, tok string, cfg DiscordConfig) (string, error) {
+	if cfg.GuildID != "" {
+		return cfg.GuildID, nil
+	}
+	guilds, err := api.GetCurrentUserGuilds(ctx, tok)
+	if err != nil {
+		return "", err
+	}
+	switch len(guilds) {
+	case 0:
+		return "", newErr("Discord bot is not in any server yet; invite the bot to your server first", http.StatusBadRequest)
+	case 1:
+		return guilds[0].ID, nil
+	default:
+		choices := make([]string, 0, len(guilds))
+		for _, g := range guilds {
+			choices = append(choices, fmt.Sprintf("%s (%s)", cmp.Or(g.Name, "server"), g.ID))
+		}
+		return "", newErr("Discord bot is in multiple servers ("+strings.Join(choices, ", ")+"); set discord.guild_id", http.StatusBadRequest)
+	}
+}
+
+func ensureDiscordCategory(ctx context.Context, api *discordAPI, tok, guildID, categoryName string, guildChannels []discordChannel) (discordChannel, error) {
+	for _, ch := range guildChannels {
+		if ch.Type == 4 && strings.EqualFold(strings.TrimSpace(ch.Name), categoryName) {
+			return ch, nil
+		}
+	}
+	return api.CreateGuildChannel(ctx, tok, guildID, map[string]any{
+		"name": categoryName,
+		"type": 4,
+	})
+}
+
+func indexGuildChannels(guildChannels []discordChannel, categoryID string) (map[string]discordChannel, map[string]discordChannel) {
+	byID := make(map[string]discordChannel, len(guildChannels))
+	catTextBySlug := make(map[string]discordChannel)
+	for _, dc := range guildChannels {
+		byID[dc.ID] = dc
+		if dc.Type == 0 && dc.ParentID == categoryID {
+			if slug := sanitizeFleetChannelID(dc.Name); slug != "" {
+				if _, exists := catTextBySlug[slug]; !exists {
+					catTextBySlug[slug] = dc
+				}
+			}
+		}
+	}
+	return byID, catTextBySlug
+}
+
+// SyncDiscordChannels reconciles Fleet channels and Discord server channels under the configured category.
+func (e *Engine) SyncDiscordChannels(ctx context.Context) (DiscordSyncResult, error) {
+	e.discordSyncMu.Lock()
+	defer e.discordSyncMu.Unlock()
+
+	cfg := normalizeDiscordConfig(e.Config().Discord)
+	if !cfg.Enabled {
+		return DiscordSyncResult{}, newErr("discord bot is disabled", http.StatusBadRequest)
+	}
+	if err := ValidateDiscordConfig(cfg); err != nil {
+		return DiscordSyncResult{}, err
+	}
+	tok, err := e.resolveDiscordBotToken(ctx, cfg)
+	if err != nil {
+		return DiscordSyncResult{}, err
+	}
+	api := e.discordClient()
+	guildID, err := resolveDiscordGuildID(ctx, api, tok, cfg)
+	if err != nil {
+		return DiscordSyncResult{}, err
+	}
+	guildChannels, err := api.GetGuildChannels(ctx, tok, guildID)
+	if err != nil {
+		return DiscordSyncResult{}, err
+	}
+	cat, err := ensureDiscordCategory(ctx, api, tok, guildID, cfg.CategoryName, guildChannels)
+	if err != nil {
+		return DiscordSyncResult{}, err
+	}
+	e.discordMu.Lock()
+	e.discordCategoryID = cat.ID
+	e.discordMu.Unlock()
+
+	byID, catTextBySlug := indexGuildChannels(guildChannels, cat.ID)
+	nextMap := maps.Clone(cfg.Channels)
+	if nextMap == nil {
+		nextMap = make(map[string]string)
+	}
+	res := DiscordSyncResult{
+		GuildID:      guildID,
+		CategoryID:   cat.ID,
+		CategoryName: cmp.Or(cat.Name, cfg.CategoryName),
+	}
+
+	var sErr error
+	guildChannels, sErr = e.syncFleetToDiscord(ctx, api, tok, guildID, cat.ID, byID, catTextBySlug, guildChannels, nextMap, &res)
+	if sErr != nil {
+		return DiscordSyncResult{}, sErr
+	}
+	e.syncDiscordToFleet(cat.ID, guildChannels, nextMap, &res)
+
+	res.Channels = maps.Clone(nextMap)
+	if guildID != cfg.GuildID || !maps.Equal(nextMap, cfg.Channels) {
+		if pErr := e.persistDiscordMapping(guildID, nextMap); pErr != nil {
+			return DiscordSyncResult{}, pErr
+		}
+	}
+	if len(res.CreatedInFleet) > 0 {
+		e.publishEvent(StreamEvent{Type: "channels_updated"})
+	}
+	return res, nil
+}
+
+func (e *Engine) syncFleetToDiscord(
+	ctx context.Context,
+	api *discordAPI,
+	tok, guildID, categoryID string,
+	byID, catTextBySlug map[string]discordChannel,
+	guildChannels []discordChannel,
+	nextMap map[string]string,
+	res *DiscordSyncResult,
+) ([]discordChannel, error) {
+	fleetChannels, err := e.store.ListChannels()
+	if err != nil {
+		return nil, err
+	}
+	for _, fch := range fleetChannels {
+		if existingID := nextMap[fch.ID]; existingID != "" {
+			if _, ok := byID[existingID]; ok {
+				continue
+			}
+		}
+		if adopted, ok := catTextBySlug[fch.ID]; ok {
+			nextMap[fch.ID] = adopted.ID
+			res.AdoptedInDiscord = append(res.AdoptedInDiscord, fch.ID)
+			continue
+		}
+		payload := map[string]any{
+			"name":      fch.ID,
+			"type":      0,
+			"parent_id": categoryID,
+		}
+		if desc := strings.TrimSpace(fch.Description); desc != "" {
+			payload["topic"] = truncateText(desc, 1024)
+		}
+		created, cErr := api.CreateGuildChannel(ctx, tok, guildID, payload)
+		if cErr != nil {
+			return nil, cErr
+		}
+		nextMap[fch.ID] = created.ID
+		byID[created.ID] = created
+		catTextBySlug[fch.ID] = created
+		guildChannels = append(guildChannels, created)
+		res.CreatedInDiscord = append(res.CreatedInDiscord, fch.ID)
+	}
+	return guildChannels, nil
+}
+
+func (e *Engine) syncDiscordToFleet(
+	categoryID string,
+	guildChannels []discordChannel,
+	nextMap map[string]string,
+	res *DiscordSyncResult,
+) {
+	mappedDiscordIDs := make(map[string]bool, len(nextMap))
+	for _, id := range nextMap {
+		mappedDiscordIDs[id] = true
+	}
+	for _, dc := range guildChannels {
+		if dc.Type != 0 || dc.ParentID != categoryID || mappedDiscordIDs[dc.ID] {
+			continue
+		}
+		slug := sanitizeFleetChannelID(dc.Name)
+		if slug == "" || nextMap[slug] != "" {
+			continue
+		}
+		if _, uErr := e.store.UpsertChannel(slug, "#"+slug, dc.Topic, ""); uErr != nil {
+			continue
+		}
+		nextMap[slug] = dc.ID
+		mappedDiscordIDs[dc.ID] = true
+		res.CreatedInFleet = append(res.CreatedInFleet, slug)
 	}
 }
