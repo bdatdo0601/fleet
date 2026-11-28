@@ -5,17 +5,20 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,6 +47,7 @@ func (e *mcpJSONRPCError) Error() string {
 
 type mcpHTTPStatusError struct {
 	Status  int
+	RPCCode int
 	Message string
 }
 
@@ -68,6 +72,9 @@ func isMCPMethodUnsupportedError(err error) bool {
 
 func isMCPProtocolVersionError(err error) bool {
 	if rpcErr, ok := errors.AsType[*mcpJSONRPCError](err); ok && rpcErr.Code == -32022 {
+		return true
+	}
+	if httpErr, ok := errors.AsType[*mcpHTTPStatusError](err); ok && httpErr.RPCCode == -32022 {
 		return true
 	}
 	if err == nil {
@@ -99,7 +106,9 @@ func shouldFallbackFromDiscover(ctx context.Context, err error) bool {
 	}
 	if httpErr, ok := errors.AsType[*mcpHTTPStatusError](err); ok {
 		switch httpErr.Status {
-		case http.StatusBadRequest, http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusUnprocessableEntity, http.StatusNotImplemented:
+		case http.StatusBadRequest:
+			return httpErr.RPCCode != -32020
+		case http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusUnprocessableEntity, http.StatusNotImplemented:
 			return true
 		default:
 			return false
@@ -117,6 +126,131 @@ func shouldFallbackFromDiscover(ctx context.Context, err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "missing matching JSON-RPC response") ||
 		strings.Contains(msg, "no matching JSON-RPC response in SSE")
+}
+
+func encodeMCPHeaderValue(val string) string {
+	needsBase64 := strings.HasPrefix(val, "=?base64?") && strings.HasSuffix(val, "?=")
+	if !needsBase64 && val != "" && (val[0] == ' ' || val[0] == '\t' || val[len(val)-1] == ' ' || val[len(val)-1] == '\t') {
+		needsBase64 = true
+	}
+	if !needsBase64 {
+		for i := 0; i < len(val); i++ {
+			b := val[i]
+			if b != '\t' && (b < 0x20 || b > 0x7E) {
+				needsBase64 = true
+				break
+			}
+		}
+	}
+	if needsBase64 {
+		return "=?base64?" + base64.StdEncoding.EncodeToString([]byte(val)) + "?="
+	}
+	return val
+}
+
+func isValidHTTPToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		isAlphaNum := (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+		if isAlphaNum {
+			continue
+		}
+		if !strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c)) {
+			return false
+		}
+	}
+	return true
+}
+
+func formatMCPHeaderParamValue(propType string, v any) (string, bool) {
+	if v == nil {
+		return "", false
+	}
+	if propType == "" || propType == "string" {
+		if s, ok := v.(string); ok {
+			return s, true
+		}
+		if propType == "string" {
+			return "", false
+		}
+	}
+	if propType == "" || propType == "boolean" {
+		if b, ok := v.(bool); ok {
+			return strconv.FormatBool(b), true
+		}
+		if propType == "boolean" {
+			return "", false
+		}
+	}
+	if propType == "" || propType == "integer" {
+		return formatMCPIntegerParam(v)
+	}
+	return "", false
+}
+
+func formatMCPIntegerParam(v any) (string, bool) {
+	const maxSafeInt = (1 << 53) - 1
+	switch n := v.(type) {
+	case int:
+		return strconv.Itoa(n), true
+	case int64:
+		return strconv.FormatInt(n, 10), true
+	case json.Number:
+		if i, err := n.Int64(); err == nil {
+			return strconv.FormatInt(i, 10), true
+		}
+	case float64:
+		if !math.IsNaN(n) && !math.IsInf(n, 0) && math.Trunc(n) == n && math.Abs(n) <= maxSafeInt {
+			return strconv.FormatInt(int64(n), 10), true
+		}
+	}
+	return "", false
+}
+
+func walkMCPHeaderParams(props, curArgs map[string]any, headers map[string]string) {
+	for name, rawProp := range props {
+		propMap, ok := rawProp.(map[string]any)
+		if !ok {
+			continue
+		}
+		val, exists := curArgs[name]
+		if !exists || val == nil {
+			continue
+		}
+		if nestedProps, ok := propMap["properties"].(map[string]any); ok {
+			if nestedArgs, ok := val.(map[string]any); ok {
+				walkMCPHeaderParams(nestedProps, nestedArgs, headers)
+			}
+			continue
+		}
+		hdrName, _ := propMap["x-mcp-header"].(string)
+		if !isValidHTTPToken(hdrName) {
+			continue
+		}
+		propType, _ := propMap["type"].(string)
+		if strVal, ok := formatMCPHeaderParamValue(propType, val); ok {
+			headers["Mcp-Param-"+hdrName] = encodeMCPHeaderValue(strVal)
+		}
+	}
+}
+
+func collectMCPHeaderParams(schema, args map[string]any) map[string]string {
+	if len(schema) == 0 || len(args) == 0 {
+		return nil
+	}
+	props, ok := schema["properties"].(map[string]any)
+	if !ok || len(props) == 0 {
+		return nil
+	}
+	out := make(map[string]string)
+	walkMCPHeaderParams(props, args, out)
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // MCPElicitationOption represents a single server-provided approval choice.
@@ -703,39 +837,49 @@ func (c *mcpClientConn) startStdioLocked(ctx context.Context, opReader OPReaderF
 	return nil
 }
 
+func (c *mcpClientConn) sendInitializedNotifyLocked(ctx context.Context, opReader OPReaderFunc) error {
+	if nErr := c.notifyLocked(ctx, opReader, "notifications/initialized"); nErr != nil && !isIgnorableInitializedNotifyError(nErr) {
+		return nErr
+	}
+	return nil
+}
+
 func (c *mcpClientConn) handshakeHTTPLocked(ctx context.Context, opReader OPReaderFunc) error {
 	c.protocolVersion = mcpProtocolVersion
-	if _, err := c.rpcCallLocked(ctx, opReader, "server/discover", map[string]any{}); err == nil {
-		return nil
-	} else if !shouldFallbackFromDiscover(ctx, err) {
-		return err
-	}
-
-	_, initErr := c.rpcCallLocked(ctx, opReader, "initialize", map[string]any{
-		"protocolVersion": mcpProtocolVersion,
-		"capabilities":    mcpClientCapabilities(),
-		"clientInfo":      mcpClientInfo(),
+	_, discoverErr := c.rpcCallLocked(ctx, opReader, "server/discover", map[string]any{
+		"_meta": mcpStatelessMeta(),
 	})
-	if initErr != nil {
+	if discoverErr == nil {
+		return nil
+	}
+	if !shouldFallbackFromDiscover(ctx, discoverErr) {
+		return discoverErr
+	}
+	if !isMCPProtocolVersionError(discoverErr) {
+		_, initErr := c.rpcCallLocked(ctx, opReader, "initialize", map[string]any{
+			"protocolVersion": mcpProtocolVersion,
+			"capabilities":    mcpClientCapabilities(),
+			"clientInfo":      mcpClientInfo(),
+		})
+		if initErr == nil {
+			return c.sendInitializedNotifyLocked(ctx, opReader)
+		}
 		if isMCPMethodUnsupportedError(initErr) {
 			return nil
 		}
 		if !isMCPProtocolVersionError(initErr) {
 			return initErr
 		}
-		c.protocolVersion = mcpLegacyProtocolVersion
-		if _, legErr := c.rpcCallLocked(ctx, opReader, "initialize", map[string]any{
-			"protocolVersion": mcpLegacyProtocolVersion,
-			"capabilities":    map[string]any{},
-			"clientInfo":      mcpClientInfo(),
-		}); legErr != nil {
-			return legErr
-		}
 	}
-	if nErr := c.notifyLocked(ctx, opReader, "notifications/initialized"); nErr != nil && !isIgnorableInitializedNotifyError(nErr) {
-		return nErr
+	c.protocolVersion = mcpLegacyProtocolVersion
+	if _, legErr := c.rpcCallLocked(ctx, opReader, "initialize", map[string]any{
+		"protocolVersion": mcpLegacyProtocolVersion,
+		"capabilities":    map[string]any{},
+		"clientInfo":      mcpClientInfo(),
+	}); legErr != nil {
+		return legErr
 	}
-	return nil
+	return c.sendInitializedNotifyLocked(ctx, opReader)
 }
 
 func (c *mcpClientConn) handshakeLocked(ctx context.Context, opReader OPReaderFunc) error {
@@ -823,6 +967,15 @@ func (c *mcpClientConn) callTool(ctx context.Context, opReader OPReaderFunc, rem
 	return c.callToolWithElicitation(ctx, opReader, remoteName, args, "", nil)
 }
 
+func (c *mcpClientConn) findToolSchemaLocked(remoteName string) map[string]any {
+	for _, t := range c.tools {
+		if t.RemoteName == remoteName {
+			return t.InputSchema
+		}
+	}
+	return nil
+}
+
 func (c *mcpClientConn) callToolWithElicitation(ctx context.Context, opReader OPReaderFunc, remoteName string, args map[string]any, requestState string, inputResponses map[string]any) (any, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -836,8 +989,11 @@ func (c *mcpClientConn) callToolWithElicitation(ctx context.Context, opReader OP
 		"name":      remoteName,
 		"arguments": cmp.Or[any](args, map[string]any{}),
 	}
+	var extraHeaders map[string]string
 	if c.useStatelessMeta() {
 		params["_meta"] = mcpStatelessMeta()
+		extraHeaders = map[string]string{"Mcp-Name": encodeMCPHeaderValue(remoteName)}
+		maps.Copy(extraHeaders, collectMCPHeaderParams(c.findToolSchemaLocked(remoteName), args))
 	}
 	if strings.TrimSpace(requestState) != "" {
 		params["requestState"] = requestState
@@ -845,7 +1001,7 @@ func (c *mcpClientConn) callToolWithElicitation(ctx context.Context, opReader OP
 	if len(inputResponses) > 0 {
 		params["inputResponses"] = inputResponses
 	}
-	raw, err := c.rpcCallLocked(ctx, opReader, "tools/call", params)
+	raw, err := c.rpcCallWithHeadersLocked(ctx, opReader, "tools/call", params, extraHeaders)
 	if err != nil {
 		return nil, err
 	}
@@ -969,7 +1125,7 @@ func (c *mcpClientConn) writeFrameLocked(payload any) error {
 func (c *mcpClientConn) notifyLocked(ctx context.Context, opReader OPReaderFunc, method string) error {
 	msg := map[string]any{"jsonrpc": "2.0", "method": method}
 	if c.cfg.Transport == "http" {
-		_, err := c.httpPostLocked(ctx, opReader, msg, 0)
+		_, err := c.httpPostLocked(ctx, opReader, msg, 0, nil)
 		return err
 	}
 	return c.writeFrameLocked(msg)
@@ -1011,6 +1167,10 @@ func (c *mcpClientConn) readStdioLineLocked(ctx context.Context) ([]byte, error)
 }
 
 func (c *mcpClientConn) rpcCallLocked(ctx context.Context, opReader OPReaderFunc, method string, params any) (json.RawMessage, error) {
+	return c.rpcCallWithHeadersLocked(ctx, opReader, method, params, nil)
+}
+
+func (c *mcpClientConn) rpcCallWithHeadersLocked(ctx context.Context, opReader OPReaderFunc, method string, params any, extraHeaders map[string]string) (json.RawMessage, error) {
 	id := c.nextID.Add(1)
 	reqBody := map[string]any{
 		"jsonrpc": "2.0",
@@ -1019,7 +1179,7 @@ func (c *mcpClientConn) rpcCallLocked(ctx context.Context, opReader OPReaderFunc
 		"params":  params,
 	}
 	if c.cfg.Transport == "http" {
-		return c.httpCallLocked(ctx, opReader, method, reqBody, id)
+		return c.httpCallLocked(ctx, opReader, method, reqBody, id, extraHeaders)
 	}
 	if err := c.writeFrameLocked(reqBody); err != nil {
 		c.resetStdioLocked()
@@ -1083,7 +1243,7 @@ func scrubAllSecrets(text string, secrets []string) string {
 	return out
 }
 
-func (c *mcpClientConn) doHTTPPostOnceLocked(ctx context.Context, opReader OPReaderFunc, raw []byte, forceRefresh bool) (int, http.Header, []byte, []string, error) {
+func (c *mcpClientConn) doHTTPPostOnceLocked(ctx context.Context, opReader OPReaderFunc, raw []byte, extraHeaders map[string]string, forceRefresh bool) (int, http.Header, []byte, []string, error) {
 	hdrs, secrets, err := c.resolveHTTPHeadersLocked(ctx, opReader, forceRefresh)
 	if err != nil {
 		return 0, nil, nil, secrets, err
@@ -1100,6 +1260,11 @@ func (c *mcpClientConn) doHTTPPostOnceLocked(ctx context.Context, opReader OPRea
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("MCP-Protocol-Version", c.effectiveProtocolVersion())
+	if c.useStatelessMeta() {
+		for k, v := range extraHeaders {
+			req.Header.Set(k, v)
+		}
+	}
 	if c.sessionID != "" {
 		req.Header.Set("Mcp-Session-Id", c.sessionID)
 	}
@@ -1118,18 +1283,18 @@ func (c *mcpClientConn) doHTTPPostOnceLocked(ctx context.Context, opReader OPRea
 	return resp.StatusCode, resp.Header.Clone(), body, secrets, nil
 }
 
-func (c *mcpClientConn) httpPostLocked(ctx context.Context, opReader OPReaderFunc, payload any, wantID int64) (json.RawMessage, error) {
+func (c *mcpClientConn) httpPostLocked(ctx context.Context, opReader OPReaderFunc, payload any, wantID int64, extraHeaders map[string]string) (json.RawMessage, error) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
-	status, respHdr, body, secrets, err := c.doHTTPPostOnceLocked(ctx, opReader, raw, false)
+	status, respHdr, body, secrets, err := c.doHTTPPostOnceLocked(ctx, opReader, raw, extraHeaders, false)
 	if err != nil {
 		return nil, err
 	}
 	if status == http.StatusUnauthorized && c.cfg.OAuth != nil && c.cfg.OAuth.Enabled && c.oauth != nil {
 		c.sessionID = ""
-		status, respHdr, body, secrets, err = c.doHTTPPostOnceLocked(ctx, opReader, raw, true)
+		status, respHdr, body, secrets, err = c.doHTTPPostOnceLocked(ctx, opReader, raw, extraHeaders, true)
 		if err != nil {
 			return nil, err
 		}
@@ -1138,8 +1303,19 @@ func (c *mcpClientConn) httpPostLocked(ctx context.Context, opReader OPReaderFun
 		return nil, fmt.Errorf("MCP HTTP response exceeded %d byte limit", mcpMaxHTTPResponseBytes)
 	}
 	if status >= 400 {
+		var rpcErrEnv struct {
+			Error *struct {
+				Code int `json:"code"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal(body, &rpcErrEnv)
+		rpcCode := 0
+		if rpcErrEnv.Error != nil {
+			rpcCode = rpcErrEnv.Error.Code
+		}
 		return nil, &mcpHTTPStatusError{
 			Status:  status,
+			RPCCode: rpcCode,
 			Message: scrubAllSecrets(fmt.Sprintf("MCP HTTP %d: %s", status, strings.TrimSpace(string(body))), secrets),
 		}
 	}
@@ -1157,8 +1333,14 @@ func (c *mcpClientConn) httpPostLocked(ctx context.Context, opReader OPReaderFun
 	return body, nil
 }
 
-func (c *mcpClientConn) httpCallLocked(ctx context.Context, opReader OPReaderFunc, method string, reqBody any, id int64) (json.RawMessage, error) {
-	body, err := c.httpPostLocked(ctx, opReader, reqBody, id)
+func (c *mcpClientConn) httpCallLocked(ctx context.Context, opReader OPReaderFunc, method string, reqBody any, id int64, extraHeaders map[string]string) (json.RawMessage, error) {
+	var hdrs map[string]string
+	if c.useStatelessMeta() {
+		hdrs = make(map[string]string, len(extraHeaders)+1)
+		maps.Copy(hdrs, extraHeaders)
+		hdrs["Mcp-Method"] = method
+	}
+	body, err := c.httpPostLocked(ctx, opReader, reqBody, id, hdrs)
 	if err != nil {
 		return nil, err
 	}

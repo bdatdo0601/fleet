@@ -857,13 +857,23 @@ func TestMCPElicitationManualApprovalAndAutoApprove(t *testing.T) {
 }
 
 func TestMCPStateless20260728ServerDiscoverAndLegacyFallback(t *testing.T) {
-	t.Run("stateless_2026_07_28_server_discover", func(t *testing.T) {
+	t.Run("stateless_2026_07_28_server_discover_and_strict_headers", func(t *testing.T) {
 		var sawDiscover atomic.Bool
 		var sawInitialize atomic.Bool
 		var sawInitializedNotify atomic.Bool
 		var listProtoHeader atomic.Value
 		var listMetaCaps atomic.Bool
 		var callMetaCaps atomic.Bool
+		var seenParamHeader atomic.Value
+
+		sendHeaderMismatch := func(w http.ResponseWriter, id int64, msg string) {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      id,
+				"error":   map[string]any{"code": -32020, "message": "Header mismatch: " + msg},
+			})
+		}
 
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			var req struct {
@@ -873,6 +883,18 @@ func TestMCPStateless20260728ServerDiscoverAndLegacyFallback(t *testing.T) {
 			}
 			_ = json.NewDecoder(r.Body).Decode(&req)
 			w.Header().Set("Content-Type", "application/json")
+
+			if gotMethod := r.Header.Get("Mcp-Method"); gotMethod != req.Method {
+				sendHeaderMismatch(w, req.ID, fmt.Sprintf("Mcp-Method=%q != %q", gotMethod, req.Method))
+				return
+			}
+			meta, _ := req.Params["_meta"].(map[string]any)
+			metaProto, _ := meta["io.modelcontextprotocol/protocolVersion"].(string)
+			if gotProto := r.Header.Get("MCP-Protocol-Version"); gotProto == "" || gotProto != metaProto {
+				sendHeaderMismatch(w, req.ID, fmt.Sprintf("MCP-Protocol-Version=%q != _meta=%q", gotProto, metaProto))
+				return
+			}
+
 			switch req.Method {
 			case "server/discover":
 				sawDiscover.Store(true)
@@ -905,12 +927,10 @@ func TestMCPStateless20260728ServerDiscoverAndLegacyFallback(t *testing.T) {
 				})
 			case "tools/list":
 				listProtoHeader.Store(r.Header.Get("MCP-Protocol-Version"))
-				if meta, _ := req.Params["_meta"].(map[string]any); meta != nil {
-					if cc, _ := meta["io.modelcontextprotocol/clientCapabilities"].(map[string]any); cc != nil {
-						if elic, _ := cc["elicitation"].(map[string]any); elic != nil {
-							if _, ok := elic["form"]; ok {
-								listMetaCaps.Store(true)
-							}
+				if cc, _ := meta["io.modelcontextprotocol/clientCapabilities"].(map[string]any); cc != nil {
+					if elic, _ := cc["elicitation"].(map[string]any); elic != nil {
+						if _, ok := elic["form"]; ok {
+							listMetaCaps.Store(true)
 						}
 					}
 				}
@@ -919,17 +939,38 @@ func TestMCPStateless20260728ServerDiscoverAndLegacyFallback(t *testing.T) {
 					"id":      req.ID,
 					"result": map[string]any{
 						"tools": []map[string]any{
-							{"name": "list_messages", "description": "List Gmail messages"},
+							{
+								"name":        "list_messages",
+								"description": "List Gmail messages",
+								"inputSchema": map[string]any{
+									"type": "object",
+									"properties": map[string]any{
+										"q":       map[string]any{"type": "string"},
+										"user_id": map[string]any{"type": "string", "x-mcp-header": "UserId"},
+									},
+								},
+							},
 						},
 					},
 				})
 			case "tools/call":
-				if meta, _ := req.Params["_meta"].(map[string]any); meta != nil {
-					if cc, _ := meta["io.modelcontextprotocol/clientCapabilities"].(map[string]any); cc != nil {
-						if elic, _ := cc["elicitation"].(map[string]any); elic != nil {
-							if _, ok := elic["form"]; ok {
-								callMetaCaps.Store(true)
-							}
+				wantName, _ := req.Params["name"].(string)
+				if gotName := r.Header.Get("Mcp-Name"); gotName != wantName {
+					sendHeaderMismatch(w, req.ID, fmt.Sprintf("Mcp-Name=%q != %q", gotName, wantName))
+					return
+				}
+				args, _ := req.Params["arguments"].(map[string]any)
+				if uid, _ := args["user_id"].(string); uid != "" {
+					seenParamHeader.Store(r.Header.Get("Mcp-Param-UserId"))
+					if r.Header.Get("Mcp-Param-UserId") == "" {
+						sendHeaderMismatch(w, req.ID, "missing Mcp-Param-UserId")
+						return
+					}
+				}
+				if cc, _ := meta["io.modelcontextprotocol/clientCapabilities"].(map[string]any); cc != nil {
+					if elic, _ := cc["elicitation"].(map[string]any); elic != nil {
+						if _, ok := elic["form"]; ok {
+							callMetaCaps.Store(true)
 						}
 					}
 				}
@@ -955,12 +996,19 @@ func TestMCPStateless20260728ServerDiscoverAndLegacyFallback(t *testing.T) {
 		if len(tools) != 1 || tools[0].RemoteName != "list_messages" {
 			t.Fatalf("expected list_messages tool, got %+v", tools)
 		}
-		res, err := mgr.CallTool(t.Context(), "mcp__gmail__list_messages", map[string]any{"q": "in:inbox"})
+		res, err := mgr.CallTool(t.Context(), "mcp__gmail__list_messages", map[string]any{
+			"q":       "in:inbox",
+			"user_id": "José@example.com",
+		})
 		if err != nil {
 			t.Fatalf("CallTool failed: %v", err)
 		}
 		if resMap, _ := res.(map[string]any); resMap == nil {
 			t.Fatalf("expected map result, got %#v", res)
+		}
+		wantEncoded := "=?base64?" + base64.StdEncoding.EncodeToString([]byte("José@example.com")) + "?="
+		if gotParam, _ := seenParamHeader.Load().(string); gotParam != wantEncoded {
+			t.Fatalf("expected Base64-encoded Mcp-Param-UserId %q, got %q", wantEncoded, gotParam)
 		}
 		if !sawDiscover.Load() {
 			t.Fatal("expected server/discover to be called")
@@ -980,6 +1028,8 @@ func TestMCPStateless20260728ServerDiscoverAndLegacyFallback(t *testing.T) {
 		var callProtoHeader atomic.Value
 		var sawMetaOnList atomic.Bool
 		var sawMetaOnCall atomic.Bool
+		var sawMethodHeaderOnLegacy atomic.Bool
+		var sawNameHeaderOnLegacy atomic.Bool
 
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			var req struct {
@@ -1022,6 +1072,9 @@ func TestMCPStateless20260728ServerDiscoverAndLegacyFallback(t *testing.T) {
 				w.WriteHeader(http.StatusAccepted)
 			case "tools/list":
 				listProtoHeader.Store(r.Header.Get("MCP-Protocol-Version"))
+				if r.Header.Get("Mcp-Method") != "" {
+					sawMethodHeaderOnLegacy.Store(true)
+				}
 				if _, hasMeta := req.Params["_meta"]; hasMeta {
 					sawMetaOnList.Store(true)
 				}
@@ -1032,6 +1085,12 @@ func TestMCPStateless20260728ServerDiscoverAndLegacyFallback(t *testing.T) {
 				})
 			case "tools/call":
 				callProtoHeader.Store(r.Header.Get("MCP-Protocol-Version"))
+				if r.Header.Get("Mcp-Method") != "" {
+					sawMethodHeaderOnLegacy.Store(true)
+				}
+				if r.Header.Get("Mcp-Name") != "" {
+					sawNameHeaderOnLegacy.Store(true)
+				}
 				if _, hasMeta := req.Params["_meta"]; hasMeta {
 					sawMetaOnCall.Store(true)
 				}
@@ -1066,8 +1125,52 @@ func TestMCPStateless20260728ServerDiscoverAndLegacyFallback(t *testing.T) {
 		if listProtoHeader.Load() != "2024-11-05" || callProtoHeader.Load() != "2024-11-05" {
 			t.Fatalf("expected 2024-11-05 protocol headers, got list=%v call=%v", listProtoHeader.Load(), callProtoHeader.Load())
 		}
-		if sawMetaOnList.Load() || sawMetaOnCall.Load() {
-			t.Fatalf("expected _meta omitted after downgrade to 2024-11-05, got list=%v call=%v", sawMetaOnList.Load(), sawMetaOnCall.Load())
+		if sawMetaOnList.Load() || sawMetaOnCall.Load() || sawMethodHeaderOnLegacy.Load() || sawNameHeaderOnLegacy.Load() {
+			t.Fatalf("expected _meta and Mcp-Method/Mcp-Name omitted after downgrade to 2024-11-05, got meta=(%v,%v) headers=(%v,%v)",
+				sawMetaOnList.Load(), sawMetaOnCall.Load(), sawMethodHeaderOnLegacy.Load(), sawNameHeaderOnLegacy.Load())
+		}
+	})
+
+	t.Run("http_400_header_mismatch_fails_fast_without_initialize", func(t *testing.T) {
+		var sawInitialize atomic.Bool
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				ID     int64  `json:"id"`
+				Method string `json:"method"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.Method == "initialize" {
+				sawInitialize.Store(true)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req.ID,
+				"error":   map[string]any{"code": -32020, "message": "Header mismatch (-32020)"},
+			})
+		}))
+		defer srv.Close()
+
+		mgr := NewMCPManager([]MCPServerConfig{{
+			Name:      "mismatch",
+			Transport: "http",
+			URL:       srv.URL,
+			Enabled:   true,
+		}}, nil)
+		defer mgr.Close()
+
+		_, err := mgr.TestServer(t.Context(), MCPServerConfig{
+			Name:      "mismatch",
+			Transport: "http",
+			URL:       srv.URL,
+			Enabled:   true,
+		})
+		if err == nil || !strings.Contains(err.Error(), "-32020") {
+			t.Fatalf("expected HTTP 400 -32020 error, got %v", err)
+		}
+		if sawInitialize.Load() {
+			t.Fatal("expected HTTP 400 -32020 on server/discover NOT to fall back to initialize")
 		}
 	})
 
