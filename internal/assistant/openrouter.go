@@ -428,16 +428,12 @@ func (c *openRouterClient) Decide(ctx context.Context, cfg Config, input string,
 	}
 	var parsed struct {
 		Answers map[string]struct {
-			Type          string   `json:"type"`
-			Choice        string   `json:"choice"`
-			Noul          *float64 `json:"noul"`
-			Value         any      `json:"value"`
-			Confidence    float64  `json:"confidence"`
-			Probabilities []struct {
-				Key         string  `json:"key"`
-				Level       string  `json:"level"`
-				Probability float64 `json:"probability"`
-			} `json:"probabilities"`
+			Type          string          `json:"type"`
+			Choice        string          `json:"choice"`
+			Noul          *float64        `json:"noul"`
+			Value         any             `json:"value"`
+			Confidence    float64         `json:"confidence"`
+			Probabilities json.RawMessage `json:"probabilities"`
 		} `json:"answers"`
 	}
 	if err := json.Unmarshal(respBytes, &parsed); err != nil {
@@ -456,14 +452,61 @@ func (c *openRouterClient) Decide(ctx context.Context, cfg Config, input string,
 		if val == "" && a.Value != nil {
 			val = fmt.Sprint(a.Value)
 		}
-		probs := make(map[string]float64, len(a.Probabilities))
-		for _, p := range a.Probabilities {
-			k := cmp.Or(p.Key, p.Level)
-			if k != "" {
-				probs[k] = p.Probability
+		probs := parseDecisionProbabilities(a.Probabilities)
+		conf := a.Confidence
+		if val == "" && len(probs) > 0 {
+			bestProb := -1.0
+			for k, p := range probs {
+				if p > bestProb {
+					bestProb = p
+					val = k
+				}
+			}
+			if conf == 0 && bestProb > 0 {
+				conf = bestProb
 			}
 		}
-		out[id] = DecisionAnswer{ID: id, Value: val, Confidence: a.Confidence, Probabilities: probs}
+		out[id] = DecisionAnswer{ID: id, Value: val, Confidence: conf, Probabilities: probs}
 	}
 	return out, nil
+}
+
+func parseDecisionProbabilities(raw json.RawMessage) map[string]float64 {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	switch trimmed[0] {
+	case '{':
+		var flat map[string]float64
+		if err := json.Unmarshal(trimmed, &flat); err == nil {
+			return flat
+		}
+		var nested map[string]struct {
+			Probability float64 `json:"probability"`
+		}
+		if err := json.Unmarshal(trimmed, &nested); err == nil {
+			out := make(map[string]float64, len(nested))
+			for k, v := range nested {
+				out[k] = v.Probability
+			}
+			return out
+		}
+	case '[':
+		var list []struct {
+			Key         string  `json:"key"`
+			Level       string  `json:"level"`
+			Probability float64 `json:"probability"`
+		}
+		if err := json.Unmarshal(trimmed, &list); err == nil {
+			out := make(map[string]float64, len(list))
+			for _, p := range list {
+				if k := cmp.Or(p.Key, p.Level); k != "" {
+					out[k] = p.Probability
+				}
+			}
+			return out
+		}
+	}
+	return nil
 }

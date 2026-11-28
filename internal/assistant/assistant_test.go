@@ -463,7 +463,7 @@ func TestDoctorAndAPIKeyOPRef(t *testing.T) {
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"answers":{"tier":{"type":"choice","choice":"fast","confidence":0.95}}}`))
+			_, _ = w.Write([]byte(`{"answers":{"tier":{"type":"choice","choice":"fast","confidence":0.95,"probabilities":{"fast":0.95,"balanced":0.05}}}}`))
 		}
 	}))
 	defer mockLLM.Close()
@@ -523,6 +523,17 @@ func TestDoctorAndAPIKeyOPRef(t *testing.T) {
 		if statuses[k] != "ok" {
 			t.Fatalf("expected check %s=ok, got %q (%+v)", k, statuses[k], rep.Checks)
 		}
+	}
+
+	// Also verify Decisions probabilities parsing supports object, nested-object, and array shapes.
+	if p := parseDecisionProbabilities(json.RawMessage(`{"fast":0.9,"balanced":0.1}`)); p["fast"] != 0.9 {
+		t.Fatalf("expected flat object probabilities parsed, got %+v", p)
+	}
+	if p := parseDecisionProbabilities(json.RawMessage(`{"fast":{"probability":0.85}}`)); p["fast"] != 0.85 {
+		t.Fatalf("expected nested object probabilities parsed, got %+v", p)
+	}
+	if p := parseDecisionProbabilities(json.RawMessage(`[{"key":"frontier","probability":0.7}]`)); p["frontier"] != 0.7 {
+		t.Fatalf("expected array probabilities parsed, got %+v", p)
 	}
 
 	// Missing op auth when api_key_op_ref is set must fail doctor on onepassword & openrouter.
