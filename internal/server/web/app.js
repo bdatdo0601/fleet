@@ -10,18 +10,18 @@ import { renderSkills } from "./skills.js";
 
 const NAV_ITEMS = [
   {
-    id: "overview",
-    label: "Overview",
-    href: "#overview",
-    adminOnly: false,
-    icon: ["M3 9.5L12 3l9 6.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1V9.5z"],
-  },
-  {
     id: "chat",
     label: "Chat",
     href: "#chat",
     adminOnly: true,
     icon: ["M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"],
+  },
+  {
+    id: "overview",
+    label: "Overview",
+    href: "#overview",
+    adminOnly: false,
+    icon: ["M3 9.5L12 3l9 6.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1V9.5z"],
   },
   {
     id: "skills",
@@ -68,17 +68,22 @@ const NAV_ITEMS = [
 ];
 
 function parseHash() {
-  const raw = (window.location.hash || "#overview").replace(/^#/, "");
+  const raw = (window.location.hash || "").replace(/^#/, "");
+  if (!raw) {
+    return { section: "", sub: "" };
+  }
   const [section, sub = ""] = raw.split("/", 2);
-  return { section: section || "overview", sub };
+  return { section: section || "", sub };
 }
 
 function updateThemeUI(mode) {
-  const themeBtn = document.getElementById("theme-btn");
-  if (themeBtn) {
-    const label = mode === "dark" ? "Theme: Dark" : mode === "light" ? "Theme: Light" : "Theme: Auto";
-    themeBtn.textContent = label;
-    themeBtn.setAttribute("aria-label", `${label}. Click to cycle theme.`);
+  const label = mode === "dark" ? "Theme: Dark" : mode === "light" ? "Theme: Light" : "Theme: Auto";
+  for (const id of ["theme-btn", "drawer-theme"]) {
+    const btn = document.getElementById(id);
+    if (btn) {
+      btn.textContent = label;
+      btn.setAttribute("aria-label", `${label}. Click to cycle theme.`);
+    }
   }
 }
 
@@ -120,6 +125,21 @@ function setControlsOpen(open) {
   }
   if (toggle) {
     toggle.setAttribute("aria-expanded", open ? "true" : "false");
+  }
+}
+
+function setDrawerOpen(open) {
+  const backdrop = document.getElementById("nav-drawer-backdrop");
+  if (!backdrop) {
+    return;
+  }
+  backdrop.classList.toggle("hidden", !open);
+  backdrop.setAttribute("aria-hidden", open ? "false" : "true");
+  if (open) {
+    const closeBtn = document.getElementById("drawer-close");
+    if (closeBtn) {
+      closeBtn.focus();
+    }
   }
 }
 
@@ -225,10 +245,41 @@ function renderTopbar(ov, activeSection) {
   if (callerBadge && ov && ov.caller) {
     callerBadge.textContent = `${ov.caller.name} · ${ov.caller.ip} · ${ov.caller.group}`;
   }
+  const drawerCaller = document.getElementById("drawer-caller");
+  if (drawerCaller && ov && ov.caller) {
+    drawerCaller.textContent = `${ov.caller.name} · ${ov.caller.ip} · ${ov.caller.group}`;
+  }
+  const drawerNav = document.getElementById("drawer-nav");
+  if (drawerNav) {
+    clear(drawerNav);
+    for (const item of visibleItems) {
+      const isActive = activeSection === item.id;
+      const badgeCount = item.id === "agents" ? waitingCount : item.id === "memory" ? propCount : item.id === "chat" ? aprCount : 0;
+      drawerNav.appendChild(
+        el(
+          "a",
+          {
+            href: item.href,
+            className: `drawer-nav-link${isActive ? " active" : ""}`,
+            "aria-current": isActive ? "page" : null,
+            onclick: () => setDrawerOpen(false),
+          },
+          el("span", { className: "drawer-nav-left" }, svgIcon(item.icon, "bottom-nav-icon"), el("span", { text: item.label })),
+          badgeCount > 0
+            ? el("span", {
+                className: `badge ${item.id === "agents" ? "badge-warn" : "badge-info"}`,
+                text: String(badgeCount),
+              })
+            : null,
+        ),
+      );
+    }
+  }
 }
 
 function navigate(hash) {
   setControlsOpen(false);
+  setDrawerOpen(false);
   if (window.location.hash === hash) {
     renderRoute();
   } else {
@@ -276,6 +327,9 @@ async function renderCurrentRoute(seq) {
     state.routeCleanup = null;
   }
   let { section, sub } = parseHash();
+  if (!section) {
+    section = state.isAdmin ? "chat" : "overview";
+  }
   if ((section === "devices" || section === "system" || section === "slacker" || section === "chat" || section === "skills") && !state.isAdmin) {
     toast("Admin device required for that view", "warn");
     section = "overview";
@@ -284,13 +338,20 @@ async function renderCurrentRoute(seq) {
   }
   state.route = section;
   state.editing = false;
+  const isChat = section === "chat";
+  document.documentElement.classList.toggle("view-chat", isChat);
+  if (!isChat) {
+    document.documentElement.classList.remove("kb-open");
+    document.documentElement.style.removeProperty("--vvh");
+    document.documentElement.style.removeProperty("--vvt");
+  }
   renderTopbar(state.overview, section);
 
   const main = document.getElementById("app-main");
   if (!main || seq !== renderSeq) {
     return;
   }
-  const ctx = { refresh, navigate };
+  const ctx = { refresh, navigate, openMenu: () => setDrawerOpen(true) };
 
   switch (section) {
     case "chat":
@@ -328,6 +389,12 @@ function setAutoRefresh(ms) {
     refreshTimer = null;
   }
   localStorage.setItem("fleet_refresh_ms", String(ms));
+  for (const id of ["refresh-select", "drawer-refresh-select"]) {
+    const sel = document.getElementById(id);
+    if (sel && sel.value !== String(ms)) {
+      sel.value = String(ms);
+    }
+  }
   if (ms > 0) {
     refreshTimer = setInterval(() => {
       const { section, sub } = parseHash();
@@ -386,13 +453,16 @@ function init() {
   updateOfflineBanner(false);
 
   const refreshSel = document.getElementById("refresh-select");
+  const drawerRefreshSel = document.getElementById("drawer-refresh-select");
   const savedRefresh = Number.parseInt(localStorage.getItem("fleet_refresh_ms") || "15000", 10);
   const initialMs = Number.isNaN(savedRefresh) ? 15000 : savedRefresh;
-  if (refreshSel) {
-    refreshSel.value = String(initialMs);
-    refreshSel.addEventListener("change", () => {
-      setAutoRefresh(Number.parseInt(refreshSel.value, 10) || 0);
-    });
+  for (const sel of [refreshSel, drawerRefreshSel]) {
+    if (sel) {
+      sel.value = String(initialMs);
+      sel.addEventListener("change", () => {
+        setAutoRefresh(Number.parseInt(sel.value, 10) || 0);
+      });
+    }
   }
   setAutoRefresh(initialMs);
 
@@ -400,10 +470,34 @@ function init() {
   if (refreshBtn) {
     refreshBtn.addEventListener("click", () => refresh());
   }
+  const drawerRefresh = document.getElementById("drawer-refresh");
+  if (drawerRefresh) {
+    drawerRefresh.addEventListener("click", () => {
+      setDrawerOpen(false);
+      refresh();
+    });
+  }
 
   const themeBtn = document.getElementById("theme-btn");
   if (themeBtn) {
     themeBtn.addEventListener("click", toggleTheme);
+  }
+  const drawerTheme = document.getElementById("drawer-theme");
+  if (drawerTheme) {
+    drawerTheme.addEventListener("click", toggleTheme);
+  }
+
+  const drawerClose = document.getElementById("drawer-close");
+  if (drawerClose) {
+    drawerClose.addEventListener("click", () => setDrawerOpen(false));
+  }
+  const drawerBackdrop = document.getElementById("nav-drawer-backdrop");
+  if (drawerBackdrop) {
+    drawerBackdrop.addEventListener("click", (ev) => {
+      if (ev.target === drawerBackdrop) {
+        setDrawerOpen(false);
+      }
+    });
   }
 
   const controlsToggle = document.getElementById("controls-toggle");
@@ -439,8 +533,11 @@ function init() {
 
   document.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape") {
+      const drawerBackdropEl = document.getElementById("nav-drawer-backdrop");
       if (state.modalOpen) {
         closeModal();
+      } else if (drawerBackdropEl && !drawerBackdropEl.classList.contains("hidden")) {
+        setDrawerOpen(false);
       } else {
         setControlsOpen(false);
       }

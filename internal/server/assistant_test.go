@@ -112,6 +112,20 @@ func TestAssistantRoutesSecurityAndFlow(t *testing.T) {
 		t.Fatalf("expected persisted assistant reply")
 	}
 
+	// Default POST reset clears channel messages while preserving long-term memory.
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/channels/general/reset", http.MethodPost, `{}`, nil, ""); st != http.StatusOK || !strings.Contains(string(b), `"cleared_history":true`) || !strings.Contains(string(b), `"long_term_memory_preserved":true`) {
+		t.Fatalf("POST /v1/assistant/channels/general/reset failed: %d (%s)", st, string(b))
+	}
+	var afterReset struct {
+		Messages []assistant.Message `json:"messages"`
+	}
+	if err := client.Call(srv.URL, http.MethodGet, "/v1/assistant/messages?channel=general", nil, 3*time.Second, nil, &afterReset); err != nil {
+		t.Fatal(err)
+	}
+	if len(afterReset.Messages) != 0 {
+		t.Fatalf("expected #general history cleared after reset, got %+v", afterReset.Messages)
+	}
+
 	// Managed device must get 403 on assistant endpoints.
 	f.IdentifyOverride = func(string) *registry.Device { return office }
 	for _, tc := range []struct {

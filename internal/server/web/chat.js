@@ -237,7 +237,7 @@ function formatMessageFooter(m) {
   return parts.join(" · ");
 }
 
-async function openAssistantSettingsModal(onSaved) {
+async function openAssistantSettingsModal(onSaved, onNavigate) {
   let cfgData;
   let timersData;
   try {
@@ -409,6 +409,19 @@ async function openAssistantSettingsModal(onSaved) {
           }
         },
       }),
+      el("button", {
+        type: "button",
+        className: "btn",
+        text: "Long-Term Memory",
+        onclick: () => {
+          closeModal();
+          if (onNavigate) {
+            onNavigate("#skills/memory");
+          } else {
+            window.location.hash = "#skills/memory";
+          }
+        },
+      }),
     ),
     doctorBox,
     el("h4", { className: "mt-3", text: `Timers (${(timersData.timers || []).length})` }),
@@ -462,13 +475,58 @@ export async function renderChat(main, ctx, sub) {
   }
   localStorage.setItem("fleet_chat_channel", activeChannel);
 
-  const channelListEl = el("div", { className: "chat-channels" });
-  const msgListEl = el("div", { className: "chat-messages" });
+  const msgInnerEl = el("div", { className: "chat-messages-inner" });
+  const msgListEl = el("div", { className: "chat-messages" }, msgInnerEl);
   const statusPill = badge("connecting", "neutral");
   const streamBox = el("div", { className: "chat-msg chat-msg-assistant hidden" });
   const streamMeta = el("div", { className: "small muted mb-1" });
   const streamBody = el("div", { className: "chat-md" });
   streamBox.append(streamMeta, streamBody);
+
+  const channelSelect = el(
+    "select",
+    { className: "chat-channel-select", "aria-label": "Channel" },
+    ...channels.map((ch) => el("option", { value: ch.id, text: ch.title || `#${ch.id}` })),
+    el("option", { value: "__new__", text: "+ New Channel…" }),
+  );
+  channelSelect.value = activeChannel;
+
+  const openNewChannelModal = () => {
+    const idIn = el("input", { type: "text", placeholder: "e.g. research" });
+    const modelIn = el("input", { type: "text", placeholder: "optional model slug" });
+    openModal(
+      "New Channel",
+      el(
+        "div",
+        { className: "stack" },
+        field("Channel Slug", idIn),
+        field("Default Model (optional)", modelIn),
+        el("button", {
+          type: "button",
+          className: "btn btn-primary",
+          text: "Create",
+          onclick: async () => {
+            try {
+              const res = await api("POST", "/v1/assistant/channels", { id: idIn.value.trim(), model: modelIn.value.trim() });
+              closeModal();
+              ctx.navigate(`#chat/${res.channel.id}`);
+            } catch (err) {
+              toast(err.message, "error");
+            }
+          },
+        }),
+      ),
+    );
+  };
+
+  channelSelect.addEventListener("change", () => {
+    if (channelSelect.value === "__new__") {
+      channelSelect.value = activeChannel;
+      openNewChannelModal();
+      return;
+    }
+    ctx.navigate(`#chat/${channelSelect.value}`);
+  });
 
   const modelSelect = el(
     "select",
@@ -477,10 +535,20 @@ export async function renderChat(main, ctx, sub) {
   );
   const inputEl = el("textarea", {
     className: "chat-input",
-    rows: "2",
-    placeholder: "Message assistant… (tip: prefix /astra, /opus, /sonnet, /muse, /deepseek)",
+    rows: "1",
+    placeholder: "Message assistant… (/astra, /opus, /sonnet, /muse, /deepseek)",
   });
-  const sendBtn = el("button", { type: "button", className: "btn btn-primary", text: "Send" });
+  const sendBtn = el("button", { type: "button", className: "btn btn-sm btn-primary", text: "Send" });
+
+  const resizeComposer = () => {
+    inputEl.style.height = "auto";
+    inputEl.style.height = `${Math.min(inputEl.scrollHeight, 128)}px`;
+  };
+  inputEl.addEventListener("input", resizeComposer);
+
+  const scrollMessagesToBottom = () => {
+    msgListEl.scrollTop = msgListEl.scrollHeight;
+  };
 
   let pendingApprovals = [];
   const loadChannelData = async () => {
@@ -499,6 +567,7 @@ export async function renderChat(main, ctx, sub) {
     }
     if (overrideText === null) {
       inputEl.value = "";
+      resizeComposer();
     }
     try {
       await api("POST", "/v1/assistant/messages", {
@@ -512,13 +581,13 @@ export async function renderChat(main, ctx, sub) {
   };
 
   const renderMessages = (messages) => {
-    clear(msgListEl);
+    clear(msgInnerEl);
     if (messages.length === 0 && pendingApprovals.length === 0) {
-      msgListEl.appendChild(
+      msgInnerEl.appendChild(
         el("div", {
-          className: "muted small",
+          className: "chat-empty muted small",
           text: cfgView.configured
-            ? `No messages in #${activeChannel} yet. Ask about Fleet agents, shared memory, Slack, or your Obsidian skills.`
+            ? `Short-term thread in #${activeChannel} is empty. New Chat clears this thread while keeping long-term Observations, Reflections, and Fleet Memory.`
             : "Configure your OpenRouter API key in Settings to start chatting.",
         }),
       );
@@ -539,62 +608,13 @@ export async function renderChat(main, ctx, sub) {
       if (footer) {
         bubble.appendChild(el("div", { className: "chat-msg-footer mono", text: footer }));
       }
-      msgListEl.appendChild(bubble);
+      msgInnerEl.appendChild(bubble);
     }
     for (const apr of pendingApprovals) {
-      msgListEl.appendChild(renderApprovalCard(apr, loadChannelData));
+      msgInnerEl.appendChild(renderApprovalCard(apr, loadChannelData));
     }
-    msgListEl.appendChild(streamBox);
-    msgListEl.scrollTop = msgListEl.scrollHeight;
-  };
-
-  const renderChannelBar = () => {
-    clear(channelListEl);
-    for (const ch of channels) {
-      const active = ch.id === activeChannel;
-      channelListEl.appendChild(
-        el("button", {
-          type: "button",
-          className: `btn btn-sm ${active ? "btn-primary" : ""}`,
-          text: ch.title || `#${ch.id}`,
-          onclick: () => ctx.navigate(`#chat/${ch.id}`),
-        }),
-      );
-    }
-    channelListEl.appendChild(
-      el("button", {
-        type: "button",
-        className: "btn btn-sm btn-ghost",
-        text: "+ Channel",
-        onclick: () => {
-          const idIn = el("input", { type: "text", placeholder: "e.g. research" });
-          const modelIn = el("input", { type: "text", placeholder: "optional model slug" });
-          openModal(
-            "New Channel",
-            el(
-              "div",
-              { className: "stack" },
-              field("Channel Slug", idIn),
-              field("Default Model (optional)", modelIn),
-              el("button", {
-                type: "button",
-                className: "btn btn-primary",
-                text: "Create",
-                onclick: async () => {
-                  try {
-                    const res = await api("POST", "/v1/assistant/channels", { id: idIn.value.trim(), model: modelIn.value.trim() });
-                    closeModal();
-                    ctx.navigate(`#chat/${res.channel.id}`);
-                  } catch (err) {
-                    toast(err.message, "error");
-                  }
-                },
-              }),
-            ),
-          );
-        },
-      }),
-    );
+    msgInnerEl.appendChild(streamBox);
+    scrollMessagesToBottom();
   };
 
   sendBtn.addEventListener("click", () => sendMessage(null));
@@ -605,48 +625,106 @@ export async function renderChat(main, ctx, sub) {
     }
   });
 
-  const actions = el(
-    "div",
-    { className: "actions-row" },
-    statusPill,
-    el("button", {
-      type: "button",
-      className: "btn btn-sm",
-      text: "Reset Context",
-      title: "Start a fresh LLM context window while keeping scrollback",
-      onclick: async () => {
-        try {
-          await api("POST", `/v1/assistant/channels/${encodeURIComponent(activeChannel)}/reset`);
-          toast(`Context reset for #${activeChannel}`, "ok");
-        } catch (err) {
-          toast(err.message, "error");
-        }
-      },
-    }),
-    el("button", {
-      type: "button",
-      className: "btn btn-sm",
-      text: "Settings",
-      onclick: () => openAssistantSettingsModal(() => ctx.refresh()),
-    }),
+  const topbar = el(
+    "header",
+    { className: "chat-topbar" },
+    el(
+      "div",
+      { className: "chat-topbar-left" },
+      el("button", {
+        type: "button",
+        className: "btn btn-sm chat-menu-btn",
+        "aria-label": "Open Fleet menu",
+        text: "☰",
+        onclick: () => ctx.openMenu && ctx.openMenu(),
+      }),
+      channelSelect,
+      statusPill,
+    ),
+    el(
+      "div",
+      { className: "chat-topbar-right" },
+      el("button", {
+        type: "button",
+        className: "btn btn-sm",
+        text: "New Chat",
+        title: "Clear this chat thread & start fresh context (long-term memory stays intact)",
+        onclick: async () => {
+          try {
+            await api("POST", `/v1/assistant/channels/${encodeURIComponent(activeChannel)}/reset`, { clear_history: true });
+            streamBox.classList.add("hidden");
+            streamText = "";
+            await loadChannelData();
+            toast("Chat cleared — long-term memory preserved", "ok");
+          } catch (err) {
+            toast(err.message, "error");
+          }
+        },
+      }),
+      el("button", {
+        type: "button",
+        className: "btn btn-sm",
+        text: "Settings",
+        onclick: () => openAssistantSettingsModal(() => ctx.refresh(), (h) => ctx.navigate(h)),
+      }),
+    ),
   );
 
-  renderChannelBar();
   const shell = el(
     "div",
     { className: "chat-shell" },
-    channelListEl,
+    topbar,
     msgListEl,
     el(
       "div",
       { className: "chat-composer" },
-      inputEl,
-      el("div", { className: "chat-composer-bar" }, modelSelect, sendBtn),
+      el(
+        "div",
+        { className: "chat-composer-inner" },
+        inputEl,
+        el("div", { className: "chat-composer-bar" }, modelSelect, sendBtn),
+      ),
     ),
   );
-  main.appendChild(section("Assistant Chat", { subtitle: cfgView.configured ? `Model: ${(cfgView.models && cfgView.models.default_chat) || ""}` : "Not configured", actions }, shell));
+  main.appendChild(shell);
 
   await loadChannelData();
+
+  const kbTimers = new Set();
+  const syncViewport = () => {
+    const vv = window.visualViewport;
+    const vh = vv ? vv.height : window.innerHeight;
+    const vt = vv ? vv.offsetTop : 0;
+    const kbOpen = vv ? window.innerHeight - vv.height > 110 : false;
+    const nearBottom = msgListEl.scrollHeight - msgListEl.scrollTop - msgListEl.clientHeight < 96;
+    document.documentElement.style.setProperty("--vvh", `${Math.round(vh)}px`);
+    document.documentElement.style.setProperty("--vvt", `${Math.round(vt)}px`);
+    document.documentElement.classList.toggle("kb-open", kbOpen);
+    if (kbOpen) {
+      window.scrollTo(0, 0);
+    }
+    if (kbOpen || nearBottom) {
+      scrollMessagesToBottom();
+    }
+  };
+  const onFocusInput = () => {
+    syncViewport();
+    for (const delay of [80, 260]) {
+      const id = setTimeout(() => {
+        kbTimers.delete(id);
+        syncViewport();
+        scrollMessagesToBottom();
+      }, delay);
+      kbTimers.add(id);
+    }
+  };
+  syncViewport();
+  window.addEventListener("resize", syncViewport);
+  inputEl.addEventListener("focus", onFocusInput);
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", syncViewport);
+    window.visualViewport.addEventListener("scroll", syncViewport);
+  }
 
   let streamText = "";
   const es = new EventSource("/v1/assistant/stream");
@@ -665,7 +743,7 @@ export async function renderChat(main, ctx, sub) {
     streamMeta.textContent = `Running (${(d.data && d.data.model) || ""})…`;
     clear(streamBody);
     streamBox.classList.remove("hidden");
-    msgListEl.scrollTop = msgListEl.scrollHeight;
+    scrollMessagesToBottom();
   });
   es.addEventListener("tool_start", (ev) => {
     const d = JSON.parse(ev.data || "{}");
@@ -681,7 +759,7 @@ export async function renderChat(main, ctx, sub) {
     streamText += (d.data && d.data.delta) || "";
     clear(streamBody);
     streamBody.appendChild(renderMarkdownDOM(streamText));
-    msgListEl.scrollTop = msgListEl.scrollHeight;
+    scrollMessagesToBottom();
   });
   const onReloadEvent = (ev) => {
     const d = JSON.parse(ev.data || "{}");
@@ -695,6 +773,7 @@ export async function renderChat(main, ctx, sub) {
   es.addEventListener("message_done", onReloadEvent);
   es.addEventListener("approval", onReloadEvent);
   es.addEventListener("approval_decided", onReloadEvent);
+  es.addEventListener("channel_reset", onReloadEvent);
   es.addEventListener("error", (ev) => {
     if (!ev.data) {
       return;
@@ -731,5 +810,16 @@ export async function renderChat(main, ctx, sub) {
   state.routeCleanup = () => {
     es.close();
     window.removeEventListener("message", onWindowMsg);
+    window.removeEventListener("resize", syncViewport);
+    inputEl.removeEventListener("focus", onFocusInput);
+    if (window.visualViewport) {
+      window.visualViewport.removeEventListener("resize", syncViewport);
+      window.visualViewport.removeEventListener("scroll", syncViewport);
+    }
+    for (const id of kbTimers) {
+      clearTimeout(id);
+    }
+    kbTimers.clear();
+    document.documentElement.classList.remove("kb-open");
   };
 }

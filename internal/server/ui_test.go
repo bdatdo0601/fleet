@@ -145,7 +145,7 @@ func TestWebUIAssetsSecurityAndStrangers(t *testing.T) {
 			if err := json.Unmarshal(b, &manifest); err != nil {
 				t.Fatalf("unmarshal manifest: %v", err)
 			}
-			if manifest.ID != "/" || manifest.StartURL != "/#overview" || manifest.Scope != "/" || manifest.Display != "standalone" {
+			if manifest.ID != "/" || manifest.StartURL != "/" || manifest.Scope != "/" || manifest.Display != "standalone" {
 				t.Fatalf("unexpected manifest metadata: %+v", manifest)
 			}
 			seen := make(map[string]bool)

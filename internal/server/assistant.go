@@ -247,11 +247,25 @@ func registerAssistantChatRoutes(
 		return nil
 	}))
 	mux.HandleFunc("POST /v1/assistant/channels/{id}/reset", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
-		ch, err := fleet.Assistant.Store().ResetChannelContext(r.PathValue("id"))
+		var req struct {
+			ClearHistory *bool `json:"clear_history"`
+		}
+		if err := readJSONBody(r, &req); err != nil {
+			return err
+		}
+		clearHistory := true
+		if req.ClearHistory != nil {
+			clearHistory = *req.ClearHistory
+		}
+		ch, err := fleet.Assistant.ResetChannel(r.PathValue("id"), clearHistory)
 		if err != nil {
 			return err
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"channel": ch})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"channel":                    ch,
+			"cleared_history":            clearHistory,
+			"long_term_memory_preserved": true,
+		})
 		return nil
 	}))
 	mux.HandleFunc("GET /v1/assistant/messages", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {

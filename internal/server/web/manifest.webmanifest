@@ -3,7 +3,7 @@
   "name": "Fleet Console",
   "short_name": "Fleet",
   "description": "Fleet mesh, AI agent sessions, shared memory, and Slacker control plane",
-  "start_url": "/#overview",
+  "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "orientation": "any",

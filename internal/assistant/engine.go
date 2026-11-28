@@ -470,6 +470,21 @@ func (e *Engine) DecideApproval(id string, approve bool, note string) (Approval,
 	return apr, nil
 }
 
+// ResetChannel starts a fresh context epoch and optionally clears channel message history,
+// leaving long-term Vault Observational Memory and Fleet shared memory untouched.
+func (e *Engine) ResetChannel(id string, clearHistory bool) (Channel, error) {
+	ch, err := e.store.ResetChannelContext(id, clearHistory)
+	if err != nil {
+		return Channel{}, err
+	}
+	e.publishEvent(StreamEvent{
+		Type:      "channel_reset",
+		ChannelID: ch.ID,
+		Data:      map[string]any{"channel": ch, "cleared": clearHistory},
+	})
+	return ch, nil
+}
+
 func (e *Engine) runWorker(ctx context.Context) {
 	defer e.wg.Done()
 	for {

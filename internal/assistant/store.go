@@ -357,14 +357,16 @@ func (s *Store) UpsertChannel(id, title, description, model string) (Channel, er
 	return ch, nil
 }
 
-// ResetChannelContext increments context_epoch so active LLM context starts fresh while UI scrollback stays intact.
-func (s *Store) ResetChannelContext(id string) (Channel, error) {
+// ResetChannelContext increments context_epoch so active LLM context starts fresh,
+// and optionally clears channel scrollback & pending approvals without touching long-term memory.
+func (s *Store) ResetChannelContext(id string, clearHistory bool) (Channel, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	cleanID := strings.TrimSpace(id)
 	now := registry.NowISO()
 	res, err := s.db.Exec(
 		`UPDATE assistant_channels SET context_epoch = context_epoch + 1, updated_at = ? WHERE id = ?`,
-		now, strings.TrimSpace(id),
+		now, cleanID,
 	)
 	if err != nil {
 		return Channel{}, err
@@ -372,9 +374,20 @@ func (s *Store) ResetChannelContext(id string) (Channel, error) {
 	if n, _ := res.RowsAffected(); n == 0 {
 		return Channel{}, newErr(fmt.Sprintf("channel %q not found", id), http.StatusNotFound)
 	}
+	if clearHistory {
+		if _, err := s.db.Exec(`DELETE FROM assistant_messages WHERE channel_id = ?`, cleanID); err != nil {
+			return Channel{}, err
+		}
+		if _, err := s.db.Exec(
+			`UPDATE assistant_approvals SET status = 'cancelled', decided_at = ? WHERE channel_id = ? AND status = 'pending'`,
+			now, cleanID,
+		); err != nil {
+			return Channel{}, err
+		}
+	}
 	var ch Channel
 	if err := s.db.QueryRow(
-		`SELECT id, title, description, model, context_epoch, created_at, updated_at FROM assistant_channels WHERE id = ?`, id,
+		`SELECT id, title, description, model, context_epoch, created_at, updated_at FROM assistant_channels WHERE id = ?`, cleanID,
 	).Scan(&ch.ID, &ch.Title, &ch.Description, &ch.Model, &ch.ContextEpoch, &ch.CreatedAt, &ch.UpdatedAt); err != nil {
 		return Channel{}, err
 	}

@@ -409,6 +409,35 @@ func TestEngineStreamingRoutingApprovalsAndObservationalMemory(t *testing.T) {
 	if err != nil || refl == "" {
 		t.Fatalf("RunReflector failed: %q (%v)", refl, err)
 	}
+
+	// ResetChannel with clearHistory=false bumps epoch while retaining messages;
+	// clearHistory=true clears channel messages & cancels pending approvals while preserving Vault memory.
+	if _, err := eng.Store().AppendMessage(Message{ChannelID: "general", ContextEpoch: 1, Role: "user", Content: "keep temporarily"}); err != nil {
+		t.Fatal(err)
+	}
+	chKeep, err := eng.ResetChannel("general", false)
+	if err != nil || chKeep.ContextEpoch != 2 {
+		t.Fatalf("expected epoch=2, got %+v (%v)", chKeep, err)
+	}
+	if msgs, err := eng.Store().ListMessages("general", 50); err != nil || len(msgs) == 0 {
+		t.Fatalf("expected messages kept when clearHistory=false, got %d (%v)", len(msgs), err)
+	}
+	if _, err := eng.Store().CreateApproval(Approval{ChannelID: "general", ToolName: "vault_write", ArgsJSON: "{}", Summary: "pending test"}); err != nil {
+		t.Fatal(err)
+	}
+	chClear, err := eng.ResetChannel("general", true)
+	if err != nil || chClear.ContextEpoch != 3 {
+		t.Fatalf("expected epoch=3, got %+v (%v)", chClear, err)
+	}
+	if msgs, err := eng.Store().ListMessages("general", 50); err != nil || len(msgs) != 0 {
+		t.Fatalf("expected channel messages cleared when clearHistory=true, got %d (%v)", len(msgs), err)
+	}
+	if pend, err := eng.Store().ListApprovals("pending", 10); err != nil || len(pend) != 0 {
+		t.Fatalf("expected pending approvals cancelled on clearHistory=true, got %+v (%v)", pend, err)
+	}
+	if reflAfter, rErr := v.ReadFile("_agent/memory/REFLECTIONS.md"); rErr != nil || !strings.Contains(reflAfter, "Observational Memory") {
+		t.Fatalf("expected long-term REFLECTIONS.md preserved across channel reset, got %q (%v)", reflAfter, rErr)
+	}
 }
 
 func TestSaveAndResolveOPToken(t *testing.T) {

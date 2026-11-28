@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
   <meta name="description" content="Fleet mesh, AI agent sessions, shared memory, and Slacker control plane">
   <meta name="theme-color" content="#f8fafc" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#0b1120" media="(prefers-color-scheme: dark)">
@@ -23,7 +23,7 @@
   <div class="app-shell">
     <header class="topbar">
       <div class="topbar-left">
-        <a href="#overview" class="brand">
+        <a href="#" class="brand">
           <img src="/assets/favicon.svg" alt="" class="brand-icon">
           <span>fleet</span>
         </a>
@@ -59,6 +59,35 @@
     </main>
 
     <nav id="mobile-nav" class="bottom-nav" aria-label="Mobile navigation"></nav>
+  </div>
+
+  <div id="nav-drawer-backdrop" class="nav-drawer-backdrop hidden" aria-hidden="true">
+    <aside id="nav-drawer" class="nav-drawer" role="dialog" aria-modal="true" aria-label="Fleet Menu">
+      <div class="nav-drawer-header">
+        <a href="#" class="brand">
+          <img src="/assets/favicon.svg" alt="" class="brand-icon">
+          <span>fleet</span>
+        </a>
+        <button id="drawer-close" type="button" class="btn btn-sm btn-ghost" aria-label="Close menu">Close</button>
+      </div>
+      <nav id="drawer-nav" class="drawer-nav" aria-label="Fleet sections"></nav>
+      <div class="drawer-controls">
+        <div id="drawer-caller" class="caller-badge">connecting…</div>
+        <div class="actions-row">
+          <button id="drawer-refresh" type="button" class="btn btn-sm grow">Refresh</button>
+          <button id="drawer-theme" type="button" class="btn btn-sm grow">Theme</button>
+        </div>
+        <label class="field">
+          <span class="field-label">Auto-refresh</span>
+          <select id="drawer-refresh-select" aria-label="Drawer auto refresh">
+            <option value="0">Auto: Off</option>
+            <option value="5000">Auto: 5s</option>
+            <option value="15000">Auto: 15s</option>
+            <option value="30000">Auto: 30s</option>
+          </select>
+        </label>
+      </div>
+    </aside>
   </div>
 
   <div id="modal-backdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-title" aria-hidden="true">
