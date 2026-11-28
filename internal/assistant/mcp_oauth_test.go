@@ -855,3 +855,255 @@ func TestMCPElicitationManualApprovalAndAutoApprove(t *testing.T) {
 		t.Fatalf("unexpected replay choices: %+v", replayChoices)
 	}
 }
+
+func TestMCPStateless20260728ServerDiscoverAndLegacyFallback(t *testing.T) {
+	t.Run("stateless_2026_07_28_server_discover", func(t *testing.T) {
+		var sawDiscover atomic.Bool
+		var sawInitialize atomic.Bool
+		var sawInitializedNotify atomic.Bool
+		var listProtoHeader atomic.Value
+		var listMetaCaps atomic.Bool
+		var callMetaCaps atomic.Bool
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				ID     int64          `json:"id"`
+				Method string         `json:"method"`
+				Params map[string]any `json:"params"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			w.Header().Set("Content-Type", "application/json")
+			switch req.Method {
+			case "server/discover":
+				sawDiscover.Store(true)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      req.ID,
+					"result": map[string]any{
+						"resultType":        "complete",
+						"supportedVersions": []string{"2026-07-28"},
+						"_meta": map[string]any{
+							"io.modelcontextprotocol/serverInfo": map[string]any{
+								"name":    "gmail",
+								"version": "1.0.0",
+							},
+						},
+					},
+				})
+			case "initialize":
+				sawInitialize.Store(true)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      req.ID,
+					"error":   map[string]any{"code": -32601, "message": "Method not supported"},
+				})
+			case "notifications/initialized":
+				sawInitializedNotify.Store(true)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"error":   map[string]any{"code": -32601, "message": "Method not supported"},
+				})
+			case "tools/list":
+				listProtoHeader.Store(r.Header.Get("MCP-Protocol-Version"))
+				if meta, _ := req.Params["_meta"].(map[string]any); meta != nil {
+					if cc, _ := meta["io.modelcontextprotocol/clientCapabilities"].(map[string]any); cc != nil {
+						if elic, _ := cc["elicitation"].(map[string]any); elic != nil {
+							if _, ok := elic["form"]; ok {
+								listMetaCaps.Store(true)
+							}
+						}
+					}
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      req.ID,
+					"result": map[string]any{
+						"tools": []map[string]any{
+							{"name": "list_messages", "description": "List Gmail messages"},
+						},
+					},
+				})
+			case "tools/call":
+				if meta, _ := req.Params["_meta"].(map[string]any); meta != nil {
+					if cc, _ := meta["io.modelcontextprotocol/clientCapabilities"].(map[string]any); cc != nil {
+						if elic, _ := cc["elicitation"].(map[string]any); elic != nil {
+							if _, ok := elic["form"]; ok {
+								callMetaCaps.Store(true)
+							}
+						}
+					}
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      req.ID,
+					"result":  map[string]any{"messages": []string{"msg-1"}},
+				})
+			}
+		}))
+		defer srv.Close()
+
+		mgr := NewMCPManager([]MCPServerConfig{{
+			Name:           "gmail",
+			Transport:      "http",
+			URL:            srv.URL,
+			Enabled:        true,
+			ApprovalPolicy: MCPApprovalPolicyNone,
+		}}, nil)
+		defer mgr.Close()
+
+		tools := mgr.ListTools(t.Context())
+		if len(tools) != 1 || tools[0].RemoteName != "list_messages" {
+			t.Fatalf("expected list_messages tool, got %+v", tools)
+		}
+		res, err := mgr.CallTool(t.Context(), "mcp__gmail__list_messages", map[string]any{"q": "in:inbox"})
+		if err != nil {
+			t.Fatalf("CallTool failed: %v", err)
+		}
+		if resMap, _ := res.(map[string]any); resMap == nil {
+			t.Fatalf("expected map result, got %#v", res)
+		}
+		if !sawDiscover.Load() {
+			t.Fatal("expected server/discover to be called")
+		}
+		if sawInitialize.Load() || sawInitializedNotify.Load() {
+			t.Fatalf("expected initialize (%v) and notifications/initialized (%v) NOT to be called on stateless server", sawInitialize.Load(), sawInitializedNotify.Load())
+		}
+		if gotProto, _ := listProtoHeader.Load().(string); gotProto != "2026-07-28" || !listMetaCaps.Load() || !callMetaCaps.Load() {
+			t.Fatalf("expected 2026-07-28 header (%q) + list/call meta caps (%v/%v)", gotProto, listMetaCaps.Load(), callMetaCaps.Load())
+		}
+	})
+
+	t.Run("legacy_2024_11_05_fallback", func(t *testing.T) {
+		var sawLegacyInit atomic.Bool
+		var sawInitializedNotify atomic.Bool
+		var listProtoHeader atomic.Value
+		var callProtoHeader atomic.Value
+		var sawMetaOnList atomic.Bool
+		var sawMetaOnCall atomic.Bool
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				ID     int64          `json:"id"`
+				Method string         `json:"method"`
+				Params map[string]any `json:"params"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			w.Header().Set("Content-Type", "application/json")
+			switch req.Method {
+			case "server/discover":
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      req.ID,
+					"error":   map[string]any{"code": -32601, "message": "Method not found"},
+				})
+			case "initialize":
+				pv, _ := req.Params["protocolVersion"].(string)
+				if pv == "2026-07-28" || r.Header.Get("MCP-Protocol-Version") == "2026-07-28" {
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"jsonrpc": "2.0",
+						"id":      req.ID,
+						"error":   map[string]any{"code": -32022, "message": "Unsupported protocol version"},
+					})
+					return
+				}
+				if pv != "2024-11-05" {
+					http.Error(w, "bad protocolVersion "+pv, http.StatusBadRequest)
+					return
+				}
+				sawLegacyInit.Store(true)
+				w.Header().Set("Mcp-Session-Id", "legacy-sess-1")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      req.ID,
+					"result":  map[string]any{"protocolVersion": "2024-11-05"},
+				})
+			case "notifications/initialized":
+				sawInitializedNotify.Store(true)
+				w.WriteHeader(http.StatusAccepted)
+			case "tools/list":
+				listProtoHeader.Store(r.Header.Get("MCP-Protocol-Version"))
+				if _, hasMeta := req.Params["_meta"]; hasMeta {
+					sawMetaOnList.Store(true)
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      req.ID,
+					"result":  map[string]any{"tools": []map[string]any{{"name": "legacy_ping"}}},
+				})
+			case "tools/call":
+				callProtoHeader.Store(r.Header.Get("MCP-Protocol-Version"))
+				if _, hasMeta := req.Params["_meta"]; hasMeta {
+					sawMetaOnCall.Store(true)
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      req.ID,
+					"result":  map[string]any{"pong": true},
+				})
+			}
+		}))
+		defer srv.Close()
+
+		mgr := NewMCPManager([]MCPServerConfig{{
+			Name:           "legacy",
+			Transport:      "http",
+			URL:            srv.URL,
+			Enabled:        true,
+			ApprovalPolicy: MCPApprovalPolicyNone,
+		}}, nil)
+		defer mgr.Close()
+
+		res, err := mgr.CallTool(t.Context(), "mcp__legacy__legacy_ping", nil)
+		if err != nil {
+			t.Fatalf("legacy CallTool failed: %v", err)
+		}
+		if resMap, _ := res.(map[string]any); resMap == nil || resMap["pong"] != true {
+			t.Fatalf("unexpected legacy result: %#v", res)
+		}
+		if !sawLegacyInit.Load() || !sawInitializedNotify.Load() {
+			t.Fatalf("expected legacy initialize (%v) + notifications/initialized (%v)", sawLegacyInit.Load(), sawInitializedNotify.Load())
+		}
+		if listProtoHeader.Load() != "2024-11-05" || callProtoHeader.Load() != "2024-11-05" {
+			t.Fatalf("expected 2024-11-05 protocol headers, got list=%v call=%v", listProtoHeader.Load(), callProtoHeader.Load())
+		}
+		if sawMetaOnList.Load() || sawMetaOnCall.Load() {
+			t.Fatalf("expected _meta omitted after downgrade to 2024-11-05, got list=%v call=%v", sawMetaOnList.Load(), sawMetaOnCall.Load())
+		}
+	})
+
+	t.Run("http_403_fails_fast_without_initialize", func(t *testing.T) {
+		var sawInitialize atomic.Bool
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				Method string `json:"method"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.Method == "initialize" {
+				sawInitialize.Store(true)
+			}
+			http.Error(w, "forbidden", http.StatusForbidden)
+		}))
+		defer srv.Close()
+
+		mgr := NewMCPManager([]MCPServerConfig{{
+			Name:      "blocked",
+			Transport: "http",
+			URL:       srv.URL,
+			Enabled:   true,
+		}}, nil)
+		defer mgr.Close()
+
+		_, err := mgr.TestServer(t.Context(), MCPServerConfig{
+			Name:      "blocked",
+			Transport: "http",
+			URL:       srv.URL,
+			Enabled:   true,
+		})
+		if err == nil || !strings.Contains(err.Error(), "403") {
+			t.Fatalf("expected HTTP 403 error, got %v", err)
+		}
+		if sawInitialize.Load() {
+			t.Fatal("expected HTTP 403 on server/discover NOT to fall back to initialize")
+		}
+	})
+}

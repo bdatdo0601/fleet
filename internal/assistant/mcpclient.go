@@ -27,9 +27,97 @@ import (
 const (
 	mcpMaxHTTPResponseBytes    = 4 * 1024 * 1024
 	mcpProtocolVersion         = "2026-07-28"
+	mcpLegacyProtocolVersion   = "2024-11-05"
 	MCPElicitationApprovalTool = "mcp_elicitation"
 	maxMCPElicitationAutoRound = 3
 )
+
+type mcpJSONRPCError struct {
+	Method  string
+	Code    int
+	Message string
+}
+
+func (e *mcpJSONRPCError) Error() string {
+	return fmt.Sprintf("MCP %s: %s", e.Method, e.Message)
+}
+
+type mcpHTTPStatusError struct {
+	Status  int
+	Message string
+}
+
+func (e *mcpHTTPStatusError) Error() string {
+	return e.Message
+}
+
+func isMCPMethodUnsupportedError(err error) bool {
+	if rpcErr, ok := errors.AsType[*mcpJSONRPCError](err); ok {
+		if rpcErr.Code == -32601 {
+			return true
+		}
+		msg := strings.ToLower(rpcErr.Message)
+		return strings.Contains(msg, "method not supported") ||
+			strings.Contains(msg, "method not found") ||
+			strings.Contains(msg, "unknown method") ||
+			strings.Contains(msg, "unsupported method") ||
+			strings.Contains(msg, "not implemented")
+	}
+	return false
+}
+
+func isMCPProtocolVersionError(err error) bool {
+	if rpcErr, ok := errors.AsType[*mcpJSONRPCError](err); ok && rpcErr.Code == -32022 {
+		return true
+	}
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "protocol version") ||
+		strings.Contains(msg, "protocolversion") ||
+		strings.Contains(msg, "mcp-protocol-version") ||
+		strings.Contains(msg, "unsupported version")
+}
+
+func isIgnorableInitializedNotifyError(err error) bool {
+	if isMCPMethodUnsupportedError(err) {
+		return true
+	}
+	if httpErr, ok := errors.AsType[*mcpHTTPStatusError](err); ok {
+		switch httpErr.Status {
+		case http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusNotImplemented:
+			return true
+		}
+	}
+	return false
+}
+
+func shouldFallbackFromDiscover(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil {
+		return false
+	}
+	if httpErr, ok := errors.AsType[*mcpHTTPStatusError](err); ok {
+		switch httpErr.Status {
+		case http.StatusBadRequest, http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusUnprocessableEntity, http.StatusNotImplemented:
+			return true
+		default:
+			return false
+		}
+	}
+	if _, ok := errors.AsType[*mcpJSONRPCError](err); ok {
+		return true
+	}
+	if _, ok := errors.AsType[*json.SyntaxError](err); ok {
+		return true
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "missing matching JSON-RPC response") ||
+		strings.Contains(msg, "no matching JSON-RPC response in SSE")
+}
 
 // MCPElicitationOption represents a single server-provided approval choice.
 type MCPElicitationOption struct {
@@ -155,18 +243,27 @@ type MCPServerStatus struct {
 }
 
 type mcpClientConn struct {
-	cfg        MCPServerConfig
-	cmd        *exec.Cmd
-	stdin      io.WriteCloser
-	stdout     io.ReadCloser
-	reader     *bufio.Reader
-	httpClient *http.Client
-	oauth      *MCPOAuthManager
-	sessionID  string
-	mu         sync.Mutex
-	nextID     atomic.Int64
-	tools      []ExternalTool
-	started    bool
+	cfg             MCPServerConfig
+	cmd             *exec.Cmd
+	stdin           io.WriteCloser
+	stdout          io.ReadCloser
+	reader          *bufio.Reader
+	httpClient      *http.Client
+	oauth           *MCPOAuthManager
+	sessionID       string
+	protocolVersion string
+	mu              sync.Mutex
+	nextID          atomic.Int64
+	tools           []ExternalTool
+	started         bool
+}
+
+func (c *mcpClientConn) effectiveProtocolVersion() string {
+	return cmp.Or(c.protocolVersion, mcpProtocolVersion)
+}
+
+func (c *mcpClientConn) useStatelessMeta() bool {
+	return c.cfg.Transport == "http" && c.effectiveProtocolVersion() == mcpProtocolVersion
 }
 
 // MCPManager lazily spawns/connects and calls configured stdio or HTTP/SSE MCP servers.
@@ -457,6 +554,7 @@ func (c *mcpClientConn) finishStdioWaitLocked() {
 	}
 	c.reader = nil
 	c.sessionID = ""
+	c.protocolVersion = ""
 	c.started = false
 }
 
@@ -485,6 +583,7 @@ func (c *mcpClientConn) ensureStarted(ctx context.Context, opReader OPReaderFunc
 		if err := c.handshakeLocked(ctx, opReader); err != nil {
 			c.started = false
 			c.sessionID = ""
+			c.protocolVersion = ""
 			return err
 		}
 		return nil
@@ -604,26 +703,63 @@ func (c *mcpClientConn) startStdioLocked(ctx context.Context, opReader OPReaderF
 	return nil
 }
 
-func (c *mcpClientConn) handshakeLocked(ctx context.Context, opReader OPReaderFunc) error {
-	caps := map[string]any{}
-	if c.cfg.Transport == "http" {
-		caps = mcpClientCapabilities()
+func (c *mcpClientConn) handshakeHTTPLocked(ctx context.Context, opReader OPReaderFunc) error {
+	c.protocolVersion = mcpProtocolVersion
+	if _, err := c.rpcCallLocked(ctx, opReader, "server/discover", map[string]any{}); err == nil {
+		return nil
+	} else if !shouldFallbackFromDiscover(ctx, err) {
+		return err
 	}
-	if _, err := c.rpcCallLocked(ctx, opReader, "initialize", map[string]any{
+
+	_, initErr := c.rpcCallLocked(ctx, opReader, "initialize", map[string]any{
 		"protocolVersion": mcpProtocolVersion,
-		"capabilities":    caps,
+		"capabilities":    mcpClientCapabilities(),
 		"clientInfo":      mcpClientInfo(),
-	}); err != nil {
-		return err
+	})
+	if initErr != nil {
+		if isMCPMethodUnsupportedError(initErr) {
+			return nil
+		}
+		if !isMCPProtocolVersionError(initErr) {
+			return initErr
+		}
+		c.protocolVersion = mcpLegacyProtocolVersion
+		if _, legErr := c.rpcCallLocked(ctx, opReader, "initialize", map[string]any{
+			"protocolVersion": mcpLegacyProtocolVersion,
+			"capabilities":    map[string]any{},
+			"clientInfo":      mcpClientInfo(),
+		}); legErr != nil {
+			return legErr
+		}
 	}
-	if err := c.notifyLocked(ctx, opReader, "notifications/initialized"); err != nil {
-		return err
+	if nErr := c.notifyLocked(ctx, opReader, "notifications/initialized"); nErr != nil && !isIgnorableInitializedNotifyError(nErr) {
+		return nErr
+	}
+	return nil
+}
+
+func (c *mcpClientConn) handshakeLocked(ctx context.Context, opReader OPReaderFunc) error {
+	if c.cfg.Transport == "http" {
+		if err := c.handshakeHTTPLocked(ctx, opReader); err != nil {
+			return err
+		}
+	} else {
+		if _, err := c.rpcCallLocked(ctx, opReader, "initialize", map[string]any{
+			"protocolVersion": mcpLegacyProtocolVersion,
+			"capabilities":    map[string]any{},
+			"clientInfo":      mcpClientInfo(),
+		}); err != nil {
+			return err
+		}
+		if err := c.notifyLocked(ctx, opReader, "notifications/initialized"); err != nil {
+			return err
+		}
 	}
 	c.tools = nil
 	cursor := ""
 	for range 20 {
 		params := map[string]any{}
-		if c.cfg.Transport == "http" {
+		if c.useStatelessMeta() {
 			params["_meta"] = mcpStatelessMeta()
 		}
 		if cursor != "" {
@@ -700,7 +836,7 @@ func (c *mcpClientConn) callToolWithElicitation(ctx context.Context, opReader OP
 		"name":      remoteName,
 		"arguments": cmp.Or[any](args, map[string]any{}),
 	}
-	if c.cfg.Transport == "http" {
+	if c.useStatelessMeta() {
 		params["_meta"] = mcpStatelessMeta()
 	}
 	if strings.TrimSpace(requestState) != "" {
@@ -963,7 +1099,7 @@ func (c *mcpClientConn) doHTTPPostOnceLocked(ctx context.Context, opReader OPRea
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	req.Header.Set("MCP-Protocol-Version", mcpProtocolVersion)
+	req.Header.Set("MCP-Protocol-Version", c.effectiveProtocolVersion())
 	if c.sessionID != "" {
 		req.Header.Set("Mcp-Session-Id", c.sessionID)
 	}
@@ -1002,7 +1138,10 @@ func (c *mcpClientConn) httpPostLocked(ctx context.Context, opReader OPReaderFun
 		return nil, fmt.Errorf("MCP HTTP response exceeded %d byte limit", mcpMaxHTTPResponseBytes)
 	}
 	if status >= 400 {
-		return nil, errors.New(scrubAllSecrets(fmt.Sprintf("MCP HTTP %d: %s", status, strings.TrimSpace(string(body))), secrets))
+		return nil, &mcpHTTPStatusError{
+			Status:  status,
+			Message: scrubAllSecrets(fmt.Sprintf("MCP HTTP %d: %s", status, strings.TrimSpace(string(body))), secrets),
+		}
 	}
 	if wantID == 0 {
 		return nil, nil
@@ -1091,7 +1230,11 @@ func parseJSONRPCResponse(raw []byte, id int64, method string) (json.RawMessage,
 		return nil, false, nil
 	}
 	if resp.Error != nil {
-		return nil, true, fmt.Errorf("MCP %s: %s", method, resp.Error.Message)
+		return nil, true, &mcpJSONRPCError{
+			Method:  method,
+			Code:    resp.Error.Code,
+			Message: resp.Error.Message,
+		}
 	}
 	return resp.Result, true, nil
 }
