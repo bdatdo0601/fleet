@@ -22,8 +22,9 @@ func resolveSessionHome() string {
 	return h
 }
 
-// EnsureDirectoryTrusted pre-populates Claude Code (~/.claude.json) or Codex (~/.codex/config.toml)
-// workspace trust entries for directory so newly spawned sessions skip interactive trust prompts.
+// EnsureDirectoryTrusted pre-populates Claude Code (~/.claude.json), Codex (~/.codex/config.toml),
+// or Antigravity CLI (~/.gemini/antigravity-cli/settings.json) workspace trust entries for directory
+// so newly spawned sessions skip interactive trust prompts.
 func EnsureDirectoryTrusted(harness, directory string) error {
 	dir := strings.TrimSpace(directory)
 	if dir == "" {
@@ -38,6 +39,8 @@ func EnsureDirectoryTrusted(harness, directory string) error {
 		return ensureClaudeTrusted(dir)
 	case HarnessCodex:
 		return ensureCodexTrusted(dir)
+	case HarnessAgy:
+		return ensureAgyTrusted(dir)
 	default:
 		return nil
 	}
@@ -177,5 +180,63 @@ func ensureCodexTrusted(dir string) error {
 		return err
 	}
 	_, err = paths.WriteFileAtomic(cfgPath, []byte(out), 0o600, nil, nil)
+	return err
+}
+
+func agyCLISettingsFilePath() string {
+	if cfgDir := strings.TrimSpace(os.Getenv("FLEET_AGY_CLI_DIR")); cfgDir != "" {
+		return filepath.Join(cfgDir, "settings.json")
+	}
+	return filepath.Join(resolveSessionHome(), ".gemini", "antigravity-cli", "settings.json")
+}
+
+func ensureAgyTrusted(dir string) error {
+	cfgPath := agyCLISettingsFilePath()
+	var root map[string]any
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		root = map[string]any{}
+	} else if len(bytes.TrimSpace(raw)) == 0 {
+		root = map[string]any{}
+	} else {
+		if err := json.Unmarshal(raw, &root); err != nil {
+			return fmt.Errorf("parse %s: %w", cfgPath, err)
+		}
+		if root == nil {
+			root = map[string]any{}
+		}
+	}
+
+	var workspaces []any
+	if rawWS, exists := root["trustedWorkspaces"]; !exists || rawWS == nil {
+		workspaces = []any{}
+	} else {
+		var ok bool
+		workspaces, ok = rawWS.([]any)
+		if !ok {
+			return fmt.Errorf("unexpected trustedWorkspaces field type in %s", cfgPath)
+		}
+		for _, item := range workspaces {
+			if s, ok := item.(string); ok && s == dir {
+				return nil
+			}
+		}
+	}
+
+	workspaces = append(workspaces, dir)
+	root["trustedWorkspaces"] = workspaces
+
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return err
+	}
+	out = append(out, '\n')
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o700); err != nil {
+		return err
+	}
+	_, err = paths.WriteFileAtomic(cfgPath, out, 0o600, nil, nil)
 	return err
 }

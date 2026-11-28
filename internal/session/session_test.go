@@ -1120,8 +1120,65 @@ trust_level = "trusted"
 		t.Fatalf("expected custom codex config.toml created, got %q (%v)", string(raw), err)
 	}
 
-	// 3. Agy is a no-op.
+	// 3. Agy CLI: preserves existing settings & trustedWorkspaces, idempotent, honors FLEET_AGY_CLI_DIR, rejects malformed JSON.
+	t.Setenv("FLEET_AGY_CLI_DIR", "")
+	agyDir := filepath.Join(home, ".gemini", "antigravity-cli")
+	if err := os.MkdirAll(agyDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	agySettingsPath := filepath.Join(agyDir, "settings.json")
+	seedAgy := map[string]any{
+		"model":             "Orchestrator (Neon)",
+		"permissions":       map[string]any{"allow": []string{"command(ls)"}},
+		"trustedWorkspaces": []string{"/existing/agy-repo"},
+	}
+	seedAgyBytes, _ := json.MarshalIndent(seedAgy, "", "  ")
+	if err := os.WriteFile(agySettingsPath, seedAgyBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := EnsureDirectoryTrusted("agy", targetDir); err != nil {
-		t.Fatalf("expected agy no-op, got %v", err)
+		t.Fatalf("EnsureDirectoryTrusted(agy) failed: %v", err)
+	}
+	if err := EnsureDirectoryTrusted("agy", targetDir); err != nil {
+		t.Fatalf("repeat EnsureDirectoryTrusted(agy) failed: %v", err)
+	}
+	rawAgy, err := os.ReadFile(agySettingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotAgy map[string]any
+	if err := json.Unmarshal(rawAgy, &gotAgy); err != nil {
+		t.Fatal(err)
+	}
+	if gotAgy["model"] != "Orchestrator (Neon)" || gotAgy["permissions"].(map[string]any)["allow"] == nil {
+		t.Fatalf("expected existing agy settings preserved, got %+v", gotAgy)
+	}
+	rawTrusted, _ := gotAgy["trustedWorkspaces"].([]any)
+	var trustedList []string
+	for _, it := range rawTrusted {
+		if s, ok := it.(string); ok {
+			trustedList = append(trustedList, s)
+		}
+	}
+	if !slices.Equal(trustedList, []string{"/existing/agy-repo", targetDir}) {
+		t.Fatalf("expected [/existing/agy-repo, %s] without duplicates, got %+v", targetDir, trustedList)
+	}
+
+	customAgyDir := filepath.Join(home, "custom-agy-cli")
+	t.Setenv("FLEET_AGY_CLI_DIR", customAgyDir)
+	if err := EnsureDirectoryTrusted("agy", targetDir); err != nil {
+		t.Fatalf("EnsureDirectoryTrusted(agy custom dir) failed: %v", err)
+	}
+	if raw, err := os.ReadFile(filepath.Join(customAgyDir, "settings.json")); err != nil || !strings.Contains(string(raw), targetDir) {
+		t.Fatalf("expected custom agy settings.json created with %s, got %q (%v)", targetDir, string(raw), err)
+	}
+	if err := os.WriteFile(filepath.Join(customAgyDir, "settings.json"), []byte("{bad-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureDirectoryTrusted("agy", targetDir); err == nil {
+		t.Fatalf("expected error on malformed agy settings.json")
+	}
+	if corrupt, _ := os.ReadFile(filepath.Join(customAgyDir, "settings.json")); string(corrupt) != "{bad-json" {
+		t.Fatalf("malformed agy settings.json should not be overwritten, got %q", string(corrupt))
 	}
 }
