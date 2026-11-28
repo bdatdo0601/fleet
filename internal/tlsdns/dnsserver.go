@@ -298,28 +298,18 @@ func addResource(b *dnsmessage.Builder, r dnsmessage.Resource) error {
 	}
 }
 
-func listenDNS(port int, logf func(string, ...any)) (net.PacketConn, net.Listener, error) {
-	bindHosts := []string{"0.0.0.0", paths.LighthouseIP}
-	var lastErr error
-	for _, host := range bindHosts {
-		addr := fmt.Sprintf("%s:%d", host, port)
-		pc, err := net.ListenPacket("udp4", addr)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		ln, err := net.Listen("tcp4", addr)
-		if err != nil {
-			_ = pc.Close()
-			lastErr = err
-			continue
-		}
-		if host != "0.0.0.0" && logf != nil {
-			logf("dns listening on %s (0.0.0.0 unavailable)", addr)
-		}
-		return pc, ln, nil
+func bindDNSAddr(host string, port int) (net.PacketConn, net.Listener, error) {
+	addr := fmt.Sprintf("%s:%d", host, port)
+	pc, err := net.ListenPacket("udp4", addr)
+	if err != nil {
+		return nil, nil, err
 	}
-	return nil, nil, fmt.Errorf("bind DNS on port %d: %w", port, lastErr)
+	ln, err := net.Listen("tcp4", addr)
+	if err != nil {
+		_ = pc.Close()
+		return nil, nil, err
+	}
+	return pc, ln, nil
 }
 
 func serveDNSPacketConn(ctx context.Context, pc net.PacketConn, provider RecordProvider) {
@@ -379,18 +369,13 @@ func handleDNSTCPConn(ctx context.Context, conn net.Conn, provider RecordProvide
 	_, _ = conn.Write(reply)
 }
 
-// ServeDNS runs UDP and TCP authoritative DNS listeners on bindPort until ctx is canceled.
-func ServeDNS(ctx context.Context, bindPort int, provider RecordProvider, logf func(string, ...any)) error {
-	pc, ln, err := listenDNS(bindPort, logf)
-	if err != nil {
-		return err
-	}
-	if logf != nil {
-		logf("fleet dns listening on %s (udp+tcp)", ln.Addr().String())
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(2)
+func serveDNSListeners(
+	ctx context.Context,
+	pc net.PacketConn,
+	ln net.Listener,
+	provider RecordProvider,
+	wg *sync.WaitGroup,
+) {
 	go func() {
 		defer wg.Done()
 		serveDNSPacketConn(ctx, pc, provider)
@@ -408,10 +393,73 @@ func ServeDNS(ctx context.Context, bindPort int, provider RecordProvider, logf f
 			go handleDNSTCPConn(ctx, conn, provider)
 		}
 	}()
+}
+
+// ServeDNS runs UDP and TCP authoritative DNS listeners on loopback and the Nebula lighthouse IP
+// (never 0.0.0.0, so unrelated virtual bridges such as Apple container vmnet keep their own :53).
+func ServeDNS(ctx context.Context, bindPort int, provider RecordProvider, logf func(string, ...any)) error {
+	var (
+		mu      sync.Mutex
+		closed  bool
+		closers []io.Closer
+		wg      sync.WaitGroup
+	)
+	registerAndServe := func(pc net.PacketConn, ln net.Listener) bool {
+		mu.Lock()
+		if closed {
+			mu.Unlock()
+			_ = pc.Close()
+			_ = ln.Close()
+			return false
+		}
+		closers = append(closers, pc, ln)
+		wg.Add(2)
+		mu.Unlock()
+		if logf != nil {
+			logf("fleet dns listening on %s (udp+tcp)", ln.Addr().String())
+		}
+		serveDNSListeners(ctx, pc, ln, provider, &wg)
+		return true
+	}
+
+	pc, ln, err := bindDNSAddr("127.0.0.1", bindPort)
+	if err != nil {
+		return fmt.Errorf("bind DNS on 127.0.0.1:%d: %w", bindPort, err)
+	}
+	registerAndServe(pc, ln)
+
+	if meshPC, meshLN, meshErr := bindDNSAddr(paths.LighthouseIP, bindPort); meshErr == nil {
+		registerAndServe(meshPC, meshLN)
+	} else {
+		if logf != nil {
+			logf("fleet dns waiting for %s:%d (%v)", paths.LighthouseIP, bindPort, meshErr)
+		}
+		wg.Go(func() {
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					mpc, mln, err := bindDNSAddr(paths.LighthouseIP, bindPort)
+					if err == nil {
+						registerAndServe(mpc, mln)
+						return
+					}
+				}
+			}
+		})
+	}
 
 	<-ctx.Done()
-	_ = pc.Close()
-	_ = ln.Close()
+	mu.Lock()
+	closed = true
+	toClose := append([]io.Closer(nil), closers...)
+	mu.Unlock()
+	for _, c := range toClose {
+		_ = c.Close()
+	}
 	wg.Wait()
 	return nil
 }

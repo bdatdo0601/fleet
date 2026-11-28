@@ -128,9 +128,9 @@ func TestSandboxPackageValidationAndContainerfile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RenderCustomContainerfile failed: %v", err)
 	}
-	if !strings.Contains(cf, "FROM python:3.13-slim-bookworm") ||
+	if !strings.Contains(cf, "FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim") ||
 		strings.Contains(cf, "FROM fleet-sandbox:base") ||
-		!strings.Contains(cf, "apt-get install -y -o Acquire::Retries=3 --no-install-recommends graphviz") ||
+		!strings.Contains(cf, "apt-get install -y -o Acquire::ForceIPv4=true -o Acquire::Retries=3 --no-install-recommends graphviz") ||
 		!strings.Contains(cf, `uv pip install --system --no-cache "seaborn>=0.13"`) ||
 		!strings.HasSuffix(cf, "ENV HOME=/tmp MPLCONFIGDIR=/tmp/matplotlib\n") {
 		t.Fatalf("unexpected containerfile output:\n%s", cf)

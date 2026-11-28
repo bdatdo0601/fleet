@@ -25,11 +25,11 @@ import (
 
 const (
 	sandboxOutputCapBytes    = 16 * 1024
-	defaultSandboxUpstreamOS = "python:3.13-slim-bookworm"
+	defaultSandboxUpstreamOS = "ghcr.io/astral-sh/uv:python3.13-bookworm-slim"
 
 	sandboxBaseSteps = `
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y -o Acquire::Retries=3 --no-install-recommends \
+RUN apt-get -o Acquire::ForceIPv4=true update && apt-get install -y -o Acquire::ForceIPv4=true -o Acquire::Retries=3 --no-install-recommends \
     ca-certificates \
     curl \
     file \
@@ -49,8 +49,7 @@ RUN apt-get update && apt-get install -y -o Acquire::Retries=3 --no-install-reco
     zip \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir uv \
-    && UV_COMPILE_BYTECODE=0 UV_LINK_MODE=copy uv pip install --system --no-cache \
+RUN UV_COMPILE_BYTECODE=0 UV_LINK_MODE=copy uv pip install --system --no-cache \
     pypdf \
     pdfplumber \
     pymupdf \
@@ -106,7 +105,7 @@ func RenderCustomContainerfile(baseImage string, extraApt, extraPip []string) (s
 	fmt.Fprintf(&b, "FROM %s\n", base)
 	b.WriteString(sandboxBaseSteps)
 	if len(aptClean) > 0 {
-		fmt.Fprintf(&b, "RUN apt-get update && apt-get install -y -o Acquire::Retries=3 --no-install-recommends %s && rm -rf /var/lib/apt/lists/*\n", strings.Join(aptClean, " "))
+		fmt.Fprintf(&b, "RUN apt-get -o Acquire::ForceIPv4=true update && apt-get install -y -o Acquire::ForceIPv4=true -o Acquire::Retries=3 --no-install-recommends %s && rm -rf /var/lib/apt/lists/*\n", strings.Join(aptClean, " "))
 	}
 	if len(pipClean) > 0 {
 		quoted := make([]string, len(pipClean))

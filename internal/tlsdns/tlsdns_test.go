@@ -653,3 +653,93 @@ func TestEdgeHTTPSProxyStripsSpoofedHeaders(t *testing.T) {
 		t.Fatalf("expected 403 for public client IP, got %d", badRec.Code)
 	}
 }
+
+func TestServeDNSBindsLoopbackNotWildcard(t *testing.T) {
+	pc, ln, err := bindDNSAddr("127.0.0.1", 0)
+	if err != nil {
+		t.Fatalf("bindDNSAddr(127.0.0.1, 0) failed: %v", err)
+	}
+	udpAddr := pc.LocalAddr().String()
+	tcpAddr := ln.Addr().String()
+	_ = pc.Close()
+	_ = ln.Close()
+
+	if !strings.HasPrefix(udpAddr, "127.0.0.1:") || !strings.HasPrefix(tcpAddr, "127.0.0.1:") {
+		t.Fatalf("expected loopback bind addresses, got udp=%q tcp=%q", udpAddr, tcpAddr)
+	}
+
+	// Find a free port on 127.0.0.1 where both UDP and TCP are available.
+	probeLN, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := probeLN.Addr().(*net.TCPAddr).Port
+	_ = probeLN.Close()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	snap := DNSSnapshot{
+		Domain:       "fleet.example.com",
+		Enabled:      true,
+		LighthouseIP: "10.213.0.1",
+		Records:      map[string]string{"fleet.example.com": "10.213.0.1"},
+	}
+	prov := func(context.Context) (DNSSnapshot, error) { return snap, nil }
+
+	var (
+		logMu sync.Mutex
+		logs  []string
+	)
+	done := make(chan error, 1)
+	go func() {
+		done <- ServeDNS(ctx, port, prov, func(format string, _ ...any) {
+			logMu.Lock()
+			defer logMu.Unlock()
+			logs = append(logs, format)
+		})
+	}()
+
+	// Wait briefly for 127.0.0.1:port to answer UDP queries.
+	addr := probeLN.Addr().(*net.TCPAddr)
+	target := net.JoinHostPort("127.0.0.1", strings.Split(addr.String(), ":")[1])
+	q := buildDNSQueryPacket(t, "fleet.example.com.", dnsmessage.TypeA)
+	var gotIP string
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		uconn, dErr := net.DialTimeout("udp4", target, 200*time.Millisecond)
+		if dErr == nil {
+			_ = uconn.SetDeadline(time.Now().Add(200 * time.Millisecond))
+			_, _ = uconn.Write(q)
+			buf := make([]byte, 512)
+			n, rErr := uconn.Read(buf)
+			_ = uconn.Close()
+			if rErr == nil {
+				var p dnsmessage.Parser
+				if hdr, pErr := p.Start(buf[:n]); pErr == nil && hdr.RCode == dnsmessage.RCodeSuccess {
+					_ = p.SkipAllQuestions()
+					if ah, aErr := p.AnswerHeader(); aErr == nil && ah.Type == dnsmessage.TypeA {
+						if res, resErr := p.AResource(); resErr == nil {
+							gotIP = net.IP(res.A[:]).String()
+							break
+						}
+					}
+				}
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if gotIP != "10.213.0.1" {
+		t.Fatalf("expected 10.213.0.1 from ServeDNS loopback listener on %s, got %q", target, gotIP)
+	}
+
+	cancel()
+	select {
+	case sErr := <-done:
+		if sErr != nil {
+			t.Fatalf("ServeDNS returned error on cancel: %v", sErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ServeDNS did not shut down promptly after cancel")
+	}
+}
