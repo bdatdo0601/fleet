@@ -459,7 +459,7 @@ export async function renderChat(main, ctx, sub) {
   const approvalsBox = el("div", { className: "chat-msg-group hidden" });
   const streamBox = el("div", { className: "chat-msg chat-msg-assistant hidden" });
   const streamMeta = el("div", { className: "small muted mb-1" });
-  const streamBody = el("div", { className: "chat-md" });
+  const streamBody = el("div", { className: "chat-stream-body" });
   streamBox.append(streamMeta, streamBody);
   const msgInnerEl = el("div", { className: "chat-messages-inner" }, emptyBox, msgItemsEl, approvalsBox, streamBox);
   const msgListEl = el("div", { className: "chat-messages" }, msgInnerEl);

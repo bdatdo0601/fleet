@@ -112,6 +112,7 @@ func TestWebUIAssetsSecurityAndStrangers(t *testing.T) {
 	}{
 		{"/assets/app.js", "text/javascript"},
 		{"/assets/chat.js", "text/javascript"},
+		{"/assets/chat_markdown.js", "text/javascript"},
 		{"/assets/skills.js", "text/javascript"},
 		{"/assets/usage.js", "text/javascript"},
 		{"/assets/app.css", "text/css"},

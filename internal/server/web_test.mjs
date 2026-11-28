@@ -124,6 +124,8 @@ function createMockDOM() {
       this.attributes.set(k, String(v));
       if (k === "id") {
         doc._byId.set(String(v), this);
+      } else if (k === "checked") {
+        this.checked = true;
       }
     }
     getAttribute(k) {
@@ -203,16 +205,33 @@ async function withMockDOM(fn) {
   }
 }
 
-test("sanitizeLinkHref allows http/https and #fragments, blocks dangerous schemes", () => {
-  assert.equal(sanitizeLinkHref("https://example.com/path?a=1"), "https://example.com/path?a=1");
+test("sanitizeLinkHref allows safe schemes and #fragments, blocks dangerous schemes", () => {
+  assert.equal(sanitizeLinkHref("https://example.com/path?a=1#b"), "https://example.com/path?a=1#b");
   assert.equal(sanitizeLinkHref("http://127.0.0.1:8080/ok"), "http://127.0.0.1:8080/ok");
+  assert.equal(sanitizeLinkHref("<https://example.com>"), "https://example.com");
   assert.equal(sanitizeLinkHref("#memory/proposals"), "#memory/proposals");
+  assert.equal(sanitizeLinkHref("/v1/assistant/files/1"), "/v1/assistant/files/1");
+  assert.equal(sanitizeLinkHref("mailto:ops@example.com"), "mailto:ops@example.com");
+
   assert.equal(sanitizeLinkHref("javascript:alert(1)"), "");
   assert.equal(sanitizeLinkHref("JAVASCRIPT:alert(1)"), "");
   assert.equal(sanitizeLinkHref("data:text/html,<script>alert(1)</script>"), "");
   assert.equal(sanitizeLinkHref("vbscript:msgbox(1)"), "");
+  assert.equal(sanitizeLinkHref("//evil.example.com/path"), "");
+  assert.equal(sanitizeLinkHref("/\\evil.example.com"), "");
+  assert.equal(sanitizeLinkHref("https://"), "");
   assert.equal(sanitizeLinkHref(""), "");
 });
+
+function walkNodes(node, predicate, out = []) {
+  if (predicate(node)) {
+    out.push(node);
+  }
+  for (const c of node.children || []) {
+    walkNodes(c, predicate, out);
+  }
+  return out;
+}
 
 test("tokenizeInlineMarkdown and parseMarkdownBlocks render safely", async () => {
   const tokens = tokenizeInlineMarkdown("See `code` and **bold** and [ok](https://example.com) and [bad](javascript:evil)");
@@ -220,30 +239,208 @@ test("tokenizeInlineMarkdown and parseMarkdownBlocks render safely", async () =>
     { type: "text", text: "See " },
     { type: "code", text: "code" },
     { type: "text", text: " and " },
-    { type: "strong", text: "bold" },
+    { type: "strong", children: [{ type: "text", text: "bold" }] },
     { type: "text", text: " and " },
-    { type: "link", text: "ok", href: "https://example.com/", external: true },
-    { type: "text", text: " and " },
-    { type: "text", text: "[bad](javascript:evil)" },
+    { type: "link", href: "https://example.com", title: "", children: [{ type: "text", text: "ok" }] },
+    { type: "text", text: " and [bad](javascript:evil)" },
   ]);
 
   const blocks = parseMarkdownBlocks("# Title\n\n- one\n- two\n\n```js\nconst x = 1;\n```");
   assert.deepEqual(blocks, [
-    { type: "heading", text: "Title" },
-    { type: "list", items: ["one", "two"] },
-    { type: "code", text: "const x = 1;" },
+    { type: "heading", level: 1, children: [{ type: "text", text: "Title" }] },
+    {
+      type: "list",
+      ordered: false,
+      start: 1,
+      items: [
+        { checked: null, inline: [{ type: "text", text: "one" }], blocks: [] },
+        { checked: null, inline: [{ type: "text", text: "two" }], blocks: [] },
+      ],
+    },
+    { type: "code", lang: "js", code: "const x = 1;" },
   ]);
 
   await withMockDOM(() => {
     const dom = renderMarkdownDOM("Click [safe](#agents) or [xss](javascript:evil)");
-    const links = [];
-    const walk = (n) => {
-      if (n.tagName === "A") links.push(n);
-      for (const c of n.children || []) walk(c);
-    };
-    walk(dom);
+    const links = walkNodes(dom, (n) => n.tagName === "A");
     assert.equal(links.length, 1);
     assert.equal(links[0].getAttribute("href"), "#agents");
+    assert.equal(links[0].getAttribute("target"), null);
+  });
+});
+
+test("bare URLs and angle-bracket autolinks highlight with punctuation trimming", async () => {
+  await withMockDOM(() => {
+    const dom = renderMarkdownDOM(
+      "Check https://example.com/docs?q=1, (also http://foo.bar/a_(b)), www.github.com/org/repo! And <https://fleet.dev/guide> or <ops@fleet.dev>.",
+    );
+    const links = walkNodes(dom, (n) => n.tagName === "A");
+    assert.deepEqual(
+      links.map((a) => ({ href: a.getAttribute("href"), text: a.textContent, cls: a.className })),
+      [
+        { href: "https://example.com/docs?q=1", text: "https://example.com/docs?q=1", cls: "chat-link" },
+        { href: "http://foo.bar/a_(b)", text: "http://foo.bar/a_(b)", cls: "chat-link" },
+        { href: "https://www.github.com/org/repo", text: "www.github.com/org/repo", cls: "chat-link" },
+        { href: "https://fleet.dev/guide", text: "https://fleet.dev/guide", cls: "chat-link" },
+        { href: "mailto:ops@fleet.dev", text: "ops@fleet.dev", cls: "chat-link" },
+      ],
+    );
+    for (const a of links) {
+      assert.equal(a.getAttribute("target"), "_blank");
+      assert.equal(a.getAttribute("rel"), "noopener noreferrer");
+    }
+  });
+});
+
+test("URLs inside inline code and fenced code blocks are NOT autolinked", async () => {
+  await withMockDOM(() => {
+    const dom = renderMarkdownDOM("Use `https://code.example.com`.\n\n```\nhttps://fenced.example.com\n```");
+    assert.equal(walkNodes(dom, (n) => n.tagName === "A").length, 0);
+    const codes = walkNodes(dom, (n) => n.tagName === "CODE");
+    assert.equal(codes.length, 2);
+    assert.equal(codes[0].textContent, "https://code.example.com");
+    assert.equal(codes[1].textContent, "https://fenced.example.com");
+  });
+});
+
+test("headings, lists, and paragraphs without blank lines render properly", async () => {
+  await withMockDOM(() => {
+    const dom = renderMarkdownDOM(
+      [
+        "# Title One",
+        "### Subheading ###",
+        "Intro paragraph",
+        "- first item",
+        "- second item",
+        "1. ordered one",
+        "2. ordered two",
+        "###### Tiny heading",
+      ].join("\n"),
+    );
+    const headings = walkNodes(dom, (n) => /^H[1-6]$/.test(n.tagName || ""));
+    assert.deepEqual(
+      headings.map((h) => [h.tagName, h.textContent]),
+      [
+        ["H1", "Title One"],
+        ["H3", "Subheading"],
+        ["H6", "Tiny heading"],
+      ],
+    );
+    const uls = walkNodes(dom, (n) => n.tagName === "UL");
+    const ols = walkNodes(dom, (n) => n.tagName === "OL");
+    assert.equal(uls.length, 1);
+    assert.equal(ols.length, 1);
+    assert.equal(uls[0].children.length, 2);
+    assert.equal(ols[0].children.length, 2);
+  });
+});
+
+test("ordered list start attribute, nested lists, and task lists render properly", async () => {
+  await withMockDOM(() => {
+    const dom = renderMarkdownDOM(
+      [
+        "3. Start at three",
+        "   - Nested bullet",
+        "   - [x] Done subtask",
+        "4) Paren delimiter",
+        "- [ ] Pending task",
+      ].join("\n"),
+    );
+    const ols = walkNodes(dom, (n) => n.tagName === "OL");
+    assert.equal(ols.length, 2);
+    assert.equal(ols[0].getAttribute("start"), "3");
+    assert.equal(ols[1].getAttribute("start"), "4");
+    const checks = walkNodes(dom, (n) => n.tagName === "INPUT");
+    assert.equal(checks.length, 2);
+    assert.equal(checks[0].checked, true);
+    assert.equal(checks[1].checked, false);
+  });
+});
+
+test("blockquotes, horizontal rules, and GFM tables with alignment classes render properly", async () => {
+  await withMockDOM(() => {
+    const dom = renderMarkdownDOM(
+      [
+        "> Quoted **bold**",
+        "> > Nested quote",
+        "",
+        "---",
+        "",
+        "| Name | Count | Note |",
+        "| :--- | :---: | ---: |",
+        "| `a\\|b` | 42 | https://example.com |",
+      ].join("\n"),
+    );
+    assert.equal(walkNodes(dom, (n) => n.tagName === "BLOCKQUOTE").length, 2);
+    assert.equal(walkNodes(dom, (n) => n.tagName === "HR").length, 1);
+    const table = walkNodes(dom, (n) => n.tagName === "TABLE")[0];
+    assert.ok(table);
+    const ths = walkNodes(table, (n) => n.tagName === "TH");
+    assert.deepEqual(
+      ths.map((th) => th.className),
+      ["chat-align-left", "chat-align-center", "chat-align-right"],
+    );
+    const tds = walkNodes(table, (n) => n.tagName === "TD");
+    assert.equal(tds[0].textContent, "a|b");
+    assert.equal(tds[1].textContent, "42");
+    const tdLink = walkNodes(tds[2], (n) => n.tagName === "A")[0];
+    assert.equal(tdLink.getAttribute("href"), "https://example.com");
+  });
+});
+
+test("inline emphasis, intraword underscores, nested formatting, escapes, and multi-backtick code", async () => {
+  await withMockDOM(() => {
+    const input =
+      "***both*** **bold** *italic* _under_ __strong__ ~~gone~~ snake_case_name foo__bar__baz 2 * 3 * 4 ``a `b` c`` **[go](https://x.test/a_(b))** \\*lit\\*";
+    const dom = renderMarkdownDOM(input);
+    assert.equal(walkNodes(dom, (n) => n.tagName === "STRONG").length, 4);
+    assert.equal(walkNodes(dom, (n) => n.tagName === "EM").length, 3);
+    const dels = walkNodes(dom, (n) => n.tagName === "DEL");
+    assert.equal(dels.length, 1);
+    assert.equal(dels[0].textContent, "gone");
+    const codes = walkNodes(dom, (n) => n.tagName === "CODE");
+    assert.equal(codes[0].textContent, "a `b` c");
+    const links = walkNodes(dom, (n) => n.tagName === "A");
+    assert.equal(links[0].getAttribute("href"), "https://x.test/a_(b)");
+    assert.ok(dom.textContent.includes("snake_case_name foo__bar__baz 2 * 3 * 4"));
+    assert.ok(dom.textContent.includes("*lit*"));
+  });
+});
+
+test("fenced code blocks support tilde, 4-backtick, unclosed streaming fences, and copy header", async () => {
+  await withMockDOM(() => {
+    const dom = renderMarkdownDOM("````markdown\n```js\nconst x = 1;\n```\n````\n\n~~~python\nprint('streaming')\n");
+    const wraps = walkNodes(dom, (n) => n.className === "chat-code-wrap");
+    assert.equal(wraps.length, 2);
+    const langs = walkNodes(dom, (n) => n.className === "chat-code-lang");
+    assert.deepEqual(
+      langs.map((l) => l.textContent),
+      ["markdown", "python"],
+    );
+    const blocks = walkNodes(dom, (n) => n.tagName === "PRE");
+    assert.equal(blocks[0].textContent, "```js\nconst x = 1;\n```");
+    assert.equal(blocks[1].textContent, "print('streaming')\n");
+  });
+});
+
+test("CSP safety and CRLF handling in chat markdown", async () => {
+  await withMockDOM(() => {
+    const dom = renderMarkdownDOM(
+      "[bad](javascript:alert(1)) ![ext](https://cdn.example.com/pic.png) ![local](/assets/icon-192.png)\r\nLine 2",
+    );
+    const styled = walkNodes(dom, (n) => n.tagName && n.getAttribute("style") !== null);
+    assert.equal(styled.length, 0);
+
+    const imgs = walkNodes(dom, (n) => n.tagName === "IMG");
+    assert.equal(imgs.length, 1);
+    assert.equal(imgs[0].getAttribute("src"), "/assets/icon-192.png");
+
+    const links = walkNodes(dom, (n) => n.tagName === "A");
+    assert.equal(links.length, 1);
+    assert.equal(links[0].getAttribute("href"), "https://cdn.example.com/pic.png");
+    assert.equal(links[0].textContent, "ext");
+    assert.ok(dom.textContent.includes("[bad](javascript:alert(1))"));
+    assert.equal(walkNodes(dom, (n) => n.tagName === "BR").length, 1);
   });
 });
 
