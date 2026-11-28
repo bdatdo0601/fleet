@@ -25,7 +25,7 @@ const (
 	DefaultChatModel     = "anthropic/claude-haiku-5.5"
 	DefaultFastModel     = "thinkingmachines/inkling-2-mini"
 	DefaultFrontierModel = "openai/gpt-6.2-sol"
-	DefaultDecisionModel = "google/gemini-decision-1"
+	DefaultDecisionModel = "typesafe/jev-1.14"
 	DefaultObserverModel = "meta/muse-ember"
 	DefaultHeartbeatMins = 30
 	DefaultObserveTokens = 12000
@@ -374,6 +374,9 @@ func NormalizeConfig(cfg Config) Config {
 	cfg.Models.Fast = cmp.Or(strings.TrimSpace(cfg.Models.Fast), def.Models.Fast)
 	cfg.Models.Frontier = cmp.Or(strings.TrimSpace(cfg.Models.Frontier), def.Models.Frontier)
 	cfg.Models.Decision = cmp.Or(strings.TrimSpace(cfg.Models.Decision), def.Models.Decision)
+	if cfg.ZDR && strings.Contains(strings.ToLower(cfg.BaseURL), "openrouter.ai") && cfg.Models.Decision == "google/gemini-decision-1" {
+		cfg.Models.Decision = DefaultDecisionModel
+	}
 	cfg.Models.Observer = cmp.Or(strings.TrimSpace(cfg.Models.Observer), def.Models.Observer)
 	cfg.Models.Reflector = cmp.Or(strings.TrimSpace(cfg.Models.Reflector), def.Models.Reflector)
 	cfg.Models.Heartbeat = cmp.Or(strings.TrimSpace(cfg.Models.Heartbeat), def.Models.Heartbeat)

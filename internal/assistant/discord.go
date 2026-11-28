@@ -830,6 +830,54 @@ func (e *Engine) sendApprovalToDiscord(cfg Config, ch Channel, apr Approval) boo
 	return true
 }
 
+func buildOutboxDiscordPayload(item OutboxItem, deepLink string) map[string]any {
+	desc := truncateText(strings.TrimSpace(item.Body), 1500)
+	if deepLink != "" {
+		if desc != "" {
+			desc += "\n\n"
+		}
+		desc += fmt.Sprintf("[Open in Fleet Console](%s)", deepLink)
+	}
+	return map[string]any{
+		"embeds": []map[string]any{{
+			"title":       truncateText(cmp.Or(strings.TrimSpace(item.Title), "Assistant Notification"), 120),
+			"description": desc,
+			"url":         deepLink,
+			"color":       discordEmbedColor(Notification{Category: "outbox", Priority: item.Priority}),
+			"fields": []map[string]any{
+				{"name": "Channel", "value": "#" + item.ChannelID, "inline": true},
+				{"name": "Priority", "value": cmp.Or(item.Priority, "normal"), "inline": true},
+			},
+			"footer":    map[string]string{"text": "Fleet Assistant · Proactive alert"},
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+		}},
+	}
+}
+
+func (e *Engine) sendOutboxToDiscord(ctx context.Context, cfg Config, item OutboxItem) bool {
+	if !cfg.Discord.Enabled {
+		return false
+	}
+	discChannelID := cfg.Discord.Channels[item.ChannelID]
+	if discChannelID == "" {
+		return false
+	}
+	tok, err := e.resolveDiscordBotToken(ctx, cfg.Discord)
+	if err != nil {
+		return false
+	}
+	deepLink := buildFleetDeepLink(cfg.Discord.FleetBaseURL, item.ChannelID)
+	payload := buildOutboxDiscordPayload(item, deepLink)
+	msgID, err := e.discordClient().CreateMessage(ctx, tok, discChannelID, payload)
+	if err != nil {
+		return false
+	}
+	if msgID != "" {
+		_ = e.store.SetDiscordCursor(item.ChannelID, discChannelID, msgID)
+	}
+	return true
+}
+
 func buildContextClearedDiscordPayload(ch Channel, origin string, clearHistory bool) map[string]any {
 	var desc string
 	switch {

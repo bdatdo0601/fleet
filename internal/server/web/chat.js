@@ -564,6 +564,7 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
     field("External stdio / HTTP MCP Servers (JSON)", mcpIn),
     field("Replace 1Password Credential Aliases (optional JSON)", credsIn),
     el("h4", { className: "mt-2", text: "Outbound Discord Notifications (Read-Only Alerts)" }),
+    el("div", { className: "small muted", text: "Optional if Two-Way Discord Bot is enabled below (bot already delivers interactive approvals & outbox alerts to mapped channels)." }),
     el("label", { className: "check-row" }, notifEnabledChk, el("span", { text: "Enable outbound Discord webhook alerts" })),
     el("label", { className: "check-row" }, notifApprovalsChk, el("span", { text: "Notify immediately on pending HITL approvals" })),
     el(

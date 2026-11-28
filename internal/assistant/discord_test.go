@@ -1035,3 +1035,72 @@ func TestDiscordContextClearedNoteFromWebReset(t *testing.T) {
 		t.Fatalf("expected Discord cursor updated to 880000000000000001, got %q", cursor)
 	}
 }
+
+func TestDiscordOutboxNotifyDelivery(t *testing.T) {
+	disc := newMockDiscordServer(t)
+	defer disc.Close()
+
+	eng, cfg := setupDiscordTestEngine(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}, disc)
+
+	// Confirm outbound webhook is disabled while two-way Discord bot is enabled.
+	if cfg.Notifications.Enabled {
+		t.Fatalf("expected outbound webhook notifications disabled in test fixture")
+	}
+
+	// Mapped channel ("general" -> "555555555555555555") delivers embed and marks outbox delivered.
+	if _, err := eng.executeTool(t.Context(), ToolCall{
+		ID:   "call_outbox_1",
+		Type: "function",
+		Function: ToolCallFunction{
+			Name:      "outbox_notify",
+			Arguments: `{"priority":"urgent","title":"Disk check","body":"NVMe usage crossed 85%."}`,
+		},
+	}, &toolExecContext{ChannelID: "general", Source: "chat", Config: cfg}); err != nil {
+		t.Fatalf("outbox_notify mapped channel failed: %v", err)
+	}
+
+	post := waitForPost(t, disc.postCh, 5*time.Second, func(p recordedDiscordPost) bool {
+		return p.ChannelID == "555555555555555555"
+	})
+	embeds, _ := post.Payload["embeds"].([]any)
+	if len(embeds) != 1 {
+		t.Fatalf("expected 1 embed in Discord outbox post, got %+v", post.Payload)
+	}
+	emb, _ := embeds[0].(map[string]any)
+	if emb["title"] != "Disk check" || !strings.Contains(fmt.Sprint(emb["description"]), "NVMe usage crossed 85%.") {
+		t.Fatalf("unexpected outbox embed: %+v", emb)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	delivered := false
+	for time.Now().Before(deadline) {
+		items, err := eng.store.ListOutbox(10, false)
+		if err == nil && len(items) > 0 && items[0].Delivered {
+			delivered = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !delivered {
+		t.Fatalf("expected mapped outbox item to be marked delivered")
+	}
+
+	// Unmapped channel ("briefing") with webhook disabled must NOT post or falsely mark delivered.
+	unmapped, err := eng.store.AddOutbox("briefing", "normal", "Unmapped alert", "Should stay undelivered")
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng.dispatchOutboxNotification(unmapped)
+
+	items, err := eng.store.ListOutbox(10, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, it := range items {
+		if it.ID == unmapped.ID && it.Delivered {
+			t.Fatalf("expected unmapped outbox item to remain undelivered when webhook is disabled")
+		}
+	}
+}

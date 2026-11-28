@@ -1837,6 +1837,14 @@ func (e *Engine) dispatchNotification(ctx context.Context, n Notification) error
 func (e *Engine) dispatchOutboxNotification(item OutboxItem) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	cfg := e.Config()
+	if e.sendOutboxToDiscord(ctx, cfg, item) {
+		_ = e.store.MarkOutboxDelivered(item.ID)
+		return
+	}
+	if !cfg.Notifications.Enabled {
+		return
+	}
 	if err := e.dispatchNotification(ctx, Notification{
 		Category:  "outbox",
 		ChannelID: item.ChannelID,

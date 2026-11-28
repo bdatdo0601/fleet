@@ -492,7 +492,7 @@ func (e *Engine) dispatchAutomationTool(name string, args map[string]any, tctx *
 			return nil, err
 		}
 		e.publishEvent(StreamEvent{Type: "outbox", ChannelID: tctx.ChannelID, Data: item})
-		if tctx.Config.Notifications.Enabled && priorityMeetsMin(item.Priority, tctx.Config.Notifications.MinPriority) {
+		if (tctx.Config.Discord.Enabled || tctx.Config.Notifications.Enabled) && priorityMeetsMin(item.Priority, tctx.Config.Notifications.MinPriority) {
 			go e.dispatchOutboxNotification(item)
 		}
 		return item, nil

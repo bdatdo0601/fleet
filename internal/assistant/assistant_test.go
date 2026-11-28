@@ -1188,6 +1188,22 @@ func TestDiscordWebhookNotifierAndDoctor(t *testing.T) {
 	if dcPass.Status != "ok" {
 		t.Fatalf("expected notifications doctor ok for valid https://discord.com/api/webhooks/ URL, got %+v", dcPass)
 	}
+
+	dcSkip := eng.checkNotificationsDoctor(t.Context(), Config{})
+	if dcSkip.Status != "skip" {
+		t.Fatalf("expected notifications doctor skip when webhook and discord bot are disabled, got %+v", dcSkip)
+	}
+
+	dcBot := eng.checkNotificationsDoctor(t.Context(), Config{
+		Discord: DiscordConfig{
+			Enabled:          true,
+			BotTokenOPRef:    "op://Fleet-Agent/Discord/bot",
+			AuthorizedUserID: "143190607408398336",
+		},
+	})
+	if dcBot.Status != "ok" || !strings.Contains(dcBot.Detail, "two-way Discord bot") {
+		t.Fatalf("expected notifications doctor ok via two-way Discord bot, got %+v", dcBot)
+	}
 }
 
 type mockTestDecision struct {
@@ -1564,5 +1580,52 @@ func TestHybridAutoRoutingTopicGrantsAndModes(t *testing.T) {
 	mHB := waitDone()
 	if mHB.Model != DefaultFrontierModel && mHB.Model != DefaultChatModel {
 		t.Fatalf("unexpected heartbeat model %s", mHB.Model)
+	}
+}
+
+func TestDecisionModelZDRMigrationAndDoctorHint(t *testing.T) {
+	if DefaultDecisionModel != "typesafe/jev-1.14" {
+		t.Fatalf("expected DefaultDecisionModel=typesafe/jev-1.14, got %q", DefaultDecisionModel)
+	}
+
+	upgraded := NormalizeConfig(Config{
+		BaseURL: DefaultOpenRouterURL,
+		ZDR:     true,
+		Models:  ModelConfig{Decision: "google/gemini-decision-1"},
+	})
+	if upgraded.Models.Decision != DefaultDecisionModel {
+		t.Fatalf("expected ZDR OpenRouter config to auto-upgrade decision model to %q, got %q", DefaultDecisionModel, upgraded.Models.Decision)
+	}
+
+	preserved := NormalizeConfig(Config{
+		BaseURL: DefaultOpenRouterURL,
+		ZDR:     false,
+		Models:  ModelConfig{Decision: "google/gemini-decision-1"},
+	})
+	if preserved.Models.Decision != "google/gemini-decision-1" {
+		t.Fatalf("expected non-ZDR config to preserve explicit decision model, got %q", preserved.Models.Decision)
+	}
+
+	mockDecisions := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":{"message":"No endpoints found matching your data policy (Zero data retention).","code":404}}`))
+	}))
+	defer mockDecisions.Close()
+
+	tmp := t.TempDir()
+	eng, err := Open(filepath.Join(tmp, "assistant.db"), filepath.Join(tmp, "assistant.json"), filepath.Join(tmp, "vault"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = eng.Close() }()
+
+	check := eng.checkDecisionsDoctor(t.Context(), Config{
+		BaseURL: mockDecisions.URL + "/api/v1",
+		APIKey:  "sk-or-test",
+		ZDR:     true,
+		Models:  ModelConfig{DefaultChat: DefaultChatModel, Decision: "google/gemini-decision-1"},
+	}, nil)
+	if check.Status != "warn" || !strings.Contains(check.Hint, DefaultDecisionModel) {
+		t.Fatalf("expected decisions doctor warn with ZDR hint mentioning %s, got %+v", DefaultDecisionModel, check)
 	}
 }

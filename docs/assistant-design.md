@@ -9,7 +9,7 @@ An always-on, sleep-wake personal assistant and second-brain coordinator built n
 1. **Sleep-wake-repeat (0 tokens at rest):** Inspired by Anthropic's *Building always-on agents*, the assistant sleeps almost all the time (~20–30 MB baseline RAM inside `fleet serve`) and wakes only for discrete runs triggered by chat messages, timers, heartbeat checks, or human approvals.
 2. **Nebula mesh identity:** No public HTTP ports or extra auth stack. All `/v1/assistant/*` routes and `/assistant-widget` are admin-only and authenticated via `fleet.Identify` (Nebula source IP) plus `Host`/`Origin` anti-DNS-rebinding checks.
 3. **Single binary, auto-synced:** Embedded PWA assets (`go:embed`) + pure-Go SQLite (`modernc.org/sqlite`), updated automatically on the lighthouse via `fleet sync`.
-4. **System 1 + System 2 separation:** Cheap, non-generative Decision Models (`google/gemini-decision-1` / `typesafe/jev`) handle routing/triage; OpenRouter LLMs handle reasoning with `zdr: true` and explicit `cache_control` prefix caching.
+4. **System 1 + System 2 separation:** Cheap, non-generative Decision Models (`typesafe/jev-1.14`, ZDR-eligible) handle routing/triage; OpenRouter LLMs handle reasoning with `zdr: true` and explicit `cache_control` prefix caching.
 5. **Zero-exposure secrets & scoped blast radius:** No shell/bash tool is exposed to the assistant. Secrets live in a scoped 1Password vault (`Fleet-Agent`) resolved in memory at runtime and scrubbed from responses.
 
 ```text
@@ -64,7 +64,7 @@ Managed in `internal/assistant/store.go`:
    2. Explicit UI/CLI `model` override
    3. Matching skill `SKILL.md` frontmatter `model:`
    4. Channel default `model` (`general`, `fleet-ops`, `briefing`, or custom)
-   5. System role default (`heartbeat` uses `models.heartbeat`; interactive `chat` defaults to **Hybrid** auto-routing via `routing.mode`: `hybrid` | `gate` | `auto` | `off`). When auto-routing runs, OpenRouter `/api/alpha/decisions` (`google/gemini-decision-1` with a 2s timeout and `provider: {zdr, data_collection}` when on `openrouter.ai`) evaluates `needs_frontier` (and `same_topic` when a Topic Grant is active) over the prompt + recent tail:
+   5. System role default (`heartbeat` uses `models.heartbeat`; interactive `chat` defaults to **Hybrid** auto-routing via `routing.mode`: `hybrid` | `gate` | `auto` | `off`). When auto-routing runs, OpenRouter `/api/alpha/decisions` (`typesafe/jev-1.14` with a 2s timeout and `provider: {zdr, data_collection}` when on `openrouter.ai`) evaluates `needs_frontier` (and `same_topic` when a Topic Grant is active) over the prompt + recent tail:
       - `< borderline_prob` (`0.60`): runs immediately on `default_chat` (`claude-haiku-5.5`).
       - `borderline_prob .. gate_prob` (`0.60–0.80`, `hybrid` mode): runs immediately on `default_chat` and attaches a 1-tap `frontier_retry` bar (`Retry with <frontier>` / `Retry + unlock topic`).
       - `>= gate_prob` (`0.80`): auto-approves Frontier if a context-scoped **Topic Grant** is active (same topic, within `grant_max_turns`, `grant_max_cost_usd`, `grant_idle_minutes`, and `daily_soft_cap_usd`); otherwise pauses with an inline HITL escalation card (`Use Frontier (this topic)` / `Once` / `Use Haiku`, no Discord alert). In `auto` mode it escalates unattended; on Decisions API error/timeout it fails open to `default_chat`.
@@ -153,7 +153,7 @@ Managed in `internal/assistant/store.go`:
   - Messages from the authorized Discord user enqueue into `assistant_inbox` and appear live in `#chat` (`via Discord` badge); assistant replies post back cleanly (`render_card` embeds + deep link for `render_widget`).
   - Web/timer turns mirror to Discord with non-spoofed `> **You (Fleet Web):**` blockquotes (never impersonating the user's Discord account).
   - `/new` in Discord (or `New Chat` in Web) starts a new context epoch with a divider while preserving Discord history.
-  - Pending HITL approvals render interactive **Approve / Deny** Discord buttons (`INTERACTION_CREATE`), verified against `AuthorizedUserID`.
+  - Pending HITL approvals render interactive **Approve / Deny** Discord buttons (`INTERACTION_CREATE`), verified against `AuthorizedUserID`, and `outbox_notify` embeds also deliver directly to mapped Discord channels (making the separate outbound webhook optional when the bot is enabled).
 - **Privacy boundary:** Keep outbound payloads to concise summaries + Fleet Console deep links (never raw secrets, vault note contents, or sensitive tool arguments).
 
 ---

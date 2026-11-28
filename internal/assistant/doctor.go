@@ -196,10 +196,15 @@ func (e *Engine) checkDecisionsDoctor(ctx context.Context, rtCfg Config, rtErr e
 		},
 	}})
 	if err != nil {
+		hint := "Verify OpenRouter Decisions API access or update models.decision in Settings"
+		if rtCfg.ZDR && strings.Contains(strings.ToLower(err.Error()), "zero data retention") {
+			hint = fmt.Sprintf("Model %s has no ZDR endpoint on OpenRouter; switch to %s via `fleet assistant setup --decision-model %s` or Settings", rtCfg.Models.Decision, DefaultDecisionModel, DefaultDecisionModel)
+		}
 		return DoctorCheck{
 			Name:   "decisions",
 			Status: "warn",
 			Detail: fmt.Sprintf("%s failed (%v); chat falls back to %s", rtCfg.Models.Decision, err, rtCfg.Models.DefaultChat),
+			Hint:   hint,
 		}
 	}
 	return DoctorCheck{
@@ -386,6 +391,10 @@ func (e *Engine) checkMCPDoctor(ctx context.Context, cfg Config) DoctorCheck {
 func (e *Engine) checkNotificationsDoctor(ctx context.Context, cfg Config) DoctorCheck {
 	n := normalizeNotificationsConfig(cfg.Notifications)
 	if !n.Enabled {
+		d := normalizeDiscordConfig(cfg.Discord)
+		if d.Enabled && ValidateDiscordConfig(d) == nil {
+			return DoctorCheck{Name: "notifications", Status: "ok", Detail: "Delivered via two-way Discord bot (optional outbound webhook disabled)"}
+		}
 		return DoctorCheck{Name: "notifications", Status: "skip", Detail: "Outbound Discord webhook notifications disabled"}
 	}
 	if n.DiscordWebhookOPRef == "" && len(n.DiscordChannelOPRefs) == 0 {
