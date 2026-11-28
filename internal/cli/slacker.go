@@ -48,7 +48,7 @@ Agent Read & Send:
 
 Runtime:
   listen                                run the lighthouse Slack Socket Mode listener(s)
-  worker    [--once] [--poll-timeout S] [--use-tmux] [--policy auto|bypass|safe]
+  worker    [--once] [--poll-timeout S] [--use-rex | --use-tmux] [--policy auto|bypass|safe]
                                         pull and run jobs for this Mac as logged-in user
 
 Jobs & Services:
@@ -674,6 +674,7 @@ func cmdSlackerWorker(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("slacker worker", flag.ContinueOnError)
 	once := fs.Bool("once", false, "poll once and exit")
 	pollTimeout := fs.Float64("poll-timeout", 30.0, "long-poll seconds per request")
+	useRex := fs.Bool("use-rex", false, "force Rex for launched sessions (runs agy CLI in Rex instead of Antigravity app)")
 	useTmux := fs.Bool("use-tmux", false, "force tmux for launched sessions")
 	policyFlag := fs.String("policy", "", "fallback permission policy when job policy is unset (auto|bypass|safe)")
 	pos, err := parseFlagsInterspersed(fs, args)
@@ -681,7 +682,10 @@ func cmdSlackerWorker(args []string, cio *IO) error {
 		return err
 	}
 	if len(pos) > 0 {
-		return fmt.Errorf("usage: fleet slacker worker [--once] [--poll-timeout S] [--use-tmux] [--policy auto|bypass|safe]")
+		return fmt.Errorf("usage: fleet slacker worker [--once] [--poll-timeout S] [--use-rex | --use-tmux] [--policy auto|bypass|safe]")
+	}
+	if *useRex && *useTmux {
+		return fmt.Errorf("--use-rex and --use-tmux cannot be combined")
 	}
 	pol, err := session.ParsePolicy(*policyFlag, session.PolicyAuto)
 	if err != nil {
@@ -692,6 +696,7 @@ func cmdSlackerWorker(args []string, cio *IO) error {
 	return slacker.RunWorker(ctx, slacker.WorkerOpts{
 		Once:             *once,
 		PollTimeout:      *pollTimeout,
+		UseRex:           *useRex,
 		UseTmux:          *useTmux,
 		Policy:           pol,
 		RefreshShellPath: true,

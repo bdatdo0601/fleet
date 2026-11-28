@@ -190,7 +190,7 @@ tags: [lighthouse, ops, self-config]
 Use the lighthouse's local Fleet worker (` + "`slacker-worker`" + ` running in ` + "`gui/<uid>`" + `) to configure or troubleshoot the machine ` + "`fleet serve`" + ` runs on.
 
 ## When to Use (and When Not To)
-- **Use ` + "`fleet_spawn_agent`" + ` targeting the lighthouse device** (shown in the ` + "`Lighthouse Host Worker`" + ` system section, e.g. ` + "`mini`" + `) with ` + "`repo_path: \"~\"`" + ` and ` + "`policy: \"auto\"`" + ` (unless the user requests another policy) when:
+- **Use ` + "`fleet_spawn_agent`" + ` targeting the lighthouse device** (shown in the ` + "`Lighthouse Host Worker`" + ` system section, e.g. ` + "`mini`" + `) with ` + "`harness: \"agy\"`" + ` (default on the lighthouse unless the user requests ` + "`claude`" + ` or ` + "`codex`" + `), ` + "`repo_path: \"~\"`" + `, and ` + "`policy: \"auto\"`" + ` (unless the user requests another policy) when:
   - Installing missing host CLI dependencies or MCP runtimes (` + "`uv`" + `/` + "`uvx`" + `, ` + "`node`" + `/` + "`npx`" + `, ` + "`brew`" + ` formulae, etc.).
   - Diagnosing failing stdio MCP server commands or verifying local runtime versions.
   - Inspecting lighthouse launchd services or logs (` + "`~/.fleet/*.log`" + `).

@@ -92,6 +92,14 @@ func (f *Fleet) resolveSpawnDevices(caller *registry.Device, req SpawnAgentReque
 
 // SpawnAgent queues a Slacker spawn job on the selected Mac device and records tracked paths.
 func (f *Fleet) SpawnAgent(ctx context.Context, caller *registry.Device, req SpawnAgentRequest) (SpawnAgentResult, error) {
+	if strings.TrimSpace(req.Harness) == "" && f.Registry != nil {
+		if lh, lErr := f.Registry.Lighthouse(); lErr == nil && lh != nil && lh.Name != "" {
+			dev := strings.TrimSpace(req.Device)
+			if strings.EqualFold(dev, lh.Name) || (len(req.Devices) == 1 && strings.EqualFold(strings.TrimSpace(req.Devices[0]), lh.Name)) {
+				req.Harness = session.HarnessAgy
+			}
+		}
+	}
 	harness, ok := session.NormalizeHarness(req.Harness)
 	if !ok {
 		return SpawnAgentResult{}, newFleetErr(fmt.Sprintf("unknown harness %q (expected claude, agy, or codex)", req.Harness), http.StatusBadRequest)

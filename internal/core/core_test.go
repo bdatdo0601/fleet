@@ -303,17 +303,22 @@ func TestLegacyFleetDBMigrationAndNumericSort(t *testing.T) {
 func TestSpawnAgentLighthouseDefaultsRepoToHome(t *testing.T) {
 	f, _, _ := newTestFleet(t)
 	res, err := f.SpawnAgent(context.Background(), nil, SpawnAgentRequest{
-		Harness: "claude",
-		Device:  "mini",
-		Prompt:  "install uv",
+		Device: "mini",
+		Prompt: "install uv",
 	})
 	if err != nil {
 		t.Fatalf("SpawnAgent on lighthouse failed: %v", err)
 	}
-	if res.Job.TargetDevice != "mini" || res.Job.RepoPath != "~" {
-		t.Fatalf("expected TargetDevice=mini RepoPath=~, got %+v", res.Job)
+	if res.Job.TargetDevice != "mini" || res.Job.Harness != "agy" || res.Job.RepoPath != "~" {
+		t.Fatalf("expected TargetDevice=mini Harness=agy RepoPath=~, got %+v", res.Job)
 	}
 	if list, err := f.Agents.ListPaths("mini", ""); err != nil || len(list) != 0 {
 		t.Fatalf("expected ~ not recorded as project repo path, got %+v (err=%v)", list, err)
+	}
+	if _, err := f.SpawnAgent(context.Background(), nil, SpawnAgentRequest{
+		Device: "laptop",
+		Prompt: "fix bug",
+	}); err == nil || !strings.Contains(err.Error(), "unknown harness") {
+		t.Fatalf("expected unknown harness error on non-lighthouse device with empty harness, got %v", err)
 	}
 }

@@ -123,12 +123,12 @@ func (e *Engine) buildToolSpecs(ctx context.Context) []ToolSpec {
 		makeToolSpec("fleet_list_paths", "List known project directories and repositories tracked across Fleet Macs.", schemaObj(map[string]any{
 			"device": strProp("Optional device filter"), "query": strProp("Optional path/repo substring"), "limit": intProp("Max results"),
 		})),
-		makeToolSpec("fleet_spawn_agent", "Spawn a Claude, Codex, or Antigravity coding session on an awake Mac and watch for blockers/completion (approval-gated). Can also target the lighthouse device when its host worker is online to self-configure lighthouse dependencies/services (always requires explicit approval; see lighthouse-self-config skill).", schemaObj(map[string]any{
-			"harness": strProp("claude | codex | agy"), "device": strProp("Optional target Mac (e.g. laptop, office)"),
+		makeToolSpec("fleet_spawn_agent", "Spawn a Claude, Codex, or Antigravity coding session on an awake Mac and watch for blockers/completion (approval-gated). Can also target the lighthouse device when its host worker is online to self-configure lighthouse dependencies/services (defaults to agy unless another harness is specified; always requires explicit approval; see lighthouse-self-config skill).", schemaObj(map[string]any{
+			"harness": strProp("agy | claude | codex (defaults to agy when targeting the lighthouse unless another harness is specified)"), "device": strProp("Optional target Mac (e.g. laptop, office)"),
 			"repo_path": strProp("Repo path, ~/path, or workspace subpath"), "prompt": strProp("Task prompt for the spawned coding agent"),
 			"name": strProp("Optional friendly session name"), "model": strProp("Optional model"),
 			"policy": strProp("Optional policy (auto|bypass|safe)"), "use_tmux": boolProp("Run inside tmux"),
-		}, "harness", "prompt")),
+		}, "prompt")),
 		makeToolSpec("fleet_kill_agent", "Terminate a Fleet coding agent session (approval-gated).", schemaObj(map[string]any{
 			"session_id": strProp("Session ID or target session"),
 		}, "session_id")),
@@ -802,10 +802,11 @@ func (e *Engine) execFleetSpawnTool(ctx context.Context, args map[string]any, ra
 		if tctx.Source != "chat" && tctx.Source != "approval" {
 			return nil, newErr("spawning a worker on the lighthouse is only allowed during direct user chat", http.StatusForbidden)
 		}
+		req.Harness = cmp.Or(req.Harness, "agy")
 		req.RepoPath = cmp.Or(req.RepoPath, "~")
 		// Lighthouse host spawns always require explicit HITL approval (cannot be bypassed by auto_approve).
 		if tctx.Source != "approval" {
-			summary := fmt.Sprintf("Spawn %s worker on lighthouse %s (%s)", cmp.Or(req.Harness, "agent"), lh.Device, req.RepoPath)
+			summary := fmt.Sprintf("Spawn %s worker on lighthouse %s (%s)", req.Harness, lh.Device, req.RepoPath)
 			if p := truncateText(req.Prompt, 100); p != "" {
 				summary += ": " + p
 			}
@@ -816,13 +817,18 @@ func (e *Engine) execFleetSpawnTool(ctx context.Context, args map[string]any, ra
 				ArgsJSON:  cmp.Or(rawArgs, "{}"),
 			}
 		}
-	} else if !tctx.BypassHITL {
-		target := cmp.Or(req.Device, "auto")
-		return nil, &approvalRequiredError{
-			ToolName:  "fleet_spawn_agent",
-			Summary:   fmt.Sprintf("Spawn %s session on %s (%s)", cmp.Or(req.Harness, "agent"), target, cmp.Or(req.RepoPath, "workspace")),
-			RiskLevel: "agent_spawn",
-			ArgsJSON:  cmp.Or(rawArgs, "{}"),
+	} else {
+		if req.Harness == "" {
+			return nil, newErr("harness is required for non-lighthouse devices (expected claude, agy, or codex)", http.StatusBadRequest)
+		}
+		if !tctx.BypassHITL {
+			target := cmp.Or(req.Device, "auto")
+			return nil, &approvalRequiredError{
+				ToolName:  "fleet_spawn_agent",
+				Summary:   fmt.Sprintf("Spawn %s session on %s (%s)", req.Harness, target, cmp.Or(req.RepoPath, "workspace")),
+				RiskLevel: "agent_spawn",
+				ArgsJSON:  cmp.Or(rawArgs, "{}"),
+			}
 		}
 	}
 	res, err := e.deps.SpawnAgent(ctx, req)

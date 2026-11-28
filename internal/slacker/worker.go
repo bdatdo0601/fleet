@@ -37,6 +37,7 @@ type WorkerOpts struct {
 	APIURL           string
 	LocalStateDir    string
 	PollTimeout      float64
+	UseRex           bool
 	UseTmux          bool
 	Policy           session.Policy
 	Once             bool
@@ -62,7 +63,7 @@ func expandHomePath(p string) (string, error) {
 	return p, nil
 }
 
-func defaultLaunchJob(job Job, useTmux bool, stdout, stderr io.Writer) (string, error) {
+func defaultLaunchJob(job Job, useRex, useTmux bool, stdout, stderr io.Writer) (string, error) {
 	dir, err := expandHomePath(job.RepoPath)
 	if err != nil {
 		return "", err
@@ -71,11 +72,14 @@ func defaultLaunchJob(job Job, useTmux bool, stdout, stderr io.Writer) (string, 
 	if err != nil {
 		pol = session.PolicyAuto
 	}
+	effectiveTmux := useTmux || job.UseTmux
+	effectiveRex := useRex && !effectiveTmux
 	return session.Start(session.StartOpts{
 		Harness:   job.Harness,
 		Name:      job.SessionName,
 		Directory: dir,
-		UseTmux:   useTmux || job.UseTmux,
+		UseRex:    effectiveRex,
+		UseTmux:   effectiveTmux,
 		Model:     job.Model,
 		Policy:    pol,
 		Prompt:    job.Prompt,
@@ -189,7 +193,9 @@ func processJob(ctx context.Context, api, localStateDir string, job Job, opts Wo
 	}
 	launchFn := opts.LaunchFn
 	if launchFn == nil {
-		launchFn = defaultLaunchJob
+		launchFn = func(job Job, useTmux bool, stdout, stderr io.Writer) (string, error) {
+			return defaultLaunchJob(job, opts.UseRex, useTmux, stdout, stderr)
+		}
 	}
 
 	rec := LocalReceipt{

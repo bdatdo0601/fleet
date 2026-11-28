@@ -1631,7 +1631,7 @@ func (e *Engine) buildLighthouseWorkerPromptSection() string {
 	var b strings.Builder
 	if lh.WorkerOnline {
 		fmt.Fprintf(&b, "\n## Lighthouse Host Worker (%s, online)\n", lh.Device)
-		fmt.Fprintf(&b, "- `%s` has a local Fleet worker online for lighthouse host self-configuration (e.g. installing `uv`, `node`, `brew` packages, or troubleshooting stdio MCP servers) via `fleet_spawn_agent(device=%q, repo_path=\"~\", ...)` — call `skill_read(\"lighthouse-self-config\")` before spawning for the playbook. Always requires explicit user approval.\n", lh.Device, lh.Device)
+		fmt.Fprintf(&b, "- `%s` has a local Fleet worker online for lighthouse host self-configuration (e.g. installing `uv`, `node`, `brew` packages, or troubleshooting stdio MCP servers) via `fleet_spawn_agent(device=%q, harness=\"agy\", repo_path=\"~\", ...)` (`harness` defaults to `agy` on `%s` unless the user specifies another harness) — call `skill_read(\"lighthouse-self-config\")` before spawning for the playbook. Always requires explicit user approval.\n", lh.Device, lh.Device, lh.Device)
 		b.WriteString("- Keep using `sandbox_*` for document/data/file tasks and other awake Macs (`laptop`/`office`) for normal software repo coding.\n")
 	} else {
 		fmt.Fprintf(&b, "\n## Lighthouse Host Worker (%s, offline)\n", lh.Device)

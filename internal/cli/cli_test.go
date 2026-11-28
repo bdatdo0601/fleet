@@ -270,4 +270,11 @@ func TestCLIAssistantWorkerCommands(t *testing.T) {
 	if rc == 0 || !strings.Contains(errBuf.String(), "invalid policy") {
 		t.Fatalf("expected invalid policy error on worker-install, got rc=%d out=%q err=%q", rc, out.String(), errBuf.String())
 	}
+
+	out.Reset()
+	errBuf.Reset()
+	rc = Run([]string{"assistant", "worker-install", "--use-rex", "--use-tmux"}, &IO{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errBuf})
+	if rc == 0 || !strings.Contains(errBuf.String(), "cannot be combined") {
+		t.Fatalf("expected conflicting --use-rex/--use-tmux error on worker-install, got rc=%d out=%q err=%q", rc, out.String(), errBuf.String())
+	}
 }

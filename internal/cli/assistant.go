@@ -848,6 +848,7 @@ func detectLighthouseDeviceName(api string) string {
 
 func cmdAssistantWorkerInstall(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("assistant worker-install", flag.ContinueOnError)
+	useRex := fs.Bool("use-rex", false, "force Rex for spawned sessions (auto-enabled when rex is installed)")
 	useTmux := fs.Bool("use-tmux", false, "force tmux instead of Rex for spawned sessions")
 	policyFlag := fs.String("policy", "", "fallback permission policy when job policy is unset (auto|bypass|safe)")
 	pos, err := parseFlagsInterspersed(fs, args)
@@ -855,7 +856,10 @@ func cmdAssistantWorkerInstall(args []string, cio *IO) error {
 		return err
 	}
 	if len(pos) > 0 {
-		return fmt.Errorf("usage: fleet assistant worker-install [--use-tmux] [--policy auto|bypass|safe]")
+		return fmt.Errorf("usage: fleet assistant worker-install [--use-rex | --use-tmux] [--policy auto|bypass|safe]")
+	}
+	if *useRex && *useTmux {
+		return errors.New("--use-rex and --use-tmux cannot be combined")
 	}
 	var pol session.Policy
 	if strings.TrimSpace(*policyFlag) != "" {
@@ -871,14 +875,26 @@ func cmdAssistantWorkerInstall(args []string, cio *IO) error {
 	if err != nil {
 		return err
 	}
+	home, _ := os.UserHomeDir()
+	pathEnv := session.AugmentedPath(os.Getenv("PATH"), home)
 	workerArgs := []string{instBin, "slacker", "worker"}
-	if *useTmux {
+	var backend string
+	switch {
+	case *useTmux:
 		workerArgs = append(workerArgs, "--use-tmux")
+		backend = "tmux"
+	case *useRex || binExistsInPathEnv("rex", pathEnv):
+		workerArgs = append(workerArgs, "--use-rex")
+		backend = "rex"
+	case binExistsInPathEnv("tmux", pathEnv):
+		workerArgs = append(workerArgs, "--use-tmux")
+		backend = "tmux"
+	default:
+		backend = "none (install rex or tmux, then re-run worker-install)"
 	}
 	if pol != "" {
 		workerArgs = append(workerArgs, "--policy", string(pol))
 	}
-	home, _ := os.UserHomeDir()
 	if err := system.InstallUserAgent(system.AgentOpts{
 		Label:     paths.SlackerWorkerLabel,
 		Args:      workerArgs,
@@ -929,15 +945,8 @@ func cmdAssistantWorkerInstall(args []string, cio *IO) error {
 		}
 	}
 
-	pathEnv := session.AugmentedPath(os.Getenv("PATH"), home)
-	backend := "tmux"
-	if !*useTmux && binExistsInPathEnv("rex", pathEnv) {
-		backend = "rex"
-	} else if !*useTmux && !binExistsInPathEnv("tmux", pathEnv) {
-		backend = "none (install rex or tmux)"
-	}
 	var harnesses []string
-	for _, h := range []string{"claude", "codex", "agy"} {
+	for _, h := range []string{"agy", "claude", "codex"} {
 		if binExistsInPathEnv(h, pathEnv) {
 			harnesses = append(harnesses, h)
 		}

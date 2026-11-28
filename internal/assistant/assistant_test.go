@@ -1862,31 +1862,44 @@ func TestLighthouseSpawnGuardrailsPromptAndDoctor(t *testing.T) {
 
 	cfg := DefaultConfig()
 	cfg.AutoApprove = true
-	lhArgs := `{"harness":"claude","device":"mini","prompt":"install uv"}`
+	lhArgsDefault := `{"device":"mini","prompt":"install uv"}`
+	lhArgsExplicit := `{"harness":"claude","device":"mini","prompt":"install uv"}`
 
-	// 1. AutoApprove / BypassHITL must NOT bypass HITL for lighthouse spawns.
+	// 1. AutoApprove / BypassHITL must NOT bypass HITL for lighthouse spawns, and omitting harness defaults to agy.
 	chatCtx := &toolExecContext{ChannelID: "general", Source: "chat", Config: cfg, BypassHITL: true}
-	_, chatErr := eng.executeTool(t.Context(), ToolCall{ID: "lh-1", Type: "function", Function: ToolCallFunction{Name: "fleet_spawn_agent", Arguments: lhArgs}}, chatCtx)
+	_, chatErr := eng.executeTool(t.Context(), ToolCall{ID: "lh-1", Type: "function", Function: ToolCallFunction{Name: "fleet_spawn_agent", Arguments: lhArgsDefault}}, chatCtx)
 	aprErr, isApr := errors.AsType[*approvalRequiredError](chatErr)
-	if !isApr || aprErr.RiskLevel != "lighthouse_spawn" {
-		t.Fatalf("expected mandatory lighthouse_spawn approvalRequiredError, got %v", chatErr)
+	if !isApr || aprErr.RiskLevel != "lighthouse_spawn" || !strings.Contains(aprErr.Summary, "Spawn agy worker on lighthouse mini") {
+		t.Fatalf("expected mandatory lighthouse_spawn approvalRequiredError with agy default, got %v", chatErr)
+	}
+
+	// Non-lighthouse spawns still require an explicit harness.
+	_, missingHarnessErr := eng.executeTool(t.Context(), ToolCall{ID: "lh-nonlh", Type: "function", Function: ToolCallFunction{Name: "fleet_spawn_agent", Arguments: `{"device":"laptop","prompt":"fix"}`}}, chatCtx)
+	if ae, ok := errors.AsType[*AssistantError](missingHarnessErr); !ok || ae.HTTPStatus() != http.StatusBadRequest {
+		t.Fatalf("expected 400 when omitting harness on non-lighthouse device, got %v", missingHarnessErr)
 	}
 
 	// 2. Non-interactive timer/heartbeat runs are forbidden from spawning on the lighthouse.
 	timerCtx := &toolExecContext{ChannelID: "briefing", Source: "timer", Config: cfg, BypassHITL: true}
-	_, timerErr := eng.executeTool(t.Context(), ToolCall{ID: "lh-2", Type: "function", Function: ToolCallFunction{Name: "fleet_spawn_agent", Arguments: lhArgs}}, timerCtx)
+	_, timerErr := eng.executeTool(t.Context(), ToolCall{ID: "lh-2", Type: "function", Function: ToolCallFunction{Name: "fleet_spawn_agent", Arguments: lhArgsDefault}}, timerCtx)
 	if ae, ok := errors.AsType[*AssistantError](timerErr); !ok || ae.HTTPStatus() != http.StatusForbidden {
 		t.Fatalf("expected 403 for timer lighthouse spawn, got %v", timerErr)
 	}
 
-	// 3. Explicit approval executes and defaults empty repo_path to "~".
+	// 3. Explicit approval executes: omitted harness defaults to agy, explicit harness overrides it, empty repo_path defaults to "~".
 	aprCtx := &toolExecContext{ChannelID: "general", Source: "approval", Config: cfg, BypassHITL: true}
-	out, err := eng.executeTool(t.Context(), ToolCall{ID: "lh-3", Type: "function", Function: ToolCallFunction{Name: "fleet_spawn_agent", Arguments: lhArgs}}, aprCtx)
+	out, err := eng.executeTool(t.Context(), ToolCall{ID: "lh-3", Type: "function", Function: ToolCallFunction{Name: "fleet_spawn_agent", Arguments: lhArgsDefault}}, aprCtx)
 	if err != nil {
 		t.Fatalf("approved lighthouse spawn failed: %v", err)
 	}
-	if len(deps.spawned) != 1 || deps.spawned[0].RepoPath != "~" {
-		t.Fatalf("expected repo_path defaulted to ~, got %+v", deps.spawned)
+	if len(deps.spawned) != 1 || deps.spawned[0].Harness != "agy" || deps.spawned[0].RepoPath != "~" {
+		t.Fatalf("expected harness=agy repo_path=~, got %+v", deps.spawned)
+	}
+	if _, err := eng.executeTool(t.Context(), ToolCall{ID: "lh-4", Type: "function", Function: ToolCallFunction{Name: "fleet_spawn_agent", Arguments: lhArgsExplicit}}, aprCtx); err != nil {
+		t.Fatalf("approved explicit lighthouse spawn failed: %v", err)
+	}
+	if len(deps.spawned) != 2 || deps.spawned[1].Harness != "claude" {
+		t.Fatalf("expected explicit harness=claude override, got %+v", deps.spawned)
 	}
 	if strings.Contains(out, `"hint"`) {
 		t.Fatalf("did not expect offline hint when WorkerOnline=true: %s", out)
