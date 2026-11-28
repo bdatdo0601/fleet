@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/netip"
@@ -22,19 +23,19 @@ import (
 	"time"
 )
 
-const sandboxOutputCapBytes = 16 * 1024
+const (
+	sandboxOutputCapBytes    = 16 * 1024
+	defaultSandboxUpstreamOS = "python:3.13-slim-bookworm"
 
-// DefaultSandboxContainerfile defines the pre-baked document, data, OCR, and chart toolkit for the assistant sandbox.
-const DefaultSandboxContainerfile = `FROM python:3.13-slim-bookworm
-
+	sandboxBaseSteps = `
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y -o Acquire::Retries=3 --no-install-recommends \
     ca-certificates \
     curl \
     file \
     fonts-dejavu-core \
     jq \
-    libffi-dev \
+    libffi8 \
     libgdk-pixbuf-2.0-0 \
     libpango-1.0-0 \
     libpangocairo-1.0-0 \
@@ -48,8 +49,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zip \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir \
-    uv \
+RUN pip install --no-cache-dir uv \
+    && UV_COMPILE_BYTECODE=0 UV_LINK_MODE=copy uv pip install --system --no-cache \
     pypdf \
     pdfplumber \
     pymupdf \
@@ -63,7 +64,9 @@ RUN pip install --no-cache-dir \
     matplotlib \
     pillow \
     tabulate
+`
 
+	sandboxFooter = `
 RUN groupadd -g 1000 sandbox && useradd -m -u 1000 -g 1000 -s /bin/sh sandbox \
     && mkdir -p /work/in /work/out && chown -R sandbox:sandbox /work
 
@@ -72,9 +75,17 @@ WORKDIR /work
 ENV HOME=/tmp MPLCONFIGDIR=/tmp/matplotlib
 `
 
-// RenderCustomContainerfile builds a layered Containerfile on top of baseImage with validated extra packages.
+	// DefaultSandboxContainerfile defines the pre-baked document, data, OCR, and chart toolkit for the assistant sandbox.
+	DefaultSandboxContainerfile = "FROM " + defaultSandboxUpstreamOS + "\n" + sandboxBaseSteps + sandboxFooter
+)
+
+// RenderCustomContainerfile builds a single-stage Containerfile directly from an upstream base image
+// so BuildKit caches base layers without triggering local FROM oci-layout HTTP 500 lookups.
 func RenderCustomContainerfile(baseImage string, extraApt, extraPip []string) (string, error) {
-	base := cmp.Or(strings.TrimSpace(baseImage), DefaultSandboxBaseImage)
+	base := strings.TrimSpace(baseImage)
+	if base == "" || base == DefaultSandboxBaseImage {
+		base = defaultSandboxUpstreamOS
+	}
 	if strings.ContainsAny(base, "\r\n\t ") {
 		return "", newErr(fmt.Sprintf("invalid base image %q", base), http.StatusBadRequest)
 	}
@@ -93,20 +104,18 @@ func RenderCustomContainerfile(baseImage string, extraApt, extraPip []string) (s
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "FROM %s\n", base)
-	if len(aptClean) > 0 || len(pipClean) > 0 {
-		b.WriteString("USER root\n")
-	}
+	b.WriteString(sandboxBaseSteps)
 	if len(aptClean) > 0 {
-		fmt.Fprintf(&b, "RUN apt-get update && apt-get install -y --no-install-recommends %s && rm -rf /var/lib/apt/lists/*\n", strings.Join(aptClean, " "))
+		fmt.Fprintf(&b, "RUN apt-get update && apt-get install -y -o Acquire::Retries=3 --no-install-recommends %s && rm -rf /var/lib/apt/lists/*\n", strings.Join(aptClean, " "))
 	}
 	if len(pipClean) > 0 {
 		quoted := make([]string, len(pipClean))
 		for i, p := range pipClean {
 			quoted[i] = strconv.Quote(p)
 		}
-		fmt.Fprintf(&b, "RUN pip install --no-cache-dir %s\n", strings.Join(quoted, " "))
+		fmt.Fprintf(&b, "RUN UV_COMPILE_BYTECODE=0 UV_LINK_MODE=copy uv pip install --system --no-cache %s\n", strings.Join(quoted, " "))
 	}
-	b.WriteString("USER sandbox\nWORKDIR /work\n")
+	b.WriteString(sandboxFooter)
 	return b.String(), nil
 }
 
@@ -183,7 +192,7 @@ type SandboxRunner interface {
 	NetworkExists(ctx context.Context, name string) bool
 	EnsureNetwork(ctx context.Context, name, subnet string) (string, error)
 	ImageExists(ctx context.Context, image string) bool
-	BuildImage(ctx context.Context, tag, containerfilePath, contextDir string, cpus, memoryMB int) (string, error)
+	BuildImage(ctx context.Context, tag, containerfilePath, contextDir string, cpus, memoryMB int, noCache bool) (string, error)
 	StartContainer(ctx context.Context, opts SandboxStartOpts) error
 	ExecContainer(ctx context.Context, opts SandboxExecOpts) (SandboxRawResult, error)
 	StopRemoveContainer(ctx context.Context, name string) error
@@ -308,8 +317,8 @@ func (r *AppleContainerRunner) ImageExists(ctx context.Context, image string) bo
 	return exec.CommandContext(ctx, bin, "image", "inspect", image).Run() == nil
 }
 
-// BuildImage builds an OCI image tag from containerfilePath using `container build`.
-func (r *AppleContainerRunner) BuildImage(ctx context.Context, tag, containerfilePath, contextDir string, cpus, memoryMB int) (string, error) {
+// BuildImage builds an OCI image tag from containerfilePath using `container build` while streaming progress.
+func (r *AppleContainerRunner) BuildImage(ctx context.Context, tag, containerfilePath, contextDir string, cpus, memoryMB int, noCache bool) (string, error) {
 	bin := r.binary()
 	if bin == "" {
 		return "", newErr("Apple `container` CLI not found", http.StatusServiceUnavailable)
@@ -318,15 +327,25 @@ func (r *AppleContainerRunner) BuildImage(ctx context.Context, tag, containerfil
 		"build",
 		"-t", tag,
 		"-f", containerfilePath,
-		"-c", strconv.Itoa(max(cpus, 2)),
-		"-m", fmt.Sprintf("%dM", max(memoryMB, 1024)),
-		contextDir,
+		"-c", strconv.Itoa(max(cpus, 4)),
+		"-m", fmt.Sprintf("%dM", max(memoryMB, 4096)),
+		"--progress", "plain",
 	}
-	out, err := exec.CommandContext(ctx, bin, args...).CombinedOutput()
-	if err != nil {
-		return string(out), fmt.Errorf("container build %s failed: %w\n%s", tag, err, truncateText(string(out), 1500))
+	if noCache {
+		args = append(args, "--no-cache")
 	}
-	return string(out), nil
+	args = append(args, contextDir)
+
+	cmd := exec.CommandContext(ctx, bin, args...)
+	var outBuf bytes.Buffer
+	mw := io.MultiWriter(os.Stderr, &outBuf)
+	cmd.Stdout = mw
+	cmd.Stderr = mw
+	if err := cmd.Run(); err != nil {
+		out := outBuf.String()
+		return out, fmt.Errorf("container build %s failed: %w\n%s", tag, err, truncateText(out, 1500))
+	}
+	return outBuf.String(), nil
 }
 
 // StartContainer starts a hardened, offline micro-VM container with bounded resources.
@@ -800,7 +819,7 @@ func prepareSandboxCommand(workDir string, req SandboxExecRequest) (cmdArgs []st
 	return []string{"sh", "-c", command}, nil, nil
 }
 
-// BuildImages ensures the offline network exists and builds base + customized sandbox OCI images.
+// BuildImages ensures the offline network exists and builds a single-stage sandbox OCI image with BuildKit layer caching.
 func (m *SandboxManager) BuildImages(ctx context.Context, cfg SandboxConfig, rebuildBase bool) (SandboxBuildResult, error) {
 	norm := normalizeSandboxConfig(cfg)
 	if err := validateSandboxPackages(norm); err != nil {
@@ -821,26 +840,15 @@ func (m *SandboxManager) BuildImages(ctx context.Context, cfg SandboxConfig, reb
 	}
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 
-	baseRebuilt := rebuildBase || !m.runner.ImageExists(ctx, norm.BaseImage)
-	if baseRebuilt {
-		baseCF := filepath.Join(tmpDir, "Containerfile.base")
-		if wErr := os.WriteFile(baseCF, []byte(DefaultSandboxContainerfile), 0o644); wErr != nil {
-			return SandboxBuildResult{}, wErr
-		}
-		if _, bErr := m.runner.BuildImage(ctx, norm.BaseImage, baseCF, tmpDir, max(norm.CPUs, 2), max(norm.MemoryMB, 2048)); bErr != nil {
-			return SandboxBuildResult{}, bErr
-		}
-	}
-
-	customBody, err := RenderCustomContainerfile(norm.BaseImage, norm.ExtraAptPackages, norm.ExtraPipPackages)
+	cfBody, err := RenderCustomContainerfile("", norm.ExtraAptPackages, norm.ExtraPipPackages)
 	if err != nil {
 		return SandboxBuildResult{}, err
 	}
-	customCF := filepath.Join(tmpDir, "Containerfile")
-	if err := os.WriteFile(customCF, []byte(customBody), 0o644); err != nil {
+	cfPath := filepath.Join(tmpDir, "Containerfile")
+	if err := os.WriteFile(cfPath, []byte(cfBody), 0o644); err != nil {
 		return SandboxBuildResult{}, err
 	}
-	if _, err := m.runner.BuildImage(ctx, norm.Image, customCF, tmpDir, max(norm.CPUs, 2), max(norm.MemoryMB, 2048)); err != nil {
+	if _, err := m.runner.BuildImage(ctx, norm.Image, cfPath, tmpDir, max(norm.CPUs, 4), max(norm.MemoryMB, 4096), rebuildBase); err != nil {
 		return SandboxBuildResult{}, err
 	}
 
@@ -852,10 +860,10 @@ func (m *SandboxManager) BuildImages(ctx context.Context, cfg SandboxConfig, reb
 	m.mu.Unlock()
 
 	return SandboxBuildResult{
-		BaseImage:        norm.BaseImage,
+		BaseImage:        defaultSandboxUpstreamOS,
 		Image:            norm.Image,
 		Network:          norm.Network,
-		BaseRebuilt:      baseRebuilt,
+		BaseRebuilt:      rebuildBase,
 		ExtraAptPackages: append([]string(nil), norm.ExtraAptPackages...),
 		ExtraPipPackages: append([]string(nil), norm.ExtraPipPackages...),
 	}, nil

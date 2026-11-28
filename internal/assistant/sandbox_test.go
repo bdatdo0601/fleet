@@ -27,6 +27,9 @@ type mockSandboxRunner struct {
 	execCalls    []SandboxExecOpts
 	stopped      []string
 	built        []string
+	buildCPUs    []int
+	buildMemMB   []int
+	buildNoCache []bool
 	execFn       func(SandboxExecOpts) (SandboxRawResult, error)
 }
 
@@ -58,11 +61,14 @@ func (m *mockSandboxRunner) ImageExists(_ context.Context, image string) bool {
 	return m.imageExists[image]
 }
 
-func (m *mockSandboxRunner) BuildImage(_ context.Context, tag, containerfilePath, _ string, _, _ int) (string, error) {
+func (m *mockSandboxRunner) BuildImage(_ context.Context, tag, containerfilePath, _ string, cpus, memoryMB int, noCache bool) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	b, _ := os.ReadFile(containerfilePath)
 	m.built = append(m.built, tag+"::"+string(b))
+	m.buildCPUs = append(m.buildCPUs, cpus)
+	m.buildMemMB = append(m.buildMemMB, memoryMB)
+	m.buildNoCache = append(m.buildNoCache, noCache)
 	if m.imageExists == nil {
 		m.imageExists = make(map[string]bool)
 	}
@@ -122,10 +128,11 @@ func TestSandboxPackageValidationAndContainerfile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RenderCustomContainerfile failed: %v", err)
 	}
-	if !strings.Contains(cf, "FROM fleet-sandbox:base") ||
-		!strings.Contains(cf, "apt-get install -y --no-install-recommends graphviz") ||
-		!strings.Contains(cf, `pip install --no-cache-dir "seaborn>=0.13"`) ||
-		!strings.HasSuffix(cf, "USER sandbox\nWORKDIR /work\n") {
+	if !strings.Contains(cf, "FROM python:3.13-slim-bookworm") ||
+		strings.Contains(cf, "FROM fleet-sandbox:base") ||
+		!strings.Contains(cf, "apt-get install -y -o Acquire::Retries=3 --no-install-recommends graphviz") ||
+		!strings.Contains(cf, `uv pip install --system --no-cache "seaborn>=0.13"`) ||
+		!strings.HasSuffix(cf, "ENV HOME=/tmp MPLCONFIGDIR=/tmp/matplotlib\n") {
 		t.Fatalf("unexpected containerfile output:\n%s", cf)
 	}
 }
@@ -409,6 +416,9 @@ func TestSandboxManagerAndAssistantTools(t *testing.T) {
 	if instRes["status"] != "installed" || len(eng.Config().Sandbox.ExtraAptPackages) != 1 || len(eng.Config().Sandbox.ExtraPipPackages) != 1 {
 		t.Fatalf("expected persisted custom packages & rebuild, got %s cfg=%+v", instRaw, eng.Config().Sandbox)
 	}
+	if len(runner.built) != 1 || runner.buildCPUs[0] < 4 || runner.buildMemMB[0] < 4096 {
+		t.Fatalf("expected single 4-CPU/4GB build, got built=%d cpus=%v mem=%v", len(runner.built), runner.buildCPUs, runner.buildMemMB)
+	}
 }
 
 func TestSocketSandboxRunnerBridge(t *testing.T) {
@@ -486,7 +496,7 @@ func TestSocketSandboxRunnerBridge(t *testing.T) {
 	}
 	cfPath := filepath.Join(tmp, "Containerfile")
 	_ = os.WriteFile(cfPath, []byte("FROM scratch\n"), 0o644)
-	if out, err := sockRunner.BuildImage(t.Context(), "test:latest", cfPath, tmp, 2, 1024); err != nil || !strings.Contains(out, "built test:latest") {
+	if out, err := sockRunner.BuildImage(t.Context(), "test:latest", cfPath, tmp, 4, 4096, false); err != nil || !strings.Contains(out, "built test:latest") {
 		t.Fatalf("BuildImage via socket failed: out=%q err=%v", out, err)
 	}
 	if err := sockRunner.StartContainer(t.Context(), SandboxStartOpts{Name: "sb-test", Image: DefaultSandboxImage}); err != nil {

@@ -50,7 +50,7 @@ const (
 	DefaultSandboxNetwork     = "fleet-sandbox-offline"
 	DefaultSandboxSubnet      = "192.168.127.0/24"
 	DefaultSandboxCPUs        = 2
-	DefaultSandboxMemoryMB    = 1024
+	DefaultSandboxMemoryMB    = 2048
 	DefaultSandboxIdleMinutes = 10
 	DefaultSandboxMaxFileMB   = 25
 )
@@ -428,7 +428,7 @@ func normalizeSandboxConfig(s SandboxConfig) SandboxConfig {
 	if s.MemoryMB <= 0 {
 		s.MemoryMB = DefaultSandboxMemoryMB
 	} else {
-		s.MemoryMB = min(max(s.MemoryMB, 256), 4096)
+		s.MemoryMB = min(max(s.MemoryMB, 256), 8192)
 	}
 	if s.IdleMinutes <= 0 {
 		s.IdleMinutes = DefaultSandboxIdleMinutes

@@ -504,7 +504,7 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
   const sbCfg = cfg.sandbox || {};
   const sbEnabledChk = el("input", { type: "checkbox", checked: Boolean(sbCfg.enabled) });
   const sbCPUsIn = el("input", { type: "number", min: "1", max: "4", value: String(sbCfg.cpus ?? 2) });
-  const sbMemIn = el("input", { type: "number", min: "256", max: "4096", step: "128", value: String(sbCfg.memory_mb ?? 1024) });
+  const sbMemIn = el("input", { type: "number", min: "256", max: "8192", step: "128", value: String(sbCfg.memory_mb ?? 2048) });
   const sbIdleIn = el("input", { type: "number", min: "1", max: "120", value: String(sbCfg.idle_minutes ?? 10) });
   const sbMaxFileIn = el("input", { type: "number", min: "1", max: "100", value: String(sbCfg.max_file_mb ?? 25) });
   const extraPkgsSummary = [
@@ -628,7 +628,7 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
       "div",
       { className: "grid-2" },
       field("CPUs (1-4)", sbCPUsIn),
-      field("Memory MB (256-4096)", sbMemIn),
+      field("Memory MB (256-8192)", sbMemIn),
       field("Idle Auto-Stop (mins)", sbIdleIn),
       field("Max File Size (MB)", sbMaxFileIn),
     ),
@@ -767,7 +767,7 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
               ...sbCfg,
               enabled: sbEnabledChk.checked,
               cpus: Number.parseInt(sbCPUsIn.value || "2", 10) || 2,
-              memory_mb: Number.parseInt(sbMemIn.value || "1024", 10) || 1024,
+              memory_mb: Number.parseInt(sbMemIn.value || "2048", 10) || 2048,
               idle_minutes: Number.parseInt(sbIdleIn.value || "10", 10) || 10,
               max_file_mb: Number.parseInt(sbMaxFileIn.value || "25", 10) || 25,
             },

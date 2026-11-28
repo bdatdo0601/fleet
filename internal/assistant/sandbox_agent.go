@@ -90,12 +90,13 @@ func buildSandboxAgentHandler(runner SandboxRunner) http.Handler {
 			ContextDir        string `json:"context_dir"`
 			CPUs              int    `json:"cpus"`
 			MemoryMB          int    `json:"memory_mb"`
+			NoCache           bool   `json:"no_cache"`
 		}
 		if err := decodeAgentJSON(r, &req); err != nil {
 			writeAgentErr(w, http.StatusBadRequest, err)
 			return
 		}
-		out, err := runner.BuildImage(r.Context(), req.Tag, req.ContainerfilePath, req.ContextDir, req.CPUs, req.MemoryMB)
+		out, err := runner.BuildImage(r.Context(), req.Tag, req.ContainerfilePath, req.ContextDir, req.CPUs, req.MemoryMB, req.NoCache)
 		if err != nil {
 			writeAgentErr(w, http.StatusInternalServerError, err)
 			return
@@ -335,7 +336,7 @@ func (r *SocketSandboxRunner) ImageExists(ctx context.Context, image string) boo
 }
 
 // BuildImage builds an OCI image via the gui/<uid> agent socket when present.
-func (r *SocketSandboxRunner) BuildImage(ctx context.Context, tag, containerfilePath, contextDir string, cpus, memoryMB int) (string, error) {
+func (r *SocketSandboxRunner) BuildImage(ctx context.Context, tag, containerfilePath, contextDir string, cpus, memoryMB int, noCache bool) (string, error) {
 	if r.hasSocket() {
 		var out struct {
 			Output string `json:"output"`
@@ -346,12 +347,13 @@ func (r *SocketSandboxRunner) BuildImage(ctx context.Context, tag, containerfile
 			"context_dir":        contextDir,
 			"cpus":               cpus,
 			"memory_mb":          memoryMB,
+			"no_cache":           noCache,
 		}, &out); err != nil {
 			return "", err
 		}
 		return out.Output, nil
 	}
-	return r.direct.BuildImage(ctx, tag, containerfilePath, contextDir, cpus, memoryMB)
+	return r.direct.BuildImage(ctx, tag, containerfilePath, contextDir, cpus, memoryMB, noCache)
 }
 
 // StartContainer starts a sandbox container via the gui/<uid> agent socket when present.
