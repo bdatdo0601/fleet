@@ -30,9 +30,16 @@ import (
 	"github.com/bdatdo0601/fleet/internal/session"
 )
 
-const MaxTranscriptBytes = 256 * 1024
+const (
+	MaxTranscriptBytes    = 256 * 1024
+	maxTailItemRunes      = 400
+	maxLastAssistantRunes = 2000
+)
 
-var userRequestRE = regexp.MustCompile(`(?s)<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>`)
+var (
+	userRequestRE       = regexp.MustCompile(`(?s)<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>`)
+	claudeProjectSlugRE = regexp.MustCompile(`[^a-zA-Z0-9-]`)
+)
 
 // GitContext returns (repo, branch, shortStatus) for cwd without blocking longer than 1.5s.
 func GitContext(cwd string) (string, string, string) {
@@ -138,6 +145,81 @@ func FindCodexTranscript(cwd, codexHome string) string {
 	return ""
 }
 
+// FindClaudeTranscript locates the Claude Code transcript JSONL for a session ID.
+func FindClaudeTranscript(cwd, fullRawID, claudeHome string) string {
+	if fullRawID == "" || strings.HasPrefix(fullRawID, "pid-") || strings.ContainsAny(fullRawID, `/\`) || strings.Contains(fullRawID, "..") {
+		return ""
+	}
+	if claudeHome == "" {
+		h, _ := os.UserHomeDir()
+		claudeHome = filepath.Join(h, ".claude")
+	}
+	projectsDir := filepath.Join(claudeHome, "projects")
+	filename := fullRawID + ".jsonl"
+	if cwd != "" {
+		slug := claudeProjectSlugRE.ReplaceAllString(cwd, "-")
+		cand := filepath.Join(projectsDir, slug, filename)
+		if isRegularFile(cand) {
+			return cand
+		}
+	}
+	matches, err := filepath.Glob(filepath.Join(projectsDir, "*", filename))
+	if err != nil {
+		return ""
+	}
+	for _, m := range matches {
+		if isRegularFile(m) {
+			return m
+		}
+	}
+	return ""
+}
+
+// FindCodexTranscriptForSession locates a Codex rollout JSONL matching fullRawID, falling back to CWD matching.
+func FindCodexTranscriptForSession(fullRawID, cwd, codexHome string) string {
+	if codexHome == "" {
+		h, _ := os.UserHomeDir()
+		codexHome = filepath.Join(h, ".codex")
+	}
+	if fullRawID != "" && !strings.HasPrefix(fullRawID, "pid-") && !strings.ContainsAny(fullRawID, `/\`) && !strings.Contains(fullRawID, "..") {
+		sessionsDir := filepath.Join(codexHome, "sessions")
+		if info, err := os.Stat(sessionsDir); err == nil && info.IsDir() {
+			exact := fullRawID + ".jsonl"
+			suffix := "-" + exact
+			var bestPath string
+			var bestTime time.Time
+			_ = filepath.WalkDir(sessionsDir, func(p string, d os.DirEntry, walkErr error) error {
+				if walkErr == nil && !d.IsDir() {
+					name := d.Name()
+					if name == exact || strings.HasSuffix(name, suffix) {
+						if fi, fiErr := d.Info(); fiErr == nil && (bestPath == "" || fi.ModTime().After(bestTime)) {
+							bestPath = p
+							bestTime = fi.ModTime()
+						}
+					}
+				}
+				return nil
+			})
+			if bestPath != "" {
+				return bestPath
+			}
+		}
+	}
+	return FindCodexTranscript(cwd, codexHome)
+}
+
+// FindSessionTranscript resolves the local transcript file path for a live harness session.
+func FindSessionTranscript(harness, fullRawID, cwd string) string {
+	switch harness {
+	case "claude":
+		return FindClaudeTranscript(cwd, fullRawID, "")
+	case "codex":
+		return FindCodexTranscriptForSession(fullRawID, cwd, "")
+	default:
+		return ""
+	}
+}
+
 func extractTextBlocks(raw json.RawMessage) string {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
@@ -205,7 +287,7 @@ func parseClaudeLine(raw []byte) []agents.TailItem {
 	}
 	if ev.Type == "user" && !ev.IsMeta {
 		if text := extractTextBlocks(ev.Message.Content); text != "" {
-			return []agents.TailItem{{Role: "user", Text: agents.TruncateRunes(text, 400)}}
+			return []agents.TailItem{{Role: "user", Text: agents.TruncateRunes(text, maxTailItemRunes)}}
 		}
 		return nil
 	}
@@ -216,7 +298,7 @@ func parseClaudeLine(raw []byte) []agents.TailItem {
 	if len(trimmed) > 0 && trimmed[0] == '"' {
 		var s string
 		if json.Unmarshal(trimmed, &s) == nil && strings.TrimSpace(s) != "" {
-			return []agents.TailItem{{Role: "assistant", Text: agents.TruncateRunes(strings.TrimSpace(s), 400)}}
+			return []agents.TailItem{{Role: "assistant", Text: agents.TruncateRunes(strings.TrimSpace(s), maxLastAssistantRunes)}}
 		}
 		return nil
 	}
@@ -234,10 +316,10 @@ func parseClaudeLine(raw []byte) []agents.TailItem {
 		switch b.Type {
 		case "text":
 			if txt := strings.TrimSpace(b.Text); txt != "" {
-				items = append(items, agents.TailItem{Role: "assistant", Text: agents.TruncateRunes(txt, 400)})
+				items = append(items, agents.TailItem{Role: "assistant", Text: agents.TruncateRunes(txt, maxLastAssistantRunes)})
 			}
 		case "tool_use":
-			items = append(items, agents.TailItem{Role: "tool", Text: agents.TruncateRunes(fmtTool(b.Name, b.Input), 400)})
+			items = append(items, agents.TailItem{Role: "tool", Text: agents.TruncateRunes(fmtTool(b.Name, b.Input), maxTailItemRunes)})
 		}
 	}
 	return items
@@ -264,14 +346,18 @@ func parseCodexLine(raw []byte) []agents.TailItem {
 		if text == "" || strings.HasPrefix(text, "<environment_context>") || strings.HasPrefix(text, "<permissions") {
 			return nil
 		}
-		return []agents.TailItem{{Role: p.Role, Text: agents.TruncateRunes(text, 400)}}
+		limit := maxTailItemRunes
+		if p.Role == "assistant" {
+			limit = maxLastAssistantRunes
+		}
+		return []agents.TailItem{{Role: p.Role, Text: agents.TruncateRunes(text, limit)}}
 	}
 	if p.Type == "function_call" || p.Type == "custom_tool_call" || p.Type == "local_shell_call" {
 		args := p.Arguments
 		if args == nil {
 			args = p.Input
 		}
-		return []agents.TailItem{{Role: "tool", Text: agents.TruncateRunes(fmtTool(cmp.Or(p.Name, p.Type), args), 400)}}
+		return []agents.TailItem{{Role: "tool", Text: agents.TruncateRunes(fmtTool(cmp.Or(p.Name, p.Type), args), maxTailItemRunes)}}
 	}
 	return nil
 }
@@ -294,7 +380,7 @@ func parseAntigravityLine(raw []byte) []agents.TailItem {
 			text = m[1]
 		}
 		if trimmed := strings.TrimSpace(text); trimmed != "" {
-			return []agents.TailItem{{Role: "user", Text: agents.TruncateRunes(trimmed, 400)}}
+			return []agents.TailItem{{Role: "user", Text: agents.TruncateRunes(trimmed, maxTailItemRunes)}}
 		}
 		return nil
 	}
@@ -303,16 +389,32 @@ func parseAntigravityLine(raw []byte) []agents.TailItem {
 	}
 	var items []agents.TailItem
 	if txt := strings.TrimSpace(ev.Content); txt != "" {
-		items = append(items, agents.TailItem{Role: "assistant", Text: agents.TruncateRunes(txt, 400)})
+		items = append(items, agents.TailItem{Role: "assistant", Text: agents.TruncateRunes(txt, maxLastAssistantRunes)})
 	}
 	if len(ev.ToolCalls) > 0 {
 		names := make([]string, len(ev.ToolCalls))
 		for i, tc := range ev.ToolCalls {
 			names[i] = cmp.Or(tc.Name, tc.Tool, "tool")
 		}
-		items = append(items, agents.TailItem{Role: "tool", Text: agents.TruncateRunes(strings.Join(names, ", "), 400)})
+		items = append(items, agents.TailItem{Role: "tool", Text: agents.TruncateRunes(strings.Join(names, ", "), maxTailItemRunes)})
 	}
 	return items
+}
+
+func normalizeTailLengths(tail []agents.TailItem) {
+	lastAssistantIdx := -1
+	for i, it := range tail {
+		if it.Role == "assistant" {
+			lastAssistantIdx = i
+		}
+	}
+	for i := range tail {
+		limit := maxTailItemRunes
+		if i == lastAssistantIdx {
+			limit = maxLastAssistantRunes
+		}
+		tail[i].Text = agents.TruncateRunes(tail[i].Text, limit)
+	}
 }
 
 // ReadTranscriptTail reads up to the last maxItems normalized events from a harness transcript JSONL.
@@ -367,6 +469,7 @@ func ReadTranscriptTail(harness, transcriptPath, cwd string, maxItems int) (stri
 	if tail == nil {
 		tail = []agents.TailItem{}
 	}
+	normalizeTailLengths(tail)
 	summary := ""
 	for _, it := range slices.Backward(items) {
 		if it.Role == "user" && it.Text != "" {
@@ -661,22 +764,24 @@ type hookInput struct {
 		Args any    `json:"args"`
 	} `json:"toolCall"`
 
-	SnakeEvent          string `json:"hook_event_name"`
-	SessionID           string `json:"session_id"`
-	SnakeTranscriptPath string `json:"transcript_path"`
-	Prompt              string `json:"prompt"`
-	StopHookActive      bool   `json:"stop_hook_active"`
-	ToolName            string `json:"tool_name"`
-	ToolInput           any    `json:"tool_input"`
-	NotificationType    string `json:"notification_type"`
-	Message             string `json:"message"`
-	Title               string `json:"title"`
-	CWD                 string `json:"cwd"`
-	AgentID             string `json:"agent_id"`
-	AgentIDCamel        string `json:"agentId"`
-	ParentConvID        string `json:"parentConversationId"`
-	ParentConvSnake     string `json:"parent_conversation_id"`
-	IsSubagent          bool   `json:"isSubagent"`
+	SnakeEvent           string `json:"hook_event_name"`
+	SessionID            string `json:"session_id"`
+	SnakeTranscriptPath  string `json:"transcript_path"`
+	Prompt               string `json:"prompt"`
+	StopHookActive       bool   `json:"stop_hook_active"`
+	LastAssistantMessage string `json:"last_assistant_message"`
+	LastAssistantCamel   string `json:"lastAssistantMessage"`
+	ToolName             string `json:"tool_name"`
+	ToolInput            any    `json:"tool_input"`
+	NotificationType     string `json:"notification_type"`
+	Message              string `json:"message"`
+	Title                string `json:"title"`
+	CWD                  string `json:"cwd"`
+	AgentID              string `json:"agent_id"`
+	AgentIDCamel         string `json:"agentId"`
+	ParentConvID         string `json:"parentConversationId"`
+	ParentConvSnake      string `json:"parent_conversation_id"`
+	IsSubagent           bool   `json:"isSubagent"`
 }
 
 func classifyAntigravityEvent(event string, in *hookInput) (string, map[string]string, bool) {
@@ -866,6 +971,32 @@ func maybeRecordSessionHook(harness string, in *hookInput, rawID, cwd, transcrip
 	session.RecordHookState(harness, rawID, cwd, transcriptPath)
 }
 
+func mergeLastAssistantMessage(tail []agents.TailItem, msg string, maxItems int) []agents.TailItem {
+	text := strings.TrimSpace(msg)
+	if text == "" {
+		return tail
+	}
+	if maxItems <= 0 {
+		maxItems = 20
+	}
+	truncated := agents.TruncateRunes(text, maxLastAssistantRunes)
+	if len(tail) > 0 && tail[len(tail)-1].Role == "assistant" {
+		existing := strings.TrimSpace(tail[len(tail)-1].Text)
+		if existing == truncated || strings.HasPrefix(truncated, existing) || strings.HasPrefix(existing, truncated) {
+			if len(truncated) > len(existing) {
+				tail[len(tail)-1].Text = truncated
+			}
+			return tail
+		}
+	}
+	tail = append(tail, agents.TailItem{Role: "assistant", Text: truncated})
+	if len(tail) > maxItems {
+		tail = tail[len(tail)-maxItems:]
+	}
+	normalizeTailLengths(tail)
+	return tail
+}
+
 // RunHook processes a single lifecycle hook payload from stdin and writes harness JSON to stdout.
 func RunHook(harness string, stdin io.Reader, stdout io.Writer, apiURL string) (int, error) {
 	if !paths.ValidHarness(harness) {
@@ -896,6 +1027,7 @@ func RunHook(harness string, stdin io.Reader, stdout io.Writer, apiURL string) (
 	wg.Go(func() { tailSummary, tail = ReadTranscriptTail(harness, transcriptPath, cwd, 20) })
 	wg.Go(func() { title, isExplicitName = ReadSessionTitle(harness, rawID, transcriptPath, "", "") })
 	wg.Wait()
+	tail = mergeLastAssistantMessage(tail, cmp.Or(in.LastAssistantMessage, in.LastAssistantCamel), 20)
 
 	summary := tailSummary
 	if trimmed := strings.TrimSpace(prompt); trimmed != "" {

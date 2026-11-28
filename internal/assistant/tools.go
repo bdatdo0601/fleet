@@ -99,12 +99,12 @@ func makeToolSpec(name, desc string, params map[string]any) ToolSpec {
 
 func (e *Engine) buildToolSpecs(ctx context.Context) []ToolSpec {
 	specs := []ToolSpec{
-		makeToolSpec("fleet_list_agents", "List active Fleet AI agent sessions across Macs.", schemaObj(map[string]any{
+		makeToolSpec("fleet_list_agents", "List active Fleet AI agent sessions across Macs. state=\"idle\" means the agent finished its last turn and is waiting for input; state_changed_at/state_age_seconds show when it entered that state while updated_at/age_seconds reflect periodic liveness pings.", schemaObj(map[string]any{
 			"device": strProp("Optional device filter"), "repo": strProp("Optional repo filter"),
 			"harness": strProp("Optional harness filter"), "state": strProp("Optional state filter (working, waiting, idle)"),
 			"include_stale": boolProp("Include recently exited/stale sessions"),
 		})),
-		makeToolSpec("fleet_inspect_agent", "Inspect one Fleet agent session's status, pending prompt, and tail.", schemaObj(map[string]any{
+		makeToolSpec("fleet_inspect_agent", "Inspect one Fleet agent session's status, pending prompt, and tail. state=\"idle\" means the last turn finished; use state_changed_at/state_age_seconds to tell when it finished rather than updated_at/age_seconds (which only reflect periodic 60s liveness pings).", schemaObj(map[string]any{
 			"agent_id": strProp("Session name, device/name, title, or session_id"),
 		}, "agent_id")),
 		makeToolSpec("fleet_send_message", "Send a message to a peer Fleet agent session or device.", schemaObj(map[string]any{

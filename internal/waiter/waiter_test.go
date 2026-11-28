@@ -548,3 +548,66 @@ func TestRunRelayClaudeCodexAndLivenessSweep(t *testing.T) {
 		t.Fatal("RunRelay did not stop on context cancel")
 	}
 }
+
+func TestLivenessSweepRefreshesTranscriptTail(t *testing.T) {
+	f, srv, tmp := setupWaiterServer(t)
+	t.Setenv("HOME", tmp)
+
+	uuid := "ca8a2ad4-7afe-431e-a1f5-231ac8134547"
+	cwd := "/Users/datdo/workspace/demo"
+	projDir := filepath.Join(tmp, ".claude", "projects", "-Users-datdo-workspace-demo")
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	transcriptPath := filepath.Join(projDir, uuid+".jsonl")
+	if err := os.WriteFile(transcriptPath, []byte(strings.Join([]string{
+		`{"type":"ai-title","aiTitle":"Demo Hygiene Report"}`,
+		`{"type":"user","message":{"role":"user","content":"run hygiene check"}}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"git status"}}]}}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Final hygiene report: everything passed."}]}}`,
+	}, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pid := 5501
+	if _, err := f.Agents.Heartbeat(agents.HeartbeatParams{
+		Device:  "mini",
+		Harness: "claude",
+		RawID:   uuid,
+		PID:     &pid,
+		CWD:     cwd,
+		State:   "idle",
+		Tail: []agents.TailItem{
+			{Role: "user", Text: "run hygiene check"},
+			{Role: "tool", Text: "Bash(command=git status)"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite", filepath.Join(f.Root, "agents.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldTS := time.Now().UTC().Add(-90 * time.Second).Format("2006-01-02T15:04:05+00:00")
+	if _, err := db.Exec("UPDATE agent_sessions SET updated_at = ? WHERE session_id = ?", oldTS, "mini:claude:ca8a2ad4-7af"); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	runLivenessSweep(context.Background(), srv.URL, "mini", map[string]bool{"claude": true}, filepath.Join(tmp, "cache"), func(int) bool {
+		return true
+	})
+
+	detail, err := f.Agents.GetSession("mini:claude:ca8a2ad4-7af")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(detail.Tail) != 3 || detail.Tail[2].Role != "assistant" || detail.Tail[2].Text != "Final hygiene report: everything passed." {
+		t.Fatalf("expected liveness sweep to refresh transcript tail, got %+v", detail.Tail)
+	}
+	if detail.Title != "Demo Hygiene Report" {
+		t.Fatalf("expected title refreshed from transcript, got %q", detail.Title)
+	}
+}

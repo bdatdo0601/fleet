@@ -427,3 +427,49 @@ func TestUsageUpsertPreservesGoodSnapshotAgainstDegradedReport(t *testing.T) {
 		t.Fatalf("unexpected ListUsage order/result: %+v err=%v", list, err)
 	}
 }
+
+func TestKeepalivePreservesStateAgeSeconds(t *testing.T) {
+	hub := openTestHub(t)
+
+	if _, err := hub.Heartbeat(HeartbeatParams{
+		Device:  "laptop",
+		Harness: "claude",
+		RawID:   "idle-age-1",
+		CWD:     "/tmp/proj",
+		State:   "idle",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite", hub.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldTS := time.Now().UTC().Add(-180 * time.Second).Format("2006-01-02T15:04:05+00:00")
+	if _, err := db.Exec("UPDATE agent_sessions SET state_changed_at = ?, updated_at = ? WHERE session_id = ?", oldTS, oldTS, "laptop:claude:idle-age-1"); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	if _, err := hub.Heartbeat(HeartbeatParams{
+		Device:  "laptop",
+		Harness: "claude",
+		RawID:   "idle-age-1",
+		CWD:     "/tmp/proj",
+		State:   "idle",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	detail, err := hub.GetSession("laptop:claude:idle-age-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.AgeSeconds >= 5 {
+		t.Fatalf("expected AgeSeconds refreshed near 0, got %d", detail.AgeSeconds)
+	}
+	if detail.StateAgeSeconds < 175 {
+		t.Fatalf("expected StateAgeSeconds preserved >= 175s, got %d", detail.StateAgeSeconds)
+	}
+}

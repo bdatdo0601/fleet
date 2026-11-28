@@ -243,13 +243,26 @@ func runLivenessSweep(ctx context.Context, api, localDevice string, managed map[
 		}
 		if s.AgeSeconds >= 60 {
 			rawID := cmp.Or(s.FullRawID, sessionShortRawID(s.SessionID))
-			_ = client.CallContext(ctx, api, http.MethodPost, "/v1/agents/heartbeat", agents.HeartbeatParams{
+			hb := agents.HeartbeatParams{
 				Harness: s.Harness,
 				RawID:   rawID,
 				PID:     s.PID,
 				CWD:     s.CWD,
 				State:   s.State,
-			}, 5*time.Second, nil, nil)
+			}
+			if tp := hooks.FindSessionTranscript(s.Harness, s.FullRawID, s.CWD); tp != "" {
+				if _, tail := hooks.ReadTranscriptTail(s.Harness, tp, s.CWD, 20); len(tail) > 0 {
+					hb.Tail = tail
+				}
+				if title, isExplicit := hooks.ReadSessionTitle(s.Harness, rawID, tp, "", ""); title != "" {
+					hb.Title = &title
+					if isExplicit {
+						hb.Name = &title
+						hb.ExplicitName = true
+					}
+				}
+			}
+			_ = client.CallContext(ctx, api, http.MethodPost, "/v1/agents/heartbeat", hb, 5*time.Second, nil, nil)
 		}
 	}
 }

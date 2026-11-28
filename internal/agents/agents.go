@@ -160,29 +160,30 @@ type TailItem struct {
 
 // Session represents a serialized agent session in list/report responses.
 type Session struct {
-	SessionID      string            `json:"session_id"`
-	Device         string            `json:"device"`
-	Harness        string            `json:"harness"`
-	FullRawID      string            `json:"full_raw_id"`
-	PID            *int              `json:"pid"`
-	CWD            string            `json:"cwd"`
-	Repo           string            `json:"repo"`
-	Branch         string            `json:"branch"`
-	State          string            `json:"state"`
-	StateChangedAt string            `json:"state_changed_at"`
-	WaitingSeconds *int              `json:"waiting_seconds"`
-	PendingAction  map[string]string `json:"pending_action"`
-	Live           bool              `json:"live"`
-	Listening      bool              `json:"listening"`
-	Delivery       string            `json:"delivery"`
-	AgeSeconds     int               `json:"age_seconds"`
-	Title          string            `json:"title"`
-	Name           string            `json:"name"`
-	Summary        string            `json:"summary"`
-	GitStatus      string            `json:"git_status"`
-	TurnCount      int               `json:"turn_count"`
-	StartedAt      string            `json:"started_at"`
-	UpdatedAt      string            `json:"updated_at"`
+	SessionID       string            `json:"session_id"`
+	Device          string            `json:"device"`
+	Harness         string            `json:"harness"`
+	FullRawID       string            `json:"full_raw_id"`
+	PID             *int              `json:"pid"`
+	CWD             string            `json:"cwd"`
+	Repo            string            `json:"repo"`
+	Branch          string            `json:"branch"`
+	State           string            `json:"state"`
+	StateChangedAt  string            `json:"state_changed_at"`
+	StateAgeSeconds int               `json:"state_age_seconds"`
+	WaitingSeconds  *int              `json:"waiting_seconds"`
+	PendingAction   map[string]string `json:"pending_action"`
+	Live            bool              `json:"live"`
+	Listening       bool              `json:"listening"`
+	Delivery        string            `json:"delivery"`
+	AgeSeconds      int               `json:"age_seconds"`
+	Title           string            `json:"title"`
+	Name            string            `json:"name"`
+	Summary         string            `json:"summary"`
+	GitStatus       string            `json:"git_status"`
+	TurnCount       int               `json:"turn_count"`
+	StartedAt       string            `json:"started_at"`
+	UpdatedAt       string            `json:"updated_at"`
 }
 
 // SessionDetail extends Session with the recent transcript tail.
@@ -552,38 +553,40 @@ func rowToSession(r *sessionRow, now time.Time, listening bool) Session {
 	if stateChangedAt == "" {
 		stateChangedAt = r.updatedAt
 	}
+	stateAge := max(int(now.Sub(parseTS(stateChangedAt)).Seconds()), 0)
 	var pendingAction map[string]string
 	var waitingSecs *int
 	if IsWaitingState(r.state) {
 		pendingAction = parsePendingAction(r.pendingActionJSON)
-		ws := max(int(now.Sub(parseTS(stateChangedAt)).Seconds()), 0)
+		ws := stateAge
 		waitingSecs = &ws
 	}
 	isListening := listening && live && r.state != "exited"
 	return Session{
-		SessionID:      r.sessionID,
-		Device:         r.device,
-		Harness:        r.harness,
-		FullRawID:      r.fullRawID,
-		PID:            r.pid,
-		CWD:            r.cwd,
-		Repo:           r.repo,
-		Branch:         r.branch,
-		State:          r.state,
-		StateChangedAt: stateChangedAt,
-		WaitingSeconds: waitingSecs,
-		PendingAction:  pendingAction,
-		Live:           live,
-		Listening:      isListening,
-		Delivery:       DeliveryMode(live, r.state, isListening),
-		AgeSeconds:     age,
-		Title:          r.title,
-		Name:           r.name,
-		Summary:        r.summary,
-		GitStatus:      r.gitStatus,
-		TurnCount:      len(tail),
-		StartedAt:      r.startedAt,
-		UpdatedAt:      r.updatedAt,
+		SessionID:       r.sessionID,
+		Device:          r.device,
+		Harness:         r.harness,
+		FullRawID:       r.fullRawID,
+		PID:             r.pid,
+		CWD:             r.cwd,
+		Repo:            r.repo,
+		Branch:          r.branch,
+		State:           r.state,
+		StateChangedAt:  stateChangedAt,
+		StateAgeSeconds: stateAge,
+		WaitingSeconds:  waitingSecs,
+		PendingAction:   pendingAction,
+		Live:            live,
+		Listening:       isListening,
+		Delivery:        DeliveryMode(live, r.state, isListening),
+		AgeSeconds:      age,
+		Title:           r.title,
+		Name:            r.name,
+		Summary:         r.summary,
+		GitStatus:       r.gitStatus,
+		TurnCount:       len(tail),
+		StartedAt:       r.startedAt,
+		UpdatedAt:       r.updatedAt,
 	}
 }
 

@@ -64,8 +64,10 @@ var Tools = []ToolDef{
 		},
 	},
 	{
-		Name:        "fleet_inspect_agent",
-		Description: "Inspect another agent session's cwd, git branch/status, pending permission/question prompts (pending_action, waiting_seconds), and recent conversation/tool activity.",
+		Name: "fleet_inspect_agent",
+		Description: "Inspect another agent session's cwd, git branch/status, pending permission/question prompts (pending_action, waiting_seconds), " +
+			"state timestamps (state_changed_at/state_age_seconds show when it entered its current state, e.g. finished to idle, whereas updated_at/age_seconds reflect periodic liveness pings), " +
+			"and recent conversation/tool activity.",
 		InputSchema: toolInputSchema{
 			Type: "object",
 			Properties: map[string]toolSchemaProp{

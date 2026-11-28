@@ -338,3 +338,129 @@ func TestClaudeSocketHandoffSaveLoadAndSessionEnd(t *testing.T) {
 		t.Fatal("expected socket handoff removed on SessionEnd")
 	}
 }
+
+func TestStopHookLastAssistantMessageAndTruncation(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_CACHE_DIR", filepath.Join(tmp, "cache"))
+	pubFile := filepath.Join(tmp, "mini.pub")
+	if err := pki.Keygen(filepath.Join(tmp, "mini.key"), pubFile); err != nil {
+		t.Skip("nebula-cert not installed")
+	}
+	miniPub, _ := os.ReadFile(pubFile)
+	f, err := core.Initialize(core.InitOpts{
+		Root: filepath.Join(tmp, "state"), Host: "h.example.com", Port: 443,
+		Passphrase: "correct horse battery staple", LighthousePubkey: string(miniPub),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	srv := httptest.NewServer(server.NewHandler(f, true))
+	t.Cleanup(srv.Close)
+
+	transcript := filepath.Join(tmp, "claude-stop.jsonl")
+	earlierAssistant := strings.Repeat("a", 600)
+	_ = os.WriteFile(transcript, []byte(strings.Join([]string{
+		`{"type":"user","message":{"role":"user","content":"audit repo"}}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"` + earlierAssistant + `"},{"type":"tool_use","name":"Bash","input":{"command":"git grep foo"}}]}}`,
+	}, "\n")+"\n"), 0o644)
+
+	finalReport := strings.Repeat("r", 1500)
+	stopPayload := map[string]any{
+		"hook_event_name":        "Stop",
+		"session_id":             "cl-stop-race",
+		"cwd":                    tmp,
+		"transcript_path":        transcript,
+		"last_assistant_message": finalReport,
+	}
+	b, _ := json.Marshal(stopPayload)
+	var out bytes.Buffer
+	rc, err := RunHook("claude", bytes.NewReader(b), &out, srv.URL)
+	if err != nil || rc != 0 {
+		t.Fatalf("RunHook Stop failed: rc=%d err=%v", rc, err)
+	}
+
+	detail, err := f.Agents.GetSession("cl-stop-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(detail.Tail) != 4 {
+		t.Fatalf("expected 4 tail items, got %d: %+v", len(detail.Tail), detail.Tail)
+	}
+	if detail.Tail[1].Role != "assistant" || len(detail.Tail[1].Text) != maxTailItemRunes {
+		t.Fatalf("expected earlier assistant truncated to %d runes, got len=%d", maxTailItemRunes, len(detail.Tail[1].Text))
+	}
+	if detail.Tail[3].Role != "assistant" || detail.Tail[3].Text != finalReport {
+		t.Fatalf("expected final assistant report (len=%d), got role=%q len=%d", len(finalReport), detail.Tail[3].Role, len(detail.Tail[3].Text))
+	}
+
+	// Once transcript flushes the same assistant message, Stop must not duplicate it.
+	_ = os.WriteFile(transcript, []byte(strings.Join([]string{
+		`{"type":"user","message":{"role":"user","content":"audit repo"}}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"` + earlierAssistant + `"},{"type":"tool_use","name":"Bash","input":{"command":"git grep foo"}}]}}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"` + finalReport + `"}]}}`,
+	}, "\n")+"\n"), 0o644)
+	out.Reset()
+	rc, err = RunHook("claude", bytes.NewReader(b), &out, srv.URL)
+	if err != nil || rc != 0 {
+		t.Fatalf("second RunHook Stop failed: rc=%d err=%v", rc, err)
+	}
+	detail2, err := f.Agents.GetSession("cl-stop-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(detail2.Tail) != 4 || detail2.Tail[3].Text != finalReport {
+		t.Fatalf("expected no duplicate assistant entry after flush, got len=%d tail=%+v", len(detail2.Tail), detail2.Tail)
+	}
+}
+
+func TestReadTranscriptTailFinalAssistantCapAndDiscovery(t *testing.T) {
+	tmp := t.TempDir()
+
+	// ReadTranscriptTail keeps 2000 runes for last assistant and 400 for earlier assistant.
+	claudeLog := filepath.Join(tmp, "tail-cap.jsonl")
+	firstResp := strings.Repeat("x", 800)
+	lastResp := strings.Repeat("y", 2500)
+	_ = os.WriteFile(claudeLog, []byte(strings.Join([]string{
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"` + firstResp + `"}]}}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"` + lastResp + `"}]}}`,
+	}, "\n")+"\n"), 0o644)
+	_, tail := ReadTranscriptTail("claude", claudeLog, "", 20)
+	if len(tail) != 2 {
+		t.Fatalf("expected 2 items, got %+v", tail)
+	}
+	if len(tail[0].Text) != maxTailItemRunes || len(tail[1].Text) != maxLastAssistantRunes {
+		t.Fatalf("unexpected lengths: first=%d last=%d", len(tail[0].Text), len(tail[1].Text))
+	}
+
+	// FindClaudeTranscript: direct slug path, glob fallback, and invalid-ID guards.
+	claudeHome := filepath.Join(tmp, ".claude")
+	uuid := "ca8a2ad4-7afe-431e-a1f5-231ac8134547"
+	slugDir := filepath.Join(claudeHome, "projects", "-Users-datdo-workspace-demo")
+	_ = os.MkdirAll(slugDir, 0o755)
+	directFile := filepath.Join(slugDir, uuid+".jsonl")
+	_ = os.WriteFile(directFile, []byte("{}\n"), 0o644)
+
+	if got := FindClaudeTranscript("/Users/datdo/workspace/demo", uuid, claudeHome); got != directFile {
+		t.Fatalf("direct slug match failed: got %q want %q", got, directFile)
+	}
+	if got := FindClaudeTranscript("/Users/datdo/workspace/other", uuid, claudeHome); got != directFile {
+		t.Fatalf("glob fallback failed: got %q want %q", got, directFile)
+	}
+	for _, bad := range []string{"", "pid-123", "../secret", "a/b", `a\b`} {
+		if got := FindClaudeTranscript("/Users/datdo/workspace/demo", bad, claudeHome); got != "" {
+			t.Fatalf("expected empty for invalid id %q, got %q", bad, got)
+		}
+	}
+
+	// FindCodexTranscriptForSession: matches rollout-<ts>-<uuid>.jsonl.
+	codexHome := filepath.Join(tmp, ".codex")
+	codexDir := filepath.Join(codexHome, "sessions", "2026", "11", "28")
+	_ = os.MkdirAll(codexDir, 0o755)
+	codexUUID := "01a21505-c4cd-71a0-bd2a-272af7cde762"
+	rolloutFile := filepath.Join(codexDir, "rollout-2026-11-28T00-00-00-"+codexUUID+".jsonl")
+	_ = os.WriteFile(rolloutFile, []byte("{}\n"), 0o644)
+	if got := FindCodexTranscriptForSession(codexUUID, "", codexHome); got != rolloutFile {
+		t.Fatalf("codex UUID match failed: got %q want %q", got, rolloutFile)
+	}
+}
