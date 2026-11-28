@@ -24,15 +24,16 @@ import (
 const (
 	PrimaryVaultName = "agent"
 
-	DefaultOpenRouterURL = "https://openrouter.ai/api/v1"
-	DefaultChatModel     = "anthropic/claude-haiku-5.5"
-	DefaultFastModel     = "thinkingmachines/inkling-2-mini"
-	DefaultFrontierModel = "openai/gpt-6.2-sol"
-	DefaultDecisionModel = "typesafe/jev-1.14"
-	DefaultObserverModel = "meta/muse-ember"
-	DefaultHeartbeatMins = 30
-	DefaultObserveTokens = 12000
-	DefaultReflectBytes  = 24000
+	DefaultOpenRouterURL    = "https://openrouter.ai/api/v1"
+	DefaultChatModel        = "anthropic/claude-haiku-5.5"
+	DefaultFastModel        = "thinkingmachines/inkling-2-mini"
+	DefaultFrontierModel    = "openai/gpt-6.2-sol"
+	DefaultDecisionModel    = "typesafe/jev-1.14"
+	DefaultObserverModel    = "meta/muse-ember"
+	DefaultHeartbeatMins    = 30
+	DefaultObserveTokens    = 3000
+	DefaultObserverIdleMins = 30
+	DefaultReflectBytes     = 24000
 
 	RoutingModeOff     = "off"
 	RoutingModeHybrid  = "hybrid"
@@ -255,6 +256,7 @@ type Config struct {
 	GitAutoCommit            bool                `json:"git_auto_commit"`
 	HeartbeatIntervalMinutes int                 `json:"heartbeat_interval_minutes"`
 	ObserverThresholdTokens  int                 `json:"observer_threshold_tokens"`
+	ObserverIdleMinutes      int                 `json:"observer_idle_minutes"`
 	ReflectorThresholdBytes  int                 `json:"reflector_threshold_bytes"`
 	Models                   ModelConfig         `json:"models"`
 	LocalLLM                 LocalLLMConfig      `json:"local_llm"`
@@ -296,6 +298,7 @@ type ConfigView struct {
 	GitAutoCommit            bool                `json:"git_auto_commit"`
 	HeartbeatIntervalMinutes int                 `json:"heartbeat_interval_minutes"`
 	ObserverThresholdTokens  int                 `json:"observer_threshold_tokens"`
+	ObserverIdleMinutes      int                 `json:"observer_idle_minutes"`
 	ReflectorThresholdBytes  int                 `json:"reflector_threshold_bytes"`
 	Models                   ModelConfig         `json:"models"`
 	LocalLLM                 LocalLLMConfig      `json:"local_llm"`
@@ -353,6 +356,7 @@ func DefaultConfig() Config {
 		GitAutoCommit:            true,
 		HeartbeatIntervalMinutes: DefaultHeartbeatMins,
 		ObserverThresholdTokens:  DefaultObserveTokens,
+		ObserverIdleMinutes:      DefaultObserverIdleMins,
 		ReflectorThresholdBytes:  DefaultReflectBytes,
 		Models: ModelConfig{
 			DefaultChat: DefaultChatModel,
@@ -446,6 +450,9 @@ func NormalizeConfig(cfg Config) Config {
 	}
 	if cfg.ObserverThresholdTokens <= 0 {
 		cfg.ObserverThresholdTokens = def.ObserverThresholdTokens
+	}
+	if cfg.ObserverIdleMinutes < 0 {
+		cfg.ObserverIdleMinutes = 0
 	}
 	if cfg.ReflectorThresholdBytes <= 0 {
 		cfg.ReflectorThresholdBytes = def.ReflectorThresholdBytes
@@ -1117,6 +1124,7 @@ func (c Config) View(effectiveVault string) ConfigView {
 		GitAutoCommit:            c.GitAutoCommit,
 		HeartbeatIntervalMinutes: c.HeartbeatIntervalMinutes,
 		ObserverThresholdTokens:  c.ObserverThresholdTokens,
+		ObserverIdleMinutes:      c.ObserverIdleMinutes,
 		ReflectorThresholdBytes:  c.ReflectorThresholdBytes,
 		Models:                   c.Models,
 		LocalLLM:                 normalizeLocalLLMConfig(c.LocalLLM),

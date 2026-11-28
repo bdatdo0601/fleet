@@ -23,6 +23,8 @@ export async function openAssistantSettingsModal(onSaved, onNavigate) {
   const frontierIn = el("input", { type: "text", value: models.frontier || "" });
   const decisionIn = el("input", { type: "text", value: models.decision || "" });
   const observerIn = el("input", { type: "text", value: models.observer || "" });
+  const observerThresholdIn = el("input", { type: "number", value: String(cfg.observer_threshold_tokens ?? 3000), min: "500", step: "250" });
+  const observerIdleIn = el("input", { type: "number", value: String(cfg.observer_idle_minutes ?? 30), min: "0" });
   const hbIn = el("input", { type: "number", value: String(cfg.heartbeat_interval_minutes ?? 30), min: "0" });
   const routingModeSel = el(
     "select",
@@ -254,6 +256,8 @@ export async function openAssistantSettingsModal(onSaved, onNavigate) {
       field("Frontier Model", frontierIn),
       field("Decision Model", decisionIn),
       field("Observer / Reflector Model", observerIn),
+      field("Observer Threshold (tokens)", observerThresholdIn),
+      field("Observer Idle Flush (mins, 0=off)", observerIdleIn),
       field("Heartbeat Interval (mins, 0=off)", hbIn),
     ),
     el("h4", { className: "mt-2", text: "Frontier Auto-Routing & Topic Grants" }),
@@ -471,6 +475,9 @@ export async function openAssistantSettingsModal(onSaved, onNavigate) {
             extra_vaults: extraVaults,
             git_auto_commit: cfg.git_auto_commit !== false,
             heartbeat_interval_minutes: Number.parseInt(hbIn.value || "0", 10) || 0,
+            observer_threshold_tokens: Math.max(500, Number.parseInt(observerThresholdIn.value || "3000", 10) || 3000),
+            observer_idle_minutes: Math.max(0, Number.parseInt(observerIdleIn.value || "0", 10) || 0),
+            reflector_threshold_bytes: cfg.reflector_threshold_bytes || 24000,
             models: {
               ...models,
               default_chat: defaultChatIn.value.trim(),

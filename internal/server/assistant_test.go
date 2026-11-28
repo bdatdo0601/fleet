@@ -727,3 +727,80 @@ func TestDelegationReceiptBindAndDeregisterWakeup(t *testing.T) {
 		t.Fatalf("expected delegation status=exited after deregister, got %+v", resAfterExit.Delegations[0])
 	}
 }
+
+func TestAssistantObserverResetAndConfigIntegration(t *testing.T) {
+	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			http.NotFound(w, r)
+			return
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if stream, _ := body["stream"].(bool); stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"Got it, I will track the Q4 launch date.\"}}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\ndata: [DONE]\n\n"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"content": "- 🔴 Q4 launch date targeted for December 15."}}},
+		})
+	}))
+	defer mockLLM.Close()
+
+	f, srv, _ := setupTestServer(t)
+	f.Assistant.Start(t.Context())
+	defer f.Assistant.Stop()
+
+	cfgReq := map[string]any{
+		"enabled":                   true,
+		"base_url":                  mockLLM.URL,
+		"api_key":                   "sk-or-test",
+		"observer_threshold_tokens": 2500,
+		"observer_idle_minutes":     20,
+		"git_auto_commit":           false,
+	}
+	var cfgResp struct {
+		Config assistant.ConfigView `json:"config"`
+	}
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/assistant/config", cfgReq, 5*time.Second, nil, &cfgResp); err != nil {
+		t.Fatalf("POST /v1/assistant/config failed: %v", err)
+	}
+	if cfgResp.Config.ObserverThresholdTokens != 2500 || cfgResp.Config.ObserverIdleMinutes != 20 {
+		t.Fatalf("expected observer_threshold_tokens=2500 observer_idle_minutes=20, got %+v", cfgResp.Config)
+	}
+
+	// Send one chat turn, wait for assistant reply, then reset with clear_history=true.
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/messages", http.MethodPost, `{"channel":"general","content":"Remember our Q4 launch date is December 15."}`, nil, ""); st != http.StatusAccepted {
+		t.Fatalf("POST /v1/assistant/messages expected 202, got %d (%s)", st, string(b))
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var msgResp struct {
+			Messages []assistant.Message `json:"messages"`
+		}
+		if err := client.Call(srv.URL, http.MethodGet, "/v1/assistant/messages?channel=general&limit=20", nil, 3*time.Second, nil, &msgResp); err == nil && len(msgResp.Messages) >= 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/channels/general/reset", http.MethodPost, `{"clear_history":true}`, nil, ""); st != http.StatusOK {
+		t.Fatalf("POST /v1/assistant/channels/general/reset expected 200, got %d (%s)", st, string(b))
+	}
+
+	obsDeadline := time.Now().Add(5 * time.Second)
+	var obsBody string
+	for time.Now().Before(obsDeadline) {
+		st, _, b := doRawReq(t, srv.URL+"/v1/assistant/vault/file?path=_agent/memory/OBSERVATIONS.md", http.MethodGet, "", nil, "")
+		obsBody = string(b)
+		if st == http.StatusOK && strings.Contains(obsBody, "December 15") {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !strings.Contains(obsBody, "December 15") {
+		t.Fatalf("expected OBSERVATIONS.md to capture pre-reset turn, got: %s", obsBody)
+	}
+}

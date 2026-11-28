@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"path/filepath"
 	"regexp"
@@ -88,6 +89,11 @@ type Engine struct {
 
 	configWriteMu sync.Mutex
 	memoryMu      sync.Mutex
+	observedMaxID map[string]int64
+	observerMu    sync.Mutex
+	observerRun   bool
+	observerErrAt time.Time
+	observerLogW  io.Writer
 	vaultSyncMu   sync.Mutex
 	lastEmbedSync map[string]time.Time
 
@@ -162,6 +168,7 @@ func Open(dbPath, configPath, defaultVaultDir string, deps FleetDeps) (*Engine, 
 		transcriber:     NewLocalWhisperTranscriber(),
 		opReader:        opReader,
 		cfg:             cfg,
+		observedMaxID:   make(map[string]int64),
 		subscribers:     make(map[chan StreamEvent]struct{}),
 		discordReloadCh: make(chan struct{}, 1),
 		notifyCh:        make(chan struct{}, 1),
@@ -669,6 +676,10 @@ func (e *Engine) ResetChannel(id string, clearHistory bool) (Channel, error) {
 }
 
 func (e *Engine) resetChannelInternal(ctx context.Context, id string, clearHistory bool, origin string) (Channel, error) {
+	var pendingMsgs []Message
+	if msgs, err := e.store.ListUnobservedMessages(id, 200); err == nil {
+		pendingMsgs = msgs
+	}
 	ch, err := e.store.ResetChannelContext(id, clearHistory)
 	if err != nil {
 		return Channel{}, err
@@ -678,6 +689,7 @@ func (e *Engine) resetChannelInternal(ctx context.Context, id string, clearHisto
 		ChannelID: ch.ID,
 		Data:      map[string]any{"channel": ch, "cleared": clearHistory},
 	})
+	e.flushObserverOnReset(ctx, ch.ID, pendingMsgs, clearHistory)
 	if origin != "discord" {
 		cfg := e.Config()
 		if cfg.Discord.Enabled && cfg.Discord.Channels[ch.ID] != "" {
@@ -718,6 +730,7 @@ func (e *Engine) runWorker(ctx context.Context) {
 func (e *Engine) runScheduler(ctx context.Context) {
 	defer e.wg.Done()
 	lastHeartbeat := time.Now().Add(-time.Hour)
+	lastObserverCheck := time.Now().Add(-observerCheckInterval)
 	var tickCount int
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -748,6 +761,10 @@ func (e *Engine) runScheduler(ctx context.Context) {
 						e.notify()
 					}
 				}
+			}
+			if cfg.ObserverIdleMinutes > 0 && now.Sub(lastObserverCheck) >= observerCheckInterval {
+				lastObserverCheck = now
+				e.maybeScheduleIdleObserve(ctx, cfg, now)
 			}
 			if cfg.HeartbeatIntervalMinutes > 0 && now.Sub(lastHeartbeat) >= time.Duration(cfg.HeartbeatIntervalMinutes)*time.Minute {
 				lastHeartbeat = now

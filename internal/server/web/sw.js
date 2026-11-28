@@ -1,4 +1,4 @@
-const CACHE_NAME = "fleet-console-v17";
+const CACHE_NAME = "fleet-console-v18";
 const APP_SHELL = [
   "/",
   "/manifest.webmanifest",

@@ -102,6 +102,12 @@ func mergePreservedConfig(cur, next Config, clearAPIKey bool) Config {
 	if isZeroSandboxConfig(next.Sandbox) {
 		next.Sandbox = cur.Sandbox
 	}
+	if next.ObserverThresholdTokens <= 0 && cur.ObserverThresholdTokens > 0 {
+		next.ObserverThresholdTokens = cur.ObserverThresholdTokens
+	}
+	if next.ReflectorThresholdBytes <= 0 && cur.ReflectorThresholdBytes > 0 {
+		next.ReflectorThresholdBytes = cur.ReflectorThresholdBytes
+	}
 	if isZeroDiscordConfig(next.Discord) {
 		next.Discord = cur.Discord
 	}

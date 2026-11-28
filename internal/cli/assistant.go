@@ -97,6 +97,9 @@ type assistantSetupFlags struct {
 	routingMode           string
 	decisionModel         string
 	observerModel         string
+	observerThreshold     int
+	observerIdle          int
+	observerIdleSet       bool
 	zdr                   bool
 	zdrSet                bool
 	enable                bool
@@ -232,10 +235,7 @@ func applyAssistantSetupFlags(cfg *assistant.Config, opts assistantSetupFlags, c
 	if opts.decisionModel != "" {
 		cfg.Models.Decision = opts.decisionModel
 	}
-	if opts.observerModel != "" {
-		cfg.Models.Observer = opts.observerModel
-		cfg.Models.Reflector = opts.observerModel
-	}
+	applyObserverSetupFlags(cfg, opts)
 	if err := applyDiscordSetupFlags(cfg, opts); err != nil {
 		return err
 	}
@@ -243,6 +243,19 @@ func applyAssistantSetupFlags(cfg *assistant.Config, opts assistantSetupFlags, c
 		return err
 	}
 	return applyLocalFeatureSetupFlags(cfg, opts)
+}
+
+func applyObserverSetupFlags(cfg *assistant.Config, opts assistantSetupFlags) {
+	if opts.observerModel != "" {
+		cfg.Models.Observer = opts.observerModel
+		cfg.Models.Reflector = opts.observerModel
+	}
+	if opts.observerThreshold > 0 {
+		cfg.ObserverThresholdTokens = opts.observerThreshold
+	}
+	if opts.observerIdleSet {
+		cfg.ObserverIdleMinutes = max(0, opts.observerIdle)
+	}
 }
 
 func applySandboxSetupFlags(cfg *assistant.Config, opts assistantSetupFlags) error {
@@ -371,6 +384,8 @@ func registerAssistantSetupFlags(fs *flag.FlagSet, opts *assistantSetupFlags) {
 	fs.StringVar(&opts.routingMode, "routing-mode", "", "auto frontier routing mode (hybrid|gate|auto|off)")
 	fs.StringVar(&opts.decisionModel, "decision-model", "", "decision model slug")
 	fs.StringVar(&opts.observerModel, "observer-model", "", "observer/reflector model slug")
+	fs.IntVar(&opts.observerThreshold, "observer-threshold-tokens", 0, "unobserved token threshold before auto-observing")
+	fs.IntVar(&opts.observerIdle, "observer-idle-minutes", 0, "idle minutes before background Observer flushes unobserved messages (0 disables)")
 	fs.BoolVar(&opts.zdr, "zdr", true, "enforce OpenRouter Zero Data Retention")
 	fs.BoolVar(&opts.enable, "enable", true, "enable assistant background scheduler")
 	fs.BoolVar(&opts.autoApprove, "auto-approve", false, "bypass HITL approvals for all tools and frontier escalations")
@@ -434,6 +449,8 @@ func cmdAssistantSetup(args []string, cio *IO) error {
 			opts.discordAutoApproveSet = true
 		case "sandbox-profiles":
 			opts.sandboxProfilesSet = true
+		case "observer-idle-minutes":
+			opts.observerIdleSet = true
 		}
 	})
 	if *checkOnly {
@@ -467,6 +484,7 @@ func cmdAssistantSetup(args []string, cio *IO) error {
 		"git_auto_commit":            cfg.GitAutoCommit,
 		"heartbeat_interval_minutes": cfg.HeartbeatIntervalMinutes,
 		"observer_threshold_tokens":  cfg.ObserverThresholdTokens,
+		"observer_idle_minutes":      cfg.ObserverIdleMinutes,
 		"reflector_threshold_bytes":  cfg.ReflectorThresholdBytes,
 		"models":                     cfg.Models,
 		"local_llm":                  cfg.LocalLLM,
