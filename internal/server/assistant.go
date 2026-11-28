@@ -573,6 +573,38 @@ func registerAssistantSkillRoutes(
 		writeJSON(w, http.StatusOK, map[string]any{"skills": skills})
 		return nil
 	}))
+	mux.HandleFunc("GET /v1/assistant/skills/search", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		q := r.URL.Query().Get("q")
+		results, err := fleet.Assistant.SearchSkills(r.Context(), q, queryInt(r, "limit"))
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"query": strings.TrimSpace(q), "results": results})
+		return nil
+	}))
+	mux.HandleFunc("POST /v1/assistant/skills/install", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		var req struct {
+			Source    string `json:"source"`
+			Skill     string `json:"skill"`
+			Ref       string `json:"ref"`
+			Slug      string `json:"slug"`
+			Overwrite bool   `json:"overwrite"`
+		}
+		if err := readJSONBody(r, &req); err != nil {
+			return err
+		}
+		sk, bundle, err := fleet.Assistant.InstallSkill(r.Context(), req.Source, req.Skill, req.Ref, req.Slug, req.Overwrite)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"skill":                  sk,
+			"has_scripts":            bundle.HasScripts,
+			"skipped_files":          bundle.SkippedFiles,
+			"sync_to_fleet_stripped": bundle.SyncToFleetStripped,
+		})
+		return nil
+	}))
 	mux.HandleFunc("GET /v1/assistant/skills/{name}", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
 		v, err := fleet.Assistant.Vault()
 		if err != nil {
@@ -583,6 +615,20 @@ func registerAssistantSkillRoutes(
 			return err
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"skill": sk})
+		return nil
+	}))
+	mux.HandleFunc("GET /v1/assistant/skills/{name}/file", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		v, err := fleet.Assistant.Vault()
+		if err != nil {
+			return err
+		}
+		name := r.PathValue("name")
+		relPath := r.URL.Query().Get("path")
+		content, err := v.ReadSkillFile(name, relPath)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"name": name, "path": cmp.Or(strings.TrimSpace(relPath), "SKILL.md"), "content": content})
 		return nil
 	}))
 	mux.HandleFunc("PUT /v1/assistant/skills/{name}", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {

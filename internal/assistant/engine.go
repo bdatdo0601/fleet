@@ -78,6 +78,7 @@ type Engine struct {
 	deps        FleetDeps
 	llm         *openRouterClient
 	mcp         *MCPManager
+	skills      *SkillRegistry
 	sandbox     *SandboxManager
 	opReader    OPReaderFunc
 	Probes      DoctorProbes
@@ -146,6 +147,7 @@ func Open(dbPath, configPath, defaultVaultDir string, deps FleetDeps) (*Engine, 
 		deps:            deps,
 		llm:             newOpenRouterClient(),
 		mcp:             mcpMgr,
+		skills:          NewSkillRegistry(),
 		sandbox:         NewSandboxManager(filepath.Join(stateRoot, "sandbox"), NewSocketSandboxRunner(paths.SandboxSocketPath(stateRoot), NewAppleContainerRunner())),
 		opReader:        opReader,
 		cfg:             cfg,
@@ -698,6 +700,56 @@ func (e *Engine) SetSandboxRunner(r SandboxRunner) {
 	if e.sandbox != nil {
 		e.sandbox.setRunner(r)
 	}
+}
+
+// SetSkillRegistry overrides the remote skill registry client (used in tests).
+func (e *Engine) SetSkillRegistry(r *SkillRegistry) {
+	e.cfgMu.Lock()
+	e.skills = r
+	e.cfgMu.Unlock()
+}
+
+func (e *Engine) skillRegistry() *SkillRegistry {
+	e.cfgMu.RLock()
+	r := e.skills
+	e.cfgMu.RUnlock()
+	if r != nil {
+		return r
+	}
+	return NewSkillRegistry()
+}
+
+// SearchSkills searches the configured skills registry (skills.sh) for matching playbooks.
+func (e *Engine) SearchSkills(ctx context.Context, query string, limit int) ([]SkillSearchResult, error) {
+	return e.skillRegistry().Search(ctx, query, limit)
+}
+
+// FetchSkill fetches and validates a remote skill bundle without writing it to the vault.
+func (e *Engine) FetchSkill(ctx context.Context, source, skill, ref, slug string) (*FetchedSkillBundle, error) {
+	return e.skillRegistry().Fetch(ctx, source, skill, ref, slug)
+}
+
+// InstallSkill fetches a remote skill bundle and saves it into _skills/<slug>/ in the primary vault.
+func (e *Engine) InstallSkill(ctx context.Context, source, skill, ref, slug string, overwrite bool) (Skill, *FetchedSkillBundle, error) {
+	bundle, err := e.FetchSkill(ctx, source, skill, ref, slug)
+	if err != nil {
+		return Skill{}, nil, err
+	}
+	v, err := e.vault()
+	if err != nil {
+		return Skill{}, nil, err
+	}
+	if !overwrite {
+		if _, gErr := v.GetSkill(bundle.Slug); gErr == nil {
+			return Skill{}, nil, newErr(fmt.Sprintf("skill %q already exists; set overwrite=true to update", bundle.Slug), http.StatusConflict)
+		}
+	}
+	sk, err := v.SaveSkillBundle(bundle.Slug, bundle.Content, bundle.ExtraFiles, &bundle.Provenance)
+	if err != nil {
+		return Skill{}, nil, err
+	}
+	v.MaybeGitCommit(e.Config().GitAutoCommit, "assistant: install skill "+sk.Name)
+	return sk, bundle, nil
 }
 
 // BuildSandboxImages builds or rebuilds the sandbox OCI images and offline network.
@@ -1420,12 +1472,19 @@ func (e *Engine) buildPromptMessages(ctx context.Context, ch Channel, tail []Mes
 	sysStatic.WriteString(soul)
 	sysStatic.WriteString("\nCurrent UTC time: " + time.Now().UTC().Format(time.RFC3339) + "\n")
 	sysStatic.WriteString("Active channel: #" + ch.ID + "\n")
+	sysStatic.WriteString("\n## Skills Catalog\n")
 	if len(skills) > 0 {
-		sysStatic.WriteString("\n## Available Skills (call skill_read for full instructions)\n")
 		for _, sk := range skills {
-			fmt.Fprintf(&sysStatic, "- %s: %s\n", sk.Name, cmp.Or(sk.Description, "(no description)"))
+			extra := ""
+			if len(sk.Files) > 0 {
+				extra = fmt.Sprintf(" (+%d files)", len(sk.Files))
+			}
+			fmt.Fprintf(&sysStatic, "- %s%s: %s\n", sk.Name, extra, cmp.Or(sk.Description, "(no description)"))
 		}
+	} else {
+		sysStatic.WriteString("- (no installed skills yet)\n")
 	}
+	sysStatic.WriteString("Use `skill_read` (with optional `file`) to load `SKILL.md` and companion files; use `skill_search` + `skill_fetch` to discover/preview `skills.sh` or GitHub (`owner/repo@skill`) playbooks, `skill_install` (approval-gated, direct chat only) to install bundles, `skill_write` to author or adapt skills to Fleet tools, and `skill_remove` to uninstall. Bundled skill scripts are non-executable on the host and must only be inspected or run inside `sandbox_exec` if needed.\n")
 	if fleetCtx != "" {
 		sysStatic.WriteString("\n## Fleet Standing Memory\n" + fleetCtx + "\n")
 	}

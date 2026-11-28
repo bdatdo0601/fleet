@@ -54,6 +54,127 @@ function openSkillEditor(existing, onSaved) {
   );
 }
 
+function openSkillRegistryModal(onInstalled) {
+  const sourceIn = el("input", {
+    type: "text",
+    placeholder: "e.g. anthropics/skills@pdf or https://github.com/owner/repo",
+  });
+  const overwriteIn = el("input", { type: "checkbox" });
+  const installStatus = el("div", { className: "small muted" });
+
+  const doInstall = async (source, skill = "") => {
+    const src = String(source || "").trim();
+    if (!src) {
+      toast("Skill source is required", "warn");
+      return;
+    }
+    installStatus.textContent = `Installing ${src}…`;
+    try {
+      const res = await api("POST", "/v1/assistant/skills/install", {
+        source: src,
+        skill,
+        overwrite: overwriteIn.checked,
+      });
+      const sk = res.skill || {};
+      const extra = res.has_scripts ? " (includes scripts — sandbox only)" : "";
+      toast(`Installed skill ${sk.name || src}${extra}`, "ok");
+      closeModal();
+      if (onInstalled) {
+        await onInstalled();
+      }
+    } catch (err) {
+      installStatus.textContent = err.message;
+      toast(err.message, "error");
+    }
+  };
+
+  const queryIn = el("input", { type: "search", placeholder: "Search skills.sh (e.g. pdf, code review, postgres)…" });
+  const resultsBox = el("div", { className: "stack" });
+
+  const doSearch = async () => {
+    const q = queryIn.value.trim();
+    if (!q) {
+      toast("Enter a search query", "warn");
+      return;
+    }
+    clear(resultsBox);
+    resultsBox.appendChild(el("div", { className: "small muted", text: "Searching skills.sh…" }));
+    try {
+      const res = await api("GET", `/v1/assistant/skills/search?q=${encodeURIComponent(q)}&limit=10`);
+      const items = res.results || [];
+      clear(resultsBox);
+      if (items.length === 0) {
+        resultsBox.appendChild(el("div", { className: "small muted", text: "No skills matched that query." }));
+        return;
+      }
+      for (const item of items) {
+        const spec = item.install_spec || item.source || "";
+        resultsBox.appendChild(
+          el(
+            "article",
+            { className: "card" },
+            el(
+              "div",
+              { className: "card-header" },
+              el("div", { className: "actions-row" }, el("strong", { text: item.name || item.skill_id }), badge(item.source || "registry", "neutral"), item.installs ? badge(`${item.installs} installs`, "info") : null),
+              item.url ? el("a", { href: item.url, target: "_blank", rel: "noopener noreferrer", className: "small", text: "skills.sh" }) : null,
+            ),
+            el(
+              "div",
+              { className: "actions-row" },
+              el("span", { className: "mono small muted", text: spec }),
+              el("button", {
+                type: "button",
+                className: "btn btn-sm btn-primary",
+                text: "Install",
+                onclick: () => doInstall(spec),
+              }),
+            ),
+          ),
+        );
+      }
+    } catch (err) {
+      clear(resultsBox);
+      resultsBox.appendChild(el("div", { className: "alert-banner alert-danger", text: err.message }));
+    }
+  };
+
+  queryIn.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      doSearch();
+    }
+  });
+
+  openModal(
+    "Install Skill from Registry",
+    el(
+      "div",
+      { className: "stack" },
+      field("Direct Source (GitHub owner/repo@skill, skills.sh URL, or HTTPS SKILL.md)", sourceIn),
+      el(
+        "div",
+        { className: "actions-row" },
+        el("label", { className: "actions-row small" }, overwriteIn, "Overwrite if exists"),
+        el("button", {
+          type: "button",
+          className: "btn btn-primary btn-sm",
+          text: "Install",
+          onclick: () => doInstall(sourceIn.value),
+        }),
+      ),
+      installStatus,
+      el("hr"),
+      el(
+        "div",
+        { className: "actions-row" },
+        queryIn,
+        el("button", { type: "button", className: "btn btn-sm", text: "Search skills.sh", onclick: doSearch }),
+      ),
+      resultsBox,
+    ),
+  );
+}
+
 async function renderVaultFileEditor(container, relPath, title, hint, extraActions = null) {
   let content = "";
   try {
@@ -109,6 +230,12 @@ export async function renderSkills(main, ctx, sub) {
   const actions = el(
     "div",
     { className: "actions-row" },
+    el("button", {
+      type: "button",
+      className: "btn btn-sm",
+      text: "Install from Registry",
+      onclick: () => openSkillRegistryModal(() => ctx.refresh()),
+    }),
     el("button", {
       type: "button",
       className: "btn btn-sm btn-primary",
@@ -334,7 +461,15 @@ export async function renderSkills(main, ctx, sub) {
           "div",
           { className: "card-header" },
           el("h3", { className: "card-title", text: sk.name }),
-          el("div", { className: "actions-row" }, sk.sync_to_fleet ? badge("sync_to_fleet", "ok") : null, sk.model ? badge(sk.model, "info") : null, ...(sk.tags || []).map((t) => badge(t, "neutral"))),
+          el(
+            "div",
+            { className: "actions-row" },
+            sk.sync_to_fleet ? badge("sync_to_fleet", "ok") : null,
+            sk.source && sk.source.source ? badge(sk.source.source, "info") : null,
+            sk.files && sk.files.length > 0 ? badge(`+${sk.files.length} files`, "neutral") : null,
+            sk.model ? badge(sk.model, "info") : null,
+            ...(sk.tags || []).map((t) => badge(t, "neutral")),
+          ),
         ),
         el("div", { className: "small muted mb-2", text: sk.description || "(no description)" }),
         el(

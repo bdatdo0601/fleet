@@ -154,13 +154,6 @@ func (e *Engine) buildToolSpecs(ctx context.Context) []ToolSpec {
 		makeToolSpec("fleet_slack_send", "Post a Slack message or thread reply (requires human approval).", schemaObj(map[string]any{
 			"account": strProp("Optional account"), "channel": strProp("Channel ID"), "text": strProp("Message text"), "thread_ts": strProp("Optional thread_ts"),
 		}, "channel", "text")),
-		makeToolSpec("skill_list", "List available SKILL.md playbooks in the Obsidian vault.", schemaObj(map[string]any{})),
-		makeToolSpec("skill_read", "Read the full SKILL.md instructions for a named skill.", schemaObj(map[string]any{
-			"name": strProp("Skill slug"),
-		}, "name")),
-		makeToolSpec("skill_write", "Create or update a SKILL.md playbook (direct user chat only).", schemaObj(map[string]any{
-			"name": strProp("Skill slug (lowercase alphanumeric, - or _)"), "content": strProp("Full SKILL.md markdown including YAML frontmatter"),
-		}, "name", "content")),
 		makeToolSpec("vault_search", "Search Markdown notes across the primary agent vault and any mounted Obsidian vaults.", schemaObj(map[string]any{
 			"query": strProp("Search query terms"), "limit": intProp("Max results"),
 			"vault": strProp("Optional vault name (\"all\" searches agent + mounted vaults, or specify \"agent\" / mounted vault name)"),
@@ -205,6 +198,7 @@ func (e *Engine) buildToolSpecs(ctx context.Context) []ToolSpec {
 			"max_bytes": intProp("Max bytes to return (default 16384, max 32768)"),
 		}, "output_id")),
 	}
+	specs = append(specs, skillToolSpecs()...)
 	specs = append(specs, credentialAndMCPToolSpecs()...)
 	if e.Config().Sandbox.Enabled {
 		specs = append(specs, sandboxToolSpecs()...)
@@ -215,6 +209,39 @@ func (e *Engine) buildToolSpecs(ctx context.Context) []ToolSpec {
 		}
 	}
 	return specs
+}
+
+func skillToolSpecs() []ToolSpec {
+	return []ToolSpec{
+		makeToolSpec("skill_list", "List available SKILL.md playbooks in the Obsidian vault.", schemaObj(map[string]any{})),
+		makeToolSpec("skill_read", "Read the full SKILL.md instructions (or a companion file) for a named skill.", schemaObj(map[string]any{
+			"name": strProp("Skill slug"),
+			"file": strProp("Optional relative companion file inside the skill bundle (e.g. REFERENCE.md or references/guide.md); omit to read SKILL.md"),
+		}, "name")),
+		makeToolSpec("skill_write", "Create or update a SKILL.md playbook (direct user chat only).", schemaObj(map[string]any{
+			"name": strProp("Skill slug (lowercase alphanumeric, - or _)"), "content": strProp("Full SKILL.md markdown including YAML frontmatter"),
+		}, "name", "content")),
+		makeToolSpec("skill_search", "Search the open agent skills registry (skills.sh) for installable SKILL.md playbooks.", schemaObj(map[string]any{
+			"query": strProp("Search keywords (e.g. 'pdf', 'react testing', 'postgres')"),
+			"limit": intProp("Max results (default 8, max 20)"),
+		}, "query")),
+		makeToolSpec("skill_fetch", "Preview an external skill from skills.sh, GitHub (owner/repo@skill or repo URL), or a direct HTTPS SKILL.md URL without installing it.", schemaObj(map[string]any{
+			"source": strProp("Skill source: owner/repo@skill, owner/repo, skills.sh URL, GitHub URL, or https://.../SKILL.md"),
+			"skill":  strProp("Optional skill name when source is owner/repo"),
+			"ref":    strProp("Optional git branch, tag, or commit SHA"),
+			"slug":   strProp("Optional target slug override"),
+		}, "source")),
+		makeToolSpec("skill_install", "Install or update a skill bundle into _skills/<slug>/ from skills.sh, GitHub (owner/repo@skill), or a direct HTTPS SKILL.md URL (approval-gated, direct user chat only; sync_to_fleet is stripped for safety).", schemaObj(map[string]any{
+			"source":    strProp("Skill source: owner/repo@skill, owner/repo, skills.sh URL, GitHub URL, or https://.../SKILL.md"),
+			"skill":     strProp("Optional skill name when source is owner/repo"),
+			"ref":       strProp("Optional git branch, tag, or commit SHA"),
+			"slug":      strProp("Optional target slug override"),
+			"overwrite": boolProp("Overwrite if a skill with the same slug already exists"),
+		}, "source")),
+		makeToolSpec("skill_remove", "Uninstall a skill bundle from _skills/<name>/ (approval-gated, direct user chat only).", schemaObj(map[string]any{
+			"name": strProp("Skill slug to remove"),
+		}, "name")),
+	}
 }
 
 func credentialAndMCPToolSpecs() []ToolSpec {
@@ -334,7 +361,10 @@ func (e *Engine) dispatchTool(ctx context.Context, name string, args map[string]
 	if strings.HasPrefix(name, "fleet_") {
 		return e.dispatchFleetTool(ctx, name, args, rawArgs, tctx)
 	}
-	if strings.HasPrefix(name, "skill_") || strings.HasPrefix(name, "vault_") {
+	if strings.HasPrefix(name, "skill_") {
+		return e.dispatchSkillTool(ctx, name, args, rawArgs, tctx)
+	}
+	if strings.HasPrefix(name, "vault_") {
 		return e.dispatchVaultTool(name, args, rawArgs, tctx)
 	}
 	if strings.HasPrefix(name, "timer_") || name == "outbox_notify" {
@@ -356,22 +386,26 @@ func (e *Engine) dispatchTool(ctx context.Context, name string, args map[string]
 		return e.dispatchSandboxTool(ctx, name, args, rawArgs, tctx)
 	}
 	if strings.HasPrefix(name, "mcp__") && e.mcp != nil {
-		ext, ok := e.mcp.FindTool(ctx, name)
-		if !ok {
-			return nil, newErr(fmt.Sprintf("external MCP tool %q not found", name), http.StatusNotFound)
-		}
-		if ext.RequireApproval && !tctx.BypassHITL {
-			return nil, &approvalRequiredError{
-				ToolName:   name,
-				ServerName: ext.ServerName,
-				Summary:    fmt.Sprintf("Execute external MCP tool %s", name),
-				RiskLevel:  "external",
-				ArgsJSON:   cmp.Or(rawArgs, "{}"),
-			}
-		}
-		return e.mcp.CallTool(ctx, name, args)
+		return e.dispatchExternalMCPTool(ctx, name, args, rawArgs, tctx)
 	}
 	return nil, newErr(fmt.Sprintf("unknown tool %q", name), http.StatusBadRequest)
+}
+
+func (e *Engine) dispatchExternalMCPTool(ctx context.Context, name string, args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {
+	ext, ok := e.mcp.FindTool(ctx, name)
+	if !ok {
+		return nil, newErr(fmt.Sprintf("external MCP tool %q not found", name), http.StatusNotFound)
+	}
+	if ext.RequireApproval && !tctx.BypassHITL {
+		return nil, &approvalRequiredError{
+			ToolName:   name,
+			ServerName: ext.ServerName,
+			Summary:    fmt.Sprintf("Execute external MCP tool %s", name),
+			RiskLevel:  "external",
+			ArgsJSON:   cmp.Or(rawArgs, "{}"),
+		}
+	}
+	return e.mcp.CallTool(ctx, name, args)
 }
 
 func (e *Engine) dispatchFleetTool(ctx context.Context, name string, args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {
@@ -425,7 +459,7 @@ func (e *Engine) dispatchFleetTool(ctx context.Context, name string, args map[st
 	}
 }
 
-func (e *Engine) dispatchVaultTool(name string, args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {
+func (e *Engine) dispatchSkillTool(ctx context.Context, name string, args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {
 	switch name {
 	case "skill_list":
 		v, err := e.vault()
@@ -438,7 +472,15 @@ func (e *Engine) dispatchVaultTool(name string, args map[string]any, rawArgs str
 		if err != nil {
 			return nil, err
 		}
-		return v.GetSkill(strArg(args, "name"))
+		slug := strArg(args, "name")
+		if file := strArg(args, "file"); file != "" {
+			content, rErr := v.ReadSkillFile(slug, file)
+			if rErr != nil {
+				return nil, rErr
+			}
+			return map[string]any{"name": slug, "file": file, "content": content}, nil
+		}
+		return v.GetSkill(slug)
 	case "skill_write":
 		if tctx.Source != "chat" && tctx.Source != "approval" && !tctx.BypassHITL {
 			return nil, newErr("skill_write is only allowed during direct user chat", http.StatusForbidden)
@@ -453,6 +495,51 @@ func (e *Engine) dispatchVaultTool(name string, args map[string]any, rawArgs str
 		}
 		v.MaybeGitCommit(tctx.Config.GitAutoCommit, "assistant: update skill "+sk.Name)
 		return sk, nil
+	case "skill_search":
+		q := strArg(args, "query")
+		results, err := e.SearchSkills(ctx, q, intArg(args, "limit", 8))
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"query": q, "results": results, "count": len(results)}, nil
+	case "skill_fetch":
+		return e.execSkillFetchTool(ctx, args)
+	case "skill_install":
+		return e.execSkillInstallTool(ctx, args, tctx)
+	case "skill_remove":
+		return e.execSkillRemoveTool(args, rawArgs, tctx)
+	default:
+		return nil, newErr("unknown skill tool "+name, http.StatusBadRequest)
+	}
+}
+
+func (e *Engine) execSkillFetchTool(ctx context.Context, args map[string]any) (any, error) {
+	bundle, err := e.FetchSkill(ctx, strArg(args, "source"), strArg(args, "skill"), strArg(args, "ref"), strArg(args, "slug"))
+	if err != nil {
+		return nil, err
+	}
+	content := bundle.Content
+	truncated := false
+	if len(content) > 16*1024 {
+		content = content[:16*1024]
+		truncated = true
+	}
+	return map[string]any{
+		"slug":                   bundle.Slug,
+		"name":                   bundle.Name,
+		"description":            bundle.Description,
+		"content":                content,
+		"truncated":              truncated,
+		"files":                  bundle.Files,
+		"skipped_files":          bundle.SkippedFiles,
+		"has_scripts":            bundle.HasScripts,
+		"sync_to_fleet_stripped": bundle.SyncToFleetStripped,
+		"provenance":             bundle.Provenance,
+	}, nil
+}
+
+func (e *Engine) dispatchVaultTool(name string, args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {
+	switch name {
 	case "vault_search":
 		return e.SearchVaults(strArg(args, "vault"), strArg(args, "query"), intArg(args, "limit", 15))
 	case "vault_read":
@@ -1047,5 +1134,114 @@ func (e *Engine) execMCPRemoveTool(args map[string]any, rawArgs string, tctx *to
 	}
 	_ = e.RevokeMCPOAuth(name)
 	tctx.Config = e.Config()
+	return map[string]any{"status": "removed", "name": name}, nil
+}
+
+func (e *Engine) execSkillInstallTool(ctx context.Context, args map[string]any, tctx *toolExecContext) (any, error) {
+	if tctx.Source != "chat" && tctx.Source != "approval" && !tctx.BypassHITL {
+		return nil, newErr("skill_install is only allowed during direct user chat", http.StatusForbidden)
+	}
+	source := strArg(args, "source")
+	skill := strArg(args, "skill")
+	ref := strArg(args, "ref")
+	slug := strArg(args, "slug")
+	overwrite := boolArg(args, "overwrite")
+
+	bundle, err := e.FetchSkill(ctx, source, skill, ref, slug)
+	if err != nil {
+		return nil, err
+	}
+	v, err := e.vault()
+	if err != nil {
+		return nil, err
+	}
+	_, existingErr := v.GetSkill(bundle.Slug)
+	exists := existingErr == nil
+	if !overwrite && exists {
+		return nil, newErr(fmt.Sprintf("skill %q already exists; set overwrite=true to update", bundle.Slug), http.StatusConflict)
+	}
+	if !tctx.BypassHITL {
+		pinnedRef := cmp.Or(bundle.Provenance.CommitSHA, ref)
+		pinnedArgs := map[string]any{
+			"source":    source,
+			"overwrite": overwrite,
+			"slug":      bundle.Slug,
+		}
+		if skill != "" {
+			pinnedArgs["skill"] = skill
+		}
+		if pinnedRef != "" {
+			pinnedArgs["ref"] = pinnedRef
+		}
+		rawPinned, _ := json.Marshal(pinnedArgs)
+
+		verb := "Install"
+		if exists {
+			verb = "Update"
+		}
+		var meta []string
+		if bundle.Provenance.CommitSHA != "" {
+			shortSHA := bundle.Provenance.CommitSHA
+			if len(shortSHA) > 7 {
+				shortSHA = shortSHA[:7]
+			}
+			meta = append(meta, "commit "+shortSHA)
+		}
+		meta = append(meta, fmt.Sprintf("%d file(s)", len(bundle.Files)+1))
+		if bundle.HasScripts {
+			meta = append(meta, "includes scripts — sandbox only")
+		}
+		return nil, &approvalRequiredError{
+			ToolName:   "skill_install",
+			ServerName: bundle.Slug,
+			Summary:    fmt.Sprintf("%s skill %q from %s (%s)", verb, bundle.Slug, bundle.Provenance.Source, strings.Join(meta, ", ")),
+			RiskLevel:  "skill_install",
+			ArgsJSON:   string(rawPinned),
+		}
+	}
+
+	sk, err := v.SaveSkillBundle(bundle.Slug, bundle.Content, bundle.ExtraFiles, &bundle.Provenance)
+	if err != nil {
+		return nil, err
+	}
+	v.MaybeGitCommit(tctx.Config.GitAutoCommit, "assistant: install skill "+sk.Name)
+	return map[string]any{
+		"status":                 "installed",
+		"skill":                  sk,
+		"files_installed":        len(bundle.Files) + 1,
+		"skipped_files":          bundle.SkippedFiles,
+		"has_scripts":            bundle.HasScripts,
+		"sync_to_fleet_stripped": bundle.SyncToFleetStripped,
+	}, nil
+}
+
+func (e *Engine) execSkillRemoveTool(args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {
+	if tctx.Source != "chat" && tctx.Source != "approval" && !tctx.BypassHITL {
+		return nil, newErr("skill_remove is only allowed during direct user chat", http.StatusForbidden)
+	}
+	name := strings.TrimSpace(strArg(args, "name"))
+	if !skillSlugRE.MatchString(name) {
+		return nil, newErr("invalid skill name", http.StatusBadRequest)
+	}
+	v, err := e.vault()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := v.GetSkill(name); err != nil {
+		return nil, err
+	}
+	if !tctx.BypassHITL {
+		return nil, &approvalRequiredError{
+			ToolName:   "skill_remove",
+			ServerName: name,
+			Summary:    fmt.Sprintf("Remove skill %q from _skills/", name),
+			RiskLevel:  "skill_remove",
+			ArgsJSON:   cmp.Or(rawArgs, "{}"),
+		}
+	}
+	if err := v.DeleteSkill(name); err != nil {
+		return nil, err
+	}
+	v.MaybeGitCommit(tctx.Config.GitAutoCommit, "assistant: remove skill "+name)
 	return map[string]any{"status": "removed", "name": name}, nil
 }

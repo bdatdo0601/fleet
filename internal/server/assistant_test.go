@@ -68,6 +68,50 @@ func TestAssistantRoutesSecurityAndFlow(t *testing.T) {
 	if syncRes, sErr := f.Sync(office, "test", "", ""); sErr != nil || len(syncRes.SyncedSkills) != 1 || syncRes.SyncedSkills[0].Name != "daily-check" {
 		t.Fatalf("expected SyncResult.SyncedSkills to include daily-check, got %+v (err=%v)", syncRes.SyncedSkills, sErr)
 	}
+
+	// Admin can search and install multi-file skill bundles via registry HTTP routes.
+	mockSkillReg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/search":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"skills": []map[string]any{{"id": "anthropics/skills/pdf", "source": "anthropics/skills", "skillId": "pdf", "name": "pdf", "installs": 99}},
+			})
+		case "/repos/anthropics/skills/commits/HEAD":
+			_, _ = w.Write([]byte("0123456789abcdef0123456789abcdef01234567"))
+		case "/repos/anthropics/skills/git/trees/0123456789abcdef0123456789abcdef01234567":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"tree": []map[string]any{
+					{"path": "skills/pdf/SKILL.md", "mode": "100644", "type": "blob", "size": 80},
+					{"path": "skills/pdf/REFERENCE.md", "mode": "100644", "type": "blob", "size": 30},
+				},
+			})
+		case "/anthropics/skills/0123456789abcdef0123456789abcdef01234567/skills/pdf/SKILL.md":
+			_, _ = w.Write([]byte("---\nname: pdf\ndescription: PDF helper\nsync_to_fleet: true\n---\nUse sandbox.\n"))
+		case "/anthropics/skills/0123456789abcdef0123456789abcdef01234567/skills/pdf/REFERENCE.md":
+			_, _ = w.Write([]byte("PDF ref doc\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer mockSkillReg.Close()
+	f.Assistant.SetSkillRegistry(&assistant.SkillRegistry{
+		RegistryBaseURL:  mockSkillReg.URL,
+		GitHubAPIBaseURL: mockSkillReg.URL,
+		GitHubRawBaseURL: mockSkillReg.URL,
+		AllowPrivateURLs: true,
+	})
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/skills/search?q=pdf", http.MethodGet, "", nil, ""); st != http.StatusOK || !strings.Contains(string(b), "anthropics/skills@pdf") {
+		t.Fatalf("GET /v1/assistant/skills/search expected 200 with pdf match, got %d (%s)", st, string(b))
+	}
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/skills/install", http.MethodPost, `{"source":"anthropics/skills@pdf"}`, nil, ""); st != http.StatusOK || !strings.Contains(string(b), `"sync_to_fleet_stripped":true`) {
+		t.Fatalf("POST /v1/assistant/skills/install expected 200, got %d (%s)", st, string(b))
+	}
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/skills/pdf/file?path=REFERENCE.md", http.MethodGet, "", nil, ""); st != http.StatusOK || !strings.Contains(string(b), "PDF ref doc") {
+		t.Fatalf("GET /v1/assistant/skills/pdf/file expected 200, got %d (%s)", st, string(b))
+	}
+	if st, _, _ := doRawReq(t, srv.URL+"/v1/assistant/skills/pdf", http.MethodDelete, "", nil, ""); st != http.StatusOK {
+		t.Fatalf("DELETE /v1/assistant/skills/pdf expected 200, got %d", st)
+	}
 	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/vault/search?vault=all&q=Kyoto", http.MethodGet, "", nil, ""); st != http.StatusOK || !strings.Contains(string(b), `"vault":"personal"`) {
 		t.Fatalf("GET /v1/assistant/vault/search?vault=all expected personal hit, got %d (%s)", st, string(b))
 	}

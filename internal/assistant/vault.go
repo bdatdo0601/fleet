@@ -2,6 +2,7 @@ package assistant
 
 import (
 	"cmp"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -10,23 +11,28 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"unicode/utf8"
 )
 
+const skillProvenanceFile = ".fleet-skill.json"
+
 var skillSlugRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 
 // Skill describes one SKILL.md bundle inside <vault>/_skills/<name>/SKILL.md.
 type Skill struct {
-	Name        string   `json:"name"`
-	Description string   `json:"description"`
-	Model       string   `json:"model,omitempty"`
-	Approval    string   `json:"approval,omitempty"`
-	SyncToFleet bool     `json:"sync_to_fleet,omitempty"`
-	Tags        []string `json:"tags,omitempty"`
-	Path        string   `json:"path"`
-	Content     string   `json:"content,omitempty"`
+	Name        string           `json:"name"`
+	Description string           `json:"description"`
+	Model       string           `json:"model,omitempty"`
+	Approval    string           `json:"approval,omitempty"`
+	SyncToFleet bool             `json:"sync_to_fleet,omitempty"`
+	Tags        []string         `json:"tags,omitempty"`
+	Path        string           `json:"path"`
+	Content     string           `json:"content,omitempty"`
+	Files       []string         `json:"files,omitempty"`
+	Source      *SkillProvenance `json:"source,omitempty"`
 }
 
 // VaultSearchHit represents one search match in the Obsidian vault.
@@ -371,13 +377,17 @@ func (v *Vault) ListSkills() ([]Skill, error) {
 		if !ent.IsDir() || strings.HasPrefix(ent.Name(), ".") {
 			continue
 		}
-		rel := "_skills/" + ent.Name() + "/SKILL.md"
+		slug := ent.Name()
+		rel := "_skills/" + slug + "/SKILL.md"
 		content, rErr := v.ReadFile(rel)
 		if rErr != nil {
 			continue
 		}
-		sk := ParseSkillFrontmatter(ent.Name(), content)
+		sk := ParseSkillFrontmatter(slug, content)
+		sk.Name = slug
 		sk.Path = rel
+		sk.Files = v.listSkillFiles(slug)
+		sk.Source = v.readSkillProvenance(slug)
 		out = append(out, sk)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
@@ -396,9 +406,33 @@ func (v *Vault) GetSkill(name string) (Skill, error) {
 		return Skill{}, err
 	}
 	sk := ParseSkillFrontmatter(slug, content)
+	sk.Name = slug
 	sk.Path = rel
 	sk.Content = content
+	sk.Files = v.listSkillFiles(slug)
+	sk.Source = v.readSkillProvenance(slug)
 	return sk, nil
+}
+
+// ReadSkillFile reads SKILL.md or a validated companion file inside _skills/<name>/.
+func (v *Vault) ReadSkillFile(name, relFile string) (string, error) {
+	slug := strings.TrimSpace(name)
+	if !skillSlugRE.MatchString(slug) {
+		return "", newErr("invalid skill name", http.StatusBadRequest)
+	}
+	trimmed := strings.TrimSpace(relFile)
+	if trimmed == "" || trimmed == "SKILL.md" {
+		return v.ReadFile("_skills/" + slug + "/SKILL.md")
+	}
+	cleanSub, err := validateSkillSubpath(trimmed)
+	if err != nil {
+		return "", err
+	}
+	b, err := v.ReadFileBytes("_skills/"+slug+"/"+cleanSub, maxSkillFileBytes)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
 }
 
 // SaveSkill writes _skills/<name>/SKILL.md.
@@ -411,13 +445,74 @@ func (v *Vault) SaveSkill(name, content string) (Skill, error) {
 	if _, err := v.WriteFile(rel, content); err != nil {
 		return Skill{}, err
 	}
-	sk := ParseSkillFrontmatter(slug, content)
-	sk.Path = rel
-	sk.Content = content
-	return sk, nil
+	return v.GetSkill(slug)
 }
 
-// DeleteSkill removes _skills/<name>/SKILL.md and its directory if empty.
+// SaveSkillBundle atomically replaces _skills/<name>/ with SKILL.md, companion files, and optional provenance.
+func (v *Vault) SaveSkillBundle(name, skillMD string, extraFiles map[string][]byte, prov *SkillProvenance) (Skill, error) {
+	slug := strings.TrimSpace(name)
+	if !skillSlugRE.MatchString(slug) {
+		return Skill{}, newErr("skill name must match [a-z0-9][a-z0-9_-]*", http.StatusBadRequest)
+	}
+	if len(extraFiles)+1 > maxSkillBundleFiles {
+		return Skill{}, newErr(fmt.Sprintf("skill bundle exceeds %d file limit", maxSkillBundleFiles), http.StatusBadRequest)
+	}
+	totalBytes := len(skillMD)
+	cleanExtra := make(map[string][]byte, len(extraFiles))
+	for rawSub, data := range extraFiles {
+		cleanSub, err := validateSkillSubpath(rawSub)
+		if err != nil {
+			return Skill{}, err
+		}
+		if len(data) > maxSkillFileBytes {
+			return Skill{}, newErr(fmt.Sprintf("skill file %q exceeds %d byte limit", cleanSub, maxSkillFileBytes), http.StatusBadRequest)
+		}
+		totalBytes += len(data)
+		if totalBytes > maxSkillBundleBytes {
+			return Skill{}, newErr(fmt.Sprintf("skill bundle exceeds %d byte total limit", maxSkillBundleBytes), http.StatusBadRequest)
+		}
+		cleanExtra[cleanSub] = data
+	}
+
+	_, dirFull, err := v.ResolveRel("_skills/" + slug)
+	if err != nil {
+		return Skill{}, err
+	}
+	if err := os.RemoveAll(dirFull); err != nil {
+		return Skill{}, err
+	}
+	if _, err := v.WriteFile("_skills/"+slug+"/SKILL.md", skillMD); err != nil {
+		return Skill{}, err
+	}
+	for cleanSub, data := range cleanExtra {
+		_, fileFull, rErr := v.ResolveRel("_skills/" + slug + "/" + cleanSub)
+		if rErr != nil {
+			return Skill{}, rErr
+		}
+		if mkErr := os.MkdirAll(filepath.Dir(fileFull), 0o755); mkErr != nil {
+			return Skill{}, mkErr
+		}
+		if wErr := os.WriteFile(fileFull, data, 0o644); wErr != nil {
+			return Skill{}, wErr
+		}
+	}
+	if prov != nil {
+		rawProv, mErr := json.MarshalIndent(prov, "", "  ")
+		if mErr != nil {
+			return Skill{}, mErr
+		}
+		_, provFull, rErr := v.ResolveRel("_skills/" + slug + "/" + skillProvenanceFile)
+		if rErr != nil {
+			return Skill{}, rErr
+		}
+		if wErr := os.WriteFile(provFull, append(rawProv, '\n'), 0o644); wErr != nil {
+			return Skill{}, wErr
+		}
+	}
+	return v.GetSkill(slug)
+}
+
+// DeleteSkill removes the entire _skills/<name>/ bundle directory.
 func (v *Vault) DeleteSkill(name string) error {
 	slug := strings.TrimSpace(name)
 	if !skillSlugRE.MatchString(slug) {
@@ -428,14 +523,85 @@ func (v *Vault) DeleteSkill(name string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(full); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
+	if _, statErr := os.Stat(full); statErr != nil {
+		if errors.Is(statErr, os.ErrNotExist) {
 			return newErr(fmt.Sprintf("skill %q not found", slug), http.StatusNotFound)
 		}
+		return statErr
+	}
+	_, dirFull, err := v.ResolveRel("_skills/" + slug)
+	if err != nil {
 		return err
 	}
-	_ = os.Remove(filepath.Dir(full))
-	return nil
+	return os.RemoveAll(dirFull)
+}
+
+func validateSkillSubpath(rel string) (string, error) {
+	if strings.ContainsRune(rel, 0) {
+		return "", newErr("invalid skill file path", http.StatusBadRequest)
+	}
+	trimmed := strings.TrimSpace(rel)
+	if trimmed == "" || filepath.IsAbs(trimmed) || strings.HasPrefix(trimmed, "/") || strings.HasPrefix(trimmed, `\`) {
+		return "", newErr("skill file path must be relative", http.StatusBadRequest)
+	}
+	slash := filepath.ToSlash(filepath.Clean(trimmed))
+	if slash == "." || slash == ".." || strings.HasPrefix(slash, "../") || strings.Contains(slash, "/../") {
+		return "", newErr("skill file path escapes bundle directory", http.StatusBadRequest)
+	}
+	if slash == "SKILL.md" || slash == skillProvenanceFile {
+		return "", newErr(fmt.Sprintf("%s cannot be addressed as a companion file", slash), http.StatusBadRequest)
+	}
+	for seg := range strings.SplitSeq(slash, "/") {
+		if seg == "" || strings.HasPrefix(seg, ".") {
+			return "", newErr("hidden files are not allowed in skill bundles", http.StatusBadRequest)
+		}
+	}
+	return slash, nil
+}
+
+func (v *Vault) listSkillFiles(slug string) []string {
+	_, dirFull, err := v.ResolveRel("_skills/" + slug)
+	if err != nil {
+		return nil
+	}
+	var files []string
+	_ = filepath.WalkDir(dirFull, func(p string, d fs.DirEntry, wErr error) error {
+		if wErr != nil {
+			return wErr
+		}
+		if d == nil || p == dirFull {
+			return nil
+		}
+		if strings.HasPrefix(d.Name(), ".") {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if rel, rErr := filepath.Rel(dirFull, p); rErr == nil {
+			if slash := filepath.ToSlash(rel); slash != "SKILL.md" {
+				files = append(files, slash)
+			}
+		}
+		return nil
+	})
+	slices.Sort(files)
+	return files
+}
+
+func (v *Vault) readSkillProvenance(slug string) *SkillProvenance {
+	b, err := v.ReadFileBytes("_skills/"+slug+"/"+skillProvenanceFile, 64*1024)
+	if err != nil {
+		return nil
+	}
+	var prov SkillProvenance
+	if err := json.Unmarshal(b, &prov); err != nil || strings.TrimSpace(prov.Source) == "" {
+		return nil
+	}
+	return &prov
 }
 
 // Search scans Markdown files in the vault for query terms.
