@@ -758,11 +758,11 @@ func Serve(port int, host string) error {
 			_, _ = fmt.Fprintf(os.Stderr, format+"\n", args...)
 		},
 	})
-	srv := NewServer(fleet, addr, false, watchdog, tlsMgr)
-	_, _ = fmt.Fprintf(os.Stderr, "fleet serve listening on %s\n", addr)
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	srv := NewServer(fleet, addr, false, watchdog, tlsMgr)
+	_, _ = fmt.Fprintf(os.Stderr, "fleet serve listening on %s\n", addr)
 
 	watchdog.Start(ctx)
 	tlsMgr.Start(ctx)
@@ -775,6 +775,12 @@ func Serve(port int, host string) error {
 		fleet.Assistant.Start(ctx)
 		defer fleet.Assistant.Stop()
 	}
+
+	return serveUntilCanceled(ctx, srv, ln)
+}
+
+func serveUntilCanceled(ctx context.Context, srv *http.Server, ln net.Listener) error {
+	srv.BaseContext = func(net.Listener) context.Context { return ctx }
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -789,7 +795,9 @@ func Serve(port int, host string) error {
 	case <-ctx.Done():
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(shutCtx)
+		if err := srv.Shutdown(shutCtx); err != nil {
+			_ = srv.Close()
+		}
 		return <-errCh
 	case err := <-errCh:
 		return err

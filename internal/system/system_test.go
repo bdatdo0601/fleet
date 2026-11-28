@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -366,5 +367,70 @@ func TestPullLighthouseRepoIgnoresPullRebaseAndMultipleMergeRefs(t *testing.T) {
 
 	if got := pullLighthouseRepo(cloneDir, ""); got != wantSHA {
 		t.Fatalf("pullLighthouseRepo() HEAD = %q, want %q", got, wantSHA)
+	}
+}
+
+func TestReloadLaunchdServiceWaitsPastSlowShutdownAndRetriesBootstrap(t *testing.T) {
+	bootoutCalls := 0
+	loadedChecks := 0
+	bootstrapCalls := 0
+	var slept time.Duration
+
+	err := reloadLaunchdService(
+		"/Library/LaunchDaemons/io.github.bdatdo0601.fleet.serve.plist",
+		func() { bootoutCalls++ },
+		func() bool {
+			loadedChecks++
+			// Simulate a 6-second teardown (40 * 150ms > old 3s cap).
+			return loadedChecks <= 40
+		},
+		func() (string, error) {
+			bootstrapCalls++
+			// Simulate transient launchd EIO (exit status 5) before succeeding.
+			if bootstrapCalls < 4 {
+				return "Bootstrap failed: 5: Input/output error", errors.New("exit status 5")
+			}
+			return "", nil
+		},
+		func(d time.Duration) { slept += d },
+	)
+	if err != nil {
+		t.Fatalf("reloadLaunchdService failed: %v", err)
+	}
+	if bootoutCalls != 1 {
+		t.Fatalf("bootoutCalls = %d, want 1", bootoutCalls)
+	}
+	if loadedChecks != 41 {
+		t.Fatalf("loadedChecks = %d, want 41", loadedChecks)
+	}
+	if bootstrapCalls != 4 {
+		t.Fatalf("bootstrapCalls = %d, want 4", bootstrapCalls)
+	}
+	wantSleep := 40*launchdUnloadPollInterval + 3*launchdBootstrapInterval
+	if slept != wantSleep {
+		t.Fatalf("slept = %v, want %v", slept, wantSleep)
+	}
+}
+
+func TestReloadLaunchdServiceReturnsErrorWhenBootstrapNeverSucceeds(t *testing.T) {
+	bootstrapCalls := 0
+	err := reloadLaunchdService(
+		"/Library/LaunchDaemons/test.plist",
+		func() {},
+		func() bool { return false },
+		func() (string, error) {
+			bootstrapCalls++
+			return "Bootstrap failed: 5: Input/output error\n", errors.New("exit status 5")
+		},
+		func(time.Duration) {},
+	)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if bootstrapCalls != launchdBootstrapAttempts {
+		t.Fatalf("bootstrapCalls = %d, want %d", bootstrapCalls, launchdBootstrapAttempts)
+	}
+	if !strings.Contains(err.Error(), "Bootstrap failed: 5: Input/output error") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

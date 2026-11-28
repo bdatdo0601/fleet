@@ -255,9 +255,13 @@ func RunEdge(ctx context.Context, opts EdgeOpts) error {
 	if err != nil {
 		return fmt.Errorf("listen HTTPS %s: %w", opts.HTTPSAddr, err)
 	}
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	srv := &http.Server{
 		Addr:              opts.HTTPSAddr,
 		Handler:           proxyHandler,
+		BaseContext:       func(net.Listener) context.Context { return runCtx },
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       90 * time.Second,
 		MaxHeaderBytes:    64 * 1024,
@@ -267,9 +271,6 @@ func RunEdge(ctx context.Context, opts EdgeOpts) error {
 		},
 	}
 	logf("fleet edge HTTPS listening on %s -> %s", opts.HTTPSAddr, opts.UpstreamURL)
-
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
 
 	errCh := make(chan error, 2)
 	go func() {
@@ -296,7 +297,9 @@ func RunEdge(ctx context.Context, opts EdgeOpts) error {
 	}
 	shutCtx, shutCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer shutCancel()
-	_ = srv.Shutdown(shutCtx)
+	if err := srv.Shutdown(shutCtx); err != nil {
+		_ = srv.Close()
+	}
 	if second := <-errCh; second != nil && firstErr == nil && ctx.Err() == nil {
 		firstErr = second
 	}

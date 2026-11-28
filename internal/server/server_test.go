@@ -1,9 +1,11 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -210,4 +212,51 @@ func TestAgentsHTTPEndpointsAndWait(t *testing.T) {
 			t.Fatalf("GET %s failed: %v", path, err)
 		}
 	}
+}
+
+func TestServeUntilCanceledAbortsLongPollImmediately(t *testing.T) {
+	f, _, _ := setupTestServer(t)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(f, ln.Addr().String(), true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- serveUntilCanceled(ctx, srv, ln)
+	}()
+
+	pollStarted := make(chan struct{})
+	pollDone := make(chan error, 1)
+	go func() {
+		close(pollStarted)
+		var out map[string]any
+		pollDone <- client.Call("http://"+ln.Addr().String(), http.MethodPost, "/v1/agents/wait-harness", map[string]any{
+			"harness": "antigravity",
+			"timeout": 30.0,
+		}, 35*time.Second, nil, &out)
+	}()
+
+	<-pollStarted
+	// Give the long-poll request a moment to reach WaitForHarnessMessages.
+	time.Sleep(100 * time.Millisecond)
+
+	start := time.Now()
+	cancel()
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("serveUntilCanceled returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("serveUntilCanceled hung on active long-poll request")
+	}
+	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
+		t.Fatalf("shutdown took %v; expected immediate cancellation of long-poll", elapsed)
+	}
+	<-pollDone
 }

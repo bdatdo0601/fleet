@@ -391,26 +391,58 @@ func BuildAgentPlist(opts AgentOpts) (string, error) {
 	}), nil
 }
 
-func reloadDaemon(label, plistPath string) error {
-	_, _, _, _ = Sudo(false, "launchctl", "bootout", "system/"+label)
-	for range 20 {
-		if !LaunchdLoaded(label) {
+const (
+	launchdUnloadPollInterval = 150 * time.Millisecond
+	launchdUnloadWaitAttempts = 140 // ~21s, covering macOS launchd's default 20s ExitTimeOut
+	launchdBootstrapAttempts  = 20
+	launchdBootstrapInterval  = 500 * time.Millisecond
+)
+
+func reloadLaunchdService(
+	plistPath string,
+	bootout func(),
+	isLoaded func() bool,
+	bootstrap func() (string, error),
+	sleep func(time.Duration),
+) error {
+	bootout()
+	for range launchdUnloadWaitAttempts {
+		if !isLoaded() {
 			break
 		}
-		time.Sleep(150 * time.Millisecond)
+		sleep(launchdUnloadPollInterval)
 	}
 	var lastStderr string
 	var lastErr error
-	for range 5 {
-		_, stderrStr, rc, err := Sudo(false, "launchctl", "bootstrap", "system", plistPath)
-		if err == nil && rc == 0 {
+	for range launchdBootstrapAttempts {
+		stderrStr, err := bootstrap()
+		if err == nil {
 			return nil
 		}
 		lastStderr = stderrStr
 		lastErr = err
-		time.Sleep(300 * time.Millisecond)
+		sleep(launchdBootstrapInterval)
 	}
 	return fmt.Errorf("launchctl bootstrap %s failed: %w (%s)", plistPath, lastErr, strings.TrimSpace(lastStderr))
+}
+
+func reloadDaemon(label, plistPath string) error {
+	return reloadLaunchdService(
+		plistPath,
+		func() { _, _, _, _ = Sudo(false, "launchctl", "bootout", "system/"+label) },
+		func() bool { return LaunchdLoaded(label) },
+		func() (string, error) {
+			_, stderrStr, rc, err := Sudo(false, "launchctl", "bootstrap", "system", plistPath)
+			if err == nil && rc == 0 {
+				return "", nil
+			}
+			if err == nil {
+				err = fmt.Errorf("exit status %d", rc)
+			}
+			return stderrStr, err
+		},
+		time.Sleep,
+	)
 }
 
 // InstallDaemon writes the LaunchDaemon plist and loads/restarts it in launchd.
@@ -428,8 +460,9 @@ func InstallDaemon(opts DaemonOpts) error {
 		return ReloadDaemonDetached(opts.Label, plistPath)
 	}
 	if !changed && LaunchdLoaded(opts.Label) {
-		Restart(opts.Label)
-		return nil
+		if RestartService(opts.Label) == nil {
+			return nil
+		}
 	}
 	return reloadDaemon(opts.Label, plistPath)
 }
@@ -440,14 +473,14 @@ func ReloadDaemonDetached(label, plistPath string) error {
 	script := `sleep 1
 launchctl bootout "system/$1" >/dev/null 2>&1 || true
 i=0
-while [ "$i" -lt 20 ] && launchctl print "system/$1" >/dev/null 2>&1; do
+while [ "$i" -lt 140 ] && launchctl print "system/$1" >/dev/null 2>&1; do
   sleep 0.15
   i=$((i + 1))
 done
 i=0
-while [ "$i" -lt 5 ]; do
+while [ "$i" -lt 20 ]; do
   launchctl bootstrap system "$2" >/dev/null 2>&1 && exit 0
-  sleep 0.3
+  sleep 0.5
   i=$((i + 1))
 done
 exit 1`
@@ -676,25 +709,16 @@ func InstallUserAgent(opts AgentOpts) error {
 
 func reloadUserAgent(label, plistPath string) error {
 	domain := launchAgentDomain()
-	_ = exec.Command("launchctl", "bootout", domain+"/"+label).Run()
-	for range 20 {
-		if !UserAgentLoaded(label) {
-			break
-		}
-		time.Sleep(150 * time.Millisecond)
-	}
-	var lastOut string
-	var lastErr error
-	for range 5 {
-		out, err := exec.Command("launchctl", "bootstrap", domain, plistPath).CombinedOutput()
-		if err == nil {
-			return nil
-		}
-		lastOut = string(out)
-		lastErr = err
-		time.Sleep(300 * time.Millisecond)
-	}
-	return fmt.Errorf("launchctl bootstrap %s failed: %w (%s)", plistPath, lastErr, strings.TrimSpace(lastOut))
+	return reloadLaunchdService(
+		plistPath,
+		func() { _ = exec.Command("launchctl", "bootout", domain+"/"+label).Run() },
+		func() bool { return UserAgentLoaded(label) },
+		func() (string, error) {
+			out, err := exec.Command("launchctl", "bootstrap", domain, plistPath).CombinedOutput()
+			return string(out), err
+		},
+		time.Sleep,
+	)
 }
 
 // StartUserAgent kickstarts or bootstraps a per-user LaunchAgent.
@@ -1155,11 +1179,10 @@ func restartAndVerifyLighthouse(opts LighthouseUpdateOpts, targetBin, prevBin, o
 		return nil
 	}
 	ensureServe := func() {
-		if LaunchdLoaded(paths.ServeLabel) {
-			Restart(paths.ServeLabel)
-		} else {
-			_ = InstallServeDaemon(targetBin, owner, stateDir, stateDir)
+		if LaunchdLoaded(paths.ServeLabel) && RestartService(paths.ServeLabel) == nil {
+			return
 		}
+		_ = InstallServeDaemon(targetBin, owner, stateDir, stateDir)
 	}
 	if err := InstallServeDaemon(targetBin, owner, stateDir, stateDir); err != nil {
 		_ = RollbackBinary(targetBin, prevBin)
