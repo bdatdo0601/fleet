@@ -36,6 +36,7 @@ type DoctorProbes struct {
 	OBRunningFor func(name, vaultPath string) bool
 	CheckOP      func(context.Context, string) (string, bool, string, error)
 	ListVaults   func(context.Context, string) ([]OPVaultMeta, error)
+	SandboxProbe func(context.Context, SandboxConfig) DoctorCheck
 }
 
 // FindOBBinary locates `ob` (obsidian-headless) across PATH, Homebrew, npm/nvm/fnm/volta/mise/pnpm, and login shell PATH.
@@ -114,6 +115,8 @@ func (e *Engine) Doctor(ctx context.Context) DoctorReport {
 	checks = append(checks, opCheck)
 	checks = append(checks, e.checkMCPDoctor(ctx, cfg))
 	checks = append(checks, e.checkNotificationsDoctor(ctx, cfg))
+	checks = append(checks, e.checkDiscordBotDoctor(ctx, cfg))
+	checks = append(checks, e.checkSandboxDoctor(ctx, cfg))
 
 	ok := true
 	for _, c := range checks {
@@ -310,6 +313,9 @@ func opRequiredByConfig(cfg Config) bool {
 	if strings.TrimSpace(cfg.APIKeyOPRef) != "" || len(cfg.Credentials) > 0 {
 		return true
 	}
+	if cfg.Discord.Enabled && strings.TrimSpace(cfg.Discord.BotTokenOPRef) != "" {
+		return true
+	}
 	if cfg.Notifications.Enabled && (strings.TrimSpace(cfg.Notifications.DiscordWebhookOPRef) != "" || len(cfg.Notifications.DiscordChannelOPRefs) > 0) {
 		return true
 	}
@@ -423,5 +429,94 @@ func (e *Engine) checkNotificationsDoctor(ctx context.Context, cfg Config) Docto
 		Name:   "notifications",
 		Status: "ok",
 		Detail: fmt.Sprintf("Discord webhook ready (%d ref(s), min_priority=%s)", len(refs), n.MinPriority),
+	}
+}
+
+func (e *Engine) checkDiscordBotDoctor(ctx context.Context, cfg Config) DoctorCheck {
+	d := normalizeDiscordConfig(cfg.Discord)
+	if !d.Enabled {
+		return DoctorCheck{Name: "discord_bot", Status: "skip", Detail: "Two-way Discord Gateway bot disabled"}
+	}
+	if err := ValidateDiscordConfig(d); err != nil {
+		return DoctorCheck{Name: "discord_bot", Status: "fail", Detail: err.Error()}
+	}
+	tok, err := e.resolveDiscordBotToken(ctx, d)
+	if err != nil {
+		return DoctorCheck{
+			Name:   "discord_bot",
+			Status: "fail",
+			Detail: "Failed to resolve bot_token_op_ref: " + err.Error(),
+			Hint:   "Verify 1Password Service Account access to the Discord bot token item",
+		}
+	}
+	user, err := e.discordClient().GetMe(ctx, tok)
+	if err != nil {
+		return DoctorCheck{
+			Name:   "discord_bot",
+			Status: "fail",
+			Detail: err.Error(),
+			Hint:   "Verify the Discord bot token and Gateway Message Content Intent",
+		}
+	}
+	e.discordMu.RLock()
+	connected := e.discordConnected
+	e.discordMu.RUnlock()
+	return DoctorCheck{
+		Name:   "discord_bot",
+		Status: "ok",
+		Detail: fmt.Sprintf("@%s (%s, %d channel(s), gateway_connected=%v)", cmp.Or(user.Username, user.ID), d.AuthorizedUserID, len(d.Channels), connected),
+	}
+}
+
+func (e *Engine) checkSandboxDoctor(ctx context.Context, cfg Config) DoctorCheck {
+	sb := normalizeSandboxConfig(cfg.Sandbox)
+	if !sb.Enabled {
+		return DoctorCheck{Name: "sandbox", Status: "skip", Detail: "Sandboxed computer disabled"}
+	}
+	if e.Probes.SandboxProbe != nil {
+		return e.Probes.SandboxProbe(ctx, sb)
+	}
+	var runner SandboxRunner
+	if e.sandbox != nil && e.sandbox.runner != nil {
+		runner = e.sandbox.runner
+	} else {
+		runner = NewAppleContainerRunner()
+	}
+	if runner.FindBinary() == "" {
+		return DoctorCheck{
+			Name:   "sandbox",
+			Status: "fail",
+			Detail: "Apple `container` CLI not found",
+			Hint:   "Install with `brew install --cask container` on macOS 26+",
+		}
+	}
+	if err := runner.SystemStatus(ctx); err != nil {
+		return DoctorCheck{
+			Name:   "sandbox",
+			Status: "fail",
+			Detail: err.Error(),
+			Hint:   "Start container service on lighthouse: `container system start`",
+		}
+	}
+	if !runner.NetworkExists(ctx, sb.Network) {
+		return DoctorCheck{
+			Name:   "sandbox",
+			Status: "warn",
+			Detail: fmt.Sprintf("Internal network %q not created yet", sb.Network),
+			Hint:   "Run `fleet assistant sandbox-build` to create the offline network and build the sandbox image",
+		}
+	}
+	if !runner.ImageExists(ctx, sb.Image) {
+		return DoctorCheck{
+			Name:   "sandbox",
+			Status: "fail",
+			Detail: fmt.Sprintf("Sandbox image %q not built yet", sb.Image),
+			Hint:   "Run `fleet assistant sandbox-build` (or click Build Sandbox Image in Settings)",
+		}
+	}
+	return DoctorCheck{
+		Name:   "sandbox",
+		Status: "ok",
+		Detail: fmt.Sprintf("Apple container ready (%s, net=%s, %d CPU, %d MB)", sb.Image, sb.Network, sb.CPUs, sb.MemoryMB),
 	}
 }

@@ -189,6 +189,21 @@ func (e *Engine) buildToolSpecs(ctx context.Context) []ToolSpec {
 		makeToolSpec("render_widget", "Attach an interactive sandboxed HTML/CSS/SVG Generative UI widget to this reply (no external URLs; use CSS vars --text/--muted/--border/--accent/--surface and data-fleet-action=\"...\" for clickable prompts).", schemaObj(map[string]any{
 			"title": strProp("Widget title"), "html": strProp("Self-contained HTML snippet (inline <style>/<script>/<svg> only; no external URLs)"),
 		}, "title", "html")),
+	}
+	specs = append(specs, credentialAndMCPToolSpecs()...)
+	if e.Config().Sandbox.Enabled {
+		specs = append(specs, sandboxToolSpecs()...)
+	}
+	if e.mcp != nil {
+		for _, ext := range e.mcp.ListTools(ctx) {
+			specs = append(specs, makeToolSpec(ext.FullName, ext.Description, ext.InputSchema))
+		}
+	}
+	return specs
+}
+
+func credentialAndMCPToolSpecs() []ToolSpec {
+	return []ToolSpec{
 		makeToolSpec("credential_list_aliases", "List configured 1Password credential aliases and allowlisted hosts (no secrets returned).", schemaObj(map[string]any{})),
 		makeToolSpec("onepassword_list_vaults", "List 1Password vaults accessible to the assistant Service Account.", schemaObj(map[string]any{})),
 		makeToolSpec("onepassword_list_items", "List items in a 1Password vault (titles, categories, URLs, tags — no secrets).", schemaObj(map[string]any{
@@ -229,12 +244,6 @@ func (e *Engine) buildToolSpecs(ctx context.Context) []ToolSpec {
 			"name": strProp("MCP server name to remove"),
 		}, "name")),
 	}
-	if e.mcp != nil {
-		for _, ext := range e.mcp.ListTools(ctx) {
-			specs = append(specs, makeToolSpec(ext.FullName, ext.Description, ext.InputSchema))
-		}
-	}
-	return specs
 }
 
 func decodeToolArgs(raw string) (map[string]any, error) {
@@ -303,6 +312,9 @@ func (e *Engine) dispatchTool(ctx context.Context, name string, args map[string]
 	}
 	if name == "mcp_list" || name == "mcp_test" || name == "mcp_configure" || name == "mcp_remove" {
 		return e.dispatchMCPManageTool(ctx, name, args, rawArgs, tctx)
+	}
+	if strings.HasPrefix(name, "sandbox_") {
+		return e.dispatchSandboxTool(ctx, name, args, rawArgs, tctx)
 	}
 	if strings.HasPrefix(name, "mcp__") && e.mcp != nil {
 		ext, ok := e.mcp.FindTool(ctx, name)

@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS assistant_messages (
   tool_calls_json   TEXT NOT NULL DEFAULT '',
   tool_call_id      TEXT NOT NULL DEFAULT '',
   widgets_json      TEXT NOT NULL DEFAULT '',
+  source            TEXT NOT NULL DEFAULT '',
+  external_id       TEXT NOT NULL DEFAULT '',
   observed          INTEGER NOT NULL DEFAULT 0,
   created_at        TEXT NOT NULL
 );
@@ -141,6 +143,27 @@ CREATE TABLE IF NOT EXISTS assistant_frontier_grants (
   created_at    TEXT NOT NULL,
   updated_at    TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS assistant_files (
+  id           TEXT PRIMARY KEY,
+  channel_id   TEXT NOT NULL,
+  message_id   INTEGER NOT NULL DEFAULT 0,
+  direction    TEXT NOT NULL,
+  name         TEXT NOT NULL,
+  mime_type    TEXT NOT NULL DEFAULT 'application/octet-stream',
+  size_bytes   INTEGER NOT NULL DEFAULT 0,
+  storage_path TEXT NOT NULL,
+  created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_assistant_files_channel
+  ON assistant_files(channel_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS assistant_discord_state (
+  channel_id         TEXT PRIMARY KEY,
+  discord_channel_id TEXT NOT NULL,
+  last_message_id    TEXT NOT NULL DEFAULT '',
+  updated_at         TEXT NOT NULL
+);
 `
 
 // Channel represents one persistent assistant conversation stream.
@@ -177,6 +200,8 @@ type Message struct {
 	ToolCallsJSON    string          `json:"tool_calls_json,omitempty"`
 	ToolCallID       string          `json:"tool_call_id,omitempty"`
 	Widgets          []WidgetPayload `json:"widgets,omitempty"`
+	Source           string          `json:"source,omitempty"`
+	ExternalID       string          `json:"external_id,omitempty"`
 	Observed         bool            `json:"observed"`
 	CreatedAt        string          `json:"created_at"`
 }
@@ -282,6 +307,21 @@ type SummaryCounts struct {
 	OutboxPending    int `json:"outbox_pending"`
 }
 
+// AssistantFile represents an uploaded or sandbox-generated file attached to a channel.
+type AssistantFile struct {
+	ID          string `json:"id"`
+	ChannelID   string `json:"channel_id"`
+	MessageID   int64  `json:"message_id,omitempty"`
+	Direction   string `json:"direction"`
+	Name        string `json:"name"`
+	MimeType    string `json:"mime_type"`
+	SizeBytes   int64  `json:"size_bytes"`
+	StoragePath string `json:"-"`
+	URL         string `json:"url,omitempty"`
+	IsImage     bool   `json:"is_image,omitempty"`
+	CreatedAt   string `json:"created_at"`
+}
+
 // Store wraps SQLite persistence in ~/.fleet/assistant.db.
 type Store struct {
 	Path string
@@ -295,10 +335,19 @@ func randomHexID(prefix string) string {
 	return prefix + "-" + hex.EncodeToString(b[:])
 }
 
+var messageMigrations = []registry.ColumnMigration{
+	{Col: "source", Def: "TEXT NOT NULL DEFAULT ''"},
+	{Col: "external_id", Def: "TEXT NOT NULL DEFAULT ''"},
+}
+
 // OpenStore initializes assistant.db at path and seeds default channels.
 func OpenStore(path string) (*Store, error) {
-	db, err := registry.OpenSQLite(path, assistantSchema, "assistant_messages", nil)
+	db, err := registry.OpenSQLite(path, assistantSchema, "assistant_messages", messageMigrations)
 	if err != nil {
+		return nil, err
+	}
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_messages_external ON assistant_messages(source, external_id) WHERE external_id != ''`); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
 	s := &Store{Path: path, db: db}
@@ -483,11 +532,11 @@ func (s *Store) AppendMessage(m Message) (Message, error) {
 		`INSERT INTO assistant_messages(
 			channel_id, context_epoch, role, content, model,
 			prompt_tokens, cached_tokens, completion_tokens, cost_usd,
-			tool_calls_json, tool_call_id, widgets_json, observed, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			tool_calls_json, tool_call_id, widgets_json, source, external_id, observed, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		m.ChannelID, max(m.ContextEpoch, 1), m.Role, m.Content, m.Model,
 		m.PromptTokens, m.CachedTokens, m.CompletionTokens, m.CostUSD,
-		m.ToolCallsJSON, m.ToolCallID, widgetsRaw, obs, m.CreatedAt,
+		m.ToolCallsJSON, m.ToolCallID, widgetsRaw, m.Source, m.ExternalID, obs, m.CreatedAt,
 	)
 	if err != nil {
 		return Message{}, err
@@ -507,7 +556,7 @@ func scanMessage(rows *sql.Rows) (Message, error) {
 	if err := rows.Scan(
 		&m.ID, &m.ChannelID, &m.ContextEpoch, &m.Role, &m.Content, &m.Model,
 		&m.PromptTokens, &m.CachedTokens, &m.CompletionTokens, &m.CostUSD,
-		&m.ToolCallsJSON, &m.ToolCallID, &widgetsRaw, &obs, &m.CreatedAt,
+		&m.ToolCallsJSON, &m.ToolCallID, &widgetsRaw, &m.Source, &m.ExternalID, &obs, &m.CreatedAt,
 	); err != nil {
 		return Message{}, err
 	}
@@ -528,7 +577,7 @@ func (s *Store) ListMessages(channelID string, limit int) ([]Message, error) {
 	rows, err := s.db.Query(
 		`SELECT id, channel_id, context_epoch, role, content, model,
 		        prompt_tokens, cached_tokens, completion_tokens, cost_usd,
-		        tool_calls_json, tool_call_id, widgets_json, observed, created_at
+		        tool_calls_json, tool_call_id, widgets_json, source, external_id, observed, created_at
 		 FROM assistant_messages
 		 WHERE channel_id = ?
 		 ORDER BY id DESC LIMIT ?`,
@@ -565,7 +614,7 @@ func (s *Store) ListContextMessages(channelID string, epoch, limit int) ([]Messa
 	rows, err := s.db.Query(
 		`SELECT id, channel_id, context_epoch, role, content, model,
 		        prompt_tokens, cached_tokens, completion_tokens, cost_usd,
-		        tool_calls_json, tool_call_id, widgets_json, observed, created_at
+		        tool_calls_json, tool_call_id, widgets_json, source, external_id, observed, created_at
 		 FROM assistant_messages
 		 WHERE channel_id = ? AND context_epoch = ? AND observed = 0
 		 ORDER BY id DESC LIMIT ?`,
@@ -601,7 +650,7 @@ func (s *Store) ListUnobservedMessages(channelID string, limit int) ([]Message, 
 	}
 	query := `SELECT id, channel_id, context_epoch, role, content, model,
 	        prompt_tokens, cached_tokens, completion_tokens, cost_usd,
-	        tool_calls_json, tool_call_id, widgets_json, observed, created_at
+	        tool_calls_json, tool_call_id, widgets_json, source, external_id, observed, created_at
 	 FROM assistant_messages
 	 WHERE observed = 0 AND role IN ('user', 'assistant')`
 	var args []any
@@ -1378,6 +1427,49 @@ func (s *Store) UpdateDelegationState(id, sessionID, status, lastNotified string
 	return err
 }
 
+// HasExternalMessage reports whether a message from source with externalID has already been ingested.
+func (s *Store) HasExternalMessage(source, externalID string) bool {
+	if strings.TrimSpace(source) == "" || strings.TrimSpace(externalID) == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var n int
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM assistant_messages WHERE source = ? AND external_id = ?`, source, externalID).Scan(&n)
+	return n > 0
+}
+
+// GetDiscordCursor returns the last processed Discord message snowflake for channelID.
+func (s *Store) GetDiscordCursor(channelID string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var lastID string
+	err := s.db.QueryRow(`SELECT last_message_id FROM assistant_discord_state WHERE channel_id = ?`, channelID).Scan(&lastID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return lastID, err
+}
+
+// SetDiscordCursor saves the latest processed Discord message snowflake for channelID.
+func (s *Store) SetDiscordCursor(channelID, discordChannelID, lastMessageID string) error {
+	if strings.TrimSpace(channelID) == "" || strings.TrimSpace(lastMessageID) == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(
+		`INSERT INTO assistant_discord_state(channel_id, discord_channel_id, last_message_id, updated_at)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(channel_id) DO UPDATE SET
+		   discord_channel_id = excluded.discord_channel_id,
+		   last_message_id = excluded.last_message_id,
+		   updated_at = excluded.updated_at`,
+		channelID, discordChannelID, lastMessageID, registry.NowISO(),
+	)
+	return err
+}
+
 // Summary returns aggregate counts for Fleet overview.
 func (s *Store) Summary() SummaryCounts {
 	s.mu.Lock()
@@ -1389,4 +1481,110 @@ func (s *Store) Summary() SummaryCounts {
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM assistant_inbox WHERE status = 'queued'`).Scan(&sc.QueuedInbox)
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM assistant_outbox WHERE delivered = 0`).Scan(&sc.OutboxPending)
 	return sc
+}
+
+func decorateAssistantFile(f AssistantFile) AssistantFile {
+	f.URL = "/v1/assistant/files/" + f.ID
+	f.IsImage = isSafeInlineImageMIME(f.MimeType)
+	return f
+}
+
+func scanAssistantFile(scanner interface{ Scan(...any) error }) (AssistantFile, error) {
+	var f AssistantFile
+	err := scanner.Scan(&f.ID, &f.ChannelID, &f.MessageID, &f.Direction, &f.Name, &f.MimeType, &f.SizeBytes, &f.StoragePath, &f.CreatedAt)
+	if err != nil {
+		return AssistantFile{}, err
+	}
+	return decorateAssistantFile(f), nil
+}
+
+// CreateFile persists an uploaded or generated file record in assistant_files.
+func (s *Store) CreateFile(f AssistantFile) (AssistantFile, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if f.ID == "" {
+		f.ID = randomHexID("file")
+	}
+	f.ChannelID = cmp.Or(strings.TrimSpace(f.ChannelID), "general")
+	f.Direction = cmp.Or(strings.TrimSpace(f.Direction), "upload")
+	f.MimeType = cmp.Or(strings.TrimSpace(f.MimeType), "application/octet-stream")
+	if f.CreatedAt == "" {
+		f.CreatedAt = registry.NowISO()
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO assistant_files(id, channel_id, message_id, direction, name, mime_type, size_bytes, storage_path, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		f.ID, f.ChannelID, f.MessageID, f.Direction, f.Name, f.MimeType, f.SizeBytes, f.StoragePath, f.CreatedAt,
+	)
+	if err != nil {
+		return AssistantFile{}, err
+	}
+	return decorateAssistantFile(f), nil
+}
+
+// GetFile returns one AssistantFile by ID.
+func (s *Store) GetFile(id string) (*AssistantFile, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f, err := scanAssistantFile(s.db.QueryRow(
+		`SELECT id, channel_id, message_id, direction, name, mime_type, size_bytes, storage_path, created_at
+		 FROM assistant_files WHERE id = ?`, strings.TrimSpace(id),
+	))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, newErr(fmt.Sprintf("file %q not found", id), http.StatusNotFound)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &f, nil
+}
+
+// ListChannelFiles returns recent files associated with channelID.
+func (s *Store) ListChannelFiles(channelID string, limit int) ([]AssistantFile, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	rows, err := s.db.Query(
+		`SELECT id, channel_id, message_id, direction, name, mime_type, size_bytes, storage_path, created_at
+		 FROM assistant_files WHERE channel_id = ? ORDER BY created_at DESC LIMIT ?`,
+		cmp.Or(strings.TrimSpace(channelID), "general"), limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []AssistantFile
+	for rows.Next() {
+		f, scanErr := scanAssistantFile(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// AttachFilesToMessage links pending uploaded file IDs to msgID.
+func (s *Store) AttachFilesToMessage(channelID string, msgID int64, fileIDs []string) error {
+	if msgID <= 0 || len(fileIDs) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cleanCh := cmp.Or(strings.TrimSpace(channelID), "general")
+	for _, id := range fileIDs {
+		cleanID := strings.TrimSpace(id)
+		if cleanID == "" {
+			continue
+		}
+		if _, err := s.db.Exec(
+			`UPDATE assistant_files SET message_id = ? WHERE id = ? AND channel_id = ? AND message_id = 0`,
+			msgID, cleanID, cleanCh,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }

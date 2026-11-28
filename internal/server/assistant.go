@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"encoding/json"
 	"fmt"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
@@ -109,6 +110,7 @@ func buildAssistantSummary(fleet *core.Fleet) map[string]any {
 		"pending_approvals": sc.PendingApprovals,
 		"enabled_timers":    sc.EnabledTimers,
 		"skills":            skillsCount,
+		"sandbox_enabled":   view.Sandbox.Enabled,
 	}
 }
 
@@ -124,6 +126,7 @@ func registerAssistantRoutes(
 	registerAssistantChatRoutes(mux, fleet, route)
 	registerAssistantSkillRoutes(mux, fleet, route)
 	registerAssistantVaultRoutes(mux, fleet, route)
+	registerAssistantSandboxRoutes(mux, fleet, route)
 }
 
 func registerAssistantAdminRoutes(
@@ -310,14 +313,15 @@ func registerAssistantChatRoutes(
 	}))
 	mux.HandleFunc("POST /v1/assistant/messages", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
 		var req struct {
-			Channel string `json:"channel"`
-			Content string `json:"content"`
-			Model   string `json:"model"`
+			Channel string   `json:"channel"`
+			Content string   `json:"content"`
+			Model   string   `json:"model"`
+			FileIDs []string `json:"file_ids"`
 		}
 		if err := readJSONBody(r, &req); err != nil {
 			return err
 		}
-		msg, ev, err := fleet.Assistant.EnqueueUserMessage(req.Channel, req.Content, req.Model)
+		msg, ev, err := fleet.Assistant.EnqueueUserMessageWithFiles(req.Channel, req.Content, req.Model, req.FileIDs)
 		if err != nil {
 			return err
 		}
@@ -678,6 +682,96 @@ func registerAssistantVaultRoutes(
 			return err
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"vault": mount.Name, "commit": commit})
+		return nil
+	}))
+}
+
+func registerAssistantSandboxRoutes(
+	mux *http.ServeMux,
+	fleet *core.Fleet,
+	route func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc,
+) {
+	mux.HandleFunc("POST /v1/assistant/files", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		maxMB := fleet.Assistant.ConfigView().Sandbox.MaxFileMB
+		if maxMB <= 0 {
+			maxMB = assistant.DefaultSandboxMaxFileMB
+		}
+		maxLimit := int64(maxMB+1) << 20
+		r.Body = http.MaxBytesReader(w, r.Body, maxLimit)
+		if err := r.ParseMultipartForm(maxLimit); err != nil {
+			return &core.FleetError{Msg: "invalid file upload: " + err.Error(), Status: http.StatusBadRequest}
+		}
+		defer func() {
+			if r.MultipartForm != nil {
+				_ = r.MultipartForm.RemoveAll()
+			}
+		}()
+		ch := cmp.Or(strings.TrimSpace(r.FormValue("channel")), "general")
+		fh, header, err := r.FormFile("file")
+		if err != nil {
+			return &core.FleetError{Msg: "multipart field 'file' is required", Status: http.StatusBadRequest}
+		}
+		defer func() { _ = fh.Close() }()
+		rec, err := fleet.Assistant.SaveUploadedFile(ch, header.Filename, header.Header.Get("Content-Type"), fh)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusCreated, map[string]any{"file": rec})
+		return nil
+	}))
+	mux.HandleFunc("GET /v1/assistant/files", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		ch := cmp.Or(strings.TrimSpace(r.URL.Query().Get("channel")), "general")
+		files, err := fleet.Assistant.Store().ListChannelFiles(ch, queryInt(r, "limit"))
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"channel": ch, "files": files})
+		return nil
+	}))
+	mux.HandleFunc("GET /v1/assistant/files/{id}", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		f, fh, err := fleet.Assistant.OpenStoredFile(r.PathValue("id"))
+		if err != nil {
+			return err
+		}
+		defer func() { _ = fh.Close() }()
+		w.Header().Set("Content-Type", cmp.Or(f.MimeType, "application/octet-stream"))
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Cache-Control", "private, no-store")
+		disp := "attachment"
+		if queryBool(r, "inline") && assistant.IsSafeInlinePreviewMIME(f.MimeType) {
+			disp = "inline"
+		}
+		w.Header().Set("Content-Disposition", mime.FormatMediaType(disp, map[string]string{"filename": f.Name}))
+		http.ServeContent(w, r, f.Name, time.Time{}, fh)
+		return nil
+	}))
+	mux.HandleFunc("POST /v1/assistant/sandbox/build", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		var req struct {
+			RebuildBase bool `json:"rebuild_base"`
+		}
+		if err := readJSONBody(r, &req); err != nil {
+			return err
+		}
+		res, err := fleet.Assistant.BuildSandboxImages(r.Context(), req.RebuildBase)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, res)
+		return nil
+	}))
+	mux.HandleFunc("POST /v1/assistant/sandbox/reset", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		var req struct {
+			Channel     string `json:"channel"`
+			ClearOutput bool   `json:"clear_output"`
+		}
+		if err := readJSONBody(r, &req); err != nil {
+			return err
+		}
+		ch := cmp.Or(strings.TrimSpace(req.Channel), "general")
+		if err := fleet.Assistant.ResetSandbox(r.Context(), ch, req.ClearOutput); err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "channel": ch, "clear_output": req.ClearOutput})
 		return nil
 	}))
 }

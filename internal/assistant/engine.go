@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	maxToolRounds = 8
+	maxToolRounds = 14
 
 	// FrontierEscalationTool is the synthetic HITL approval tool name used when gating frontier model escalation.
 	FrontierEscalationTool = "frontier_escalation"
@@ -34,6 +34,9 @@ type frontierEscalationArgs struct {
 type turnOptions struct {
 	RetryReplaceMsgID int64
 	TrackGrant        bool
+	TriggerSource     string
+	TriggerUserText   string
+	ReplyToExternalID string
 }
 
 type turnRoute struct {
@@ -51,15 +54,17 @@ type StreamEvent struct {
 	Data      any    `json:"data,omitempty"`
 }
 
-// Engine coordinates assistant storage, Vault, OpenRouter, Decisions, MCP, timers, and SSE streaming.
+// Engine coordinates assistant storage, Vault, OpenRouter, Decisions, MCP, sandbox, timers, and SSE streaming.
 type Engine struct {
 	store       *Store
 	configPath  string
 	opTokenPath string
 	vaultDir    string
+	filesDir    string
 	deps        FleetDeps
 	llm         *openRouterClient
 	mcp         *MCPManager
+	sandbox     *SandboxManager
 	opReader    OPReaderFunc
 	Probes      DoctorProbes
 
@@ -77,6 +82,13 @@ type Engine struct {
 	delMu                sync.RWMutex
 	hasActiveDelegations bool
 	notifier             Notifier
+
+	discordMu         sync.RWMutex
+	discordConnected  bool
+	discordBotUserID  string
+	discordAPIBase    string
+	discordGatewayURL string
+	discordReloadCh   chan struct{}
 
 	notifyCh chan struct{}
 	cancel   context.CancelFunc
@@ -100,22 +112,27 @@ func Open(dbPath, configPath, defaultVaultDir string, deps FleetDeps) (*Engine, 
 		return nil, err
 	}
 	opTokenPath := ""
+	stateRoot := filepath.Dir(defaultVaultDir)
 	if configPath != "" {
-		opTokenPath = filepath.Join(filepath.Dir(configPath), "op-service-account.token")
+		stateRoot = filepath.Dir(configPath)
+		opTokenPath = filepath.Join(stateRoot, "op-service-account.token")
 	}
 	opReader := NewOPReader(opTokenPath)
 	e := &Engine{
-		store:       store,
-		configPath:  configPath,
-		opTokenPath: opTokenPath,
-		vaultDir:    defaultVaultDir,
-		deps:        deps,
-		llm:         newOpenRouterClient(),
-		mcp:         NewMCPManager(cfg.MCPServers, opReader),
-		opReader:    opReader,
-		cfg:         cfg,
-		subscribers: make(map[chan StreamEvent]struct{}),
-		notifyCh:    make(chan struct{}, 1),
+		store:           store,
+		configPath:      configPath,
+		opTokenPath:     opTokenPath,
+		vaultDir:        defaultVaultDir,
+		filesDir:        filepath.Join(stateRoot, "assistant-files"),
+		deps:            deps,
+		llm:             newOpenRouterClient(),
+		mcp:             NewMCPManager(cfg.MCPServers, opReader),
+		sandbox:         NewSandboxManager(filepath.Join(stateRoot, "sandbox"), nil),
+		opReader:        opReader,
+		cfg:             cfg,
+		subscribers:     make(map[chan StreamEvent]struct{}),
+		discordReloadCh: make(chan struct{}, 1),
+		notifyCh:        make(chan struct{}, 1),
 	}
 	e.refreshDelegationsFlag()
 	return e, nil
@@ -132,9 +149,10 @@ func (e *Engine) Start(parent context.Context) {
 	e.cancel = cancel
 	e.cfgMu.Unlock()
 
-	e.wg.Add(2)
+	e.wg.Add(3)
 	go e.runWorker(ctx)
 	go e.runScheduler(ctx)
+	go e.runDiscordGateway(ctx)
 }
 
 // Stop stops background goroutines and waits for them to exit.
@@ -149,6 +167,11 @@ func (e *Engine) Stop() {
 	e.wg.Wait()
 	if e.mcp != nil {
 		e.mcp.Close()
+	}
+	if e.sandbox != nil {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		e.sandbox.Close(stopCtx)
 	}
 }
 
@@ -269,15 +292,17 @@ func (e *Engine) ConfigView() ConfigView {
 
 // Status returns combined config view and live queue counts.
 func (e *Engine) Status() map[string]any {
+	e.discordMu.RLock()
+	discConnected := e.discordConnected
+	e.discordMu.RUnlock()
 	return map[string]any{
-		"config":  e.ConfigView(),
-		"summary": e.store.Summary(),
+		"config":            e.ConfigView(),
+		"summary":           e.store.Summary(),
+		"discord_connected": discConnected,
 	}
 }
 
-// UpdateConfig validates, saves, and applies new assistant configuration.
-func (e *Engine) UpdateConfig(next Config, clearAPIKey bool) (ConfigView, error) {
-	cur := e.Config()
+func mergePreservedConfig(cur, next Config, clearAPIKey bool) Config {
 	if !clearAPIKey && strings.TrimSpace(next.APIKey) == "" && strings.TrimSpace(next.APIKeyOPRef) == "" {
 		next.APIKey = cur.APIKey
 		next.APIKeyOPRef = cur.APIKeyOPRef
@@ -299,7 +324,24 @@ func (e *Engine) UpdateConfig(next Config, clearAPIKey bool) (ConfigView, error)
 	if next.Routing == (RoutingConfig{}) {
 		next.Routing = cur.Routing
 	}
-	next = NormalizeConfig(next)
+	if isZeroSandboxConfig(next.Sandbox) {
+		next.Sandbox = cur.Sandbox
+	}
+	if next.Discord.AllowApprovals == nil && next.Discord.MirrorWebTurns == nil && !next.Discord.Enabled && next.Discord.BotTokenOPRef == "" && next.Discord.AuthorizedUserID == "" && len(next.Discord.Channels) == 0 && next.Discord.FleetBaseURL == "" {
+		next.Discord = cur.Discord
+	}
+	return NormalizeConfig(next)
+}
+
+// UpdateConfig validates, saves, and applies new assistant configuration.
+func (e *Engine) UpdateConfig(next Config, clearAPIKey bool) (ConfigView, error) {
+	next = mergePreservedConfig(e.Config(), next, clearAPIKey)
+	if err := validateSandboxPackages(next.Sandbox); err != nil {
+		return ConfigView{}, err
+	}
+	if err := ValidateDiscordConfig(next.Discord); err != nil {
+		return ConfigView{}, err
+	}
 	for _, srv := range next.MCPServers {
 		if err := ValidateMCPServerConfig(srv, false); err != nil {
 			return ConfigView{}, err
@@ -323,6 +365,7 @@ func (e *Engine) UpdateConfig(next Config, clearAPIKey bool) (ConfigView, error)
 	if e.mcp != nil {
 		e.mcp.Reload(next.MCPServers)
 	}
+	e.notifyDiscordReload()
 	e.notify()
 	return next.View(vaultRoot), nil
 }
@@ -475,38 +518,145 @@ func (e *Engine) notify() {
 	}
 }
 
+func isZeroSandboxConfig(s SandboxConfig) bool {
+	return !s.Enabled && s.Image == "" && s.BaseImage == "" && s.Network == "" &&
+		s.CPUs == 0 && s.MemoryMB == 0 && s.IdleMinutes == 0 && s.MaxFileMB == 0 &&
+		len(s.ExtraAptPackages) == 0 && len(s.ExtraPipPackages) == 0
+}
+
+// SetSandboxRunner overrides the container runtime backend (used in tests).
+func (e *Engine) SetSandboxRunner(r SandboxRunner) {
+	if e.sandbox != nil {
+		e.sandbox.setRunner(r)
+	}
+}
+
+// BuildSandboxImages builds or rebuilds the sandbox OCI images and offline network.
+func (e *Engine) BuildSandboxImages(ctx context.Context, rebuildBase bool) (SandboxBuildResult, error) {
+	if e.sandbox == nil {
+		return SandboxBuildResult{}, newErr("sandbox unavailable", http.StatusServiceUnavailable)
+	}
+	return e.sandbox.BuildImages(ctx, e.Config().Sandbox, rebuildBase)
+}
+
+// ResetSandbox stops/removes the channel sandbox container and optionally clears /work/out.
+func (e *Engine) ResetSandbox(ctx context.Context, channelID string, clearOutput bool) error {
+	if e.sandbox == nil {
+		return newErr("sandbox unavailable", http.StatusServiceUnavailable)
+	}
+	return e.sandbox.Reset(ctx, channelID, clearOutput)
+}
+
 // EnqueueUserMessage stores a user message, queues a wakeup, and wakes the worker.
 func (e *Engine) EnqueueUserMessage(channelID, content, modelOverride string) (Message, InboxEvent, error) {
+	return e.EnqueueUserMessageWithFiles(channelID, content, modelOverride, nil)
+}
+
+// EnqueueExternalMessage idempotently ingests a user message from an external bridge (e.g. Discord).
+func (e *Engine) EnqueueExternalMessage(channelID, content, source, externalID string) (Message, InboxEvent, bool, error) {
+	return e.enqueueMessageInternal(channelID, content, "", nil, source, externalID)
+}
+
+// EnqueueUserMessageWithFiles stores a user message with optional uploaded file attachments and wakes the worker.
+func (e *Engine) EnqueueUserMessageWithFiles(channelID, content, modelOverride string, fileIDs []string) (Message, InboxEvent, error) {
+	msg, ev, _, err := e.enqueueMessageInternal(channelID, content, modelOverride, fileIDs, "web", "")
+	return msg, ev, err
+}
+
+func (e *Engine) enqueueMessageInternal(channelID, content, modelOverride string, fileIDs []string, source, externalID string) (Message, InboxEvent, bool, error) {
 	channelID = cmp.Or(strings.TrimSpace(channelID), "general")
 	content = strings.TrimSpace(content)
-	if content == "" {
-		return Message{}, InboxEvent{}, newErr("message content is required", http.StatusBadRequest)
+	cleanIDs := normalizeStringListOrdered(fileIDs)
+	if content == "" && len(cleanIDs) == 0 {
+		return Message{}, InboxEvent{}, false, newErr("message content is required", http.StatusBadRequest)
+	}
+	if externalID != "" && e.store.HasExternalMessage(source, externalID) {
+		return Message{}, InboxEvent{}, false, nil
 	}
 	ch, err := e.store.GetChannel(channelID)
 	if err != nil {
-		return Message{}, InboxEvent{}, err
+		return Message{}, InboxEvent{}, false, err
+	}
+	var widgets []WidgetPayload
+	if len(cleanIDs) > 0 {
+		entries := make([]any, 0, len(cleanIDs))
+		for _, id := range cleanIDs {
+			f, fErr := e.store.GetFile(id)
+			if fErr != nil {
+				return Message{}, InboxEvent{}, false, fErr
+			}
+			if f.ChannelID != channelID {
+				return Message{}, InboxEvent{}, false, newErr(fmt.Sprintf("file %q belongs to channel #%s", id, f.ChannelID), http.StatusBadRequest)
+			}
+			entries = append(entries, fileWidgetEntry(*f))
+		}
+		widgets = append(widgets, WidgetPayload{
+			Kind: "files",
+			Data: map[string]any{"files": entries},
+		})
+		if content == "" {
+			content = "Please inspect the attached file(s)."
+		}
 	}
 	msg, err := e.store.AppendMessage(Message{
 		ChannelID:    channelID,
 		ContextEpoch: ch.ContextEpoch,
 		Role:         "user",
 		Content:      content,
+		Widgets:      widgets,
+		Source:       source,
+		ExternalID:   externalID,
 	})
 	if err != nil {
-		return Message{}, InboxEvent{}, err
+		return Message{}, InboxEvent{}, false, err
+	}
+	if err := e.store.AttachFilesToMessage(channelID, msg.ID, cleanIDs); err != nil {
+		return Message{}, InboxEvent{}, false, err
 	}
 	e.publishEvent(StreamEvent{Type: "message_created", ChannelID: channelID, Data: msg})
 	_ = e.store.CancelPendingApprovalsByTool(channelID, FrontierEscalationTool)
 
-	ev, _, err := e.store.EnqueueInbox(channelID, "chat", "", map[string]any{
+	dedupe := ""
+	if externalID != "" {
+		dedupe = source + ":" + externalID
+	}
+	payload := map[string]any{
 		"message_id": msg.ID,
 		"content":    content,
-	}, modelOverride)
+		"source":     source,
+	}
+	if externalID != "" {
+		payload["external_id"] = externalID
+	}
+	if len(cleanIDs) > 0 {
+		payload["file_ids"] = cleanIDs
+	}
+	ev, _, err := e.store.EnqueueInbox(channelID, "chat", dedupe, payload, modelOverride)
 	if err != nil {
-		return Message{}, InboxEvent{}, err
+		return Message{}, InboxEvent{}, false, err
 	}
 	e.notify()
-	return msg, ev, nil
+	return msg, ev, true, nil
+}
+
+func normalizeStringListOrdered(items []string) []string {
+	if len(items) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(items))
+	var out []string
+	for _, raw := range items {
+		clean := strings.TrimSpace(raw)
+		if clean == "" {
+			continue
+		}
+		if _, ok := seen[clean]; ok {
+			continue
+		}
+		seen[clean] = struct{}{}
+		out = append(out, clean)
+	}
+	return out
 }
 
 // DecideApproval resolves a pending HITL approval and queues worker resumption.
@@ -608,6 +758,10 @@ func (e *Engine) RetryWithFrontier(channelID string, replaceMsgID int64, prompt 
 // ResetChannel starts a fresh context epoch and optionally clears channel message history,
 // leaving long-term Vault Observational Memory and Fleet shared memory untouched.
 func (e *Engine) ResetChannel(id string, clearHistory bool) (Channel, error) {
+	return e.resetChannelInternal(context.Background(), id, clearHistory, "web")
+}
+
+func (e *Engine) resetChannelInternal(ctx context.Context, id string, clearHistory bool, origin string) (Channel, error) {
 	ch, err := e.store.ResetChannelContext(id, clearHistory)
 	if err != nil {
 		return Channel{}, err
@@ -617,6 +771,12 @@ func (e *Engine) ResetChannel(id string, clearHistory bool) (Channel, error) {
 		ChannelID: ch.ID,
 		Data:      map[string]any{"channel": ch, "cleared": clearHistory},
 	})
+	if origin != "discord" {
+		cfg := e.Config()
+		if cfg.Discord.Enabled && cfg.Discord.Channels[ch.ID] != "" {
+			go e.postDiscordDivider(context.WithoutCancel(ctx), cfg, ch.ID, "── *New chat context started in Fleet Console* ──")
+		}
+	}
 	return ch, nil
 }
 
@@ -658,6 +818,9 @@ func (e *Engine) runScheduler(ctx context.Context) {
 			return
 		case now := <-ticker.C:
 			cfg := e.Config()
+			if e.sandbox != nil {
+				e.sandbox.ReapIdle(ctx, cfg.Sandbox.IdleMinutes)
+			}
 			if !cfg.Enabled || (strings.TrimSpace(cfg.APIKey) == "" && strings.TrimSpace(cfg.APIKeyOPRef) == "") {
 				continue
 			}
@@ -724,9 +887,14 @@ func (e *Engine) processInboxEvent(ctx context.Context, ev InboxEvent) error {
 		retryReplaceID = int64(rawID)
 	}
 	useGrant, _ := payload["use_grant"].(bool)
+	trigSource := cmp.Or(strArg(payload, "source"), ev.Source)
+	replyToExt := strArg(payload, "external_id")
 	return e.runAgentTurn(ctx, cfg, *ch, ev.Source, userText, ev.ModelOverride, turnOptions{
 		RetryReplaceMsgID: retryReplaceID,
 		TrackGrant:        useGrant,
+		TriggerSource:     trigSource,
+		TriggerUserText:   userText,
+		ReplyToExternalID: replyToExt,
 	})
 }
 
@@ -764,7 +932,7 @@ func (e *Engine) handleApprovalResume(ctx context.Context, cfg Config, ch Channe
 		Content:      "[approval_result] " + toolSummary,
 	})
 	resumeModel := e.store.GetMessageModel(apr.MessageID)
-	return e.runAgentTurn(ctx, cfg, ch, "approval", toolSummary, resumeModel, turnOptions{})
+	return e.runAgentTurn(ctx, cfg, ch, "approval", toolSummary, resumeModel, turnOptions{TriggerSource: "approval"})
 }
 
 func (e *Engine) handleFrontierEscalationResume(ctx context.Context, cfg Config, ch Channel, apr *Approval, payload map[string]any) error {
@@ -772,7 +940,7 @@ func (e *Engine) handleFrontierEscalationResume(ctx context.Context, cfg Config,
 	_ = json.Unmarshal([]byte(apr.ArgsJSON), &args)
 	fallback := cmp.Or(args.FallbackModel, concreteDefaultChat(cfg))
 	if apr.Status != "approved" {
-		return e.runAgentTurn(ctx, cfg, ch, "chat", args.OriginalPrompt, fallback, turnOptions{})
+		return e.runAgentTurn(ctx, cfg, ch, "chat", args.OriginalPrompt, fallback, turnOptions{TriggerSource: "approval"})
 	}
 	scope, _ := payload["scope"].(string)
 	isTopic := strings.EqualFold(scope, "topic") || strings.Contains(apr.DecisionNote, "scope:topic")
@@ -792,7 +960,7 @@ func (e *Engine) handleFrontierEscalationResume(ctx context.Context, cfg Config,
 		e.publishEvent(StreamEvent{Type: "grant_updated", ChannelID: ch.ID})
 	}
 	_ = e.store.SetApprovalResult(apr.ID, "executed", "Approved model: "+frontierModel)
-	return e.runAgentTurn(ctx, cfg, ch, "chat", args.OriginalPrompt, frontierModel, turnOptions{TrackGrant: isTopic})
+	return e.runAgentTurn(ctx, cfg, ch, "chat", args.OriginalPrompt, frontierModel, turnOptions{TrackGrant: isTopic, TriggerSource: "approval"})
 }
 
 func parseSlashModelOverride(text string, aliases map[string]string) (model string, cleaned string) {
@@ -1012,6 +1180,9 @@ func (e *Engine) buildPromptMessages(ctx context.Context, ch Channel, tail []Mes
 	if opSection := e.buildOPPromptSection(ctx); opSection != "" {
 		sysStatic.WriteString(opSection)
 	}
+	if sbSection := buildSandboxPromptSection(e.Config()); sbSection != "" {
+		sysStatic.WriteString(sbSection)
+	}
 	sysStatic.WriteString(buildGenerativeUIPromptSection())
 
 	var memPrefix strings.Builder
@@ -1040,10 +1211,52 @@ func (e *Engine) buildPromptMessages(ctx context.Context, ch Channel, tail []Mes
 		txt := m.Content
 		if m.Role == "user" {
 			_, txt = parseSlashModelOverride(txt, slashAliases)
+			if hint := formatAttachedFilesHint(m.Widgets); hint != "" {
+				txt += "\n" + hint
+			}
 		}
 		out = append(out, ChatMessage{Role: m.Role, Content: txt})
 	}
 	return out
+}
+
+func formatAttachedFilesHint(widgets []WidgetPayload) string {
+	var parts []string
+	for _, w := range widgets {
+		if w.Kind != "files" {
+			continue
+		}
+		dataMap, ok := w.Data.(map[string]any)
+		if !ok {
+			continue
+		}
+		rawFiles, ok := dataMap["files"].([]any)
+		if !ok {
+			continue
+		}
+		for _, item := range rawFiles {
+			fm, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			name, _ := fm["name"].(string)
+			mimeType, _ := fm["mime_type"].(string)
+			var sizeBytes int64
+			switch v := fm["size_bytes"].(type) {
+			case float64:
+				sizeBytes = int64(v)
+			case int64:
+				sizeBytes = v
+			}
+			if name != "" {
+				parts = append(parts, fmt.Sprintf("%s (%s, %s)", name, formatByteSize(sizeBytes), cmp.Or(mimeType, "application/octet-stream")))
+			}
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "[Attached files staged in sandbox /work/in/: " + strings.Join(parts, ", ") + "]"
 }
 
 func (e *Engine) buildVaultsPromptSection() string {
@@ -1178,7 +1391,7 @@ func (e *Engine) runAgentTurn(ctx context.Context, cfg Config, ch Channel, sourc
 			if route.BorderlineProb > 0 {
 				widgets = append(widgets, buildFrontierRetryWidget(route.CleanText, cfg.Models.Frontier, route.BorderlineProb))
 			}
-			if err := e.finishTurnSuccess(ctx, cfg, ch, model, turn.Content, totalUsage, widgets); err != nil {
+			if err := e.finishTurnSuccess(ctx, cfg, ch, model, turn.Content, totalUsage, widgets, opts); err != nil {
 				return err
 			}
 			e.recordTurnGrantUsage(cfg, ch.ID, totalUsage.CostUSD, route.UsedGrant != nil || opts.TrackGrant)
@@ -1198,7 +1411,7 @@ func (e *Engine) runAgentTurn(ctx context.Context, cfg Config, ch Channel, sourc
 			msgs = append(msgs, ChatMessage{Role: "tool", ToolCallID: tc.ID, Content: outStr})
 		}
 	}
-	if err := e.finishTurnSuccess(ctx, cfg, ch, model, "Stopped after reaching max tool rounds.", totalUsage, widgets); err != nil {
+	if err := e.finishTurnSuccess(ctx, cfg, ch, model, "Stopped after reaching max tool rounds.", totalUsage, widgets, opts); err != nil {
 		return err
 	}
 	e.recordTurnGrantUsage(cfg, ch.ID, totalUsage.CostUSD, route.UsedGrant != nil || opts.TrackGrant)
@@ -1243,10 +1456,11 @@ func (e *Engine) pauseForFrontierEscalation(ch Channel, esc *frontierEscalationA
 		return err
 	}
 	e.publishEvent(StreamEvent{Type: "approval", ChannelID: ch.ID, Data: apr})
+	_ = e.sendApprovalToDiscord(e.Config(), ch, apr)
 	return nil
 }
 
-func (e *Engine) finishTurnSuccess(ctx context.Context, cfg Config, ch Channel, model, content string, usage StreamUsage, widgets []WidgetPayload) error {
+func (e *Engine) finishTurnSuccess(ctx context.Context, cfg Config, ch Channel, model, content string, usage StreamUsage, widgets []WidgetPayload, opts turnOptions) error {
 	msg, err := e.store.AppendMessage(Message{
 		ChannelID:        ch.ID,
 		ContextEpoch:     ch.ContextEpoch,
@@ -1263,6 +1477,7 @@ func (e *Engine) finishTurnSuccess(ctx context.Context, cfg Config, ch Channel, 
 		return err
 	}
 	e.publishEvent(StreamEvent{Type: "message_done", ChannelID: ch.ID, Data: msg})
+	e.mirrorTurnToDiscord(ctx, cfg, ch, opts, msg.Content, widgets)
 	e.maybeAutoObserve(ctx, cfg, ch.ID)
 	return nil
 }
@@ -1298,7 +1513,8 @@ func (e *Engine) pauseForApproval(ch Channel, model string, usage StreamUsage, w
 	e.publishEvent(StreamEvent{Type: "message_done", ChannelID: ch.ID, Data: msg})
 	e.publishEvent(StreamEvent{Type: "approval", ChannelID: ch.ID, Data: apr})
 	cfg := e.Config()
-	if cfg.Notifications.Enabled && (cfg.Notifications.NotifyApprovals == nil || *cfg.Notifications.NotifyApprovals) {
+	sentInteractive := e.sendApprovalToDiscord(cfg, ch, apr)
+	if !sentInteractive && cfg.Notifications.Enabled && (cfg.Notifications.NotifyApprovals == nil || *cfg.Notifications.NotifyApprovals) {
 		go func() {
 			nCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()

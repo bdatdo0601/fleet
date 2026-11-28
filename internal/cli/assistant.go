@@ -34,6 +34,8 @@ Subcommands:
   deny            reject a pending tool call by ID
   timers          list scheduled timers
   notify-test     send a test Discord webhook notification via 1Password ref
+  sandbox-build   build the sandbox OCI image and offline network on lighthouse
+  sandbox-reset   stop/remove a channel's sandbox micro-VM (optionally clearing /work/out)
 `
 }
 
@@ -68,27 +70,143 @@ func cmdAssistant(args []string, cio *IO) error {
 		return cmdAssistantTimers(rest, cio)
 	case "notify-test":
 		return cmdAssistantNotifyTest(rest, cio)
+	case "sandbox-build":
+		return cmdAssistantSandboxBuild(rest, cio)
+	case "sandbox-reset":
+		return cmdAssistantSandboxReset(rest, cio)
 	default:
 		return fmt.Errorf("unknown assistant subcommand %q\n\n%s", sub, assistantUsageText())
 	}
 }
 
+type assistantSetupFlags struct {
+	opRef          string
+	apiKeyOPRef    string
+	apiKey         string
+	vaultPath      string
+	model          string
+	routingMode    string
+	decisionModel  string
+	observerModel  string
+	zdr            bool
+	enable         bool
+	discordRef     string
+	fleetURL       string
+	discordBotRef  string
+	discordUserID  string
+	discordChPairs []string
+	sandboxEnable  bool
+	sandboxDisable bool
+}
+
+func applyAssistantSetupFlags(cfg *assistant.Config, opts assistantSetupFlags, cio *IO) error {
+	cfg.Enabled = opts.enable
+	cfg.ZDR = opts.zdr
+	switch {
+	case opts.apiKeyOPRef != "":
+		cfg.APIKeyOPRef = strings.TrimSpace(opts.apiKeyOPRef)
+		cfg.APIKey = ""
+	case opts.opRef != "":
+		secret, err := cio.readOPRef(opts.opRef)
+		if err != nil {
+			return err
+		}
+		cfg.APIKey = secret
+		cfg.APIKeyOPRef = ""
+	case opts.apiKey != "":
+		cfg.APIKey = strings.TrimSpace(opts.apiKey)
+		cfg.APIKeyOPRef = ""
+	}
+	if opts.vaultPath != "" {
+		cfg.VaultPath = opts.vaultPath
+	}
+	if opts.model != "" {
+		cfg.Models.DefaultChat = opts.model
+	}
+	if opts.routingMode != "" {
+		m := strings.ToLower(strings.TrimSpace(opts.routingMode))
+		switch m {
+		case assistant.RoutingModeHybrid, assistant.RoutingModeGate, assistant.RoutingModeAuto, assistant.RoutingModeOff:
+			cfg.Routing.Mode = m
+		default:
+			return fmt.Errorf("invalid --routing-mode %q (expected hybrid, gate, auto, or off)", opts.routingMode)
+		}
+	}
+	if opts.decisionModel != "" {
+		cfg.Models.Decision = opts.decisionModel
+	}
+	if opts.observerModel != "" {
+		cfg.Models.Observer = opts.observerModel
+		cfg.Models.Reflector = opts.observerModel
+	}
+	if opts.discordRef != "" {
+		cfg.Notifications.DiscordWebhookOPRef = strings.TrimSpace(opts.discordRef)
+		cfg.Notifications.Enabled = true
+	}
+	if opts.fleetURL != "" {
+		cfg.Notifications.FleetBaseURL = strings.TrimSpace(opts.fleetURL)
+		cfg.Discord.FleetBaseURL = strings.TrimSpace(opts.fleetURL)
+	}
+	if opts.discordBotRef != "" {
+		cfg.Discord.BotTokenOPRef = strings.TrimSpace(opts.discordBotRef)
+		cfg.Discord.Enabled = true
+	}
+	if opts.discordUserID != "" {
+		cfg.Discord.AuthorizedUserID = strings.TrimSpace(opts.discordUserID)
+	}
+	if err := applyDiscordChannelPairs(cfg, opts.discordChPairs); err != nil {
+		return err
+	}
+	if opts.sandboxEnable {
+		cfg.Sandbox.Enabled = true
+	} else if opts.sandboxDisable {
+		cfg.Sandbox.Enabled = false
+	}
+	return nil
+}
+
+func applyDiscordChannelPairs(cfg *assistant.Config, pairs []string) error {
+	if len(pairs) == 0 {
+		return nil
+	}
+	if cfg.Discord.Channels == nil {
+		cfg.Discord.Channels = make(map[string]string)
+	}
+	for _, pair := range pairs {
+		k, v, ok := strings.Cut(pair, "=")
+		if !ok || strings.TrimSpace(k) == "" || strings.TrimSpace(v) == "" {
+			return fmt.Errorf("invalid --discord-channel %q (expected fleet_ch=discord_id)", pair)
+		}
+		cfg.Discord.Channels[strings.ToLower(strings.TrimSpace(strings.TrimPrefix(k, "#")))] = strings.TrimSpace(v)
+	}
+	return nil
+}
+
 func cmdAssistantSetup(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("assistant setup", flag.ContinueOnError)
 	checkOnly := fs.Bool("check", false, "run lighthouse doctor check without modifying config")
-	opRef := fs.String("op-ref", "", "resolve OpenRouter API key once from local 1Password ref")
-	apiKeyOPRef := fs.String("api-key-op-ref", "", "store 1Password op:// ref on lighthouse (resolved in memory via Service Account)")
-	apiKey := fs.String("api-key", "", "OpenRouter API key")
-	vaultPath := fs.String("vault", "", "Obsidian vault path on lighthouse")
-	model := fs.String("model", "", "default chat model")
-	routingMode := fs.String("routing-mode", "", "auto frontier routing mode (hybrid|gate|auto|off)")
-	decisionModel := fs.String("decision-model", "", "decision model slug")
-	observerModel := fs.String("observer-model", "", "observer/reflector model slug")
-	zdr := fs.Bool("zdr", true, "enforce OpenRouter Zero Data Retention")
-	enable := fs.Bool("enable", true, "enable assistant background scheduler")
 	noTest := fs.Bool("no-test", false, "skip live connection test")
-	discordRef := fs.String("discord-webhook-op-ref", "", "1Password op:// ref for outbound Discord webhook notifications")
-	fleetURL := fs.String("fleet-url", "", "Fleet Console base URL used in Discord deep links")
+	var opts assistantSetupFlags
+	fs.StringVar(&opts.opRef, "op-ref", "", "resolve OpenRouter API key once from local 1Password ref")
+	fs.StringVar(&opts.apiKeyOPRef, "api-key-op-ref", "", "store 1Password op:// ref on lighthouse (resolved in memory via Service Account)")
+	fs.StringVar(&opts.apiKey, "api-key", "", "OpenRouter API key")
+	fs.StringVar(&opts.vaultPath, "vault", "", "Obsidian vault path on lighthouse")
+	fs.StringVar(&opts.model, "model", "", "default chat model")
+	fs.StringVar(&opts.routingMode, "routing-mode", "", "auto frontier routing mode (hybrid|gate|auto|off)")
+	fs.StringVar(&opts.decisionModel, "decision-model", "", "decision model slug")
+	fs.StringVar(&opts.observerModel, "observer-model", "", "observer/reflector model slug")
+	fs.BoolVar(&opts.zdr, "zdr", true, "enforce OpenRouter Zero Data Retention")
+	fs.BoolVar(&opts.enable, "enable", true, "enable assistant background scheduler")
+	fs.StringVar(&opts.discordRef, "discord-webhook-op-ref", "", "1Password op:// ref for outbound Discord webhook notifications")
+	fs.StringVar(&opts.fleetURL, "fleet-url", "", "Fleet Console base URL used in Discord deep links")
+	fs.StringVar(&opts.discordBotRef, "discord-bot-token-op-ref", "", "1Password op:// ref for two-way Discord Gateway bot token")
+	fs.StringVar(&opts.discordUserID, "discord-user-id", "", "authorized Discord user snowflake ID for two-way bot")
+	fs.Func("discord-channel", "map fleet channel to Discord channel ID (fleet_ch=discord_id, repeatable)", func(v string) error {
+		opts.discordChPairs = append(opts.discordChPairs, v)
+		return nil
+	})
+	fs.BoolVar(&opts.sandboxEnable, "sandbox-enable", false, "enable the sandboxed computer runtime")
+	fs.BoolVar(&opts.sandboxDisable, "sandbox-disable", false, "disable the sandboxed computer runtime")
 	if _, err := parseFlagsInterspersed(fs, args); err != nil {
 		return err
 	}
@@ -106,50 +224,8 @@ func cmdAssistantSetup(args []string, cio *IO) error {
 		return err
 	}
 	cfg := assistant.NormalizeConfig(curResp.Config)
-	cfg.Enabled = *enable
-	cfg.ZDR = *zdr
-	if *apiKeyOPRef != "" {
-		cfg.APIKeyOPRef = strings.TrimSpace(*apiKeyOPRef)
-		cfg.APIKey = ""
-	} else if *opRef != "" {
-		secret, rErr := cio.readOPRef(*opRef)
-		if rErr != nil {
-			return rErr
-		}
-		cfg.APIKey = secret
-		cfg.APIKeyOPRef = ""
-	} else if *apiKey != "" {
-		cfg.APIKey = strings.TrimSpace(*apiKey)
-		cfg.APIKeyOPRef = ""
-	}
-	if *vaultPath != "" {
-		cfg.VaultPath = *vaultPath
-	}
-	if *model != "" {
-		cfg.Models.DefaultChat = *model
-	}
-	if *routingMode != "" {
-		m := strings.ToLower(strings.TrimSpace(*routingMode))
-		switch m {
-		case assistant.RoutingModeHybrid, assistant.RoutingModeGate, assistant.RoutingModeAuto, assistant.RoutingModeOff:
-			cfg.Routing.Mode = m
-		default:
-			return fmt.Errorf("invalid --routing-mode %q (expected hybrid, gate, auto, or off)", *routingMode)
-		}
-	}
-	if *decisionModel != "" {
-		cfg.Models.Decision = *decisionModel
-	}
-	if *observerModel != "" {
-		cfg.Models.Observer = *observerModel
-		cfg.Models.Reflector = *observerModel
-	}
-	if *discordRef != "" {
-		cfg.Notifications.DiscordWebhookOPRef = strings.TrimSpace(*discordRef)
-		cfg.Notifications.Enabled = true
-	}
-	if *fleetURL != "" {
-		cfg.Notifications.FleetBaseURL = strings.TrimSpace(*fleetURL)
+	if err := applyAssistantSetupFlags(&cfg, opts, cio); err != nil {
+		return err
 	}
 	req := map[string]any{
 		"enabled":                    cfg.Enabled,
@@ -168,6 +244,8 @@ func cmdAssistantSetup(args []string, cio *IO) error {
 		"models":                     cfg.Models,
 		"routing":                    cfg.Routing,
 		"notifications":              cfg.Notifications,
+		"discord":                    cfg.Discord,
+		"sandbox":                    cfg.Sandbox,
 		"test":                       !*noTest && (cfg.APIKey != "" || cfg.APIKeyOPRef != ""),
 	}
 	var out struct {
@@ -396,6 +474,7 @@ func cmdAssistantStatus(args []string, cio *IO) error {
 	}
 	cio.printf("default model:     %s (decision=%s, observer=%s)\n", res.Config.Models.DefaultChat, res.Config.Models.Decision, res.Config.Models.Observer)
 	cio.printf("auto routing:      %s (frontier=%s, grant=%d turns / $%.2f)\n", res.Config.Routing.Mode, res.Config.Models.Frontier, res.Config.Routing.GrantMaxTurns, res.Config.Routing.GrantMaxCostUSD)
+	cio.printf("sandbox:           enabled=%v image=%s (%d CPU, %d MB, idle=%dm)\n", res.Config.Sandbox.Enabled, res.Config.Sandbox.Image, res.Config.Sandbox.CPUs, res.Config.Sandbox.MemoryMB, res.Config.Sandbox.IdleMinutes)
 	cio.printf("channels/timers:   %d channels, %d timers, %d pending approvals\n", res.Summary.Channels, res.Summary.EnabledTimers, res.Summary.PendingApprovals)
 	return nil
 }
@@ -527,5 +606,46 @@ func cmdAssistantNotifyTest(args []string, cio *IO) error {
 		return err
 	}
 	cio.info("sent test Discord webhook notification")
+	return nil
+}
+
+func cmdAssistantSandboxBuild(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("assistant sandbox-build", flag.ContinueOnError)
+	rebuildBase := fs.Bool("rebuild-base", false, "rebuild the base image from scratch")
+	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+		return err
+	}
+	api, err := client.ResolveAPI("")
+	if err != nil {
+		return err
+	}
+	var out assistant.SandboxBuildResult
+	if err := client.Call(api, http.MethodPost, "/v1/assistant/sandbox/build", map[string]bool{
+		"rebuild_base": *rebuildBase,
+	}, 10*time.Minute, nil, &out); err != nil {
+		return err
+	}
+	cio.info(fmt.Sprintf("sandbox image ready: %s (base=%s rebuilt=%v net=%s)", out.Image, out.BaseImage, out.BaseRebuilt, out.Network))
+	return nil
+}
+
+func cmdAssistantSandboxReset(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("assistant sandbox-reset", flag.ContinueOnError)
+	ch := fs.String("channel", "general", "target channel")
+	clearOut := fs.Bool("clear-output", false, "also clear /work/out")
+	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+		return err
+	}
+	api, err := client.ResolveAPI("")
+	if err != nil {
+		return err
+	}
+	if err := client.Call(api, http.MethodPost, "/v1/assistant/sandbox/reset", map[string]any{
+		"channel":      *ch,
+		"clear_output": *clearOut,
+	}, 30*time.Second, nil, nil); err != nil {
+		return err
+	}
+	cio.info(fmt.Sprintf("reset sandbox for #%s (clear_output=%v)", *ch, *clearOut))
 	return nil
 }

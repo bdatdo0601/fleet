@@ -189,18 +189,33 @@ _Append-only dated observation log maintained by the background Observer._
 
 // ReadFile reads a markdown or text file inside the vault.
 func (v *Vault) ReadFile(rel string) (string, error) {
-	_, full, err := v.ResolveRel(rel)
+	b, err := v.ReadFileBytes(rel, 0)
 	if err != nil {
-		return "", err
-	}
-	b, err := os.ReadFile(full)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return "", newErr(fmt.Sprintf("file %q not found", rel), http.StatusNotFound)
-		}
 		return "", err
 	}
 	return string(b), nil
+}
+
+// ReadFileBytes reads raw bytes from a file inside the vault, enforcing an optional maxBytes cap.
+func (v *Vault) ReadFileBytes(rel string, maxBytes int64) ([]byte, error) {
+	_, full, err := v.ResolveRel(rel)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(full)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, newErr(fmt.Sprintf("file %q not found", rel), http.StatusNotFound)
+		}
+		return nil, err
+	}
+	if info.IsDir() {
+		return nil, newErr(fmt.Sprintf("%q is a directory", rel), http.StatusBadRequest)
+	}
+	if maxBytes > 0 && info.Size() > maxBytes {
+		return nil, newErr(fmt.Sprintf("file %q (%d bytes) exceeds %d byte limit", rel, info.Size(), maxBytes), http.StatusRequestEntityTooLarge)
+	}
+	return os.ReadFile(full)
 }
 
 // WriteFile writes content to rel inside the vault, creating parent directories.

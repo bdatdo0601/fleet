@@ -250,6 +250,39 @@ function renderWidgetNode(w, sendPromptFn, onRetryFrontier, msgID) {
     bar.appendChild(row);
     return bar;
   }
+    card.appendChild(el("pre", { className: "code-block" }, el("code", { text: JSON.stringify(data, null, 2) })));
+    return card;
+  }
+  if (w.kind === "files" && Array.isArray(data.files)) {
+    const list = el("div", { className: "file-card-list" });
+    for (const f of data.files) {
+      if (!f || !f.url) {
+        continue;
+      }
+      const sizeKB = f.size_bytes >= 1024 * 1024
+        ? `${(f.size_bytes / (1024 * 1024)).toFixed(1)} MB`
+        : f.size_bytes >= 1024
+          ? `${(f.size_bytes / 1024).toFixed(1)} KB`
+          : `${f.size_bytes || 0} B`;
+      const row = el(
+        "div",
+        { className: "file-card-row" },
+        f.is_image
+          ? el("a", { href: `${f.url}?inline=1`, target: "_blank", rel: "noopener noreferrer" }, el("img", { className: "file-thumb", src: `${f.url}?inline=1`, alt: f.name || "attachment", loading: "lazy" }))
+          : null,
+        el(
+          "div",
+          { className: "file-card-meta" },
+          el("div", { className: "mono small", text: f.name || "file" }),
+          el("div", { className: "small muted", text: `${sizeKB} · ${f.mime_type || "file"}` }),
+        ),
+        el("a", { className: "btn btn-sm", href: f.url, download: f.name || "file", text: "Download" }),
+      );
+      list.appendChild(row);
+    }
+    card.appendChild(list);
+    return card;
+  }
   card.appendChild(el("pre", { className: "code-block" }, el("code", { text: JSON.stringify(data, null, 2) })));
   return card;
 }
@@ -349,6 +382,9 @@ function renderApprovalCard(apr, onDecided) {
 
 function formatMessageFooter(m) {
   const parts = [];
+  if (m.source === "discord") {
+    parts.push("via Discord");
+  }
   if (m.model) {
     parts.push(m.model);
   }
@@ -426,6 +462,29 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
     value: JSON.stringify(notifCfg.discord_channel_op_refs || {}, null, 2),
     placeholder: `{"approvals":"op://Fleet-Agent/Discord-Approvals/webhook"}`,
   });
+  const discCfg = cfg.discord || {};
+  const discEnabledChk = el("input", { type: "checkbox", checked: Boolean(discCfg.enabled) });
+  const discAllowApprovalsChk = el("input", { type: "checkbox", checked: discCfg.allow_approvals !== false });
+  const discMirrorWebChk = el("input", { type: "checkbox", checked: discCfg.mirror_web_turns !== false });
+  const discTokenRefIn = el("input", { type: "text", value: discCfg.bot_token_op_ref || "", placeholder: "op://Fleet-Agent/Discord/bot_token" });
+  const discUserIDIn = el("input", { type: "text", value: discCfg.authorized_user_id || "", placeholder: "18-digit Discord User ID" });
+  const discBaseURLIn = el("input", { type: "text", value: discCfg.fleet_base_url || "", placeholder: "https://fleet.example.com" });
+  const discChannelsIn = el("textarea", {
+    rows: "4",
+    className: "mono",
+    value: JSON.stringify(discCfg.channels || {}, null, 2),
+    placeholder: `{"general":"123456789012345678","fleet-ops":"234567890123456789","briefing":"345678901234567890"}`,
+  });
+  const sbCfg = cfg.sandbox || {};
+  const sbEnabledChk = el("input", { type: "checkbox", checked: Boolean(sbCfg.enabled) });
+  const sbCPUsIn = el("input", { type: "number", min: "1", max: "4", value: String(sbCfg.cpus ?? 2) });
+  const sbMemIn = el("input", { type: "number", min: "256", max: "4096", step: "128", value: String(sbCfg.memory_mb ?? 1024) });
+  const sbIdleIn = el("input", { type: "number", min: "1", max: "120", value: String(sbCfg.idle_minutes ?? 10) });
+  const sbMaxFileIn = el("input", { type: "number", min: "1", max: "100", value: String(sbCfg.max_file_mb ?? 25) });
+  const extraPkgsSummary = [
+    ...(sbCfg.extra_apt_packages || []).map((p) => `apt:${p}`),
+    ...(sbCfg.extra_pip_packages || []).map((p) => `pip:${p}`),
+  ];
   const doctorBox = el("div", { className: "stack-sm mt-2" });
 
   const renderDoctorResults = (rep) => {
@@ -489,6 +548,67 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
       field("Minimum Outbox Priority", notifMinPrioSel),
     ),
     field("Per-Category / Channel Webhook Refs (optional JSON)", notifChannelRefsIn),
+    el("h4", { className: "mt-2", text: "Discord Bot (Two-Way 1-to-1 Sync & Approvals)" }),
+    el("label", { className: "check-row" }, discEnabledChk, el("span", { text: "Enable outbound Discord Gateway bot (two-way chat)" })),
+    el("label", { className: "check-row" }, discAllowApprovalsChk, el("span", { text: "Allow interactive Approve / Deny buttons in Discord" })),
+    el("label", { className: "check-row" }, discMirrorWebChk, el("span", { text: "Mirror Fleet Console & timer turns to Discord (non-spoofed blockquote)" })),
+    el(
+      "div",
+      { className: "grid-2" },
+      field("Bot Token 1Password Ref", discTokenRefIn),
+      field("Authorized Discord User ID", discUserIDIn),
+      field("Fleet Console Base URL (deep links)", discBaseURLIn),
+    ),
+    field("1-to-1 Channel Map (JSON: fleet_channel -> discord_channel_id)", discChannelsIn),
+    el("h4", { className: "mt-2", text: "Sandboxed Computer (Apple Container)" }),
+    el("label", { className: "check-row" }, sbEnabledChk, el("span", { text: "Enable isolated micro-VM sandbox for file reading & generation" })),
+    el(
+      "div",
+      { className: "grid-2" },
+      field("CPUs (1-4)", sbCPUsIn),
+      field("Memory MB (256-4096)", sbMemIn),
+      field("Idle Auto-Stop (mins)", sbIdleIn),
+      field("Max File Size (MB)", sbMaxFileIn),
+    ),
+    extraPkgsSummary.length > 0
+      ? el("div", { className: "small muted mono", text: `Custom packages: ${extraPkgsSummary.join(", ")}` })
+      : el("div", { className: "small muted", text: "Pre-baked offline PDF/Office/CSV/chart toolkit; extra packages are approval-gated." }),
+    el(
+      "div",
+      { className: "actions-row" },
+      el("button", {
+        type: "button",
+        className: "btn",
+        text: "Build Sandbox Image",
+        onclick: async (ev) => {
+          const btn = ev.currentTarget;
+          btn.disabled = true;
+          btn.textContent = "Building…";
+          try {
+            const res = await api("POST", "/v1/assistant/sandbox/build", { rebuild_base: false });
+            toast(`Sandbox image ready: ${res.image}`, "ok");
+          } catch (err) {
+            toast(err.message, "error");
+          } finally {
+            btn.disabled = false;
+            btn.textContent = "Build Sandbox Image";
+          }
+        },
+      }),
+      el("button", {
+        type: "button",
+        className: "btn",
+        text: "Reset Sandbox",
+        onclick: async () => {
+          try {
+            await api("POST", "/v1/assistant/sandbox/reset", { channel: localStorage.getItem("fleet_chat_channel") || "general", clear_output: true });
+            toast("Sandbox reset", "ok");
+          } catch (err) {
+            toast(err.message, "error");
+          }
+        },
+      }),
+    ),
     el(
       "div",
       { className: "actions-row" },
@@ -520,6 +640,15 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
               discordChannelOPRefs = JSON.parse(notifChannelRefsIn.value);
             } catch {
               toast("Invalid Discord channel refs JSON", "error");
+              return;
+            }
+          }
+          let discordChannels = {};
+          if (discChannelsIn.value.trim()) {
+            try {
+              discordChannels = JSON.parse(discChannelsIn.value);
+            } catch {
+              toast("Invalid Discord channel map JSON", "error");
               return;
             }
           }
@@ -559,6 +688,23 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
               discord_channel_op_refs: discordChannelOPRefs,
               notify_approvals: notifApprovalsChk.checked,
               min_priority: notifMinPrioSel.value,
+            },
+            discord: {
+              enabled: discEnabledChk.checked,
+              bot_token_op_ref: discTokenRefIn.value.trim(),
+              authorized_user_id: discUserIDIn.value.trim(),
+              channels: discordChannels,
+              allow_approvals: discAllowApprovalsChk.checked,
+              mirror_web_turns: discMirrorWebChk.checked,
+              fleet_base_url: discBaseURLIn.value.trim(),
+            },
+            sandbox: {
+              ...sbCfg,
+              enabled: sbEnabledChk.checked,
+              cpus: Number.parseInt(sbCPUsIn.value || "2", 10) || 2,
+              memory_mb: Number.parseInt(sbMemIn.value || "1024", 10) || 1024,
+              idle_minutes: Number.parseInt(sbIdleIn.value || "10", 10) || 10,
+              max_file_mb: Number.parseInt(sbMaxFileIn.value || "25", 10) || 25,
             },
             test: Boolean(apiKeyIn.value.trim()),
           };
@@ -802,7 +948,73 @@ export async function renderChat(main, ctx, sub) {
     rows: "1",
     placeholder: "Message assistant… (/haiku, /mini, /sol, /sonnet, /neon)",
   });
+  const fileInput = el("input", { type: "file", multiple: true, className: "hidden" });
+  const attachBtn = el("button", { type: "button", className: "btn btn-sm", text: "📎", title: "Attach file(s) for sandbox", "aria-label": "Attach files" });
+  const attachListEl = el("div", { className: "composer-attachments hidden" });
   const sendBtn = el("button", { type: "button", className: "btn btn-sm btn-primary", text: "Send" });
+  let pendingFiles = [];
+
+  const renderPendingFiles = () => {
+    clear(attachListEl);
+    attachListEl.classList.toggle("hidden", pendingFiles.length === 0);
+    for (const f of pendingFiles) {
+      attachListEl.appendChild(
+        el(
+          "span",
+          { className: "attach-chip mono small" },
+          el("span", { text: f.name }),
+          el("button", {
+            type: "button",
+            className: "attach-chip-rm",
+            "aria-label": `Remove ${f.name}`,
+            text: "×",
+            onclick: () => {
+              pendingFiles = pendingFiles.filter((it) => it.id !== f.id);
+              renderPendingFiles();
+            },
+          }),
+        ),
+      );
+    }
+  };
+
+  const uploadSelectedFiles = async (files) => {
+    if (!files || files.length === 0) {
+      return;
+    }
+    attachBtn.disabled = true;
+    try {
+      for (const file of files) {
+        const fd = new FormData();
+        fd.append("channel", activeChannel);
+        fd.append("file", file);
+        const resp = await fetch("/v1/assistant/files", { method: "POST", body: fd, credentials: "same-origin" });
+        const data = await resp.json().catch(() => null);
+        if (!resp.ok) {
+          throw new Error((data && data.error) || `${resp.status} ${resp.statusText}`);
+        }
+        if (data && data.file) {
+          pendingFiles.push(data.file);
+        }
+      }
+      renderPendingFiles();
+    } catch (err) {
+      toast(err.message, "error");
+    } finally {
+      attachBtn.disabled = false;
+      fileInput.value = "";
+    }
+  };
+
+  attachBtn.addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", () => uploadSelectedFiles(Array.from(fileInput.files || [])));
+  inputEl.addEventListener("paste", (ev) => {
+    const files = Array.from((ev.clipboardData && ev.clipboardData.files) || []);
+    if (files.length > 0) {
+      ev.preventDefault();
+      uploadSelectedFiles(files);
+    }
+  });
 
   const resizeComposer = () => {
     inputEl.style.height = "auto";
@@ -860,11 +1072,14 @@ export async function renderChat(main, ctx, sub) {
 
   const sendMessage = async (overrideText = null) => {
     const text = (overrideText !== null ? String(overrideText) : inputEl.value).trim();
-    if (!text) {
+    const fileIDs = overrideText === null ? pendingFiles.map((f) => f.id) : [];
+    if (!text && fileIDs.length === 0) {
       return;
     }
     if (overrideText === null) {
       inputEl.value = "";
+      pendingFiles = [];
+      renderPendingFiles();
       resizeComposer();
     }
     try {
@@ -872,6 +1087,7 @@ export async function renderChat(main, ctx, sub) {
         channel: activeChannel,
         content: text,
         model: modelSelect.value,
+        file_ids: fileIDs,
       });
     } catch (err) {
       toast(err.message, "error");
@@ -1001,21 +1217,40 @@ export async function renderChat(main, ctx, sub) {
     ),
   );
 
+  const composerBox = el(
+    "div",
+    { className: "chat-composer" },
+    el(
+      "div",
+      { className: "chat-composer-inner" },
+      attachListEl,
+      inputEl,
+      fileInput,
+      el(
+        "div",
+        { className: "chat-composer-bar" },
+        el("div", { className: "chat-composer-left" }, attachBtn, modelSelect),
+        sendBtn,
+      ),
+    ),
+  );
+  composerBox.addEventListener("dragover", (ev) => {
+    ev.preventDefault();
+  });
+  composerBox.addEventListener("drop", (ev) => {
+    ev.preventDefault();
+    const files = Array.from((ev.dataTransfer && ev.dataTransfer.files) || []);
+    if (files.length > 0) {
+      uploadSelectedFiles(files);
+    }
+  });
+
   const shell = el(
     "div",
     { className: "chat-shell" },
     topbar,
     msgListEl,
-    el(
-      "div",
-      { className: "chat-composer" },
-      el(
-        "div",
-        { className: "chat-composer-inner" },
-        inputEl,
-        el("div", { className: "chat-composer-bar" }, modelSelect, sendBtn),
-      ),
-    ),
+    composerBox,
   );
   main.appendChild(shell);
 

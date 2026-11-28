@@ -1,7 +1,9 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -250,5 +252,124 @@ func TestAssistantRoutingEndpoints(t *testing.T) {
 	}
 	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/channels/general/retry-frontier", http.MethodPost, `{"replace_message_id":0,"prompt":"retry me","grant_topic":true}`, nil, ""); st != http.StatusAccepted || !strings.Contains(string(b), `"event"`) {
 		t.Fatalf("POST retry-frontier failed: %d (%s)", st, string(b))
+	}
+}
+
+func uploadMultipartTestFile(t *testing.T, urlStr, channel, filename string, data []byte) (int, []byte) {
+	t.Helper()
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	if err := mw.WriteField("channel", channel); err != nil {
+		t.Fatal(err)
+	}
+	fw, err := mw.CreateFormFile("file", filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fw.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, urlStr, &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var out bytes.Buffer
+	_, _ = out.ReadFrom(resp.Body)
+	return resp.StatusCode, out.Bytes()
+}
+
+func TestAssistantFilesAndSandboxRoutes(t *testing.T) {
+	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/chat/completions" {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"File inspected.\"}}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":3,\"cost\":0.0001}}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		}
+	}))
+	defer mockLLM.Close()
+
+	f, srv, tmp := setupTestServer(t)
+	_, office := approveTestDevice(t, f, tmp, "office", "mac", "managed")
+	f.Assistant.Start(t.Context())
+	defer f.Assistant.Stop()
+
+	cfg := assistant.DefaultConfig()
+	cfg.Enabled = true
+	cfg.BaseURL = mockLLM.URL
+	cfg.APIKey = "sk-or-test"
+	cfg.Routing.Mode = assistant.RoutingModeOff
+	if _, err := f.Assistant.UpdateConfig(cfg, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Upload PNG and verify inline + attachment headers.
+	pngBytes := []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde")
+	st, body := uploadMultipartTestFile(t, srv.URL+"/v1/assistant/files", "general", "chart.png", pngBytes)
+	if st != http.StatusCreated {
+		t.Fatalf("POST /v1/assistant/files PNG expected 201, got %d (%s)", st, string(body))
+	}
+	var upResp struct {
+		File assistant.AssistantFile `json:"file"`
+	}
+	if err := json.Unmarshal(body, &upResp); err != nil || upResp.File.ID == "" || !upResp.File.IsImage {
+		t.Fatalf("unexpected upload response: %s (err=%v)", string(body), err)
+	}
+
+	if st, hdr, _ := doRawReq(t, srv.URL+"/v1/assistant/files/"+upResp.File.ID, http.MethodGet, "", nil, ""); st != http.StatusOK || hdr.Get("X-Content-Type-Options") != "nosniff" || !strings.HasPrefix(hdr.Get("Content-Disposition"), "attachment;") {
+		t.Fatalf("GET file download expected 200 + nosniff + attachment, got %d %+v", st, hdr)
+	}
+	if st, hdr, _ := doRawReq(t, srv.URL+"/v1/assistant/files/"+upResp.File.ID+"?inline=1", http.MethodGet, "", nil, ""); st != http.StatusOK || !strings.HasPrefix(hdr.Get("Content-Disposition"), "inline;") {
+		t.Fatalf("GET file inline PNG expected inline disposition, got %d %+v", st, hdr)
+	}
+
+	// SVG must never be served inline (XSS safety).
+	stSVG, bodySVG := uploadMultipartTestFile(t, srv.URL+"/v1/assistant/files", "general", "evil.svg", []byte("<svg onload=alert(1)/>"))
+	if stSVG != http.StatusCreated {
+		t.Fatalf("POST SVG expected 201, got %d", stSVG)
+	}
+	var svgResp struct {
+		File assistant.AssistantFile `json:"file"`
+	}
+	_ = json.Unmarshal(bodySVG, &svgResp)
+	if svgResp.File.IsImage {
+		t.Fatalf("SVG must not be marked is_image=true")
+	}
+	if st, hdr, _ := doRawReq(t, srv.URL+"/v1/assistant/files/"+svgResp.File.ID+"?inline=1", http.MethodGet, "", nil, ""); st != http.StatusOK || !strings.HasPrefix(hdr.Get("Content-Disposition"), "attachment;") {
+		t.Fatalf("SVG ?inline=1 must still force attachment, got %d %+v", st, hdr)
+	}
+
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/files?channel=general", http.MethodGet, "", nil, ""); st != http.StatusOK || !strings.Contains(string(b), "chart.png") {
+		t.Fatalf("GET /v1/assistant/files expected chart.png, got %d (%s)", st, string(b))
+	}
+
+	// Send message with file_ids and empty text -> 202 and attaches files widget.
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/messages", http.MethodPost, `{"channel":"general","content":"","file_ids":["`+upResp.File.ID+`"]}`, nil, ""); st != http.StatusAccepted || !strings.Contains(string(b), `"kind":"files"`) {
+		t.Fatalf("POST message with file_ids expected 202 + files widget, got %d (%s)", st, string(b))
+	}
+
+	// Non-admin managed device must be rejected.
+	f.IdentifyOverride = func(string) *registry.Device { return office }
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/v1/assistant/files"},
+		{http.MethodGet, "/v1/assistant/files/" + upResp.File.ID},
+		{http.MethodPost, "/v1/assistant/sandbox/reset"},
+	} {
+		st, _, _ := doRawReq(t, srv.URL+tc.path, tc.method, "{}", nil, "")
+		if st != http.StatusForbidden {
+			t.Fatalf("managed %s %s expected 403, got %d", tc.method, tc.path, st)
+		}
 	}
 }

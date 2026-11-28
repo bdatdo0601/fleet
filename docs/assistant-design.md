@@ -146,7 +146,25 @@ Managed in `internal/assistant/store.go`:
 - **Event-driven delegation lifecycle:** Track assistant-spawned tasks (`assistant_delegations` mapping `job_id` + `session_name` → `channel_id`) and push state transitions (launch failure, `waiting_permission`, `waiting_question`, `idle` after working, `exited`) into `assistant_inbox` so the assistant sleeps at 0 tokens while the coding agent runs, then wakes automatically to summarize blockers or PRs back in `#chat`.
 - **Vault diff & revision browser:** Surface recent `.git` commits and diffs in `#skills` for one-click audit/rollback of agent self-edits, plus `sync_to_fleet: true` skill distribution via `fleet sync`.
 
-### Phase 4 — Outbound-Only Discord Webhook Integration
-- **Outbound-only Discord Webhook:** Add a pluggable `Notifier` interface implemented first for Discord Webhooks (`op://Fleet-Agent/...` webhook URL in 1Password) — requiring zero public inbound ports, zero gateway bots, and zero sidecar processes on the Mac mini.
-- **Dedicated read-only notification channel(s):** Post rich colored Discord embeds (for `urgent`/`normal` `assistant_outbox` items, pending HITL approvals, briefings, and delegated-agent updates) into dedicated read-only Discord notification channel(s) with deep links back to `#chat/<channel>`, preserving clean, meaningful alert history without mirroring or spoofing interactive Discord conversations.
+### Phase 4 — Outbound-Only Discord Webhook & Two-Way Gateway Bot
+- **Outbound-only Discord Webhook (`NotificationsConfig`):** Pluggable `Notifier` (`DiscordWebhookNotifier`, `op://Fleet-Agent/...` webhook URL in 1Password) posting concise summary embeds + deep links into dedicated read-only Discord alert channel(s) (`#fleet-alerts`) with zero public inbound ports.
+- **Two-way Discord Gateway Bot (`DiscordConfig` — Option B):** Outbound `wss://gateway.discord.gg/?v=10` WebSocket connection using `internal/ws` (`BotTokenOPRef`, `AuthorizedUserID`, 1-to-1 `Channels` map, `assistant_discord_state` startup catch-up cursor). `assistant_messages` (`source`, `external_id`) remains the single source of truth across Fleet Console `#chat` and Discord:
+  - Messages from the authorized Discord user enqueue into `assistant_inbox` and appear live in `#chat` (`via Discord` badge); assistant replies post back cleanly (`render_card` embeds + deep link for `render_widget`).
+  - Web/timer turns mirror to Discord with non-spoofed `> **You (Fleet Web):**` blockquotes (never impersonating the user's Discord account).
+  - `/new` in Discord (or `New Chat` in Web) starts a new context epoch with a divider while preserving Discord history.
+  - Pending HITL approvals render interactive **Approve / Deny** Discord buttons (`INTERACTION_CREATE`), verified against `AuthorizedUserID`.
 - **Privacy boundary:** Keep outbound payloads to concise summaries + Fleet Console deep links (never raw secrets, vault note contents, or sensitive tool arguments).
+
+---
+
+## 6. Sandboxed Computer (Apple `container` Micro-VM)
+
+For document reading, conversion, data analysis, and file generation ("computer use" rather than software repo engineering), the assistant runs an isolated per-channel Linux micro-VM via Apple's native `container` CLI (macOS 26+ on Apple Silicon):
+
+- **Scale-to-zero lifecycle:** At most one active micro-VM (`fleet-sb-<channel>`) runs at a time (`2` CPUs, `1024 MB` RAM by default) and is reaped automatically after `idle_minutes` (default `10m`) by `Engine.runScheduler`.
+- **Offline by default + approval-gated internet:** Containers attach to an internal `fleet-sandbox-offline` `vmnet` network with `--no-dns`, `--read-only` rootfs, `--cap-drop ALL`, `--user 1000:1000`, and only `/work` mounted. When `sandbox_exec(..., internet=true)` is approved via HITL, `fleet` spawns an ephemeral authenticating `EgressProxy` on the internal gateway IP blocking loopback, RFC1918, CGNAT, Nebula mesh (`10.213.0.0/16`), and non-80/443 ports.
+- **End-to-end `#chat` file loop:**
+  - `POST /v1/assistant/files` stages uploaded files into `/work/in/` and attaches them to user messages.
+  - `sandbox_publish_file` copies generated artifacts from `/work/out/` into `~/.fleet/assistant-files/`, registers them in `assistant_files`, and renders downloadable/previewable `files` cards via `GET /v1/assistant/files/{id}`.
+  - `sandbox_vault_bridge` imports vault files into `/work/in/` or exports text results through `execVaultWriteTool` (preserving vault write/HITL policies).
+- **Pre-baked toolkit + approval-gated self-updating packages:** `fleet assistant sandbox-build` builds `fleet-sandbox:base` and `fleet-sandbox:latest` with Python 3, `pypdf`, `pdfplumber`, `pymupdf`, `weasyprint`, `reportlab`, `python-docx`, `openpyxl`, `python-pptx`, `pandas`, `duckdb`, `matplotlib`, `pillow`, `pandoc`, `poppler-utils`, `tesseract-ocr`, `sqlite3`, `jq`, `ripgrep`, and `uv`. If a task needs an extra apt or pip package, `sandbox_install_packages` requests one-time HITL approval, persists the validated package into `assistant.json`, and rebuilds `fleet-sandbox:latest`.

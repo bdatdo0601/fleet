@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/bdatdo0601/fleet/internal/registry"
@@ -43,6 +44,15 @@ const (
 	DefaultFrontierGrantMaxCostUSD  = 0.25
 	DefaultFrontierGrantIdleMinutes = 25
 	DefaultDecisionTimeoutMS        = 2000
+
+	DefaultSandboxImage       = "fleet-sandbox:latest"
+	DefaultSandboxBaseImage   = "fleet-sandbox:base"
+	DefaultSandboxNetwork     = "fleet-sandbox-offline"
+	DefaultSandboxSubnet      = "192.168.127.0/24"
+	DefaultSandboxCPUs        = 2
+	DefaultSandboxMemoryMB    = 1024
+	DefaultSandboxIdleMinutes = 10
+	DefaultSandboxMaxFileMB   = 25
 )
 
 // AssistantError is an error carrying an HTTP status code for API handlers.
@@ -109,6 +119,17 @@ type NotificationsConfig struct {
 	MinPriority          string            `json:"min_priority,omitempty"`
 }
 
+// DiscordConfig configures the outbound Discord Gateway bot for two-way 1-to-1 channel sync & approvals.
+type DiscordConfig struct {
+	Enabled          bool              `json:"enabled"`
+	BotTokenOPRef    string            `json:"bot_token_op_ref,omitempty"`
+	AuthorizedUserID string            `json:"authorized_user_id,omitempty"`
+	Channels         map[string]string `json:"channels,omitempty"`
+	AllowApprovals   *bool             `json:"allow_approvals,omitempty"`
+	MirrorWebTurns   *bool             `json:"mirror_web_turns,omitempty"`
+	FleetBaseURL     string            `json:"fleet_base_url,omitempty"`
+}
+
 // CredentialPolicy defines a zero-exposure 1Password HTTP credential alias.
 type CredentialPolicy struct {
 	Alias           string   `json:"alias"`
@@ -127,7 +148,26 @@ type VaultMount struct {
 	AutoWriteDirs []string `json:"auto_write_dirs,omitempty"`
 }
 
-var vaultNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
+// SandboxConfig configures the assistant's disposable Apple container micro-VM sandbox.
+type SandboxConfig struct {
+	Enabled          bool     `json:"enabled"`
+	Image            string   `json:"image,omitempty"`
+	BaseImage        string   `json:"base_image,omitempty"`
+	Network          string   `json:"network,omitempty"`
+	CPUs             int      `json:"cpus,omitempty"`
+	MemoryMB         int      `json:"memory_mb,omitempty"`
+	IdleMinutes      int      `json:"idle_minutes,omitempty"`
+	MaxFileMB        int      `json:"max_file_mb,omitempty"`
+	ExtraAptPackages []string `json:"extra_apt_packages,omitempty"`
+	ExtraPipPackages []string `json:"extra_pip_packages,omitempty"`
+}
+
+var (
+	vaultNameRE        = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
+	aptPkgNameRE       = regexp.MustCompile(`^[a-z0-9][a-z0-9+.-]{0,63}$`)
+	pipPkgSpecRE       = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._\-\[\],<>=!~]{0,95}$`)
+	discordSnowflakeRE = regexp.MustCompile(`^[0-9]{15,22}$`)
+)
 
 // IsValidVaultName reports whether name is a valid mounted extra vault identifier.
 func IsValidVaultName(name string) bool {
@@ -158,6 +198,8 @@ type Config struct {
 	MCPServers               []MCPServerConfig   `json:"mcp_servers,omitempty"`
 	Credentials              []CredentialPolicy  `json:"credentials,omitempty"`
 	Notifications            NotificationsConfig `json:"notifications"`
+	Discord                  DiscordConfig       `json:"discord"`
+	Sandbox                  SandboxConfig       `json:"sandbox"`
 	UpdatedAt                string              `json:"updated_at,omitempty"`
 }
 
@@ -193,6 +235,8 @@ type ConfigView struct {
 	MCPServers               []MCPServerConfig   `json:"mcp_servers"`
 	Credentials              []CredentialView    `json:"credentials"`
 	Notifications            NotificationsConfig `json:"notifications"`
+	Discord                  DiscordConfig       `json:"discord"`
+	Sandbox                  SandboxConfig       `json:"sandbox"`
 	UpdatedAt                string              `json:"updated_at,omitempty"`
 }
 
@@ -250,6 +294,7 @@ func DefaultConfig() Config {
 			Aliases:     DefaultAliases(),
 		},
 		Routing: normalizeRoutingConfig(RoutingConfig{Mode: DefaultRoutingMode}),
+		Sandbox: normalizeSandboxConfig(SandboxConfig{}),
 	}
 }
 
@@ -339,7 +384,103 @@ func NormalizeConfig(cfg Config) Config {
 	cfg.ExtraVaults = normalizeVaultMounts(cfg.ExtraVaults)
 	cfg.MCPServers = normalizeMCPServers(cfg.MCPServers)
 	cfg.Notifications = normalizeNotificationsConfig(cfg.Notifications)
+	cfg.Discord = normalizeDiscordConfig(cfg.Discord)
+	cfg.Sandbox = normalizeSandboxConfig(cfg.Sandbox)
 	return cfg
+}
+
+func normalizeStringList(items []string) []string {
+	if len(items) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(items))
+	out := make([]string, 0, len(items))
+	for _, raw := range items {
+		clean := strings.TrimSpace(raw)
+		if clean == "" {
+			continue
+		}
+		if _, ok := seen[clean]; ok {
+			continue
+		}
+		seen[clean] = struct{}{}
+		out = append(out, clean)
+	}
+	slices.Sort(out)
+	return out
+}
+
+func normalizeSandboxConfig(s SandboxConfig) SandboxConfig {
+	s.Image = cmp.Or(strings.TrimSpace(s.Image), DefaultSandboxImage)
+	s.BaseImage = cmp.Or(strings.TrimSpace(s.BaseImage), DefaultSandboxBaseImage)
+	s.Network = cmp.Or(strings.TrimSpace(s.Network), DefaultSandboxNetwork)
+	if s.CPUs <= 0 {
+		s.CPUs = DefaultSandboxCPUs
+	} else {
+		s.CPUs = min(max(s.CPUs, 1), 4)
+	}
+	if s.MemoryMB <= 0 {
+		s.MemoryMB = DefaultSandboxMemoryMB
+	} else {
+		s.MemoryMB = min(max(s.MemoryMB, 256), 4096)
+	}
+	if s.IdleMinutes <= 0 {
+		s.IdleMinutes = DefaultSandboxIdleMinutes
+	} else {
+		s.IdleMinutes = min(max(s.IdleMinutes, 1), 120)
+	}
+	if s.MaxFileMB <= 0 {
+		s.MaxFileMB = DefaultSandboxMaxFileMB
+	} else {
+		s.MaxFileMB = min(max(s.MaxFileMB, 1), 100)
+	}
+	s.ExtraAptPackages = normalizeStringList(s.ExtraAptPackages)
+	s.ExtraPipPackages = normalizeStringList(s.ExtraPipPackages)
+	return s
+}
+
+func copySandboxConfig(s SandboxConfig) SandboxConfig {
+	cp := normalizeSandboxConfig(s)
+	if len(cp.ExtraAptPackages) > 0 {
+		cp.ExtraAptPackages = append([]string(nil), cp.ExtraAptPackages...)
+	}
+	if len(cp.ExtraPipPackages) > 0 {
+		cp.ExtraPipPackages = append([]string(nil), cp.ExtraPipPackages...)
+	}
+	return cp
+}
+
+// ValidateAptPackageName validates a Debian apt package name for sandbox image customization.
+func ValidateAptPackageName(pkg string) error {
+	clean := strings.TrimSpace(pkg)
+	if !aptPkgNameRE.MatchString(clean) {
+		return newErr(fmt.Sprintf("invalid apt package name %q (must match [a-z0-9][a-z0-9+.-]*)", pkg), http.StatusBadRequest)
+	}
+	return nil
+}
+
+// ValidatePipPackageSpec validates a PyPI package specifier (no URLs, VCS refs, flags, or shell metacharacters).
+func ValidatePipPackageSpec(spec string) error {
+	clean := strings.TrimSpace(spec)
+	if clean == "" || strings.HasPrefix(clean, "-") || strings.Contains(clean, "://") ||
+		strings.ContainsAny(clean, "@ \t\r\n;&|$`\\'\"") || !pipPkgSpecRE.MatchString(clean) {
+		return newErr(fmt.Sprintf("invalid pip package spec %q", spec), http.StatusBadRequest)
+	}
+	return nil
+}
+
+func validateSandboxPackages(s SandboxConfig) error {
+	for _, pkg := range s.ExtraAptPackages {
+		if err := ValidateAptPackageName(pkg); err != nil {
+			return err
+		}
+	}
+	for _, spec := range s.ExtraPipPackages {
+		if err := ValidatePipPackageSpec(spec); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func normalizeVaultMounts(mounts []VaultMount) []VaultMount {
@@ -516,6 +657,52 @@ func normalizeNotificationsConfig(n NotificationsConfig) NotificationsConfig {
 	return n
 }
 
+func normalizeDiscordConfig(d DiscordConfig) DiscordConfig {
+	d.BotTokenOPRef = strings.TrimSpace(d.BotTokenOPRef)
+	d.AuthorizedUserID = strings.TrimSpace(d.AuthorizedUserID)
+	d.FleetBaseURL = strings.TrimRight(strings.TrimSpace(d.FleetBaseURL), "/")
+	if d.AllowApprovals == nil {
+		t := true
+		d.AllowApprovals = &t
+	}
+	if d.MirrorWebTurns == nil {
+		t := true
+		d.MirrorWebTurns = &t
+	}
+	if len(d.Channels) > 0 {
+		clean := make(map[string]string, len(d.Channels))
+		for k, v := range d.Channels {
+			ck := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(k, "#")))
+			cv := strings.TrimSpace(v)
+			if ck != "" && cv != "" {
+				clean[ck] = cv
+			}
+		}
+		d.Channels = clean
+	}
+	return d
+}
+
+// ValidateDiscordConfig validates DiscordConfig when enabled.
+func ValidateDiscordConfig(d DiscordConfig) error {
+	d = normalizeDiscordConfig(d)
+	if !d.Enabled {
+		return nil
+	}
+	if !strings.HasPrefix(d.BotTokenOPRef, "op://") {
+		return newErr("discord.bot_token_op_ref must be an op:// 1Password reference", http.StatusBadRequest)
+	}
+	if !discordSnowflakeRE.MatchString(d.AuthorizedUserID) {
+		return newErr("discord.authorized_user_id must be a numeric Discord user ID (15-22 digits)", http.StatusBadRequest)
+	}
+	for ch, id := range d.Channels {
+		if !discordSnowflakeRE.MatchString(id) {
+			return newErr(fmt.Sprintf("discord.channels[%q] must be a numeric Discord channel ID", ch), http.StatusBadRequest)
+		}
+	}
+	return nil
+}
+
 var blockedSelfSetupShells = map[string]bool{
 	"sh": true, "bash": true, "zsh": true, "dash": true, "fish": true,
 	"csh": true, "tcsh": true, "ksh": true, "osascript": true,
@@ -608,6 +795,8 @@ func (c Config) View(effectiveVault string) ConfigView {
 		MCPServers:               redactMCPServers(c.MCPServers),
 		Credentials:              creds,
 		Notifications:            normalizeNotificationsConfig(c.Notifications),
+		Discord:                  normalizeDiscordConfig(c.Discord),
+		Sandbox:                  copySandboxConfig(c.Sandbox),
 		UpdatedAt:                c.UpdatedAt,
 	}
 }
