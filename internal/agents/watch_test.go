@@ -175,3 +175,104 @@ func TestWaitForSessionEventAndOnceWatch(t *testing.T) {
 		t.Fatalf("expected IncludeCurrent immediate match, got err=%v res=%+v", err, curRes)
 	}
 }
+
+func TestAssistantPeerMessagingAndAsk(t *testing.T) {
+	hub, err := Open(filepath.Join(t.TempDir(), "agents.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = hub.Close() }()
+
+	if _, err := hub.Heartbeat(HeartbeatParams{
+		Device:  "work-mac",
+		Harness: "claude",
+		RawID:   "sess-work-1",
+		State:   "working",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	gotCh := make(chan Message, 2)
+	hub.SetOnAssistantMessage(func(m Message) {
+		gotCh <- m
+		if m.ToSession != nil && *m.ToSession == "assistant:fleet-ops" {
+			// Simulate assistant replying immediately on the same thread.
+			_, _ = hub.SendMessageWithReport(AssistantDevice, AssistantSessionID("fleet-ops"), m.FromSession, "ack from assistant", &m.ThreadID, &m.ID, map[string]bool{"work-mac": true})
+		}
+	})
+
+	askRes, err := hub.Ask(context.Background(), AskParams{
+		Device:       "work-mac",
+		FromSession:  "work-mac:claude:sess-work-1",
+		To:           "assistant:fleet-ops",
+		Body:         "PR #42 passed checks",
+		Timeout:      2,
+		KnownDevices: map[string]bool{"work-mac": true},
+	})
+	if err != nil {
+		t.Fatalf("Ask assistant failed: %v", err)
+	}
+	if !askRes.Delivered || askRes.Reply == nil || askRes.Reply.Body != "ack from assistant" {
+		t.Fatalf("unexpected Ask reply: %+v", askRes)
+	}
+}
+
+func TestAssistantWatchAndSweepStaleSessions(t *testing.T) {
+	hub, err := Open(filepath.Join(t.TempDir(), "agents.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = hub.Close() }()
+
+	if _, err := hub.Heartbeat(HeartbeatParams{
+		Device:  "laptop",
+		Harness: "codex",
+		RawID:   "sess-watch-1",
+		Name:    new("fix-auth"),
+		State:   "working",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var triggered []string
+	hub.SetOnWatchTriggered(func(w Watch, ev StateTransition) {
+		triggered = append(triggered, w.WatcherSession+"->"+ev.SessionID+":"+ev.NewState)
+	})
+
+	w, err := hub.CreateWatch(CreateWatchParams{
+		WatcherDevice:  AssistantDevice,
+		WatcherSession: AssistantSessionID("fleet-ops"),
+		Target:         "laptop/fix-auth",
+		Events:         []string{"idle", "waiting", "exited"},
+	})
+	if err != nil || w.ID == "" {
+		t.Fatalf("CreateWatch failed: %+v err=%v", w, err)
+	}
+
+	if _, err := hub.Heartbeat(HeartbeatParams{
+		Device:  "laptop",
+		Harness: "codex",
+		RawID:   "sess-watch-1",
+		State:   "idle",
+		Tail:    []TailItem{{Role: "assistant", Text: "Auth fixed and tested."}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(triggered) != 1 || triggered[0] != "assistant:fleet-ops->laptop:codex:sess-watch-1:idle" {
+		t.Fatalf("unexpected watch trigger: %v", triggered)
+	}
+
+	// Simulate time advancing past AgentActiveSeconds without a deregister.
+	trs := hub.SweepStaleSessions(time.Now().Add(15 * time.Minute))
+	if len(trs) != 1 || trs[0].NewState != "exited" {
+		t.Fatalf("expected stale sweep exited transition, got %+v", trs)
+	}
+	if len(triggered) != 2 || triggered[1] != "assistant:fleet-ops->laptop:codex:sess-watch-1:exited" {
+		t.Fatalf("expected exited watch trigger after sweep, got %v", triggered)
+	}
+	// Exited watches are automatically cleaned up.
+	rem, err := hub.ListWatches(AssistantDevice, "", "")
+	if err != nil || len(rem) != 0 {
+		t.Fatalf("expected exited watch deleted, got %+v err=%v", rem, err)
+	}
+}

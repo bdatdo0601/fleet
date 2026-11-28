@@ -32,9 +32,10 @@ const (
 )
 
 type toolSchemaProp struct {
-	Type        string   `json:"type"`
-	Enum        []string `json:"enum,omitempty"`
-	Description string   `json:"description"`
+	Type        string            `json:"type"`
+	Enum        []string          `json:"enum,omitempty"`
+	Items       map[string]string `json:"items,omitempty"`
+	Description string            `json:"description"`
 }
 
 type toolInputSchema struct {
@@ -246,11 +247,61 @@ var Tools = []ToolDef{
 			Required: []string{"channel", "text"},
 		},
 	},
+	{
+		Name:        "fleet_watch_agent",
+		Description: "Subscribe, list, or delete an authoritative Fleet agent state watch pushing lifecycle transitions to your inbox (or assistant:<channel> when specified).",
+		InputSchema: toolInputSchema{
+			Type: "object",
+			Properties: map[string]toolSchemaProp{
+				"action":        {Type: "string", Enum: []string{"create", "list", "delete"}, Description: "Action to perform (default: create)."},
+				"target":        {Type: "string", Description: "Target session name, device/name, or session_id (required for create)."},
+				"target_device": {Type: "string", Description: "Optional target device name for pending watch."},
+				"target_name":   {Type: "string", Description: "Optional target session name for pending watch."},
+				"events":        {Type: "array", Items: map[string]string{"type": "string"}, Description: "States to watch (default: idle, waiting_permission, waiting_question, exited)."},
+				"once":          {Type: "boolean", Description: "Remove watch automatically after first trigger."},
+				"allow_pending": {Type: "boolean", Description: "Allow watching a session name before it starts heartbeating."},
+				"watch_id":      {Type: "string", Description: "Watch ID to delete (optional for delete; otherwise matches target)."},
+				"session_id":    {Type: "string", Description: "Caller session_id if explicitly provided."},
+			},
+		},
+	},
+	{
+		Name:        "fleet_events_emit",
+		Description: "Publish an event (external.event or custom type) to the authoritative Fleet Event Bus.",
+		InputSchema: toolInputSchema{
+			Type: "object",
+			Properties: map[string]toolSchemaProp{
+				"type":         {Type: "string", Description: "Event type (default: external.event)."},
+				"severity":     {Type: "string", Enum: []string{"info", "warn", "error", "critical"}, Description: "Event severity (default: info)."},
+				"subject":      {Type: "string", Description: "Optional subject identifier."},
+				"channel_hint": {Type: "string", Description: "Optional preferred assistant channel (e.g. fleet-ops, general)."},
+				"dedupe_key":   {Type: "string", Description: "Optional deduplication key."},
+				"title":        {Type: "string", Description: "Short event title."},
+				"summary":      {Type: "string", Description: "Concise event details."},
+			},
+		},
+	},
+	{
+		Name:        "fleet_events_list",
+		Description: "Query the authoritative Fleet Event Bus log (agent transitions, watches, usage thresholds, infra/TLS alerts, Slacker jobs, memory, external events).",
+		InputSchema: toolInputSchema{
+			Type: "object",
+			Properties: map[string]toolSchemaProp{
+				"type":     {Type: "string", Description: "Optional event type prefix filter (e.g. 'agent.', 'infra.', 'slacker.')."},
+				"severity": {Type: "string", Enum: []string{"info", "warn", "error", "critical"}, Description: "Optional severity filter."},
+				"source":   {Type: "string", Description: "Optional source filter."},
+				"subject":  {Type: "string", Description: "Optional subject filter."},
+				"after_id": {Type: "integer", Description: "Return events with ID greater than after_id."},
+				"limit":    {Type: "integer", Description: "Maximum events to return (default 50)."},
+			},
+		},
+	},
 }
 
 // ServeOpts configures ServeStdio.
 type ServeOpts struct {
 	Harness           string
+	Profile           string
 	Stdin             io.Reader
 	Stdout            io.Writer
 	APIURL            string
@@ -544,27 +595,7 @@ func callTool(ctx context.Context, name string, rawArgs json.RawMessage, apiURL,
 	case "fleet_inspect_agent":
 		return callInspectAgent(ctx, api, rawArgs)
 	case "fleet_send_message":
-		a, err := decodeArgs[struct {
-			To        string `json:"to"`
-			Message   string `json:"message"`
-			SessionID string `json:"session_id"`
-			ThreadID  string `json:"thread_id"`
-			ReplyTo   *int64 `json:"reply_to"`
-		}](rawArgs)
-		if err != nil {
-			return nil, err
-		}
-		body := map[string]any{"to": a.To, "body": a.Message, "harness": harness, "cwd": cwd, "pid": ppid}
-		if a.SessionID != "" {
-			body["session_id"] = a.SessionID
-		}
-		if a.ThreadID != "" {
-			body["thread_id"] = a.ThreadID
-		}
-		if a.ReplyTo != nil {
-			body["reply_to"] = *a.ReplyTo
-		}
-		return callJSON(ctx, api, "POST", "/v1/agents/send", body, 30*time.Second)
+		return callSendMessageTool(ctx, api, harness, cwd, ppid, rawArgs)
 
 	case "fleet_check_inbox":
 		a, err := decodeArgs[struct {
@@ -598,20 +629,19 @@ func callTool(ctx context.Context, name string, rawArgs json.RawMessage, apiURL,
 		return callJSON(ctx, api, "POST", "/v1/agents/rename", body, 30*time.Second)
 
 	case "fleet_listen":
-		a, err := decodeArgs[struct {
-			Action    string `json:"action"`
-			SessionID string `json:"session_id"`
-		}](rawArgs)
-		if err != nil {
-			return nil, err
-		}
-		return callListenTool(ctx, api, harness, cwd, ppid, listener, a.Action, a.SessionID)
+		return callListenArgTool(ctx, api, harness, cwd, ppid, listener, rawArgs)
 
 	case "fleet_memory_search", "fleet_memory_get", "fleet_memory_set", "fleet_memory_delete":
 		return callMemoryTool(ctx, name, rawArgs, api, harness, cwd)
 
 	case "fleet_slack_channels", "fleet_slack_read", "fleet_slack_send":
 		return callSlackTool(ctx, name, rawArgs, api)
+
+	case "fleet_watch_agent":
+		return callWatchTool(ctx, api, harness, cwd, ppid, rawArgs)
+
+	case "fleet_events_emit", "fleet_events_list":
+		return callEventsTool(ctx, name, rawArgs, api)
 
 	default:
 		return nil, fmt.Errorf("unknown tool %q", name)
@@ -669,6 +699,13 @@ func dispatchRPC(ctx context.Context, req rpcRequest, opts ServeOpts, ppid int, 
 	case "ping":
 		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: struct{}{}}
 	case "tools/list":
+		if strings.EqualFold(strings.TrimSpace(opts.Profile), "personal") {
+			tools, lErr := listPersonalProfileTools(ctx, opts.APIURL)
+			if lErr != nil {
+				return rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32000, Message: lErr.Error()}}
+			}
+			return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"tools": tools}}
+		}
 		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"tools": Tools}}
 	case "tools/call":
 		var p struct {
@@ -679,7 +716,13 @@ func dispatchRPC(ctx context.Context, req rpcRequest, opts ServeOpts, ppid int, 
 		if len(trimmed) == 0 || string(trimmed) == "null" || json.Unmarshal(trimmed, &p) != nil || strings.TrimSpace(p.Name) == "" {
 			return rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32602, Message: "invalid params"}}
 		}
-		data, callErr := callTool(ctx, p.Name, p.Arguments, opts.APIURL, opts.Harness, ppid, cwd, listener)
+		var data any
+		var callErr error
+		if strings.EqualFold(strings.TrimSpace(opts.Profile), "personal") {
+			data, callErr = callPersonalProfileTool(ctx, p.Name, p.Arguments, opts.APIURL)
+		} else {
+			data, callErr = callTool(ctx, p.Name, p.Arguments, opts.APIURL, opts.Harness, ppid, cwd, listener)
+		}
 		if callErr != nil {
 			return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: toolCallResult{
 				Content: []textContent{{Type: "text", Text: callErr.Error()}},
@@ -795,6 +838,11 @@ func handleRPCLine(
 
 // ServeStdio runs the newline-delimited JSON-RPC 2.0 MCP server on stdin/stdout.
 func ServeStdio(opts ServeOpts) (int, error) {
+	prof := strings.ToLower(cmp.Or(strings.TrimSpace(opts.Profile), "core"))
+	if prof != "core" && prof != "personal" {
+		return 1, fmt.Errorf("unknown mcp profile %q (expected core or personal)", opts.Profile)
+	}
+	opts.Profile = prof
 	if !paths.ValidHarness(opts.Harness) {
 		return 1, fmt.Errorf("unknown harness %q", opts.Harness)
 	}
@@ -810,7 +858,11 @@ func ServeStdio(opts ServeOpts) (int, error) {
 	}
 
 	stopCh := make(chan struct{})
-	hbDone, listener := startBackgroundWorkers(opts, ppid, cwd, stopCh)
+	var hbDone chan struct{}
+	var listener waiter.SessionListener
+	if opts.Profile != "personal" {
+		hbDone, listener = startBackgroundWorkers(opts, ppid, cwd, stopCh)
+	}
 	defer func() {
 		close(stopCh)
 		if listener != nil {

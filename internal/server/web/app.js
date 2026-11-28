@@ -412,6 +412,7 @@ const SSE_EVENT_TYPES = [
   "tool_start",
   "tool_done",
   "delta",
+  "message",
   "message_created",
   "message_done",
   "approval",
@@ -421,7 +422,8 @@ const SSE_EVENT_TYPES = [
   "config_updated",
   "grant_updated",
   "outbox",
-  "delegation",
+  "event_routed",
+  "watch_created",
   "error",
 ];
 
@@ -560,11 +562,13 @@ function ensureAssistantSSE() {
       } else if (evType === "outbox") {
         const it = payload.data || {};
         const ch = payload.channel_id || it.channel_id || "briefing";
-        const title = it.title || `Assistant (#${ch})`;
-        if (!document.hidden) {
-          toast(`${title}: ${it.body || ""}`, it.priority === "urgent" ? "warn" : "info");
-        } else {
-          showBrowserAlert(title, it.body || "", ch);
+        if (ch !== "events") {
+          const title = it.title || `Assistant (#${ch})`;
+          if (!document.hidden) {
+            toast(`${title}: ${it.body || ""}`, it.priority === "urgent" ? "warn" : "info");
+          } else {
+            showBrowserAlert(title, it.body || "", ch);
+          }
         }
       } else if (evType === "approval") {
         const apr = payload.data || {};
@@ -575,16 +579,18 @@ function ensureAssistantSSE() {
         }
         syncOverviewBadgeCount();
         const viewingChannel = state.route === "chat" && state.activeChatChannel === ch;
-        if (apr.tool_name === "frontier_escalation") {
-          if (!document.hidden && !viewingChannel) {
-            toast(`Frontier check (#${ch}): ${apr.summary || "Approve model escalation?"}`, "info");
+        if (ch !== "events") {
+          if (apr.tool_name === "frontier_escalation") {
+            if (!document.hidden && !viewingChannel) {
+              toast(`Frontier check (#${ch}): ${apr.summary || "Approve model escalation?"}`, "info");
+            }
+          } else if (!document.hidden) {
+            if (!viewingChannel) {
+              toast(`Approval needed (#${ch}): ${apr.summary || apr.tool_name || "tool"}`, "warn");
+            }
+          } else {
+            showBrowserAlert(`Approval needed (#${ch})`, apr.summary || apr.tool_name || "", ch);
           }
-        } else if (!document.hidden) {
-          if (!viewingChannel) {
-            toast(`Approval needed (#${ch}): ${apr.summary || apr.tool_name || "tool"}`, "warn");
-          }
-        } else {
-          showBrowserAlert(`Approval needed (#${ch})`, apr.summary || apr.tool_name || "", ch);
         }
       } else if (evType === "approval_decided") {
         const curApr = (state.overview && state.overview.assistant && state.overview.assistant.pending_approvals) || 0;

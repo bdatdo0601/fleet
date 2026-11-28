@@ -36,6 +36,7 @@ type NebulaWatchdog struct {
 	BurstWindow    time.Duration
 	BurstThreshold int
 	Cooldown       time.Duration
+	OnTrigger      func(reason string)
 
 	mu          sync.Mutex
 	initialized bool
@@ -263,13 +264,21 @@ func (w *NebulaWatchdog) readNewLines() ([]string, error) {
 
 // CheckOnce inspects newly appended Nebula log lines and queues a restart when a burst is detected.
 func (w *NebulaWatchdog) CheckOnce(now time.Time) bool {
+	triggered, reason, cb := w.checkOnceLocked(now)
+	if triggered && cb != nil {
+		cb(reason)
+	}
+	return triggered
+}
+
+func (w *NebulaWatchdog) checkOnceLocked(now time.Time) (bool, string, func(string)) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	lines, err := w.readNewLines()
 	if err != nil {
 		w.lastError = err.Error()
-		return false
+		return false, "", nil
 	}
 	w.lastError = ""
 
@@ -291,23 +300,23 @@ func (w *NebulaWatchdog) CheckOnce(now time.Time) bool {
 	w.recent = kept
 
 	if len(w.recent) < w.burstThreshold() {
-		return false
+		return false, "", nil
 	}
 	if !w.lastTrigger.IsZero() && now.Sub(w.lastTrigger) < w.cooldown() {
-		return false
+		return false, "", nil
 	}
 	pending, pErr := core.PendingNebulaRestart(w.StateDir)
 	if pErr != nil || pending != nil {
-		return false
+		return false, "", nil
 	}
 
 	reason := formatWatchdogReason(sampleLine)
 	if _, err := core.RequestNebulaRestart(w.StateDir, "watchdog", reason); err != nil {
 		w.lastError = err.Error()
-		return false
+		return false, "", nil
 	}
 	w.lastTrigger = now
 	w.recent = nil
 	_, _ = fmt.Fprintf(os.Stderr, "%s %s\n", registry.NowISO(), reason)
-	return true
+	return true, reason, w.OnTrigger
 }

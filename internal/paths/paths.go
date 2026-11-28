@@ -45,6 +45,7 @@ const (
 
 var (
 	Groups       = []string{"admin", "managed"}
+	Profiles     = []string{"personal", "work"}
 	Harnesses    = []string{"claude", "codex", "antigravity"}
 	NamePattern  = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
 	NebulaLabels = []string{"sh.brew.nebula", "homebrew.mxcl.nebula"}
@@ -217,6 +218,11 @@ func ValidHarness(name string) bool {
 // ValidGroup reports whether group is a supported device group.
 func ValidGroup(group string) bool {
 	return slices.Contains(Groups, group)
+}
+
+// ValidProfile reports whether profile is a supported device trust profile ("personal" or "work").
+func ValidProfile(profile string) bool {
+	return slices.Contains(Profiles, profile)
 }
 
 // LocalStateRoot returns XDG_STATE_HOME if set, otherwise ~/.local/state.

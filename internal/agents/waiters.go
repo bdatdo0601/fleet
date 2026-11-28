@@ -321,6 +321,12 @@ func (h *Hub) Ask(ctx context.Context, p AskParams) (AskResult, error) {
 	}
 
 	subCh := h.threadSubs.subscribe(sent.ThreadID)
+	cb := h.onAssistantMessage
+	if cb != nil && sent.ToSession != nil && strings.HasPrefix(*sent.ToSession, AssistantSessionPrefix) {
+		h.mu.Unlock()
+		cb(sent)
+		h.mu.Lock()
+	}
 	defer func() {
 		h.threadSubs.unsubscribe(sent.ThreadID, subCh)
 		h.mu.Unlock()

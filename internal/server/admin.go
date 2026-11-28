@@ -173,6 +173,7 @@ func buildOverviewPayload(fleet *core.Fleet, c *registry.Device, startedAt time.
 			"ip":       c.IP,
 			"kind":     c.Kind,
 			"group":    c.Grp,
+			"profile":  c.Profile,
 			"is_admin": isAdmin,
 		},
 		"server":  serverInfo,

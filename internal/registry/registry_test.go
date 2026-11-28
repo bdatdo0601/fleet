@@ -57,8 +57,12 @@ func TestOpenSchemaMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	dev, err := reg.Get("laptop")
-	if err != nil || dev == nil || dev.ClientVersion == nil || *dev.ClientVersion != "go/abc1234" {
-		t.Fatalf("expected migrated client_version, got %+v err=%v", dev, err)
+	if err != nil || dev == nil || dev.ClientVersion == nil || *dev.ClientVersion != "go/abc1234" || dev.Profile != "personal" {
+		t.Fatalf("expected migrated client_version and default personal profile, got %+v err=%v", dev, err)
+	}
+	updated, err := reg.SetProfile("laptop", "work")
+	if err != nil || updated == nil || updated.Profile != "work" {
+		t.Fatalf("SetProfile failed: %+v err=%v", updated, err)
 	}
 }
 

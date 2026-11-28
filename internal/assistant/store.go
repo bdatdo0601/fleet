@@ -19,6 +19,11 @@ import (
 )
 
 const assistantSchema = `
+CREATE TABLE IF NOT EXISTS assistant_meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS assistant_channels (
   id            TEXT PRIMARY KEY,
   title         TEXT NOT NULL,
@@ -117,24 +122,6 @@ CREATE TABLE IF NOT EXISTS assistant_outbox (
   created_at   TEXT NOT NULL,
   delivered_at TEXT NOT NULL DEFAULT ''
 );
-
-CREATE TABLE IF NOT EXISTS assistant_delegations (
-  id                  TEXT PRIMARY KEY,
-  job_id              TEXT NOT NULL DEFAULT '',
-  channel_id          TEXT NOT NULL,
-  target_device       TEXT NOT NULL,
-  harness             TEXT NOT NULL,
-  session_name        TEXT NOT NULL,
-  session_id          TEXT NOT NULL DEFAULT '',
-  repo_path           TEXT NOT NULL DEFAULT '',
-  prompt              TEXT NOT NULL DEFAULT '',
-  status              TEXT NOT NULL DEFAULT 'queued',
-  last_notified_state TEXT NOT NULL DEFAULT '',
-  created_at          TEXT NOT NULL,
-  updated_at          TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_assistant_delegations_active
-  ON assistant_delegations(status, target_device, session_name);
 
 CREATE TABLE IF NOT EXISTS assistant_frontier_grants (
   channel_id    TEXT PRIMARY KEY,
@@ -327,23 +314,6 @@ type OutboxItem struct {
 	DeliveredAt string `json:"delivered_at,omitempty"`
 }
 
-// Delegation tracks a coding agent session spawned by the assistant for event-driven follow-ups.
-type Delegation struct {
-	ID                string `json:"id"`
-	JobID             string `json:"job_id,omitempty"`
-	ChannelID         string `json:"channel_id"`
-	TargetDevice      string `json:"target_device"`
-	Harness           string `json:"harness"`
-	SessionName       string `json:"session_name"`
-	SessionID         string `json:"session_id,omitempty"`
-	RepoPath          string `json:"repo_path,omitempty"`
-	Prompt            string `json:"prompt,omitempty"`
-	Status            string `json:"status"`
-	LastNotifiedState string `json:"last_notified_state,omitempty"`
-	CreatedAt         string `json:"created_at"`
-	UpdatedAt         string `json:"updated_at"`
-}
-
 // FrontierGrant represents a context-scoped auto-approval grant for frontier model turns on a channel topic.
 type FrontierGrant struct {
 	ChannelID    string  `json:"channel_id"`
@@ -407,15 +377,14 @@ func randomHexID(prefix string) string {
 	return prefix + "-" + hex.EncodeToString(b[:])
 }
 
-var messageMigrations = []registry.ColumnMigration{
-	{Col: "source", Def: "TEXT NOT NULL DEFAULT ''"},
-	{Col: "external_id", Def: "TEXT NOT NULL DEFAULT ''"},
-}
-
-// OpenStore initializes assistant.db at path and seeds default channels.
+// OpenStore initializes assistant.db at path, applies v2 clean reset when upgrading from v1, and seeds default channels.
 func OpenStore(path string) (*Store, error) {
-	db, err := registry.OpenSQLite(path, assistantSchema, "assistant_messages", messageMigrations)
+	db, err := registry.OpenSQLite(path, `CREATE TABLE IF NOT EXISTS assistant_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);`, "", nil)
 	if err != nil {
+		return nil, err
+	}
+	if err := ensureV2Schema(db); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
 	if path != "" && path != ":memory:" && !strings.HasPrefix(path, "file:") {
@@ -440,6 +409,38 @@ func OpenStore(path string) (*Store, error) {
 	return s, nil
 }
 
+func ensureV2Schema(db *sql.DB) error {
+	var ver string
+	err := db.QueryRow(`SELECT value FROM assistant_meta WHERE key = 'schema_version'`).Scan(&ver)
+	if err == nil && ver == "2" {
+		_, err = db.Exec(assistantSchema)
+		return err
+	}
+	// Clean v2 reset: drop v1 conversation/delegation/inbox/outbox tables while preserving OAuth tokens & vault index.
+	drops := []string{
+		"DROP TABLE IF EXISTS assistant_delegations",
+		"DROP TABLE IF EXISTS assistant_inbox",
+		"DROP TABLE IF EXISTS assistant_outbox",
+		"DROP TABLE IF EXISTS assistant_messages",
+		"DROP TABLE IF EXISTS assistant_channels",
+		"DROP TABLE IF EXISTS assistant_approvals",
+		"DROP TABLE IF EXISTS assistant_timers",
+		"DROP TABLE IF EXISTS assistant_frontier_grants",
+		"DROP TABLE IF EXISTS assistant_files",
+		"DROP TABLE IF EXISTS assistant_discord_state",
+	}
+	for _, stmt := range drops {
+		if _, err := db.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	if _, err := db.Exec(assistantSchema); err != nil {
+		return err
+	}
+	_, err = db.Exec(`INSERT OR REPLACE INTO assistant_meta(key, value) VALUES ('schema_version', '2')`)
+	return err
+}
+
 // Close closes the underlying SQLite connection.
 func (s *Store) Close() error {
 	s.mu.Lock()
@@ -453,9 +454,10 @@ func (s *Store) Close() error {
 func (s *Store) seedDefaultChannels() error {
 	now := registry.NowISO()
 	defaults := []Channel{
-		{ID: "general", Title: "#general", Description: "Everyday assistant chat across your fleet and second brain"},
+		{ID: "general", Title: "#general", Description: "Personal assistant conversation and high-signal alerts"},
 		{ID: "fleet-ops", Title: "#fleet-ops", Description: "Live Fleet coding agents, sessions, memory, and Slack triage"},
-		{ID: "briefing", Title: "#briefing", Description: "Scheduled heartbeats, morning briefings, and proactive alerts", Model: DefaultFastModel},
+		{ID: "briefing", Title: "#briefing", Description: "Scheduled heartbeats, morning briefings, and proactive digests", Model: DefaultFastModel},
+		{ID: "events", Title: "#events", Description: "Live zero-token Fleet & assistant event feed"},
 	}
 	for _, ch := range defaults {
 		if _, err := s.db.Exec(
@@ -469,13 +471,13 @@ func (s *Store) seedDefaultChannels() error {
 	return nil
 }
 
-// ListChannels returns all channels sorted with general first.
+// ListChannels returns all channels sorted with general, fleet-ops, briefing, events first.
 func (s *Store) ListChannels() ([]Channel, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rows, err := s.db.Query(`SELECT id, title, description, model, context_epoch, created_at, updated_at
 		FROM assistant_channels
-		ORDER BY CASE id WHEN 'general' THEN 0 WHEN 'fleet-ops' THEN 1 WHEN 'briefing' THEN 2 ELSE 3 END, id ASC`)
+		ORDER BY CASE id WHEN 'general' THEN 0 WHEN 'fleet-ops' THEN 1 WHEN 'briefing' THEN 2 WHEN 'events' THEN 3 ELSE 4 END, id ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -863,6 +865,37 @@ func (s *Store) FinishInbox(id int64, status, errMsg string) error {
 		status, errMsg, registry.NowISO(), id,
 	)
 	return err
+}
+
+// ListInbox returns queued/running/recent inbox wakeup items for diagnostics.
+func (s *Store) ListInbox(status string, limit int) ([]InboxEvent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	query := `SELECT id, channel_id, source, dedupe_key, payload_json, model_override, status, error, created_at, updated_at FROM assistant_inbox`
+	var args []any
+	if clean := strings.TrimSpace(status); clean != "" {
+		query += ` WHERE status = ?`
+		args = append(args, clean)
+	}
+	query += ` ORDER BY id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []InboxEvent
+	for rows.Next() {
+		var ev InboxEvent
+		if scanErr := rows.Scan(&ev.ID, &ev.ChannelID, &ev.Source, &ev.DedupeKey, &ev.PayloadJSON, &ev.ModelOverride, &ev.Status, &ev.Error, &ev.CreatedAt, &ev.UpdatedAt); scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, ev)
+	}
+	return out, rows.Err()
 }
 
 func parseCronField(field string, minVal, maxVal int, wrapSeven bool) (map[int]bool, error) {
@@ -1427,169 +1460,6 @@ func (s *Store) MarkOutboxDelivered(id int64) error {
 		return newErr(fmt.Sprintf("outbox item %d not found", id), http.StatusNotFound)
 	}
 	return nil
-}
-
-// CreateDelegation persists a newly spawned coding agent delegation.
-func (s *Store) CreateDelegation(d Delegation) (Delegation, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := registry.NowISO()
-	if d.ID == "" {
-		d.ID = randomHexID("del")
-	}
-	d.ChannelID = cmp.Or(strings.TrimSpace(d.ChannelID), "general")
-	d.Status = cmp.Or(strings.TrimSpace(d.Status), "queued")
-	d.CreatedAt = cmp.Or(d.CreatedAt, now)
-	d.UpdatedAt = now
-	_, err := s.db.Exec(
-		`INSERT INTO assistant_delegations(
-			id, job_id, channel_id, target_device, harness, session_name, session_id,
-			repo_path, prompt, status, last_notified_state, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		d.ID, d.JobID, d.ChannelID, d.TargetDevice, d.Harness, d.SessionName, d.SessionID,
-		d.RepoPath, d.Prompt, d.Status, d.LastNotifiedState, d.CreatedAt, d.UpdatedAt,
-	)
-	return d, err
-}
-
-func scanDelegation(scanner interface{ Scan(...any) error }) (Delegation, error) {
-	var d Delegation
-	err := scanner.Scan(
-		&d.ID, &d.JobID, &d.ChannelID, &d.TargetDevice, &d.Harness, &d.SessionName, &d.SessionID,
-		&d.RepoPath, &d.Prompt, &d.Status, &d.LastNotifiedState, &d.CreatedAt, &d.UpdatedAt,
-	)
-	return d, err
-}
-
-// ListActiveDelegations returns non-terminal delegations (not exited/failed/unwatched).
-func (s *Store) ListActiveDelegations() ([]Delegation, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rows, err := s.db.Query(
-		`SELECT id, job_id, channel_id, target_device, harness, session_name, session_id,
-		        repo_path, prompt, status, last_notified_state, created_at, updated_at
-		 FROM assistant_delegations WHERE status NOT IN ('exited', 'failed', 'unwatched') ORDER BY created_at DESC`,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	var out []Delegation
-	for rows.Next() {
-		d, err := scanDelegation(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, d)
-	}
-	return out, rows.Err()
-}
-
-// FindActiveDelegation looks up an active delegation in channelID matching sessionID or (device, sessionName).
-func (s *Store) FindActiveDelegation(channelID, sessionID, device, sessionName string) (*Delegation, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rows, err := s.db.Query(
-		`SELECT id, job_id, channel_id, target_device, harness, session_name, session_id,
-		        repo_path, prompt, status, last_notified_state, created_at, updated_at
-		 FROM assistant_delegations WHERE channel_id = ? AND status NOT IN ('exited', 'failed', 'unwatched') ORDER BY created_at DESC`,
-		channelID,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	for rows.Next() {
-		d, err := scanDelegation(rows)
-		if err != nil {
-			return nil, err
-		}
-		if (sessionID != "" && d.SessionID == sessionID) ||
-			(device != "" && sessionName != "" && d.TargetDevice == device && strings.EqualFold(d.SessionName, sessionName)) {
-			return &d, nil
-		}
-	}
-	return nil, rows.Err()
-}
-
-// CancelDelegation marks matching active delegation(s) in channelID as unwatched.
-func (s *Store) CancelDelegation(channelID, target string) (int64, error) {
-	clean := strings.TrimSpace(target)
-	if clean == "" {
-		return 0, newErr("agent_id is required", http.StatusBadRequest)
-	}
-	devPart, namePart, hasSlash := strings.Cut(clean, "/")
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := registry.NowISO()
-	var res sql.Result
-	var err error
-	if hasSlash && !strings.Contains(clean, ":") && namePart != "" {
-		res, err = s.db.Exec(
-			`UPDATE assistant_delegations SET status = 'unwatched', updated_at = ?
-			 WHERE channel_id = ? AND status NOT IN ('exited', 'failed', 'unwatched')
-			   AND (session_id = ? OR (target_device = ? AND LOWER(session_name) = LOWER(?)))`,
-			now, channelID, clean, strings.TrimSpace(devPart), strings.TrimSpace(namePart),
-		)
-	} else {
-		res, err = s.db.Exec(
-			`UPDATE assistant_delegations SET status = 'unwatched', updated_at = ?
-			 WHERE channel_id = ? AND status NOT IN ('exited', 'failed', 'unwatched')
-			   AND (session_id = ? OR LOWER(session_name) = LOWER(?))`,
-			now, channelID, clean, clean,
-		)
-	}
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
-}
-
-// ListDelegations returns recent delegations ordered newest first.
-func (s *Store) ListDelegations(limit int) ([]Delegation, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if limit <= 0 || limit > 200 {
-		limit = 50
-	}
-	rows, err := s.db.Query(
-		`SELECT id, job_id, channel_id, target_device, harness, session_name, session_id,
-		        repo_path, prompt, status, last_notified_state, created_at, updated_at
-		 FROM assistant_delegations ORDER BY created_at DESC LIMIT ?`, limit,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	var out []Delegation
-	for rows.Next() {
-		d, err := scanDelegation(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, d)
-	}
-	return out, rows.Err()
-}
-
-// UpdateDelegationState updates session_id, status, and last_notified_state on a delegation.
-func (s *Store) UpdateDelegationState(id, sessionID, status, lastNotified string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, err := s.db.Exec(
-		`UPDATE assistant_delegations
-		 SET session_id = CASE WHEN ? != '' THEN ? ELSE session_id END,
-		     status = CASE WHEN ? != '' THEN ? ELSE status END,
-		     last_notified_state = CASE
-		         WHEN ? != '' THEN ?
-		         WHEN ? = 'working' THEN ''
-		         ELSE last_notified_state
-		     END,
-		     updated_at = ?
-		 WHERE id = ?`,
-		sessionID, sessionID, status, status, lastNotified, lastNotified, status, registry.NowISO(), id,
-	)
-	return err
 }
 
 // HasExternalMessage reports whether a message from source with externalID has already been ingested.

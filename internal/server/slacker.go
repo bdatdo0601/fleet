@@ -363,19 +363,7 @@ func registerSlackerWorkerRoutes(
 		if rec.Status == "launched" {
 			recordSlackerJobPath(fleet, job, true)
 		}
-		if fleet.Assistant != nil {
-			sessionID := ""
-			if rec.RawSessionID != "" {
-				canonicalHarness := job.Harness
-				if canonicalHarness == "agy" {
-					canonicalHarness = "antigravity"
-				}
-				if sid, _, sidErr := agents.MakeSessionID(c.Name, canonicalHarness, rec.RawSessionID); sidErr == nil {
-					sessionID = sid
-				}
-			}
-			fleet.Assistant.OnSlackerReceipt(rec.JobID, c.Name, job.SessionName, sessionID, rec.Status, rec.Error)
-		}
+		fleet.PublishSlackerReceiptEvent(job, rec)
 		writeJSON(w, http.StatusOK, map[string]any{"job": job})
 		return nil
 	}))

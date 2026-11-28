@@ -46,12 +46,14 @@ Peer Messaging:
   send     TO [MESSAGE...] [--message TEXT] [--stdin] [--session SID] [--thread ID] [--reply-to ID] [--json]
   inbox    [--session SID] [--all] [--no-mark-read] [--json]
   ask      TO [QUESTION...] [--question TEXT] [--stdin] [--session SID] [--timeout S] [--wait-if-idle] [--json]
-  rename   [TARGET] NAME [--session SID] [--json]
-  listen   [--session SID] [--json]
   watch    TARGET [--session SID] [--on idle,waiting,exited] [--once] [--device D] [--pending] [--json]
            TARGET --wait [--on idle,waiting,exited] [--timeout S] [--include-current] [--device D] [--pending] [--json]
            ls [--session SID] [--all] [--json]
            rm ID_OR_TARGET [--session SID] [--json]
+  watches  [--target TARGET] [--assistant] [--json]
+  unwatch  WATCH_ID_OR_TARGET [--json]
+  rename   [TARGET] NAME [--session SID] [--json]
+  listen   [--session SID] [--json]
 
 Lifecycle & Relay:
   spawn    --harness claude|agy|codex [--name NAME] [--device DEV] [--repo PATH]
@@ -501,6 +503,82 @@ func cmdAgentsAsk(args []string, cio *IO) error {
 	if res.Warning != nil && *res.Warning != "" {
 		cio.printf("warning: %s\n", *res.Warning)
 	}
+	return nil
+}
+
+func cmdAgentsWatches(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("agents watches", flag.ContinueOnError)
+	target := fs.String("target", "", "filter by target")
+	asAssistant := fs.Bool("assistant", false, "list assistant watches")
+	jsonOut := fs.Bool("json", false, "output JSON")
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf("usage: fleet agents watches [--target TARGET] [--assistant] [--json]")
+	}
+	api, err := client.ResolveAPI("")
+	if err != nil {
+		return err
+	}
+	q := url.Values{}
+	if *target != "" {
+		q.Set("target", *target)
+	}
+	if *asAssistant {
+		q.Set("watcher", "assistant")
+	}
+	qs := ""
+	if enc := q.Encode(); enc != "" {
+		qs = "?" + enc
+	}
+	var res struct {
+		Watches []agents.Watch `json:"watches"`
+	}
+	if err := client.Call(api, http.MethodGet, "/v1/agents/watches"+qs, nil, 15*time.Second, nil, &res); err != nil {
+		return err
+	}
+	if *jsonOut {
+		return writeJSONOut(cio.Stdout, res)
+	}
+	if len(res.Watches) == 0 {
+		cio.printf("No active watches.\n")
+		return nil
+	}
+	for _, w := range res.Watches {
+		cio.printf("%s  %-22s -> %-24s [%s]\n", w.ID, w.WatcherSession, cmp.Or(w.TargetSession, w.TargetName), strings.Join(w.Events, ","))
+	}
+	return nil
+}
+
+func cmdAgentsUnwatch(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("agents unwatch", flag.ContinueOnError)
+	jsonOut := fs.Bool("json", false, "output JSON")
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return fmt.Errorf("usage: fleet agents unwatch WATCH_ID_OR_TARGET [--json]")
+	}
+	api, err := client.ResolveAPI("")
+	if err != nil {
+		return err
+	}
+	id := strings.TrimSpace(pos[0])
+	path := "/v1/agents/watches/" + url.PathEscape(id)
+	if !strings.HasPrefix(id, "w-") {
+		path = "/v1/agents/watches/by-target?target=" + url.QueryEscape(id)
+	}
+	var res map[string]any
+	if err := client.Call(api, http.MethodDelete, path, nil, 15*time.Second, nil, &res); err != nil {
+		return err
+	}
+	if *jsonOut {
+		return writeJSONOut(cio.Stdout, res)
+	}
+	cio.printf("removed watch(es): %v\n", res["deleted"])
 	return nil
 }
 
@@ -1438,6 +1516,10 @@ func cmdAgents(args []string, cio *IO) error {
 			return cmdAgentsInbox(args[1:], cio)
 		case "ask":
 			return cmdAgentsAsk(args[1:], cio)
+		case "watches":
+			return cmdAgentsWatches(args[1:], cio)
+		case "unwatch":
+			return cmdAgentsUnwatch(args[1:], cio)
 		case "rename":
 			return cmdAgentsRename(args[1:], cio)
 		case "listen":

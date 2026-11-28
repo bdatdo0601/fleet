@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS devices (
   created_at     TEXT NOT NULL,
   revoked_at     TEXT,
   last_seen      TEXT,
-  client_version TEXT
+  client_version TEXT,
+  profile        TEXT NOT NULL DEFAULT 'personal'
 );
 -- Every certificate ever replaced or revoked. Rendered into pki.blocklist everywhere.
 CREATE TABLE IF NOT EXISTS revoked_certs (
@@ -57,6 +58,7 @@ type Device struct {
 	IP            string
 	Kind          string
 	Grp           string
+	Profile       string
 	Pubkey        string
 	Cert          string
 	Fingerprint   string
@@ -78,6 +80,7 @@ type AddParams struct {
 	IP          string
 	Kind        string
 	Grp         string
+	Profile     string
 	Pubkey      string
 	Cert        string
 	Fingerprint string
@@ -182,6 +185,7 @@ var errRegistryClosed = errors.New("registry is closed")
 func Open(path string) (*Registry, error) {
 	db, err := OpenSQLite(path, schema, "devices", []ColumnMigration{
 		{Col: "client_version", Def: "TEXT"},
+		{Col: "profile", Def: "TEXT NOT NULL DEFAULT 'personal'"},
 	})
 	if err != nil {
 		return nil, err
@@ -263,12 +267,19 @@ func (r *Registry) SetSettings(kv map[string]string) error {
 	return tx.Commit()
 }
 
-const deviceSelectCols = "name, ip, kind, grp, pubkey, cert, fingerprint, not_after, created_at, revoked_at, last_seen, client_version"
+const deviceSelectCols = "name, ip, kind, grp, profile, pubkey, cert, fingerprint, not_after, created_at, revoked_at, last_seen, client_version"
+
+func normalizeProfile(kind, profile string) string {
+	if kind == "lighthouse" || !paths.ValidProfile(profile) {
+		return "personal"
+	}
+	return profile
+}
 
 func scanDevice(scanner interface{ Scan(...any) error }) (*Device, error) {
 	var d Device
 	err := scanner.Scan(
-		&d.Name, &d.IP, &d.Kind, &d.Grp, &d.Pubkey, &d.Cert,
+		&d.Name, &d.IP, &d.Kind, &d.Grp, &d.Profile, &d.Pubkey, &d.Cert,
 		&d.Fingerprint, &d.NotAfter, &d.CreatedAt,
 		&d.RevokedAt, &d.LastSeen, &d.ClientVersion,
 	)
@@ -278,6 +289,7 @@ func scanDevice(scanner interface{ Scan(...any) error }) (*Device, error) {
 	if err != nil {
 		return nil, err
 	}
+	d.Profile = normalizeProfile(d.Kind, d.Profile)
 	return &d, nil
 }
 
@@ -407,12 +419,39 @@ func (r *Registry) Add(p AddParams) error {
 	if r.db == nil {
 		return errRegistryClosed
 	}
+	prof := normalizeProfile(p.Kind, p.Profile)
 	_, err := r.db.Exec(
-		"INSERT INTO devices(name, ip, kind, grp, pubkey, cert, fingerprint, not_after, created_at) "+
-			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		p.Name, p.IP, p.Kind, p.Grp, p.Pubkey, p.Cert, p.Fingerprint, p.NotAfter, NowISO(),
+		"INSERT INTO devices(name, ip, kind, grp, profile, pubkey, cert, fingerprint, not_after, created_at) "+
+			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		p.Name, p.IP, p.Kind, p.Grp, prof, p.Pubkey, p.Cert, p.Fingerprint, p.NotAfter, NowISO(),
 	)
 	return err
+}
+
+// SetProfile updates the trust profile ("personal" or "work") for a non-lighthouse device.
+func (r *Registry) SetProfile(name, profile string) (*Device, error) {
+	if !paths.ValidProfile(profile) {
+		return nil, fmt.Errorf("profile must be personal or work")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.db == nil {
+		return nil, errRegistryClosed
+	}
+	dev, err := r.getLocked(name)
+	if err != nil {
+		return nil, err
+	}
+	if dev == nil {
+		return nil, fmt.Errorf("no device named %s", name)
+	}
+	if dev.Kind == "lighthouse" && profile != "personal" {
+		return nil, fmt.Errorf("lighthouse profile must remain personal")
+	}
+	if _, err := r.db.Exec("UPDATE devices SET profile = ? WHERE name = ?", profile, name); err != nil {
+		return nil, err
+	}
+	return r.getLocked(name)
 }
 
 // ReplaceCert assigns a new certificate to an existing device, blocklisting the old one

@@ -92,14 +92,14 @@ CREATE TABLE IF NOT EXISTS agent_watches (
   target_session    TEXT NOT NULL DEFAULT '',
   target_device     TEXT NOT NULL DEFAULT '',
   target_name       TEXT NOT NULL DEFAULT '',
-  events_json       TEXT NOT NULL DEFAULT '["idle","waiting_permission","waiting_question","exited"]',
+  events_json       TEXT NOT NULL,
   once              INTEGER NOT NULL DEFAULT 0,
   last_notified_key TEXT NOT NULL DEFAULT '',
   created_at        TEXT NOT NULL,
   updated_at        TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_agent_watches_lookup
-  ON agent_watches(target_session, target_device, target_name);
+CREATE INDEX IF NOT EXISTS idx_agent_watches_target
+  ON agent_watches(target_session, target_name);
 `
 
 var sessionMigrations = []registry.ColumnMigration{
@@ -114,6 +114,11 @@ var sessionMigrations = []registry.ColumnMigration{
 const (
 	MaxMessageBytes         = 32 * 1024
 	WaiterRearmGraceSeconds = 20.0
+
+	// AssistantDevice is the virtual peer device name for the always-on lighthouse assistant.
+	AssistantDevice = "assistant"
+	// AssistantSessionPrefix is the virtual peer session_id prefix ("assistant:<channel>").
+	AssistantSessionPrefix = "assistant:"
 )
 
 // ErrHubClosed is returned when operations are invoked on a closed Hub.
@@ -365,6 +370,9 @@ type Hub struct {
 	threadSubs         subMap
 	watchSubs          map[chan StateTransition]struct{}
 	onTransition       func(StateTransition)
+	onWatchTriggered   func(Watch, StateTransition)
+	onAssistantMessage func(Message)
+	onUsage            func(*HarnessUsage, HarnessUsage)
 	closed             bool
 	doneCh             chan struct{}
 }

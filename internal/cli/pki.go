@@ -404,6 +404,7 @@ func cmdJoin(args []string, cio *IO) error {
 func cmdApprove(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("approve", flag.ContinueOnError)
 	group := fs.String("group", "managed", "device group (admin|managed)")
+	profile := fs.String("profile", "personal", "device trust profile (personal|work)")
 	nameOverride := fs.String("name", "", "override the requested name")
 	replace := fs.Bool("replace", false, "re-key an existing device, keeping its IP")
 	pos, err := parseFlagsInterspersed(fs, args)
@@ -415,6 +416,9 @@ func cmdApprove(args []string, cio *IO) error {
 	}
 	if !paths.ValidGroup(*group) {
 		return fmt.Errorf("--group must be admin or managed")
+	}
+	if !paths.ValidProfile(*profile) {
+		return fmt.Errorf("--profile must be personal or work")
 	}
 	pasted, err := cio.paste("Paste the FLEET JOIN REQUEST block:", "END "+codes.Request)
 	if err != nil {
@@ -436,7 +440,7 @@ func cmdApprove(args []string, cio *IO) error {
 		repNote = "  (replacing existing cert)"
 	}
 	cio.printf("\n  device:     %s\n  request id: %s  (must match the joining machine)\n", name, codes.ShortID(req.Pubkey))
-	cio.printf("  group:      %s%s\n", *group, repNote)
+	cio.printf("  group:      %s%s\n  profile:    %s\n", *group, repNote, *profile)
 	if err := cio.confirm("Approve?"); err != nil {
 		return err
 	}
@@ -446,6 +450,7 @@ func cmdApprove(args []string, cio *IO) error {
 		"pubkey":  req.Pubkey,
 		"kind":    "mac",
 		"group":   *group,
+		"profile": *profile,
 		"replace": *replace,
 	}, 3, &resp); err != nil {
 		return err
@@ -471,16 +476,20 @@ func cmdApprove(args []string, cio *IO) error {
 func cmdApproveMobile(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("approve-mobile", flag.ContinueOnError)
 	group := fs.String("group", "admin", "device group (admin|managed)")
+	profile := fs.String("profile", "personal", "device trust profile (personal|work)")
 	replace := fs.Bool("replace", false, "re-key existing mobile device")
 	pos, err := parseFlagsInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) != 1 {
-		return fmt.Errorf("usage: fleet approve-mobile NAME [--group admin|managed] [--replace]")
+		return fmt.Errorf("usage: fleet approve-mobile NAME [--group admin|managed] [--profile personal|work] [--replace]")
 	}
 	if !paths.ValidGroup(*group) {
 		return fmt.Errorf("--group must be admin or managed")
+	}
+	if !paths.ValidProfile(*profile) {
+		return fmt.Errorf("--profile must be personal or work")
 	}
 	name := pos[0]
 	pem, err := cio.paste("Paste the public key from the Mobile Nebula app:", "END NEBULA X25519 PUBLIC KEY")
@@ -491,7 +500,7 @@ func cmdApproveMobile(args []string, cio *IO) error {
 	if err != nil {
 		return err
 	}
-	cio.printf("\n  device: %s (mobile)\n  group:  %s\n  key id: %s\n", name, *group, codes.ShortID(pubkey))
+	cio.printf("\n  device:  %s (mobile)\n  group:   %s\n  profile: %s\n  key id:  %s\n", name, *group, *profile, codes.ShortID(pubkey))
 	if err := cio.confirm("Approve?"); err != nil {
 		return err
 	}
@@ -501,6 +510,7 @@ func cmdApproveMobile(args []string, cio *IO) error {
 		"pubkey":  pubkey,
 		"kind":    "mobile",
 		"group":   *group,
+		"profile": *profile,
 		"replace": *replace,
 	}, 3, &resp); err != nil {
 		return err
@@ -524,7 +534,7 @@ func cmdLS(args []string, cio *IO) error {
 	if err := client.Call(api, "GET", "/v1/devices", nil, 30*time.Second, nil, &data); err != nil {
 		return err
 	}
-	rows := [][]string{{"NAME", "IP", "KIND", "GROUP", "LAST SEEN", "EXPIRES", "CLIENT", "STATUS"}}
+	rows := [][]string{{"NAME", "IP", "KIND", "GROUP", "PROFILE", "LAST SEEN", "EXPIRES", "CLIENT", "STATUS"}}
 	for _, d := range data.Devices {
 		status := "active"
 		if d.RevokedAt != nil && *d.RevokedAt != "" {
@@ -539,7 +549,7 @@ func cmdLS(args []string, cio *IO) error {
 			exp = exp[:10]
 		}
 		rows = append(rows, []string{
-			d.Name, d.IP, d.Kind, d.Group, ago(d.LastSeen), exp, clientVer, status,
+			d.Name, d.IP, d.Kind, d.Group, cmp.Or(d.Profile, "personal"), ago(d.LastSeen), exp, clientVer, status,
 		})
 	}
 	printTable(cio.Stdout, rows)
@@ -595,5 +605,34 @@ func cmdSet(args []string, cio *IO) error {
 	} else {
 		cio.info(fmt.Sprintf("%s is now %s; it picks up its new certificate on its next sync (<= 5 min)", name, *group))
 	}
+	return nil
+}
+
+func cmdSetProfile(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("set-profile", flag.ContinueOnError)
+	pos, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 2 || !paths.ValidProfile(strings.ToLower(pos[1])) {
+		return fmt.Errorf("usage: fleet set-profile NAME personal|work")
+	}
+	name := pos[0]
+	profile := strings.ToLower(pos[1])
+	api, err := client.ResolveAPI("")
+	if err != nil {
+		return err
+	}
+	var resp struct {
+		Name    string `json:"name"`
+		Profile string `json:"profile"`
+	}
+	if err := client.Call(api, "POST", "/v1/set-profile", map[string]string{
+		"name":    name,
+		"profile": profile,
+	}, 15*time.Second, nil, &resp); err != nil {
+		return err
+	}
+	cio.info(fmt.Sprintf("%s trust profile set to %s", resp.Name, resp.Profile))
 	return nil
 }

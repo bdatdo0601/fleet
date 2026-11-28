@@ -17,6 +17,7 @@ import (
 	"github.com/bdatdo0601/fleet/internal/assistant"
 	"github.com/bdatdo0601/fleet/internal/codes"
 	"github.com/bdatdo0601/fleet/internal/ddns"
+	"github.com/bdatdo0601/fleet/internal/events"
 	"github.com/bdatdo0601/fleet/internal/memory"
 	"github.com/bdatdo0601/fleet/internal/paths"
 	"github.com/bdatdo0601/fleet/internal/pki"
@@ -94,6 +95,7 @@ type ApproveResult struct {
 	IP            string          `json:"ip"`
 	Kind          string          `json:"kind"`
 	Group         string          `json:"group"`
+	Profile       string          `json:"profile"`
 	CA            string          `json:"ca"`
 	Cert          string          `json:"cert"`
 	CAID          string          `json:"ca_id"`
@@ -129,6 +131,7 @@ type DeviceItem struct {
 	IP            string  `json:"ip"`
 	Kind          string  `json:"kind"`
 	Group         string  `json:"group"`
+	Profile       string  `json:"profile"`
 	NotAfter      string  `json:"not_after"`
 	LastSeen      *string `json:"last_seen"`
 	RevokedAt     *string `json:"revoked_at"`
@@ -151,6 +154,7 @@ type ApproveOpts struct {
 	Pubkey     string `json:"pubkey"`
 	Kind       string `json:"kind"`
 	Group      string `json:"group"`
+	Profile    string `json:"profile"`
 	Passphrase string `json:"passphrase"`
 	Replace    bool   `json:"replace"`
 }
@@ -168,6 +172,7 @@ type Fleet struct {
 	Embedder          *memory.Embedder
 	Slacker           *slacker.Store
 	SlackClient       *slacker.SlackClient
+	Events            *events.Bus
 	Assistant         *assistant.Engine
 	EdgeToken         string
 	approveMu         sync.Mutex
@@ -202,6 +207,14 @@ func Open(root string) (*Fleet, error) {
 		_ = reg.Close()
 		return nil, err
 	}
+	evBus, err := events.Open(filepath.Join(root, "events.db"))
+	if err != nil {
+		_ = slk.Close()
+		_ = mem.Close()
+		_ = hub.Close()
+		_ = reg.Close()
+		return nil, err
+	}
 	curator := memory.NewCurator(mem, filepath.Join(root, "curator.json"))
 	embedder := memory.NewEmbedder(mem, filepath.Join(root, "embed.json"))
 	mem.SetQueryEmbedder(embedder.QueryEmbedFunc())
@@ -216,7 +229,9 @@ func Open(root string) (*Fleet, error) {
 		Curator:           curator,
 		Embedder:          embedder,
 		Slacker:           slk,
+		Events:            evBus,
 	}
+	f.wireEvents()
 	astEngine, err := assistant.Open(
 		filepath.Join(root, "assistant.db"),
 		filepath.Join(root, "assistant.json"),
@@ -224,6 +239,7 @@ func Open(root string) (*Fleet, error) {
 		&assistantDeps{fleet: f},
 	)
 	if err != nil {
+		_ = evBus.Close()
 		_ = slk.Close()
 		_ = mem.Close()
 		_ = hub.Close()
@@ -231,11 +247,6 @@ func Open(root string) (*Fleet, error) {
 		return nil, err
 	}
 	f.Assistant = astEngine
-	hub.SetOnTransition(func(ev agents.StateTransition) {
-		if f.Assistant != nil {
-			f.Assistant.OnAgentHeartbeat(ev.Device, ev.Harness, ev.SessionID, ev.Name, ev.NewState, ev.Summary, ev.GitStatus, ev.LastAssistant, ev.PendingAction)
-		}
-	})
 	f.backfillPathsOnce()
 	return f, nil
 }
@@ -389,6 +400,11 @@ func (f *Fleet) Close() error {
 	}
 	if f.Slacker != nil {
 		if err := f.Slacker.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if f.Events != nil {
+		if err := f.Events.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -694,6 +710,11 @@ func IsAdmin(dev *registry.Device) bool {
 	return dev != nil && (dev.Grp == "admin" || dev.Grp == "lighthouse")
 }
 
+// IsPersonalDevice reports whether dev is active and holds a personal trust profile.
+func IsPersonalDevice(dev *registry.Device) bool {
+	return dev != nil && dev.Active() && (dev.Kind == "lighthouse" || dev.Profile == "personal")
+}
+
 // BinDir returns <Root>/bin where compiled platform binaries and manifest.json are published.
 func (f *Fleet) BinDir() string {
 	return filepath.Join(f.Root, "bin")
@@ -800,6 +821,7 @@ func (f *Fleet) Sync(dev *registry.Device, clientVersion, osName, archName strin
 func normalizeApproveOpts(opts ApproveOpts) (ApproveOpts, error) {
 	opts.Kind = cmp.Or(opts.Kind, "mac")
 	opts.Group = cmp.Or(opts.Group, "managed")
+	opts.Profile = cmp.Or(strings.ToLower(strings.TrimSpace(opts.Profile)), "personal")
 	if !paths.NamePattern.MatchString(opts.Name) {
 		return opts, newFleetErr("name must be lowercase letters, digits and dashes (max 32)", 400)
 	}
@@ -808,6 +830,9 @@ func normalizeApproveOpts(opts ApproveOpts) (ApproveOpts, error) {
 	}
 	if !paths.ValidGroup(opts.Group) {
 		return opts, newFleetErr("group must be one of "+strings.Join(paths.Groups, ", "), 400)
+	}
+	if !paths.ValidProfile(opts.Profile) {
+		return opts, newFleetErr("profile must be one of "+strings.Join(paths.Profiles, ", "), 400)
 	}
 	pubkey, err := pki.NormalizePubkey(opts.Pubkey)
 	if err != nil {
@@ -827,7 +852,7 @@ func (f *Fleet) buildApproveResult(opts ApproveOpts, dev *registry.Device, ip, c
 		return ApproveResult{}, err
 	}
 	res := ApproveResult{
-		Name: opts.Name, IP: ip, Kind: opts.Kind, Group: opts.Group,
+		Name: opts.Name, IP: ip, Kind: opts.Kind, Group: opts.Group, Profile: dev.Profile,
 		CA: caPEM, Cert: cert, CAID: caID, NotAfter: notAfter,
 	}
 	if opts.Kind == "mac" {
@@ -912,7 +937,7 @@ func (f *Fleet) Approve(opts ApproveOpts) (ApproveResult, error) {
 		})
 	} else {
 		err = f.Registry.Add(registry.AddParams{
-			Name: opts.Name, IP: ip, Kind: opts.Kind, Grp: opts.Group,
+			Name: opts.Name, IP: ip, Kind: opts.Kind, Grp: opts.Group, Profile: opts.Profile,
 			Pubkey: opts.Pubkey, Cert: cert, Fingerprint: meta.Fingerprint, NotAfter: meta.NotAfter,
 		})
 	}
@@ -940,9 +965,26 @@ func (f *Fleet) SetGroup(name, group, passphrase string) (ApproveResult, error) 
 		Pubkey:     dev.Pubkey,
 		Kind:       dev.Kind,
 		Group:      group,
+		Profile:    dev.Profile,
 		Passphrase: passphrase,
 		Replace:    true,
 	})
+}
+
+// SetProfile updates a device's trust profile ("personal" or "work") without re-signing its Nebula cert.
+func (f *Fleet) SetProfile(name, profile string) (*registry.Device, error) {
+	profile = strings.ToLower(strings.TrimSpace(profile))
+	if !paths.ValidProfile(profile) {
+		return nil, newFleetErr("profile must be one of "+strings.Join(paths.Profiles, ", "), 400)
+	}
+	dev, err := f.existing(name)
+	if err != nil {
+		return nil, err
+	}
+	if dev.Kind == "lighthouse" && profile != "personal" {
+		return nil, newFleetErr("the lighthouse profile must remain personal", 409)
+	}
+	return f.Registry.SetProfile(name, profile)
 }
 
 // Revoke cuts off a device and blocklists its current certificate.
@@ -975,6 +1017,7 @@ func (f *Fleet) List() ([]DeviceItem, error) {
 			IP:            d.IP,
 			Kind:          d.Kind,
 			Group:         d.Grp,
+			Profile:       d.Profile,
 			NotAfter:      d.NotAfter,
 			LastSeen:      d.LastSeen,
 			RevokedAt:     d.RevokedAt,

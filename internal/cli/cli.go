@@ -23,6 +23,7 @@ Commands:
   ls              (admin) list devices
   revoke          (admin) revoke a device
   set             (admin) change a device's group (re-signs its cert)
+  set-profile     (admin) change a device's trust profile (personal|work)
   sync            (root, launchd) pull config/certs/revocations and binary updates
   serve           (lighthouse, launchd) run the API
   edge            (lighthouse, root launchd) run HTTPS :443 proxy & private mesh DNS :53
@@ -32,6 +33,7 @@ Commands:
   agents          list, inspect, message, spawn, or kill AI agent sessions across the fleet
   usage           show quota and usage status across claude, codex, and antigravity
   session         manage detached Claude, Antigravity (agy), and Codex sessions
+  events          list, tail, or emit authoritative Fleet events
   slacker         lighthouse Slack Socket Mode dispatcher & Mac task workers
   assistant       always-on lighthouse personal assistant, Obsidian skills & approvals
   memory          manage shared fleet agent memory and LLM curation
@@ -63,12 +65,14 @@ func dispatchCommand(cmd string, rest []string, cio *IO) (bool, error) {
 		"ls":             cmdLS,
 		"revoke":         cmdRevoke,
 		"set":            cmdSet,
+		"set-profile":    cmdSetProfile,
 		"sync":           cmdSync,
 		"status":         cmdStatus,
 		"ddns":           cmdDDNS,
 		"tls":            cmdTLS,
 		"edge":           cmdEdge,
 		"agents":         cmdAgents,
+		"events":         cmdEvents,
 		"usage":          cmdUsage,
 		"statusline":     cmdStatusLine,
 		"session":        cmdSession,

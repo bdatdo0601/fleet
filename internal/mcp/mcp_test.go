@@ -622,3 +622,62 @@ func TestMCPConcurrentToolsCallEOFCancelAndMalformedParams(t *testing.T) {
 		t.Fatal("ServeStdio did not exit after stdin EOF")
 	}
 }
+
+func TestMCPProfilesWatchAndEventsTools(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/agents/watches":
+			_, _ = w.Write([]byte(`{"watch":{"id":"w-test1","target_name":"worker-1","events":["idle"]}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/events":
+			_, _ = w.Write([]byte(`{"ok":true,"event":{"id":42,"type":"external.event"}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/events":
+			_, _ = w.Write([]byte(`{"events":[{"id":42,"type":"external.event","title":"Deployed"}]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/personal/mcp/tools":
+			_, _ = w.Write([]byte(`{"tools":[{"full_name":"mcp__gcal__list_events","server_name":"gcal","remote_name":"list_events","description":"List events","input_schema":{"type":"object","properties":{}}}]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/personal/vault/search":
+			_, _ = w.Write([]byte(`{"query":"kyoto","hits":[{"vault":"agent","path":"Inbox/trip.md"}]}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/personal/mcp/call":
+			_, _ = w.Write([]byte(`{"result":{"items":["ok"]}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	auto := false
+
+	// Core profile includes fleet_watch_agent, fleet_events_emit, fleet_events_list and excludes personal_* tools.
+	coreResps := runMCPSequential(t, ServeOpts{Harness: "antigravity", Profile: "core", APIURL: srv.URL, AutoListen: &auto}, []string{
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fleet_watch_agent","arguments":{"action":"create","target":"worker-1","session_id":"laptop:antigravity:s1"}}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fleet_events_emit","arguments":{"title":"Deployed"}}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"fleet_events_list","arguments":{"limit":10}}}`,
+		`{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"personal_vault_search","arguments":{"query":"kyoto"}}}`,
+	})
+	if !strings.Contains(coreResps[0], "fleet_watch_agent") || !strings.Contains(coreResps[0], "fleet_events_emit") || strings.Contains(coreResps[0], "personal_vault_search") {
+		t.Fatalf("unexpected core profile tools/list: %s", coreResps[0])
+	}
+	if !strings.Contains(coreResps[1], "w-test1") || !strings.Contains(coreResps[2], "external.event") || !strings.Contains(coreResps[3], "Deployed") {
+		t.Fatalf("unexpected core tool call results: %+v", coreResps[1:4])
+	}
+	if !strings.Contains(coreResps[4], `"isError":true`) {
+		t.Fatalf("expected personal_vault_search rejected in core profile: %s", coreResps[4])
+	}
+
+	// Personal profile exposes only personal_vault_* + dynamic /v1/personal/mcp/tools and rejects core tools.
+	persResps := runMCPSequential(t, ServeOpts{Harness: "antigravity", Profile: "personal", APIURL: srv.URL, AutoListen: &auto}, []string{
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"personal_vault_search","arguments":{"query":"kyoto"}}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"mcp__gcal__list_events","arguments":{}}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"fleet_list_agents","arguments":{}}}`,
+	})
+	if !strings.Contains(persResps[0], "personal_vault_search") || !strings.Contains(persResps[0], "mcp__gcal__list_events") || strings.Contains(persResps[0], "fleet_list_agents") {
+		t.Fatalf("unexpected personal profile tools/list: %s", persResps[0])
+	}
+	if !strings.Contains(persResps[1], "Inbox/trip.md") || !strings.Contains(persResps[2], "items") {
+		t.Fatalf("unexpected personal profile call results: %+v", persResps[1:3])
+	}
+	if !strings.Contains(persResps[3], `"isError":true`) {
+		t.Fatalf("expected fleet_list_agents rejected in personal profile: %s", persResps[3])
+	}
+}

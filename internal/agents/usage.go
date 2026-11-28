@@ -106,8 +106,8 @@ func (h *Hub) UpsertUsage(u HarnessUsage) (HarnessUsage, error) {
 	}
 
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if err := h.checkOpenLocked(); err != nil {
+		h.mu.Unlock()
 		return HarnessUsage{}, err
 	}
 
@@ -115,22 +115,29 @@ func (h *Hub) UpsertUsage(u HarnessUsage) (HarnessUsage, error) {
 		SELECT harness, device, source, plan, status, detail, windows_json, metrics_json, updated_at
 		FROM harness_usage WHERE harness = ?
 	`, norm.Harness)
+	var prevPtr *HarnessUsage
 	existing, err := scanUsageRow(row)
 	if err == nil {
+		prevCopy := existing
+		prevPtr = &prevCopy
 		if existing.Status == "ok" && norm.Status != "ok" {
+			h.mu.Unlock()
 			return existing, nil
 		}
 		if existing.Status == "ok" && norm.Status == "ok" && len(existing.Windows) > 0 && len(norm.Windows) == 0 {
 			if ts, ok := parseUsageTime(existing.UpdatedAt); ok && time.Since(ts) < 24*time.Hour {
+				h.mu.Unlock()
 				return existing, nil
 			}
 		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
+		h.mu.Unlock()
 		return HarnessUsage{}, err
 	}
 
 	winBytes, err := json.Marshal(norm.Windows)
 	if err != nil {
+		h.mu.Unlock()
 		return HarnessUsage{}, err
 	}
 	metBytes := []byte("{}")
@@ -153,8 +160,13 @@ func (h *Hub) UpsertUsage(u HarnessUsage) (HarnessUsage, error) {
 			metrics_json = excluded.metrics_json,
 			updated_at = excluded.updated_at
 	`, norm.Harness, norm.Device, norm.Source, norm.Plan, norm.Status, norm.Detail, string(winBytes), string(metBytes), norm.UpdatedAt)
+	cb := h.onUsage
+	h.mu.Unlock()
 	if err != nil {
 		return HarnessUsage{}, err
+	}
+	if cb != nil {
+		cb(prevPtr, norm)
 	}
 	return norm, nil
 }

@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -111,9 +110,13 @@ type Engine struct {
 	subMu       sync.Mutex
 	subscribers map[chan StreamEvent]struct{}
 
-	delMu                sync.RWMutex
-	hasActiveDelegations bool
-	notifier             Notifier
+	notifyMu sync.RWMutex
+	notifier Notifier
+
+	routerMu       sync.Mutex
+	lastEscalate   map[string]time.Time
+	waitingAlerted map[string]string
+	certAlerted    map[string]string
 
 	discordMu             sync.RWMutex
 	discordSyncMu         sync.Mutex
@@ -170,14 +173,16 @@ func Open(dbPath, configPath, defaultVaultDir string, deps FleetDeps) (*Engine, 
 		cfg:             cfg,
 		observedMaxID:   make(map[string]int64),
 		subscribers:     make(map[chan StreamEvent]struct{}),
+		lastEscalate:    make(map[string]time.Time),
+		waitingAlerted:  make(map[string]string),
+		certAlerted:     make(map[string]string),
 		discordReloadCh: make(chan struct{}, 1),
 		notifyCh:        make(chan struct{}, 1),
 	}
-	e.refreshDelegationsFlag()
 	return e, nil
 }
 
-// Start launches the single inbox worker and 30s timer/heartbeat scheduler.
+// Start launches the inbox worker, event bus router, 30s scheduler, and optional Discord gateway.
 func (e *Engine) Start(parent context.Context) {
 	e.cfgMu.Lock()
 	if e.cancel != nil {
@@ -188,10 +193,11 @@ func (e *Engine) Start(parent context.Context) {
 	e.cancel = cancel
 	e.stopCh = make(chan struct{})
 	e.stopped = false
-	e.wg.Add(3)
+	e.wg.Add(4)
 	e.cfgMu.Unlock()
 
 	go e.runWorker(ctx)
+	go e.runEventRouter(ctx)
 	go e.runScheduler(ctx)
 	go e.runDiscordGateway(ctx)
 }
@@ -749,9 +755,12 @@ func (e *Engine) runScheduler(ctx context.Context) {
 				e.SyncAllVaultIndexes(ctx)
 			}
 			if !cfg.Enabled || (strings.TrimSpace(cfg.APIKey) == "" && strings.TrimSpace(cfg.APIKeyOPRef) == "" && !cfg.LocalLLM.Enabled) {
+				if e.deps != nil {
+					e.deps.SweepStaleAgents(now)
+				}
 				continue
 			}
-			e.reconcileActiveDelegations(now)
+			e.runEventSweeps(ctx, now, tickCount)
 			nowISO := now.UTC().Truncate(time.Second).Format("2006-01-02T15:04:05+00:00")
 			if due, err := e.store.DueTimers(nowISO); err == nil {
 				for _, t := range due {
@@ -807,8 +816,13 @@ func (e *Engine) processInboxEvent(ctx context.Context, ev InboxEvent) error {
 	}
 	if ev.Source != "chat" && userText != "" {
 		prefix := ev.Source
-		if ev.Source == "delegation" {
-			prefix = "delegation_update"
+		switch ev.Source {
+		case "agent_watch":
+			prefix = "agent_watch"
+		case "agent_message":
+			prefix = "agent_message"
+		case "event":
+			prefix = "event"
 		}
 		_, _ = e.store.AppendMessage(Message{
 			ChannelID:    ch.ID,
@@ -1337,286 +1351,10 @@ func (e *Engine) pauseForApproval(ctx context.Context, ch Channel, model string,
 	return nil
 }
 
-var delegationSlugWordRE = regexp.MustCompile(`[a-z0-9]+`)
-
-func slugifyDelegationName(text string) string {
-	tokens := delegationSlugWordRE.FindAllString(strings.ToLower(text), -1)
-	if len(tokens) == 0 {
-		return ""
-	}
-	if len(tokens) > 5 {
-		tokens = tokens[:5]
-	}
-	slug := strings.Join(tokens, "-")
-	if len(slug) > 32 {
-		slug = slug[:32]
-	}
-	return strings.TrimRight(slug, "-")
-}
-
-func delegationNameMatches(delegationName, heartbeatName string) bool {
-	delClean := strings.TrimSpace(delegationName)
-	hbClean := strings.TrimSpace(heartbeatName)
-	if delClean == "" || hbClean == "" {
-		return false
-	}
-	if strings.EqualFold(delClean, hbClean) {
-		return true
-	}
-	delSlug := slugifyDelegationName(delClean)
-	return delSlug != "" && delSlug == slugifyDelegationName(hbClean)
-}
-
-func (e *Engine) refreshDelegationsFlag() {
-	active, err := e.store.ListActiveDelegations()
-	e.delMu.Lock()
-	e.hasActiveDelegations = err == nil && len(active) > 0
-	e.delMu.Unlock()
-}
-
-// OnSlackerReceipt updates assistant delegation state when a Slacker spawn job launches or fails.
-func (e *Engine) OnSlackerReceipt(jobID, device, sessionName, sessionID, status, errMsg string) {
-	if e == nil || strings.TrimSpace(jobID) == "" {
-		return
-	}
-	e.delMu.RLock()
-	activeFlag := e.hasActiveDelegations
-	e.delMu.RUnlock()
-	if !activeFlag {
-		return
-	}
-	dels, err := e.store.ListActiveDelegations()
-	if err != nil {
-		return
-	}
-	for _, d := range dels {
-		matched := (d.JobID != "" && d.JobID == jobID) || (d.TargetDevice == device && delegationNameMatches(d.SessionName, sessionName))
-		if !matched {
-			continue
-		}
-		if status == "failed" {
-			_ = e.store.UpdateDelegationState(d.ID, "", "failed", "failed")
-			e.refreshDelegationsFlag()
-			prompt := fmt.Sprintf("Delegated %s task %q on %s failed to launch: %s", d.Harness, d.SessionName, d.TargetDevice, cmp.Or(errMsg, "unknown error"))
-			dedupe := fmt.Sprintf("del:%s:failed", d.ID)
-			if _, ins, qErr := e.store.EnqueueInbox(d.ChannelID, "delegation", dedupe, map[string]any{"delegation_id": d.ID, "prompt": prompt}, ""); qErr == nil && ins {
-				e.publishEvent(StreamEvent{Type: "delegation", ChannelID: d.ChannelID, Data: map[string]any{"id": d.ID, "status": "failed", "error": errMsg}})
-				e.notify()
-			}
-			return
-		}
-		if status == "launched" {
-			nextStatus := ""
-			if d.Status == "queued" {
-				nextStatus = "launched"
-			}
-			if nextStatus != "" || (sessionID != "" && d.SessionID == "") {
-				_ = e.store.UpdateDelegationState(d.ID, sessionID, nextStatus, "")
-				e.publishEvent(StreamEvent{Type: "delegation", ChannelID: d.ChannelID, Data: map[string]any{
-					"id":         d.ID,
-					"session_id": cmp.Or(sessionID, d.SessionID),
-					"status":     cmp.Or(nextStatus, d.Status),
-				}})
-			}
-		}
-		return
-	}
-}
-
-func shouldNotifyDelegationState(prevStatus, state string) bool {
-	switch state {
-	case "waiting_permission", "waiting_question":
-		return true
-	case "exited":
-		return prevStatus != "idle"
-	case "idle":
-		return prevStatus == "queued" || prevStatus == "working" || prevStatus == "launched" || prevStatus == "waiting_permission" || prevStatus == "waiting_question"
-	default:
-		return false
-	}
-}
-
-// OnAgentHeartbeat checks active delegations and wakes the assistant when a delegated agent blocks, idles, or exits.
-func (e *Engine) OnAgentHeartbeat(device, harness, sessionID, name, state, summary, gitStatus, lastAssistant string, pendingAction map[string]string) {
-	if e == nil {
-		return
-	}
-	e.delMu.RLock()
-	activeFlag := e.hasActiveDelegations
-	e.delMu.RUnlock()
-	if !activeFlag {
-		return
-	}
-	dels, err := e.store.ListActiveDelegations()
-	if err != nil {
-		return
-	}
-	for _, d := range dels {
-		matched := (d.SessionID != "" && d.SessionID == sessionID) ||
-			(d.TargetDevice == device && delegationNameMatches(d.SessionName, name))
-		if !matched {
-			continue
-		}
-		if !shouldNotifyDelegationState(d.Status, state) {
-			if d.SessionID == "" || d.Status != state || (state == "working" && d.LastNotifiedState != "") {
-				_ = e.store.UpdateDelegationState(d.ID, sessionID, state, "")
-			}
-			if state == "exited" {
-				e.refreshDelegationsFlag()
-			}
-			continue
-		}
-		if d.LastNotifiedState == state {
-			continue
-		}
-		e.notifyDelegationStateChange(d, device, harness, sessionID, name, state, summary, gitStatus, lastAssistant, pendingAction)
-	}
-}
-
-func (e *Engine) notifyDelegationStateChange(d Delegation, device, harness, sessionID, name, state, summary, gitStatus, lastAssistant string, pendingAction map[string]string) {
-	_ = e.store.UpdateDelegationState(d.ID, sessionID, state, state)
-	if state == "exited" {
-		e.refreshDelegationsFlag()
-	}
-	var details []string
-	if summary != "" {
-		details = append(details, "Summary: "+truncateText(summary, 300))
-	}
-	if len(pendingAction) > 0 {
-		if rawPA, mErr := json.Marshal(pendingAction); mErr == nil {
-			details = append(details, "Pending action: "+string(rawPA))
-		}
-	}
-	if lastAssistant != "" {
-		details = append(details, "Last response: "+truncateText(lastAssistant, 600))
-	}
-	if gitStatus != "" {
-		details = append(details, "Git status: "+truncateText(gitStatus, 250))
-	}
-	prompt := fmt.Sprintf("Delegated %s session %s (%s on %s) transitioned to %s. Call `fleet_inspect_agent` to read the final output or blocker details, and give a concise update in #%s.",
-		harness, cmp.Or(name, sessionID), sessionID, device, state, d.ChannelID)
-	if len(details) > 0 {
-		prompt += "\n" + strings.Join(details, "\n")
-	}
-	dedupe := fmt.Sprintf("del:%s:%s:%d", d.ID, state, time.Now().UTC().UnixNano())
-	if _, ins, qErr := e.store.EnqueueInbox(d.ChannelID, "delegation", dedupe, map[string]any{"delegation_id": d.ID, "session_id": sessionID, "state": state, "prompt": prompt}, ""); qErr == nil && ins {
-		e.publishEvent(StreamEvent{Type: "delegation", ChannelID: d.ChannelID, Data: map[string]any{"id": d.ID, "session_id": sessionID, "status": state}})
-		e.notify()
-	}
-}
-
-type agentSnapshot struct {
-	SessionID     string            `json:"session_id"`
-	Device        string            `json:"device"`
-	Harness       string            `json:"harness"`
-	Name          string            `json:"name"`
-	State         string            `json:"state"`
-	Live          *bool             `json:"live"`
-	Summary       string            `json:"summary"`
-	GitStatus     string            `json:"git_status"`
-	PendingAction map[string]string `json:"pending_action"`
-}
-
-func (e *Engine) loadAgentSnapshots() ([]agentSnapshot, bool) {
-	raw, err := e.deps.ListAgents("", "", "", "", true)
-	if err != nil {
-		return nil, false
-	}
-	if raw == nil {
-		return nil, true
-	}
-	b, mErr := json.Marshal(raw)
-	if mErr != nil {
-		return nil, false
-	}
-	var snaps []agentSnapshot
-	if uErr := json.Unmarshal(b, &snaps); uErr != nil {
-		return nil, false
-	}
-	return snaps, true
-}
-
-func (e *Engine) reconcileActiveDelegations(now time.Time) {
-	if e == nil || e.deps == nil {
-		return
-	}
-	e.delMu.RLock()
-	activeFlag := e.hasActiveDelegations
-	e.delMu.RUnlock()
-	if !activeFlag {
-		return
-	}
-	dels, err := e.store.ListActiveDelegations()
-	if err != nil {
-		return
-	}
-	if len(dels) == 0 {
-		e.refreshDelegationsFlag()
-		return
-	}
-	snaps, ok := e.loadAgentSnapshots()
-	if !ok {
-		return
-	}
-	for _, d := range dels {
-		e.reconcileOneDelegation(now, d, snaps)
-	}
-}
-
-func findMatchingSnapshot(d Delegation, snaps []agentSnapshot) *agentSnapshot {
-	for i := range snaps {
-		s := &snaps[i]
-		if (d.SessionID != "" && d.SessionID == s.SessionID) ||
-			(d.TargetDevice == s.Device && delegationNameMatches(d.SessionName, s.Name)) {
-			return s
-		}
-	}
-	return nil
-}
-
-func (e *Engine) reconcileOneDelegation(now time.Time, d Delegation, snaps []agentSnapshot) {
-	if s := findMatchingSnapshot(d, snaps); s != nil {
-		effState := s.State
-		if s.Live != nil && !*s.Live {
-			effState = "exited"
-		}
-		needsSync := (d.SessionID == "" && s.SessionID != "") ||
-			d.Status != effState ||
-			(shouldNotifyDelegationState(d.Status, effState) && d.LastNotifiedState != effState)
-		if effState != "" && needsSync {
-			e.OnAgentHeartbeat(s.Device, s.Harness, s.SessionID, s.Name, effState, s.Summary, s.GitStatus, "", s.PendingAction)
-		}
-		return
-	}
-	e.reconcileMissingDelegation(now, d)
-}
-
-func (e *Engine) reconcileMissingDelegation(now time.Time, d Delegation) {
-	if d.Status == "queued" && d.LastNotifiedState == "" {
-		if createdAt, pErr := time.Parse(time.RFC3339, d.CreatedAt); pErr == nil && now.Sub(createdAt) >= 3*time.Minute {
-			_ = e.store.UpdateDelegationState(d.ID, "", "", "queued_timeout")
-			prompt := fmt.Sprintf("Delegated %s task %q on %s is still queued after 3 minutes (worker on %s may be offline or asleep). Check worker status or inform the user in #%s.",
-				d.Harness, d.SessionName, d.TargetDevice, d.TargetDevice, d.ChannelID)
-			dedupe := fmt.Sprintf("del:%s:queued_timeout", d.ID)
-			if _, ins, qErr := e.store.EnqueueInbox(d.ChannelID, "delegation", dedupe, map[string]any{"delegation_id": d.ID, "status": "queued_timeout", "prompt": prompt}, ""); qErr == nil && ins {
-				e.publishEvent(StreamEvent{Type: "delegation", ChannelID: d.ChannelID, Data: map[string]any{"id": d.ID, "status": "queued_timeout"}})
-				e.notify()
-			}
-		}
-		return
-	}
-	if d.Status == "idle" {
-		if updatedAt, pErr := time.Parse(time.RFC3339, d.UpdatedAt); pErr == nil && now.Sub(updatedAt) >= 24*time.Hour {
-			_ = e.store.UpdateDelegationState(d.ID, "", "exited", "")
-			e.refreshDelegationsFlag()
-		}
-	}
-}
-
 func (e *Engine) activeNotifier(cfg NotificationsConfig) Notifier {
-	e.delMu.RLock()
+	e.notifyMu.RLock()
 	custom := e.notifier
-	e.delMu.RUnlock()
+	e.notifyMu.RUnlock()
 	if custom != nil {
 		return custom
 	}

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bdatdo0601/fleet/internal/agents"
 	"github.com/bdatdo0601/fleet/internal/assistant"
 	"github.com/bdatdo0601/fleet/internal/core"
 	"github.com/bdatdo0601/fleet/internal/registry"
@@ -532,12 +533,31 @@ func registerAssistantActionRoutes(
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return nil
 	}))
-	mux.HandleFunc("GET /v1/assistant/delegations", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
-		list, err := fleet.Assistant.Store().ListDelegations(queryInt(r, "limit"))
+	registerAssistantFeedRoutes(mux, fleet, route)
+}
+
+func registerAssistantFeedRoutes(
+	mux *http.ServeMux,
+	fleet *core.Fleet,
+	route func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc,
+) {
+	mux.HandleFunc("GET /v1/assistant/delegations", route(true, func(w http.ResponseWriter, _ *http.Request, _ *registry.Device) error {
+		watches, err := fleet.Agents.ListWatches(agents.AssistantDevice, "", "")
 		if err != nil {
 			return err
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"delegations": list})
+		if watches == nil {
+			watches = []agents.Watch{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"delegations": watches, "watches": watches})
+		return nil
+	}))
+	mux.HandleFunc("GET /v1/assistant/inbox", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		items, err := fleet.Assistant.Store().ListInbox(r.URL.Query().Get("status"), queryInt(r, "limit"))
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": items})
 		return nil
 	}))
 	mux.HandleFunc("POST /v1/assistant/notifications/test", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {

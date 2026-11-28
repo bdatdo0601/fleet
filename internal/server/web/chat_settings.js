@@ -18,6 +18,14 @@ export async function openAssistantSettingsModal(onSaved, onNavigate) {
   const autoApproveChk = el("input", { type: "checkbox", checked: Boolean(cfg.auto_approve) });
   const apiKeyIn = el("input", { type: "password", placeholder: cfg.api_key_hint ? `Current: ${cfg.api_key_hint}` : "sk-or-v1-..." });
   const vaultIn = el("input", { type: "text", value: cfg.vault_path || "", placeholder: cfg.effective_vault_path || "" });
+  const vaultExposureSel = el(
+    "select",
+    null,
+    ...[
+      { value: "assistant_only", label: "assistant_only (default)" },
+      { value: "personal_devices", label: "personal_devices (personal MCP profile)" },
+    ].map((opt) => el("option", { value: opt.value, text: opt.label, selected: (cfg.vault_exposure || "assistant_only") === opt.value })),
+  );
   const defaultChatIn = el("input", { type: "text", value: models.default_chat || "" });
   const fastIn = el("input", { type: "text", value: models.fast || "" });
   const frontierIn = el("input", { type: "text", value: models.frontier || "" });
@@ -44,7 +52,7 @@ export async function openAssistantSettingsModal(onSaved, onNavigate) {
     rows: "4",
     className: "mono",
     value: JSON.stringify(cfg.extra_vaults || [], null, 2),
-    placeholder: `[{"name":"personal","path":"~/personal-vault","read_only":false,"auto_write_dirs":["Inbox"]}]`,
+    placeholder: `[{"name":"personal","path":"~/personal-vault","exposure":"assistant_only","read_only":false,"auto_write_dirs":["Inbox"]}]`,
   });
   const mcpIn = el("textarea", { rows: "5", className: "mono", value: JSON.stringify(cfg.mcp_servers || [], null, 2) });
   const mcpStatusBox = el("div", { className: "stack-sm" });
@@ -125,6 +133,7 @@ export async function openAssistantSettingsModal(onSaved, onNavigate) {
               { className: "gen-mini-row" },
               el("strong", { text: srv.name }),
               badge(srv.transport || "stdio", "neutral"),
+              badge(srv.exposure === "personal_devices" ? "personal_devices" : "assistant_only", srv.exposure === "personal_devices" ? "ok" : "neutral"),
               oauthOn ? badge(st.oauth_authorized ? "OAuth: Authorized" : "OAuth: Not connected", st.oauth_authorized ? "ok" : "warn") : null,
             ),
             el("div", { className: "small muted", text: detail }),
@@ -208,6 +217,13 @@ export async function openAssistantSettingsModal(onSaved, onNavigate) {
   const embedURLIn = el("input", { type: "text", value: embedCfg.base_url || "", placeholder: "http://127.0.0.1:11434" });
   const embedModelIn = el("input", { type: "text", value: embedCfg.model || "", placeholder: "nomic-embed-text" });
   const embedKeepAliveIn = el("input", { type: "text", value: embedCfg.keep_alive || "", placeholder: "5m" });
+  const evCfg = cfg.events || {};
+  const evEnabledChk = el("input", { type: "checkbox", checked: evCfg.enabled !== false });
+  const evQuietStartIn = el("input", { type: "text", value: evCfg.quiet_hours_start || "23:00", placeholder: "23:00" });
+  const evQuietEndIn = el("input", { type: "text", value: evCfg.quiet_hours_end || "07:00", placeholder: "07:00" });
+  const evTZIn = el("input", { type: "text", value: evCfg.timezone || "Local", placeholder: "Local" });
+  const evDwellIn = el("input", { type: "number", min: "1", value: String(evCfg.waiting_dwell_minutes ?? 5) });
+  const evCooldownIn = el("input", { type: "number", min: "1", value: String(evCfg.escalation_cooldown_minutes ?? 30) });
   const transCfg = cfg.transcribe || {};
   const transEnabledChk = el("input", { type: "checkbox", checked: Boolean(transCfg.enabled) });
   const transAutoChk = el("input", { type: "checkbox", checked: transCfg.auto_transcribe !== false });
@@ -243,6 +259,7 @@ export async function openAssistantSettingsModal(onSaved, onNavigate) {
     el("label", { className: "check-row" }, autoApproveChk, el("span", { text: "Auto-approve all tool calls & frontier escalations (bypass HITL)" })),
     field("OpenRouter API Key (leave blank to keep current)", apiKeyIn),
     field("Obsidian Vault Path on Lighthouse", vaultIn, el("div", { className: "small muted", text: `Active: ${cfg.effective_vault_path || ""}` })),
+    field("Primary Vault Exposure (MCP Profile)", vaultExposureSel),
     field(
       "Mounted Extra Vaults (JSON)",
       extraVaultsIn,
@@ -373,6 +390,17 @@ export async function openAssistantSettingsModal(onSaved, onNavigate) {
       field("Model", embedModelIn),
       field("Keep Alive", embedKeepAliveIn),
     ),
+    el("h4", { className: "mt-2", text: "Events & Smart Alerting" }),
+    el("label", { className: "check-row" }, evEnabledChk, el("span", { text: "Enable smart event routing from Event Bus (#events log always stays on)" })),
+    el(
+      "div",
+      { className: "grid-2" },
+      field("Quiet Hours Start (HH:MM)", evQuietStartIn),
+      field("Quiet Hours End (HH:MM)", evQuietEndIn),
+      field("Timezone (Local, UTC, IANA)", evTZIn),
+      field("Waiting Dwell Alert (mins)", evDwellIn),
+      field("Escalation Cooldown (mins)", evCooldownIn),
+    ),
     el("h4", { className: "mt-2", text: "Local Voice Transcription (Whisper)" }),
     el("label", { className: "check-row" }, transEnabledChk, el("span", { text: "Enable local whisper-cli + ffmpeg transcription" })),
     el("label", { className: "check-row" }, transAutoChk, el("span", { text: "Auto-transcribe uploaded voice/audio attachments on arrival" })),
@@ -471,6 +499,7 @@ export async function openAssistantSettingsModal(onSaved, onNavigate) {
             base_url: cfg.base_url,
             data_collection: cfg.data_collection,
             vault_path: vaultIn.value.trim(),
+            vault_exposure: vaultExposureSel.value,
             auto_write_dirs: cfg.auto_write_dirs,
             extra_vaults: extraVaults,
             git_auto_commit: cfg.git_auto_commit !== false,
@@ -495,6 +524,15 @@ export async function openAssistantSettingsModal(onSaved, onNavigate) {
               grant_max_cost_usd: Number.parseFloat(grantCostIn.value || "0.25") || 0.25,
               grant_idle_minutes: Number.parseInt(grantIdleIn.value || "25", 10) || 25,
               daily_soft_cap_usd: Math.max(0, Number.parseFloat(dailyCapIn.value || "0") || 0),
+            },
+            events: {
+              ...evCfg,
+              enabled: evEnabledChk.checked,
+              quiet_hours_start: evQuietStartIn.value.trim() || "23:00",
+              quiet_hours_end: evQuietEndIn.value.trim() || "07:00",
+              timezone: evTZIn.value.trim() || "Local",
+              waiting_dwell_minutes: Math.max(1, Number.parseInt(evDwellIn.value || "5", 10) || 5),
+              escalation_cooldown_minutes: Math.max(1, Number.parseInt(evCooldownIn.value || "30", 10) || 30),
             },
             mcp_servers: mcpServers,
             notifications: {

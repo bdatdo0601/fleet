@@ -1242,7 +1242,7 @@ func (e *Engine) sendDiscordMirrorChunk(ctx context.Context, api *discordAPI, to
 }
 
 func (e *Engine) mirrorTurnToDiscord(ctx context.Context, cfg Config, ch Channel, opts turnOptions, content string, widgets []WidgetPayload) {
-	if !cfg.Discord.Enabled {
+	if !cfg.Discord.Enabled || ch.ID == "events" {
 		return
 	}
 	discChannelID := cfg.Discord.Channels[ch.ID]
@@ -1274,11 +1274,15 @@ func (e *Engine) mirrorTurnToDiscord(ctx context.Context, cfg Config, ch Channel
 	if len(chunks) == 0 && (len(embeds) > 0 || len(attachments) > 0) {
 		chunks = []string{""}
 	}
+	e.deliverDiscordMirrorChunks(ctx, tok, ch.ID, discChannelID, deepLink, opts.ReplyToExternalID, chunks, embeds, attachments)
+}
+
+func (e *Engine) deliverDiscordMirrorChunks(ctx context.Context, tok, fleetChID, discChannelID, deepLink, replyTo string, chunks []string, embeds []map[string]any, attachments []discordUploadFile) {
 	api := e.discordClient()
 	for i, chunk := range chunks {
 		payload := map[string]any{"content": chunk}
-		if i == 0 && opts.ReplyToExternalID != "" {
-			payload["message_reference"] = map[string]string{"message_id": opts.ReplyToExternalID}
+		if i == 0 && replyTo != "" {
+			payload["message_reference"] = map[string]string{"message_id": replyTo}
 		}
 		var chunkAtts []discordUploadFile
 		if i == len(chunks)-1 {
@@ -1288,7 +1292,7 @@ func (e *Engine) mirrorTurnToDiscord(ctx context.Context, cfg Config, ch Channel
 			chunkAtts = attachments
 		}
 		if msgID, pErr := e.sendDiscordMirrorChunk(ctx, api, tok, discChannelID, deepLink, payload, chunkAtts); pErr == nil && msgID != "" {
-			_ = e.store.SetDiscordCursor(ch.ID, discChannelID, msgID)
+			_ = e.store.SetDiscordCursor(fleetChID, discChannelID, msgID)
 		}
 	}
 }
@@ -1344,7 +1348,7 @@ func buildOutboxDiscordPayload(item OutboxItem, deepLink string) map[string]any 
 }
 
 func (e *Engine) sendOutboxToDiscord(ctx context.Context, cfg Config, item OutboxItem) bool {
-	if !cfg.Discord.Enabled {
+	if !cfg.Discord.Enabled || item.ChannelID == "events" {
 		return false
 	}
 	discChannelID := cfg.Discord.Channels[item.ChannelID]
@@ -1680,6 +1684,9 @@ func (e *Engine) syncFleetToDiscord(
 		return nil, err
 	}
 	for _, fch := range fleetChannels {
+		if fch.ID == "events" {
+			continue
+		}
 		if existingID := nextMap[fch.ID]; existingID != "" {
 			if _, ok := byID[existingID]; ok {
 				continue
@@ -1726,7 +1733,7 @@ func (e *Engine) syncDiscordToFleet(
 			continue
 		}
 		slug := sanitizeFleetChannelID(dc.Name)
-		if slug == "" || nextMap[slug] != "" {
+		if slug == "" || slug == "events" || nextMap[slug] != "" {
 			continue
 		}
 		if _, uErr := e.store.UpsertChannel(slug, "#"+slug, dc.Topic, ""); uErr != nil {

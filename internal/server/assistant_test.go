@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bdatdo0601/fleet/internal/agents"
 	"github.com/bdatdo0601/fleet/internal/assistant"
 	"github.com/bdatdo0601/fleet/internal/client"
 	"github.com/bdatdo0601/fleet/internal/registry"
@@ -602,7 +603,7 @@ func TestAssistantAutoApproveRoutes(t *testing.T) {
 	}
 }
 
-func TestDelegationReceiptBindAndDeregisterWakeup(t *testing.T) {
+func TestWatchReceiptAndDeregisterWakeup(t *testing.T) {
 	var step atomic.Int32
 	var gotExitWakeup atomic.Bool
 	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -624,7 +625,7 @@ func TestDelegationReceiptBindAndDeregisterWakeup(t *testing.T) {
 				if strings.Contains(string(bodyBytes), "office:antigravity:conv-srv-123") && strings.Contains(string(bodyBytes), "exited") {
 					gotExitWakeup.Store(true)
 				}
-				_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"Delegated session exited.\"}}]}\n\n"))
+				_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"Watched session exited.\"}}]}\n\n"))
 				_, _ = w.Write([]byte("data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n"))
 			}
 			_, _ = w.Write([]byte("data: [DONE]\n\n"))
@@ -644,64 +645,62 @@ func TestDelegationReceiptBindAndDeregisterWakeup(t *testing.T) {
 		t.Fatalf("POST /v1/assistant/messages failed: %d (%s)", st, string(b))
 	}
 
-	var del assistant.Delegation
+	var watch agents.Watch
 	dl := time.Now().Add(4 * time.Second)
 	for time.Now().Before(dl) {
 		var res struct {
-			Delegations []assistant.Delegation `json:"delegations"`
+			Watches []agents.Watch `json:"watches"`
 		}
-		if err := client.Call(srv.URL, http.MethodGet, "/v1/assistant/delegations", nil, 3*time.Second, nil, &res); err == nil && len(res.Delegations) > 0 {
-			del = res.Delegations[0]
+		if err := client.Call(srv.URL, http.MethodGet, "/v1/agents/watches?watcher=assistant", nil, 3*time.Second, nil, &res); err == nil && len(res.Watches) > 0 {
+			watch = res.Watches[0]
 			break
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	if del.ID == "" || del.JobID == "" {
-		t.Fatalf("expected created delegation, got %+v", del)
+	if watch.ID == "" || watch.TargetName != "ui-agy-srv1" {
+		t.Fatalf("expected created assistant watch, got %+v", watch)
 	}
 
-	// Simulate office worker polling job and posting launch receipt with raw_session_id.
+	// Simulate office worker polling job and posting launch receipt, then heartbeat binding watch -> deregister wakeup.
 	f.IdentifyOverride = func(string) *registry.Device { return office }
 	var pollRes struct {
 		Job *slacker.Job `json:"job"`
 	}
-	if err := client.Call(srv.URL, http.MethodPost, "/v1/slacker/worker/poll", map[string]any{"timeout": 0.2}, 3*time.Second, nil, &pollRes); err != nil || pollRes.Job == nil || pollRes.Job.ID != del.JobID {
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/slacker/worker/poll", map[string]any{"timeout": 0.2}, 3*time.Second, nil, &pollRes); err != nil || pollRes.Job == nil {
 		t.Fatalf("worker poll failed: %+v (err=%v)", pollRes, err)
 	}
 	if err := client.Call(srv.URL, http.MethodPost, "/v1/slacker/worker/receipt", slacker.Receipt{
-		JobID:        del.JobID,
+		JobID:        pollRes.Job.ID,
 		ReceiptID:    "rcpt-srv-1",
-		SessionName:  del.SessionName,
+		SessionName:  pollRes.Job.SessionName,
 		RawSessionID: "conv-srv-123",
 		Backend:      "app",
 		Status:       "launched",
 	}, 3*time.Second, nil, nil); err != nil {
 		t.Fatalf("worker receipt failed: %v", err)
 	}
-	f.IdentifyOverride = nil
-
-	var delAfterReceipt assistant.Delegation
-	var res struct {
-		Delegations []assistant.Delegation `json:"delegations"`
-	}
-	if err := client.Call(srv.URL, http.MethodGet, "/v1/assistant/delegations", nil, 3*time.Second, nil, &res); err != nil || len(res.Delegations) == 0 {
-		t.Fatalf("GET /v1/assistant/delegations failed: %v", err)
-	}
-	delAfterReceipt = res.Delegations[0]
-	if delAfterReceipt.SessionID != "office:antigravity:conv-srv-123" || delAfterReceipt.Status != "launched" {
-		t.Fatalf("expected receipt to bind session_id=office:antigravity:conv-srv-123 and status=launched, got %+v", delAfterReceipt)
-	}
-
-	// Heartbeat working then deregister via POST /v1/agents/deregister -> assistant wakes with exited event.
-	f.IdentifyOverride = func(string) *registry.Device { return office }
 	if err := client.Call(srv.URL, http.MethodPost, "/v1/agents/heartbeat", map[string]any{
 		"harness": "antigravity",
 		"raw_id":  "conv-srv-123",
+		"name":    "ui-agy-srv1",
 		"state":   "working",
 		"cwd":     "/tmp/repo",
 	}, 3*time.Second, nil, nil); err != nil {
 		t.Fatalf("heartbeat failed: %v", err)
 	}
+	f.IdentifyOverride = nil
+
+	var watchesAfterHB struct {
+		Watches []agents.Watch `json:"watches"`
+	}
+	if err := client.Call(srv.URL, http.MethodGet, "/v1/agents/watches?watcher=assistant", nil, 3*time.Second, nil, &watchesAfterHB); err != nil || len(watchesAfterHB.Watches) == 0 {
+		t.Fatalf("GET /v1/agents/watches failed: %v", err)
+	}
+	if watchesAfterHB.Watches[0].TargetSession != "office:antigravity:conv-srv-123" {
+		t.Fatalf("expected heartbeat to bind target_session=office:antigravity:conv-srv-123, got %+v", watchesAfterHB.Watches[0])
+	}
+
+	f.IdentifyOverride = func(string) *registry.Device { return office }
 	if err := client.Call(srv.URL, http.MethodPost, "/v1/agents/deregister", map[string]any{
 		"session_id": "office:antigravity:conv-srv-123",
 	}, 3*time.Second, nil, nil); err != nil {
@@ -714,17 +713,17 @@ func TestDelegationReceiptBindAndDeregisterWakeup(t *testing.T) {
 		time.Sleep(25 * time.Millisecond)
 	}
 	if !gotExitWakeup.Load() {
-		t.Fatalf("expected assistant to wake up on POST /v1/agents/deregister with exited delegation event")
+		t.Fatalf("expected assistant to wake up on POST /v1/agents/deregister via agent.watch")
 	}
 
-	var resAfterExit struct {
-		Delegations []assistant.Delegation `json:"delegations"`
+	var watchesAfterExit struct {
+		Watches []agents.Watch `json:"watches"`
 	}
-	if err := client.Call(srv.URL, http.MethodGet, "/v1/assistant/delegations", nil, 3*time.Second, nil, &resAfterExit); err != nil || len(resAfterExit.Delegations) == 0 {
-		t.Fatalf("GET /v1/assistant/delegations after exit failed: %v", err)
+	if err := client.Call(srv.URL, http.MethodGet, "/v1/agents/watches?watcher=assistant", nil, 3*time.Second, nil, &watchesAfterExit); err != nil {
+		t.Fatalf("GET /v1/agents/watches after exit failed: %v", err)
 	}
-	if resAfterExit.Delegations[0].Status != "exited" {
-		t.Fatalf("expected delegation status=exited after deregister, got %+v", resAfterExit.Delegations[0])
+	if len(watchesAfterExit.Watches) != 0 {
+		t.Fatalf("expected exited watch to be cleaned up, got %+v", watchesAfterExit.Watches)
 	}
 }
 

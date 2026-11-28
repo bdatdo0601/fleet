@@ -13,6 +13,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/bdatdo0601/fleet/internal/events"
 )
 
 // SpawnAgentRequest describes an assistant-initiated remote coding session launch.
@@ -46,22 +48,55 @@ type LighthouseWorkerStatus struct {
 	InDefaultDevices bool   `json:"in_default_devices,omitempty"`
 }
 
+// AgentWatchRequest describes a watch subscription created by the assistant.
+type AgentWatchRequest struct {
+	ChannelID string   `json:"channel_id"`
+	Target    string   `json:"target"`
+	Events    []string `json:"events,omitempty"`
+	Once      bool     `json:"once,omitempty"`
+}
+
+// AgentWatchInfo summarizes an active watch owned by an assistant channel.
+type AgentWatchInfo struct {
+	ID            string   `json:"id"`
+	ChannelID     string   `json:"channel_id"`
+	TargetSession string   `json:"target_session,omitempty"`
+	TargetDevice  string   `json:"target_device,omitempty"`
+	TargetName    string   `json:"target_name,omitempty"`
+	Events        []string `json:"events"`
+	Once          bool     `json:"once"`
+	CreatedAt     string   `json:"created_at"`
+	UpdatedAt     string   `json:"updated_at"`
+}
+
 // FleetDeps abstracts Fleet subsystem access so assistant does not import core/slacker/agents directly.
 type FleetDeps interface {
 	ListAgents(device, repo, harness, state string, includeStale bool) (any, error)
 	InspectAgent(target string) (any, error)
-	SendAgentMessage(fromDevice, to, body string) (any, error)
+	SendAgentMessage(fromChannel, to, body, threadID string, replyTo *int64) (any, error)
+	AskAgent(ctx context.Context, fromChannel, to, question string, timeoutSec float64) (any, error)
 	ListPaths(device, query string, limit int) (any, error)
 	SpawnAgent(ctx context.Context, req SpawnAgentRequest) (SpawnAgentResult, error)
 	KillAgent(ctx context.Context, sessionID string) (any, error)
+	WatchAgent(req AgentWatchRequest) (AgentWatchInfo, error)
+	ListWatches(channelID string) ([]AgentWatchInfo, error)
+	DeleteWatch(channelID, idOrTarget string) (int, error)
+	SweepStaleAgents(now time.Time)
+	SystemHealth() (map[string]any, error)
 	LighthouseWorkerStatus() LighthouseWorkerStatus
 	MemorySearch(query, scope, kind, tier string, limit int) (any, error)
 	MemoryGet(scope, key string) (any, error)
 	MemorySet(scope, key, kind, tier, summary, body string) (any, error)
 	MemoryContext(repo, device string) (string, error)
+	ListMemoryProposals(status string, limit int) (any, error)
+	DecideMemoryProposal(id int64, approve bool) (any, error)
 	SlackChannels(ctx context.Context, account string, includeAll bool, limit int) (any, error)
 	SlackRead(ctx context.Context, account, channel, threadTS, query string, limit int) (any, error)
 	SlackSend(ctx context.Context, account, channel, text, threadTS string) (any, error)
+	ListEvents(f events.Filter) ([]events.Event, error)
+	PublishEvent(ev events.Event) (events.Event, bool, error)
+	SubscribeEvents() chan events.Event
+	UnsubscribeEvents(ch chan events.Event)
 }
 
 type toolExecContext struct {
@@ -110,7 +145,25 @@ func makeToolSpec(name, desc string, params map[string]any) ToolSpec {
 }
 
 func (e *Engine) buildToolSpecs(ctx context.Context) []ToolSpec {
-	specs := []ToolSpec{
+	specs := fleetToolSpecs()
+	specs = append(specs, skillToolSpecs()...)
+	specs = append(specs, credentialAndMCPToolSpecs()...)
+	if e.Config().Sandbox.Enabled {
+		specs = append(specs, sandboxToolSpecs()...)
+	}
+	if e.Config().Transcribe.Enabled {
+		specs = append(specs, transcribeToolSpec())
+	}
+	if e.mcp != nil {
+		for _, ext := range e.mcp.ListTools(ctx) {
+			specs = append(specs, makeToolSpec(ext.FullName, ext.Description, ext.InputSchema))
+		}
+	}
+	return specs
+}
+
+func fleetToolSpecs() []ToolSpec {
+	return []ToolSpec{
 		makeToolSpec("fleet_list_agents", "List active Fleet AI agent sessions across Macs. state=\"idle\" means the agent finished its last turn and is waiting for input; state_changed_at/state_age_seconds show when it entered that state while updated_at/age_seconds reflect periodic liveness pings.", schemaObj(map[string]any{
 			"device": strProp("Optional device filter"), "repo": strProp("Optional repo filter"),
 			"harness": strProp("Optional harness filter"), "state": strProp("Optional state filter (working, waiting, idle)"),
@@ -121,7 +174,36 @@ func (e *Engine) buildToolSpecs(ctx context.Context) []ToolSpec {
 		}, "agent_id")),
 		makeToolSpec("fleet_send_message", "Send a message to a peer Fleet agent session or device.", schemaObj(map[string]any{
 			"to": strProp("Target session name, device/name, repo:name, or *"), "message": strProp("Message text"),
+			"thread_id": strProp("Optional thread ID to continue"), "reply_to": intProp("Optional parent message ID"),
 		}, "to", "message")),
+		makeToolSpec("fleet_ask_agent", "Ask a peer Fleet agent session a question and wait for its reply (supports threads).", schemaObj(map[string]any{
+			"to": strProp("Target session name, device/name, or session_id"), "question": strProp("Question text"),
+			"timeout_sec": intProp("Wait timeout in seconds (default 30)"),
+		}, "to", "question")),
+		makeToolSpec("fleet_watch_agent", "Subscribe, list, or delete an authoritative Fleet agent state watch that wakes this channel on transitions.", schemaObj(map[string]any{
+			"action":   strProp("create, list, or delete (default create)"),
+			"target":   strProp("Target session ID or device/name (required for create)"),
+			"events":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "States to watch (default [idle, waiting_permission, waiting_question, exited])"},
+			"once":     boolProp("Automatically remove watch after firing once"),
+			"watch_id": strProp("Watch ID or target to delete"),
+		})),
+		makeToolSpec("escalate_to_general", "Post an urgent or high-signal alert from #fleet-ops or #briefing to #general and external notifications (respects cooldown unless priority=urgent).", schemaObj(map[string]any{
+			"title":        strProp("Concise alert title"),
+			"body":         strProp("Actionable alert details for the user"),
+			"priority":     strProp("low, normal, or urgent"),
+			"cooldown_key": strProp("Optional deduplication/cooldown key"),
+		}, "title", "body")),
+		makeToolSpec("fleet_events_list", "Query the authoritative Fleet event bus (agent transitions, infra alerts, usage thresholds, Slacker jobs, memory events).", schemaObj(map[string]any{
+			"type": strProp("Optional event type"), "severity": strProp("info|warn|error|critical"),
+			"source": strProp("Optional source"), "subject": strProp("Optional subject"), "limit": intProp("Max events (default 50)"),
+		})),
+		makeToolSpec("fleet_system_health", "Inspect Fleet device cert expirations, Nebula mesh health, TLS cert expiry, Slacker job counts, and harness usage.", schemaObj(map[string]any{})),
+		makeToolSpec("fleet_memory_proposals", "List, approve, or reject curated Fleet shared memory proposals.", schemaObj(map[string]any{
+			"action":      strProp("list, approve, or reject (default list)"),
+			"status":      strProp("Optional status filter for list (pending, approved, rejected)"),
+			"limit":       intProp("Max items to return"),
+			"proposal_id": intProp("Proposal ID for approve/reject"),
+		})),
 		makeToolSpec("fleet_list_paths", "List known project directories and repositories tracked across Fleet Macs.", schemaObj(map[string]any{
 			"device": strProp("Optional device filter"), "query": strProp("Optional path/repo substring"), "limit": intProp("Max results"),
 		})),
@@ -134,11 +216,6 @@ func (e *Engine) buildToolSpecs(ctx context.Context) []ToolSpec {
 		makeToolSpec("fleet_kill_agent", "Terminate a Fleet coding agent session (approval-gated).", schemaObj(map[string]any{
 			"session_id": strProp("Session ID or target session"),
 		}, "session_id")),
-		makeToolSpec("fleet_watch_agent", "Watch any Fleet agent session so this channel is automatically woken up when it finishes (idle), requires permission/input, or exits. Set stop=true to stop watching.", schemaObj(map[string]any{
-			"agent_id": strProp("Session name, device/name, title, or session_id"),
-			"note":     strProp("Optional context or follow-up reminder when woken up"),
-			"stop":     boolProp("Set true to stop watching this session"),
-		}, "agent_id")),
 		makeToolSpec("fleet_memory_search", "Search shared cross-device Fleet memories.", schemaObj(map[string]any{
 			"query": strProp("Search keywords"), "scope": strProp("global, repo:<name>, device:<name>, or all"),
 			"kind": strProp("preference|feedback|project|reference"), "tier": strProp("always|searchable"), "limit": intProp("Max results"),
@@ -205,20 +282,6 @@ func (e *Engine) buildToolSpecs(ctx context.Context) []ToolSpec {
 			"max_bytes": intProp("Max bytes to return (default 16384, max 32768)"),
 		}, "output_id")),
 	}
-	specs = append(specs, skillToolSpecs()...)
-	specs = append(specs, credentialAndMCPToolSpecs()...)
-	if e.Config().Sandbox.Enabled {
-		specs = append(specs, sandboxToolSpecs()...)
-	}
-	if e.Config().Transcribe.Enabled {
-		specs = append(specs, transcribeToolSpec())
-	}
-	if e.mcp != nil {
-		for _, ext := range e.mcp.ListTools(ctx) {
-			specs = append(specs, makeToolSpec(ext.FullName, ext.Description, ext.InputSchema))
-		}
-	}
-	return specs
 }
 
 func skillToolSpecs() []ToolSpec {
@@ -307,6 +370,7 @@ func credentialAndMCPToolSpecs() []ToolSpec {
 				},
 			},
 			"enabled":                boolProp("Enable server (default true)"),
+			"exposure":               strProp("Optional exposure scope: assistant_only (default) or personal_devices (allow personal-profile devices via MCP proxy)"),
 			"approval_policy":        strProp("Optional approval policy: all (gate every tool), writes_only (auto-allow tools declaring MCP annotations.readOnlyHint=true; gate writes/unannotated tools), or none (auto-allow unless listed in require_approval_tools)"),
 			"require_approval_tools": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Tool names requiring HITL approval (defaults to [\"*\"] for new servers unless approval_policy is set)"},
 		}, "name")),
@@ -368,6 +432,9 @@ func (e *Engine) executeTool(ctx context.Context, tc ToolCall, tctx *toolExecCon
 }
 
 func (e *Engine) dispatchTool(ctx context.Context, name string, args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {
+	if name == "escalate_to_general" {
+		return e.execEscalateToGeneralTool(ctx, args)
+	}
 	if strings.HasPrefix(name, "fleet_") {
 		return e.dispatchFleetTool(ctx, name, args, rawArgs, tctx)
 	}
@@ -464,24 +531,23 @@ func (e *Engine) dispatchFleetTool(ctx context.Context, name string, args map[st
 	case "fleet_inspect_agent":
 		return e.deps.InspectAgent(strArg(args, "agent_id"))
 	case "fleet_send_message":
-		return e.deps.SendAgentMessage("assistant", strArg(args, "to"), strArg(args, "message"))
+		return e.execFleetSendTool(args, tctx)
+	case "fleet_ask_agent":
+		return e.deps.AskAgent(ctx, tctx.ChannelID, strArg(args, "to"), strArg(args, "question"), float64(intArg(args, "timeout_sec", 30)))
+	case "fleet_watch_agent":
+		return e.execFleetWatchTool(args, tctx)
+	case "fleet_events_list":
+		return e.execFleetEventsListTool(args)
+	case "fleet_system_health":
+		return e.deps.SystemHealth()
+	case "fleet_memory_proposals":
+		return e.execFleetMemoryProposalsTool(args)
 	case "fleet_list_paths":
 		return e.deps.ListPaths(strArg(args, "device"), strArg(args, "query"), intArg(args, "limit", 30))
 	case "fleet_spawn_agent":
 		return e.execFleetSpawnTool(ctx, args, rawArgs, tctx)
 	case "fleet_kill_agent":
-		sid := strArg(args, "session_id")
-		if !tctx.BypassHITL {
-			return nil, &approvalRequiredError{
-				ToolName:  name,
-				Summary:   fmt.Sprintf("Terminate Fleet agent session %s", sid),
-				RiskLevel: "agent_kill",
-				ArgsJSON:  cmp.Or(rawArgs, "{}"),
-			}
-		}
-		return e.deps.KillAgent(ctx, sid)
-	case "fleet_watch_agent":
-		return e.execFleetWatchTool(args, tctx)
+		return e.execFleetKillTool(ctx, args, rawArgs, tctx)
 	case "fleet_memory_search":
 		return e.deps.MemorySearch(strArg(args, "query"), cmp.Or(strArg(args, "scope"), "all"), strArg(args, "kind"), strArg(args, "tier"), intArg(args, "limit", 20))
 	case "fleet_memory_get":
@@ -1005,75 +1071,119 @@ func (e *Engine) execFleetSpawnTool(ctx context.Context, args map[string]any, ra
 	if err != nil {
 		return nil, err
 	}
-	del, dErr := e.store.CreateDelegation(Delegation{
-		JobID:        res.JobID,
-		ChannelID:    tctx.ChannelID,
-		TargetDevice: res.TargetDevice,
-		Harness:      res.Harness,
-		SessionName:  res.SessionName,
-		RepoPath:     res.RepoPath,
-		Prompt:       req.Prompt,
-		Status:       "queued",
-	})
-	if dErr == nil {
-		e.refreshDelegationsFlag()
-		e.publishEvent(StreamEvent{Type: "delegation", ChannelID: tctx.ChannelID, Data: del})
+	watchTarget := res.SessionName
+	if res.TargetDevice != "" && res.SessionName != "" {
+		watchTarget = res.TargetDevice + "/" + res.SessionName
 	}
-	out := map[string]any{"spawn": res, "delegation": del}
+	watch, wErr := e.deps.WatchAgent(AgentWatchRequest{
+		ChannelID: tctx.ChannelID,
+		Target:    watchTarget,
+		Events:    []string{"idle", "waiting_permission", "waiting_question", "exited"},
+	})
+	if wErr == nil {
+		e.publishEvent(StreamEvent{Type: "watch_created", ChannelID: tctx.ChannelID, Data: watch})
+	}
+	out := map[string]any{"spawn": res, "watch": watch}
 	if isLighthouse && !res.WorkerOnline {
 		out["hint"] = "Lighthouse worker is currently offline; run `fleet assistant worker-install` on the lighthouse so queued host tasks execute."
 	}
 	return out, nil
 }
 
-func (e *Engine) execFleetWatchTool(args map[string]any, tctx *toolExecContext) (any, error) {
-	agentID := strArg(args, "agent_id")
-	if agentID == "" {
-		return nil, newErr("agent_id is required", http.StatusBadRequest)
+func (e *Engine) execFleetSendTool(args map[string]any, tctx *toolExecContext) (any, error) {
+	var replyTo *int64
+	if v := intArg(args, "reply_to", 0); v > 0 {
+		val := int64(v)
+		replyTo = &val
 	}
-	if boolArg(args, "stop") {
-		n, err := e.store.CancelDelegation(tctx.ChannelID, agentID)
+	return e.deps.SendAgentMessage(tctx.ChannelID, strArg(args, "to"), strArg(args, "message"), strArg(args, "thread_id"), replyTo)
+}
+
+func (e *Engine) execFleetKillTool(ctx context.Context, args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {
+	sid := strArg(args, "session_id")
+	if !tctx.BypassHITL {
+		return nil, &approvalRequiredError{
+			ToolName:  "fleet_kill_agent",
+			Summary:   fmt.Sprintf("Terminate Fleet agent session %s", sid),
+			RiskLevel: "agent_kill",
+			ArgsJSON:  cmp.Or(rawArgs, "{}"),
+		}
+	}
+	return e.deps.KillAgent(ctx, sid)
+}
+
+func (e *Engine) execEscalateToGeneralTool(ctx context.Context, args map[string]any) (any, error) {
+	return e.EscalateToGeneral(
+		ctx,
+		strArg(args, "title"),
+		strArg(args, "body"),
+		strArg(args, "priority"),
+		strArg(args, "cooldown_key"),
+	)
+}
+
+func (e *Engine) execFleetWatchTool(args map[string]any, tctx *toolExecContext) (any, error) {
+	action := strings.ToLower(cmp.Or(strArg(args, "action"), "create"))
+	chID := cmp.Or(tctx.ChannelID, "fleet-ops")
+	switch action {
+	case "list":
+		return e.deps.ListWatches("")
+	case "delete":
+		idOrTarget := cmp.Or(strArg(args, "watch_id"), strArg(args, "target"))
+		if idOrTarget == "" {
+			return nil, newErr("watch_id or target is required for delete", http.StatusBadRequest)
+		}
+		n, err := e.deps.DeleteWatch(chID, idOrTarget)
 		if err != nil {
 			return nil, err
 		}
-		e.refreshDelegationsFlag()
-		return map[string]any{"status": "unwatched", "removed": n}, nil
+		return map[string]any{"deleted": n}, nil
+	case "create":
+		target := strArg(args, "target")
+		if target == "" {
+			return nil, newErr("target is required for watch creation", http.StatusBadRequest)
+		}
+		return e.deps.WatchAgent(AgentWatchRequest{
+			ChannelID: chID,
+			Target:    target,
+			Events:    strSliceArg(args, "events"),
+			Once:      boolArg(args, "once"),
+		})
+	default:
+		return nil, newErr(fmt.Sprintf("unsupported fleet_watch_agent action %q", action), http.StatusBadRequest)
 	}
-	raw, err := e.deps.InspectAgent(agentID)
-	if err != nil {
-		return nil, err
-	}
-	var insp struct {
-		SessionID string `json:"session_id"`
-		Device    string `json:"device"`
-		Harness   string `json:"harness"`
-		Name      string `json:"name"`
-		State     string `json:"state"`
-		CWD       string `json:"cwd"`
-	}
-	if b, mErr := json.Marshal(raw); mErr == nil {
-		_ = json.Unmarshal(b, &insp)
-	}
-	sessName := cmp.Or(insp.Name, agentID)
-	if existing, fErr := e.store.FindActiveDelegation(tctx.ChannelID, insp.SessionID, insp.Device, sessName); fErr == nil && existing != nil {
-		return map[string]any{"status": "watching", "already_watching": true, "delegation": existing}, nil
-	}
-	del, err := e.store.CreateDelegation(Delegation{
-		ChannelID:    tctx.ChannelID,
-		TargetDevice: insp.Device,
-		Harness:      insp.Harness,
-		SessionName:  sessName,
-		SessionID:    insp.SessionID,
-		RepoPath:     insp.CWD,
-		Prompt:       strArg(args, "note"),
-		Status:       cmp.Or(insp.State, "working"),
+}
+
+func (e *Engine) execFleetEventsListTool(args map[string]any) (any, error) {
+	return e.deps.ListEvents(events.Filter{
+		TypePrefix: strArg(args, "type"),
+		Severity:   strArg(args, "severity"),
+		Source:     strArg(args, "source"),
+		Subject:    strArg(args, "subject"),
+		Limit:      intArg(args, "limit", 50),
 	})
-	if err != nil {
-		return nil, err
+}
+
+func (e *Engine) execFleetMemoryProposalsTool(args map[string]any) (any, error) {
+	action := strings.ToLower(cmp.Or(strArg(args, "action"), "list"))
+	switch action {
+	case "list":
+		return e.deps.ListMemoryProposals(strArg(args, "status"), intArg(args, "limit", 30))
+	case "approve":
+		id := int64(intArg(args, "proposal_id", 0))
+		if id <= 0 {
+			return nil, newErr("proposal_id is required", http.StatusBadRequest)
+		}
+		return e.deps.DecideMemoryProposal(id, true)
+	case "reject":
+		id := int64(intArg(args, "proposal_id", 0))
+		if id <= 0 {
+			return nil, newErr("proposal_id is required", http.StatusBadRequest)
+		}
+		return e.deps.DecideMemoryProposal(id, false)
+	default:
+		return nil, newErr(fmt.Sprintf("unsupported fleet_memory_proposals action %q", action), http.StatusBadRequest)
 	}
-	e.refreshDelegationsFlag()
-	e.publishEvent(StreamEvent{Type: "delegation", ChannelID: tctx.ChannelID, Data: del})
-	return map[string]any{"status": "watching", "delegation": del}, nil
 }
 
 func strSliceArg(m map[string]any, key string) []string {
@@ -1141,6 +1251,7 @@ func parseMCPServerFromArgs(args map[string]any, existing *MCPServerConfig) MCPS
 		Headers:              strMapArg(args, "headers"),
 		HeaderRefs:           strMapArg(args, "header_refs"),
 		Enabled:              true,
+		Exposure:             strArg(args, "exposure"),
 		ApprovalPolicy:       strArg(args, "approval_policy"),
 		RequireApprovalTools: strSliceArg(args, "require_approval_tools"),
 	}
@@ -1151,6 +1262,9 @@ func parseMCPServerFromArgs(args map[string]any, existing *MCPServerConfig) MCPS
 	}
 	if en, ok := args["enabled"].(bool); ok {
 		srv.Enabled = en
+	}
+	if _, hasExposure := args["exposure"]; !hasExposure && existing != nil {
+		srv.Exposure = existing.Exposure
 	}
 	if _, hasPolicy := args["approval_policy"]; !hasPolicy && existing != nil {
 		srv.ApprovalPolicy = existing.ApprovalPolicy

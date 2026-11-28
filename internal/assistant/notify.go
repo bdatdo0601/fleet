@@ -118,7 +118,7 @@ func discordEmbedColor(n Notification) int {
 	if strings.EqualFold(n.Priority, "urgent") || strings.EqualFold(n.Category, "approval") || strings.EqualFold(n.Category, "approvals") {
 		return 0xef4444
 	}
-	if strings.EqualFold(n.Category, "delegation") {
+	if strings.EqualFold(n.Category, "delegation") || strings.EqualFold(n.Category, "agent_watch") {
 		return 0xf59e0b
 	}
 	if strings.EqualFold(n.Priority, "low") {

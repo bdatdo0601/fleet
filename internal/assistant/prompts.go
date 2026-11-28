@@ -236,6 +236,12 @@ func (e *Engine) buildPromptMessages(ctx context.Context, ch Channel, tail []Mes
 	sysStatic.WriteString(soul)
 	sysStatic.WriteString("\nCurrent UTC time: " + time.Now().UTC().Format(time.RFC3339) + "\n")
 	sysStatic.WriteString("Active channel: #" + ch.ID + "\n")
+	sysStatic.WriteString("\n## Channel & Alerting Discipline\n")
+	sysStatic.WriteString("- `#general` is the user's calm chat and high-signal alert space: avoid noisy agent churn or speculative pings here.\n")
+	sysStatic.WriteString("- `#fleet-ops` is for live Fleet agent debugging, watches, Slacker failures, usage thresholds, and memory curation.\n")
+	sysStatic.WriteString("- `#briefing` is for scheduled heartbeats and digests; `#events` is a zero-token raw event feed (never needs replies).\n")
+	sysStatic.WriteString("- When working in `#fleet-ops` or `#briefing`, call `escalate_to_general` ONLY when an issue truly requires prompt human action or is urgent.\n")
+	sysStatic.WriteString("- Use `fleet_watch_agent` to follow existing coding agent sessions, `fleet_ask_agent` to query a peer synchronously, `fleet_events_list` / `fleet_system_health` to inspect system state, and `fleet_memory_proposals` to review memory updates.\n")
 	sysStatic.WriteString("\n## Skills Catalog\n")
 	if len(skills) > 0 {
 		for _, sk := range skills {

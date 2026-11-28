@@ -550,6 +550,24 @@ export async function renderDevices(root, ctx) {
         );
       }
       if (d.kind !== "lighthouse" && !revoked) {
+        const curProf = d.profile || "personal";
+        const nextProf = curProf === "work" ? "personal" : "work";
+        actions.appendChild(
+          el("button", {
+            type: "button",
+            className: "btn btn-sm",
+            text: curProf === "work" ? "Set Personal" : "Set Work",
+            onclick: async () => {
+              try {
+                await api("POST", "/v1/set-profile", { name: d.name, profile: nextProf });
+                toast(`${d.name} profile set to ${nextProf}`, "ok");
+                ctx.refresh();
+              } catch (err) {
+                toast(err.message, "error");
+              }
+            },
+          }),
+        );
         actions.appendChild(
           el("button", { type: "button", className: "btn btn-sm", text: "Group / Renew", onclick: () => openSetGroupModal(d, () => ctx.refresh()) }),
         );
@@ -569,6 +587,7 @@ export async function renderDevices(root, ctx) {
           ),
           cell("Kind", { text: d.kind }),
           cell("Group", null, badge(d.group, d.group === "admin" || d.group === "lighthouse" ? "info" : "neutral")),
+          cell("Profile", null, badge(d.profile || "personal", d.profile === "work" ? "warn" : "ok")),
           cell("Status", null, badge(revoked ? "revoked" : "active", revoked ? "danger" : "ok")),
           cell("Last Seen", { text: relTime(d.last_seen) }),
           cell("Cert Expires", null, expBadges),
@@ -599,6 +618,7 @@ export async function renderDevices(root, ctx) {
               el("th", { text: "IP" }),
               el("th", { text: "Kind" }),
               el("th", { text: "Group" }),
+              el("th", { text: "Profile" }),
               el("th", { text: "Status" }),
               el("th", { text: "Last Seen" }),
               el("th", { text: "Cert Expires" }),

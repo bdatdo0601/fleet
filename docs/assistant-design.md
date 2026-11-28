@@ -207,3 +207,26 @@ For document reading, conversion, data analysis, and file generation ("computer 
 - **macOS `gui/<uid>` LaunchAgent bridge & Apple `container` operational notes:**
   - `fleet serve` runs as a `system` LaunchDaemon, whereas Apple's `container` (`brew install container`, formula — not `--cask`) registers `com.apple.container.apiserver` inside the user's `gui/<uid>` LaunchAgent domain. `fleet assistant sandbox-install` installs `io.github.bdatdo0601.fleet.sandbox-agent` in `gui/<uid>` exposing a `0600` Unix-socket bridge (`~/.fleet/sandbox.sock`), and `fleet sync` automatically restarts it when the `fleet` binary updates. On headless Mac mini hosts, enable macOS **Automatic Login** so `container` and `sandbox-agent` start automatically after reboots.
   - Image builds pass `--dns 1.1.1.1 --dns 8.8.8.8` to both `container builder start` and `container build`: `fleet edge` binds mesh DNS explicitly to `127.0.0.1:53` and `10.213.0.1:53` (never `0.0.0.0:53`), and `apple/container` 1.7.1 resets `buildkit` DNS to `[]` if `--dns` is omitted on `container build` itself. Build failures preserve the log tail for clear diagnostics.
+
+---
+
+## 7. Unified Event Bus, Virtual `assistant` Peer & Personal Trust Profiles (v2 Architecture)
+
+1. **Authoritative Event Bus (`internal/events`, `~/.fleet/events.db`):**
+   - Captures all Fleet and assistant lifecycle signals in one append-only SQLite log (14-day retention) with SSE/pub-sub fanout (`GET /v1/events`, `POST /v1/events`, `GET /v1/events/stream`, `fleet events [ls|tail|emit]`):
+     - `agent.transition`, `agent.watch`, `agent.message`
+     - `usage.threshold` (85% warning / 95% critical crossings)
+     - `slacker.job`, `memory.proposal`, `memory.curator_failed`
+     - `infra.nebula_restart`, `infra.tls_error`, `infra.tls_renewed`, `infra.cert_expiring`
+     - `mcp.oauth`, `external.event`
+2. **Unified Peer Messaging & Watches (`internal/agents`):**
+   - Virtual peer target `assistant` (defaults to `#general`) and `assistant:<channel>` (e.g. `assistant:fleet-ops`, `assistant:briefing`) work directly in `fleet_send_message`, `fleet_ask_agent`, and `fleet agents send|ask`, routing peer messages through the Event Bus (`agent.message`).
+   - Authoritative `agent_watches` (`POST/GET/DELETE /v1/agents/watches`, `fleet_watch_agent`, `fleet agents watch|watches|unwatch`) replace the standalone `assistant_delegations` table; spawning an agent from the assistant automatically registers an `agent_watches` subscription for that channel, and `SweepStaleSessions` triggers watched exit events on dead/stale sessions.
+3. **4-Channel Smart Alerting & Zero-Token `#events` Feed (`assistant.db` v2):**
+   - `#events`: read-only live stream of every Event Bus entry recorded with `Observed: true` (0 Observer/Reflector tokens, excluded from Discord sync and browser toast noise).
+   - `#fleet-ops`: operational triage channel woken for watched agents (`agent.watch`), Slacker/agent error triage, usage warnings, and curator failures.
+   - `#briefing`: scheduled heartbeats and digests.
+   - `#general`: kept calm and high-signal; receives `escalate_to_general` alerts and critical infrastructure/quota outages via the 3-stage Event Router (Stage 0 deterministic rules -> Stage 1 System-1 triage -> Stage 2 cooldown/quiet-hours gate).
+4. **Device Trust Profiles & Dual-Profile MCP (`personal` vs `work`):**
+   - Every Fleet device carries a server-authoritative `profile` (`personal` default vs `work`, managed via `POST /v1/set-profile`, `fleet approve --profile`, `fleet set-profile`, and Web Console `#devices`).
+   - `fleet mcp serve` defaults to the core Fleet coordination profile. Opt-in `fleet mcp serve --profile personal` exposes only `personal_vault_search`, `personal_vault_read`, `personal_vault_capture`, and external MCPs explicitly marked `exposure: "personal_devices"` (`/v1/personal/*`), hard-blocked with `403 Forbidden` for `work`-profile devices and routed through `#fleet-ops` HITL approvals when required.

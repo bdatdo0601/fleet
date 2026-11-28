@@ -9,9 +9,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bdatdo0601/fleet/internal/agents"
 	"github.com/bdatdo0601/fleet/internal/assistant"
+	"github.com/bdatdo0601/fleet/internal/events"
 	"github.com/bdatdo0601/fleet/internal/memory"
 	"github.com/bdatdo0601/fleet/internal/slacker"
+	"github.com/bdatdo0601/fleet/internal/tlsdns"
 )
 
 type assistantDeps struct {
@@ -26,12 +29,32 @@ func (d *assistantDeps) InspectAgent(target string) (any, error) {
 	return d.fleet.Agents.GetSession(target)
 }
 
-func (d *assistantDeps) SendAgentMessage(fromDevice, to, body string) (any, error) {
+func (d *assistantDeps) SendAgentMessage(fromChannel, to, body, threadID string, replyTo *int64) (any, error) {
 	known, err := d.fleet.ActiveDeviceNames()
 	if err != nil {
 		return nil, err
 	}
-	return d.fleet.Agents.SendMessageWithReport(fromDevice, "", to, body, nil, nil, known)
+	var tid *string
+	if strings.TrimSpace(threadID) != "" {
+		clean := strings.TrimSpace(threadID)
+		tid = &clean
+	}
+	return d.fleet.Agents.SendMessageWithReport(agents.AssistantDevice, agents.AssistantSessionID(fromChannel), to, body, tid, replyTo, known)
+}
+
+func (d *assistantDeps) AskAgent(ctx context.Context, fromChannel, to, question string, timeoutSec float64) (any, error) {
+	known, err := d.fleet.ActiveDeviceNames()
+	if err != nil {
+		return nil, err
+	}
+	return d.fleet.Agents.Ask(ctx, agents.AskParams{
+		Device:       agents.AssistantDevice,
+		FromSession:  agents.AssistantSessionID(fromChannel),
+		To:           to,
+		Body:         question,
+		Timeout:      timeoutSec,
+		KnownDevices: known,
+	})
 }
 
 func (d *assistantDeps) ListPaths(device, query string, limit int) (any, error) {
@@ -72,6 +95,110 @@ func (d *assistantDeps) SpawnAgent(ctx context.Context, req assistant.SpawnAgent
 
 func (d *assistantDeps) KillAgent(ctx context.Context, sessionID string) (any, error) {
 	return d.fleet.KillAgentContext(ctx, InternalAdminCaller(), sessionID)
+}
+
+func toAssistantWatchInfo(w agents.Watch) assistant.AgentWatchInfo {
+	ch, ok := agents.ParseAssistantTarget(w.WatcherSession)
+	if !ok {
+		ch = "general"
+	}
+	return assistant.AgentWatchInfo{
+		ID:            w.ID,
+		ChannelID:     ch,
+		TargetSession: w.TargetSession,
+		TargetDevice:  w.TargetDevice,
+		TargetName:    w.TargetName,
+		Events:        w.Events,
+		Once:          w.Once,
+		CreatedAt:     w.CreatedAt,
+		UpdatedAt:     w.UpdatedAt,
+	}
+}
+
+func (d *assistantDeps) WatchAgent(req assistant.AgentWatchRequest) (assistant.AgentWatchInfo, error) {
+	w, err := d.fleet.Agents.CreateWatch(agents.CreateWatchParams{
+		WatcherDevice:  agents.AssistantDevice,
+		WatcherSession: agents.AssistantSessionID(req.ChannelID),
+		Target:         req.Target,
+		Events:         req.Events,
+		Once:           req.Once,
+		AllowPending:   true,
+	})
+	if err != nil {
+		return assistant.AgentWatchInfo{}, err
+	}
+	return toAssistantWatchInfo(w), nil
+}
+
+func (d *assistantDeps) ListWatches(channelID string) ([]assistant.AgentWatchInfo, error) {
+	ws := ""
+	if strings.TrimSpace(channelID) != "" {
+		ws = agents.AssistantSessionID(channelID)
+	}
+	list, err := d.fleet.Agents.ListWatches(agents.AssistantDevice, ws, "")
+	if err != nil {
+		return nil, err
+	}
+	out := make([]assistant.AgentWatchInfo, 0, len(list))
+	for _, w := range list {
+		out = append(out, toAssistantWatchInfo(w))
+	}
+	return out, nil
+}
+
+func (d *assistantDeps) DeleteWatch(channelID, idOrTarget string) (int, error) {
+	ws := ""
+	if strings.TrimSpace(channelID) != "" {
+		ws = agents.AssistantSessionID(channelID)
+	}
+	clean := strings.TrimSpace(idOrTarget)
+	if strings.HasPrefix(clean, "w-") {
+		return d.fleet.Agents.DeleteWatch(agents.AssistantDevice, true, clean, ws, "")
+	}
+	return d.fleet.Agents.DeleteWatch(agents.AssistantDevice, true, "", ws, clean)
+}
+
+func (d *assistantDeps) SweepStaleAgents(now time.Time) {
+	if d.fleet.Agents != nil {
+		d.fleet.Agents.SweepStaleSessions(now)
+	}
+}
+
+func (d *assistantDeps) SystemHealth() (map[string]any, error) {
+	out := map[string]any{}
+	if devs, err := d.fleet.List(); err == nil {
+		cutoff := time.Now().UTC().Add(14 * 24 * time.Hour)
+		var expiring []map[string]any
+		for _, dev := range devs {
+			if dev.RevokedAt != nil && *dev.RevokedAt != "" {
+				continue
+			}
+			if exp, pErr := time.Parse(time.RFC3339, dev.NotAfter); pErr == nil && !exp.After(cutoff) {
+				expiring = append(expiring, map[string]any{"name": dev.Name, "not_after": dev.NotAfter})
+			}
+		}
+		out["devices_total"] = len(devs)
+		out["expiring_device_certs"] = expiring
+	}
+	if neb, err := ReadNebulaHealth(d.fleet.Root); err == nil {
+		out["nebula"] = neb
+	}
+	if tlsCfg, err := d.fleet.TLSConfig(); err == nil && tlsCfg != nil {
+		cert := tlsdns.InspectCert(d.fleet.Root+"/tls", tlsCfg.Domain, time.Now().UTC())
+		out["tls"] = map[string]any{"domain": tlsCfg.Domain, "cert": cert}
+	}
+	if d.fleet.Slacker != nil {
+		counts, _ := d.fleet.Slacker.JobCounts()
+		rts, _ := d.fleet.Slacker.ListRuntimes()
+		out["slacker_jobs"] = counts
+		out["slacker_runtimes"] = rts
+	}
+	if d.fleet.Agents != nil {
+		if usage, err := d.fleet.Agents.ListUsage(); err == nil {
+			out["usage"] = usage
+		}
+	}
+	return out, nil
 }
 
 func (d *assistantDeps) LighthouseWorkerStatus() assistant.LighthouseWorkerStatus {
@@ -140,6 +267,18 @@ func (d *assistantDeps) MemoryContext(repo, device string) (string, error) {
 		return "", err
 	}
 	return res.Rendered, nil
+}
+
+func (d *assistantDeps) ListMemoryProposals(status string, limit int) (any, error) {
+	return d.fleet.Memory.ListProposals(status, limit)
+}
+
+func (d *assistantDeps) DecideMemoryProposal(id int64, approve bool) (any, error) {
+	prop, item, err := d.fleet.Memory.ResolveProposal(id, approve, "assistant")
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"proposal": prop, "memory": item}, nil
 }
 
 func (d *assistantDeps) slackClient() *slacker.SlackClient {
@@ -217,4 +356,31 @@ func (d *assistantDeps) SlackSend(ctx context.Context, account, channel, text, t
 		return nil, newFleetErr(fmt.Sprintf("account %q has no user_token or bot_token configured", acct.ID), http.StatusBadRequest)
 	}
 	return d.slackClient().PostMessage(ctx, tok, channel, text, threadTS)
+}
+
+func (d *assistantDeps) ListEvents(f events.Filter) ([]events.Event, error) {
+	if d.fleet.Events == nil {
+		return nil, nil
+	}
+	return d.fleet.Events.List(f)
+}
+
+func (d *assistantDeps) PublishEvent(ev events.Event) (events.Event, bool, error) {
+	if d.fleet.Events == nil {
+		return events.Event{}, false, nil
+	}
+	return d.fleet.Events.Publish(ev)
+}
+
+func (d *assistantDeps) SubscribeEvents() chan events.Event {
+	if d.fleet.Events == nil {
+		return make(chan events.Event)
+	}
+	return d.fleet.Events.Subscribe()
+}
+
+func (d *assistantDeps) UnsubscribeEvents(ch chan events.Event) {
+	if d.fleet.Events != nil {
+		d.fleet.Events.Unsubscribe(ch)
+	}
 }

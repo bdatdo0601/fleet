@@ -23,6 +23,7 @@ import (
 
 	"github.com/bdatdo0601/fleet/internal/agents"
 	"github.com/bdatdo0601/fleet/internal/core"
+	"github.com/bdatdo0601/fleet/internal/events"
 	"github.com/bdatdo0601/fleet/internal/paths"
 	"github.com/bdatdo0601/fleet/internal/registry"
 	"github.com/bdatdo0601/fleet/internal/tlsdns"
@@ -317,6 +318,26 @@ func registerDeviceRoutes(
 		writeJSON(w, http.StatusOK, res)
 		return nil
 	}))
+	mux.HandleFunc("POST /v1/set-profile", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		var req struct {
+			Name    string `json:"name"`
+			Profile string `json:"profile"`
+		}
+		if err := readJSONBody(r, &req); err != nil {
+			return err
+		}
+		dev, err := fleet.SetProfile(req.Name, req.Profile)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"name":    dev.Name,
+			"profile": dev.Profile,
+			"group":   dev.Grp,
+			"kind":    dev.Kind,
+		})
+		return nil
+	}))
 }
 
 // NewHandler returns the HTTP handler for the lighthouse API.
@@ -377,6 +398,8 @@ func NewHandler(fleet *core.Fleet, quiet bool, extras ...any) http.Handler {
 	registerMemoryRoutes(mux, fleet, route)
 	registerSlackerRoutes(mux, fleet, route)
 	registerAssistantRoutes(mux, fleet, route)
+	registerEventRoutes(mux, fleet, route)
+	registerPersonalRoutes(mux, fleet, route)
 	registerAdminRoutes(mux, fleet, startedAt, watchdog, tlsMgr, route)
 	registerWebRoutes(mux, route)
 	registerDeviceRoutes(mux, fleet, route)
@@ -437,6 +460,7 @@ func registerAgentRoutes(
 	}))
 	mux.HandleFunc("POST /v1/agents/deregister", route(false, handleAgentDeregister(fleet)))
 	registerAgentMessageRoutes(mux, fleet, route)
+	registerAgentWatchRoutes(mux, fleet, route)
 	registerAgentPathRoutes(mux, fleet, route)
 }
 
@@ -550,7 +574,6 @@ func registerAgentMessageRoutes(
 	mux.HandleFunc("POST /v1/agents/rename", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
 		return handleAgentRename(w, r, fleet, c)
 	}))
-	registerAgentWatchRoutes(mux, fleet, route)
 	mux.HandleFunc("GET /v1/usage", route(false, func(w http.ResponseWriter, _ *http.Request, _ *registry.Device) error {
 		list, err := fleet.Agents.ListUsage()
 		if err != nil {
@@ -571,15 +594,22 @@ func registerAgentWatchRoutes(
 ) {
 	mux.HandleFunc("GET /v1/agents/watches", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
 		q := r.URL.Query()
-		watcherDev := ""
-		if !core.IsAdmin(c) {
+		watcherDev := strings.TrimSpace(q.Get("watcher_device"))
+		watcherSess := strings.TrimSpace(q.Get("watcher"))
+		if watcherSess == "assistant" {
+			watcherDev = agents.AssistantDevice
+			watcherSess = ""
+		} else if watcherDev == "" && !core.IsAdmin(c) {
 			watcherDev = c.Name
 		}
-		list, err := fleet.Agents.ListWatches(watcherDev, q.Get("watcher"), q.Get("target"))
+		watches, err := fleet.Agents.ListWatches(watcherDev, watcherSess, strings.TrimSpace(q.Get("target")))
 		if err != nil {
 			return err
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"watches": list})
+		if watches == nil {
+			watches = []agents.Watch{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"watches": watches})
 		return nil
 	}))
 	mux.HandleFunc("POST /v1/agents/watch", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
@@ -596,6 +626,66 @@ func registerAgentWatchRoutes(
 	}))
 	mux.HandleFunc("POST /v1/agents/watch-wait", route(false, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
 		return handleAgentWatchWait(w, r, fleet)
+	}))
+	mux.HandleFunc("POST /v1/agents/watches", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
+		var raw struct {
+			Harness      string   `json:"harness"`
+			CWD          string   `json:"cwd"`
+			PID          *int     `json:"pid"`
+			SessionID    *string  `json:"session_id"`
+			Channel      string   `json:"channel"`
+			Target       string   `json:"target"`
+			TargetDevice string   `json:"target_device"`
+			TargetName   string   `json:"target_name"`
+			Events       []string `json:"events"`
+			Once         bool     `json:"once"`
+			AllowPending bool     `json:"allow_pending"`
+		}
+		if err := readJSONBody(r, &raw); err != nil {
+			return err
+		}
+		watcherDev := c.Name
+		watcherSess := ""
+		if raw.SessionID != nil {
+			watcherSess = strings.TrimSpace(*raw.SessionID)
+		}
+		if raw.Channel != "" && core.IsAdmin(c) {
+			watcherDev = agents.AssistantDevice
+			watcherSess = agents.AssistantSessionID(raw.Channel)
+		} else if watcherSess == "" {
+			resolved, rErr := fleet.Agents.ResolveCallerSession(c.Name, cmp.Or(raw.Harness, "claude"), nil, raw.CWD, raw.PID)
+			if rErr != nil {
+				return rErr
+			}
+			watcherSess = resolved
+		}
+		watch, err := fleet.Agents.CreateWatch(agents.CreateWatchParams{
+			WatcherDevice:  watcherDev,
+			WatcherSession: watcherSess,
+			Target:         raw.Target,
+			TargetDevice:   raw.TargetDevice,
+			TargetName:     raw.TargetName,
+			Events:         raw.Events,
+			Once:           raw.Once,
+			AllowPending:   raw.AllowPending,
+		})
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"watch": watch})
+		return nil
+	}))
+	mux.HandleFunc("DELETE /v1/agents/watches/{id}", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
+		id := strings.TrimSpace(r.PathValue("id"))
+		if id == "by-target" {
+			id = ""
+		}
+		deleted, err := fleet.Agents.DeleteWatch(c.Name, core.IsAdmin(c), id, r.URL.Query().Get("watcher"), r.URL.Query().Get("target"))
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "deleted": deleted})
+		return nil
 	}))
 }
 
@@ -859,9 +949,54 @@ func Serve(port int, host string) error {
 		return err
 	}
 	watchdog := NewNebulaWatchdog(fleet.Root)
+	watchdog.OnTrigger = func(reason string) {
+		if fleet.Events == nil {
+			return
+		}
+		_, _, _ = fleet.Events.Publish(events.Event{
+			Type:      "infra.nebula_restart",
+			Severity:  "warn",
+			Source:    "infra",
+			Subject:   "nebula",
+			DedupeKey: fmt.Sprintf("nebula-restart:%d", time.Now().UTC().Unix()/60),
+			Title:     "Nebula relay restart queued",
+			Summary:   reason,
+			Payload:   map[string]any{"reason": reason},
+		})
+	}
 	tlsMgr := tlsdns.NewManager(fleet.Root, fleet.TLSConfig, tlsdns.ACMEDeps{
 		Logf: func(format string, args ...any) {
 			_, _ = fmt.Fprintf(os.Stderr, format+"\n", args...)
+		},
+		OnRenewalResult: func(domain string, renewed bool, cert tlsdns.CertStatus, rErr error) {
+			if fleet.Events == nil {
+				return
+			}
+			if rErr != nil {
+				_, _, _ = fleet.Events.Publish(events.Event{
+					Type:      "infra.tls_error",
+					Severity:  "error",
+					Source:    "infra",
+					Subject:   domain,
+					DedupeKey: fmt.Sprintf("tls-err:%s:%s", domain, time.Now().UTC().Format("2006-01-02")),
+					Title:     "TLS certificate renewal failed: " + domain,
+					Summary:   rErr.Error(),
+					Payload:   map[string]any{"domain": domain, "error": rErr.Error()},
+				})
+				return
+			}
+			if renewed {
+				_, _, _ = fleet.Events.Publish(events.Event{
+					Type:      "infra.tls_renewed",
+					Severity:  "info",
+					Source:    "infra",
+					Subject:   domain,
+					DedupeKey: fmt.Sprintf("tls-renewed:%s:%s", domain, cert.NotAfter),
+					Title:     "TLS certificate renewed: " + domain,
+					Summary:   fmt.Sprintf("Valid until %s (%d days remaining)", cert.NotAfter, cert.DaysRemaining),
+					Payload:   map[string]any{"domain": domain, "not_after": cert.NotAfter},
+				})
+			}
 		},
 	})
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

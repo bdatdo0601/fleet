@@ -55,14 +55,15 @@ type CertStatus struct {
 
 // ACMEDeps injects dependencies for testing ACME and Route 53 flows.
 type ACMEDeps struct {
-	DirectoryURL string
-	HTTPClient   *http.Client
-	AWSBin       string
-	RunCmd       ddns.RunCmdFn
-	Dig          ddns.DigFn
-	Now          func() time.Time
-	PollInterval time.Duration
-	Logf         func(string, ...any)
+	DirectoryURL    string
+	HTTPClient      *http.Client
+	AWSBin          string
+	RunCmd          ddns.RunCmdFn
+	Dig             ddns.DigFn
+	Now             func() time.Time
+	PollInterval    time.Duration
+	Logf            func(string, ...any)
+	OnRenewalResult func(domain string, renewed bool, cert CertStatus, err error)
 }
 
 func (d ACMEDeps) now() time.Time {
@@ -499,6 +500,9 @@ func (m *Manager) RenewNow(ctx context.Context, force bool) (RenewResult, error)
 	if err != nil {
 		m.state.LastError = err.Error()
 		m.stateMu.Unlock()
+		if m.deps.OnRenewalResult != nil {
+			m.deps.OnRenewalResult(cfg.Domain, false, status, err)
+		}
 		return RenewResult{Cert: status, Checked: nowStr, ErrorMsg: err.Error()}, err
 	}
 	m.state.LastError = ""
@@ -506,6 +510,9 @@ func (m *Manager) RenewNow(ctx context.Context, force bool) (RenewResult, error)
 		m.state.LastRenew = m.deps.now().UTC().Format(time.RFC3339)
 	}
 	m.stateMu.Unlock()
+	if m.deps.OnRenewalResult != nil && renewed {
+		m.deps.OnRenewalResult(cfg.Domain, true, status, nil)
+	}
 	return RenewResult{
 		Renewed: renewed,
 		PublicA: publicAStr,

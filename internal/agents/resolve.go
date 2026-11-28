@@ -426,7 +426,38 @@ func (h *Hub) GetSession(target string) (SessionDetail, error) {
 	return h.getSessionLocked(target)
 }
 
+// AssistantSessionID returns the virtual peer session_id for an assistant channel.
+func AssistantSessionID(channelID string) string {
+	ch := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(channelID)), "#")
+	if ch == "" {
+		ch = "general"
+	}
+	return AssistantSessionPrefix + ch
+}
+
+// ParseAssistantTarget parses "assistant", "assistant:<channel>", or "assistant:channel:<channel>".
+func ParseAssistantTarget(target string) (string, bool) {
+	clean := strings.ToLower(strings.TrimSpace(target))
+	switch {
+	case clean == AssistantDevice || clean == "@"+AssistantDevice:
+		return "general", true
+	case strings.HasPrefix(clean, "assistant:channel:"):
+		ch := strings.TrimPrefix(strings.TrimPrefix(clean, "assistant:channel:"), "#")
+		return cmp.Or(ch, "general"), true
+	case strings.HasPrefix(clean, AssistantSessionPrefix):
+		ch := strings.TrimPrefix(strings.TrimPrefix(clean, AssistantSessionPrefix), "#")
+		return cmp.Or(ch, "general"), true
+	default:
+		return "", false
+	}
+}
+
 func (h *Hub) resolveTargetLocked(target string, knownDevices map[string]bool) (toDevice, toSession, toRepo *string, err error) {
+	if ch, ok := ParseAssistantTarget(target); ok {
+		d := AssistantDevice
+		sid := AssistantSessionID(ch)
+		return &d, &sid, nil, nil
+	}
 	switch {
 	case target == "*" || target == "all":
 		return nil, nil, nil, nil

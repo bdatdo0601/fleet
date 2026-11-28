@@ -216,6 +216,23 @@ type Curator struct {
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
 	running  bool
+	onEvent  func(kind, scope, key, detail string)
+}
+
+// SetOnEvent registers an optional callback invoked when the curator creates a proposal or fails a job.
+func (c *Curator) SetOnEvent(fn func(kind, scope, key, detail string)) {
+	c.mu.Lock()
+	c.onEvent = fn
+	c.mu.Unlock()
+}
+
+func (c *Curator) emitEvent(kind, scope, key, detail string) {
+	c.mu.Lock()
+	cb := c.onEvent
+	c.mu.Unlock()
+	if cb != nil {
+		cb(kind, scope, key, detail)
+	}
 }
 
 // NewCurator constructs a Curator and loads configPath if it exists.
@@ -654,6 +671,7 @@ func (c *Curator) queueProposal(cand Item, action, targetScope, targetKey, kind,
 	if err != nil {
 		return CurateActionReport{}, err
 	}
+	c.emitEvent("proposal", prop.TargetScope, prop.TargetKey, fmt.Sprintf("%s: %s", prop.Action, prop.Summary))
 	return CurateActionReport{
 		MemoryScope:      cand.Scope,
 		MemoryKey:        cand.Key,
@@ -834,6 +852,11 @@ func (c *Curator) drainQueue(ctx context.Context, limit int) {
 	_, _ = c.drainQueueLocked(ctx, limit)
 }
 
+func (c *Curator) failJob(jobID int64, scope, key, errMsg string) {
+	_ = c.store.FailJob(jobID, errMsg)
+	c.emitEvent("curator_failed", scope, key, errMsg)
+}
+
 func (c *Curator) drainQueueLocked(ctx context.Context, limit int) ([]CurateActionReport, error) {
 	cfg := c.currentConfig()
 	if !cfg.Enabled || cfg.BaseURL == "" || cfg.Model == "" {
@@ -860,7 +883,7 @@ func (c *Curator) drainQueueLocked(ctx context.Context, limit int) ([]CurateActi
 		}
 		cand, err := c.store.GetByID(job.MemoryID)
 		if err != nil {
-			_ = c.store.FailJob(job.ID, err.Error())
+			c.failJob(job.ID, "", fmt.Sprintf("job-%d", job.ID), err.Error())
 			lastErr = err.Error()
 			continue
 		}
@@ -870,20 +893,20 @@ func (c *Curator) drainQueueLocked(ctx context.Context, limit int) ([]CurateActi
 		}
 		prompt, err := c.buildCandidatePrompt(*cand)
 		if err != nil {
-			_ = c.store.FailJob(job.ID, err.Error())
+			c.failJob(job.ID, cand.Scope, cand.Key, err.Error())
 			lastErr = err.Error()
 			continue
 		}
 		dec, err := c.callDecisionLLM(ctx, cfg, prompt)
 		if err != nil {
-			_ = c.store.FailJob(job.ID, err.Error())
+			c.failJob(job.ID, cand.Scope, cand.Key, err.Error())
 			lastErr = err.Error()
 			reports = append(reports, CurateActionReport{MemoryScope: cand.Scope, MemoryKey: cand.Key, Action: "error", Error: err.Error()})
 			continue
 		}
 		rep, err := c.applyDecision(*cand, cfg, dec)
 		if err != nil {
-			_ = c.store.FailJob(job.ID, err.Error())
+			c.failJob(job.ID, cand.Scope, cand.Key, err.Error())
 			lastErr = err.Error()
 			reports = append(reports, CurateActionReport{MemoryScope: cand.Scope, MemoryKey: cand.Key, Action: "error", Error: err.Error()})
 			continue

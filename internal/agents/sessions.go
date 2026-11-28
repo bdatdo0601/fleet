@@ -599,40 +599,44 @@ func (h *Hub) Heartbeat(p HeartbeatParams) (HeartbeatResult, error) {
 	if err != nil {
 		return HeartbeatResult{}, err
 	}
-	h.mu.Lock()
-	res, ev, cb, err := h.heartbeatLocked(p, sessionID, shortID)
-	h.mu.Unlock()
-	if err == nil && ev.StateChanged && cb != nil {
-		cb(ev)
-	}
-	return res, err
-}
-
-func (h *Hub) heartbeatLocked(p HeartbeatParams, sessionID, shortID string) (HeartbeatResult, StateTransition, func(StateTransition), error) {
 	rawClean := TruncateRunes(strings.TrimSpace(p.RawID), 128)
 	nowISO := registry.NowISO()
+
+	h.mu.Lock()
+	res, tr, triggers, trCb, watchCb, hErr := h.heartbeatLocked(p, sessionID, shortID, rawClean, nowISO)
+	h.mu.Unlock()
+	if hErr != nil {
+		return HeartbeatResult{}, hErr
+	}
+	h.fireTransitionCallbacks(trCb, watchCb, tr, triggers)
+	return res, nil
+}
+
+func (h *Hub) heartbeatLocked(
+	p HeartbeatParams, sessionID, shortID, rawClean, nowISO string,
+) (HeartbeatResult, StateTransition, []watchTrigger, func(StateTransition), func(Watch, StateTransition), error) {
 	if err := h.checkOpenLocked(); err != nil {
-		return HeartbeatResult{}, StateTransition{}, nil, err
+		return HeartbeatResult{}, StateTransition{}, nil, nil, nil, err
 	}
 	if err := h.pruneLocked(false); err != nil {
-		return HeartbeatResult{}, StateTransition{}, nil, err
+		return HeartbeatResult{}, StateTransition{}, nil, nil, nil, err
 	}
 
 	isPlaceholder := strings.HasPrefix(shortID, "pid-")
 	if isPlaceholder && p.PID != nil {
 		promoted, err := h.findPromotedSessionLocked(p.Device, p.Harness, *p.PID, p.CWD)
 		if err != nil {
-			return HeartbeatResult{}, StateTransition{}, nil, err
+			return HeartbeatResult{}, StateTransition{}, nil, nil, nil, err
 		}
 		if promoted != nil {
 			res, err := h.heartbeatPromotedLocked(p, sessionID, promoted, nowISO)
-			return res, StateTransition{}, nil, err
+			return res, StateTransition{}, nil, nil, nil, err
 		}
 	}
 
 	tx, err := h.db.Begin()
 	if err != nil {
-		return HeartbeatResult{}, StateTransition{}, nil, err
+		return HeartbeatResult{}, StateTransition{}, nil, nil, nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -642,41 +646,44 @@ func (h *Hub) heartbeatLocked(p HeartbeatParams, sessionID, shortID string) (Hea
 	if !isPlaceholder {
 		promotedFrom, oldPID, oldStarted, oldTitle, oldName, oldCustom, err = h.promotePlaceholderLocked(tx, p.Device, p.Harness, p.CWD, p.PID, sessionID)
 		if err != nil {
-			return HeartbeatResult{}, StateTransition{}, nil, err
+			return HeartbeatResult{}, StateTransition{}, nil, nil, nil, err
 		}
 	}
 	existing, err := scanSessionDetailRow(tx.QueryRow("SELECT "+sessionDetailCols+" FROM agent_sessions WHERE session_id = ?", sessionID))
 	if err != nil {
-		return HeartbeatResult{}, StateTransition{}, nil, err
+		return HeartbeatResult{}, StateTransition{}, nil, nil, nil, err
 	}
 	baseTitle, baseName, baseCustom := baseIdentity(existing, oldTitle, oldName, oldCustom)
 	effRepo := resolveHeartbeatRepo(p.Repo, existing)
 	effTitle, effName, effCustom, err := h.resolveTitleAndNameLocked(tx, p.Device, sessionID, effRepo, p.Title, p.Name, p.ExplicitName, baseTitle, baseName, baseCustom)
 	if err != nil {
-		return HeartbeatResult{}, StateTransition{}, nil, err
+		return HeartbeatResult{}, StateTransition{}, nil, nil, nil, err
 	}
 	fullRaw := resolveHeartbeatIdentity(existing, isPlaceholder, rawClean)
 	newPendingJSON, err := resolvePendingAction(p.State, p.PendingAction, existing)
 	if err != nil {
-		return HeartbeatResult{}, StateTransition{}, nil, err
+		return HeartbeatResult{}, StateTransition{}, nil, nil, nil, err
 	}
 	newStateChangedAt := resolveStateChangedAt(p.State, newPendingJSON, nowISO, existing)
 	if err := upsertSessionTxLocked(tx, p, existing, sessionID, shortID, fullRaw, effRepo, effTitle, effName, effCustom, newPendingJSON, newStateChangedAt, oldStarted, nowISO, oldPID); err != nil {
-		return HeartbeatResult{}, StateTransition{}, nil, err
+		return HeartbeatResult{}, StateTransition{}, nil, nil, nil, err
 	}
 	if err := recordHeartbeatSessionPathLocked(tx, p, existing, effRepo, nowISO); err != nil {
-		return HeartbeatResult{}, StateTransition{}, nil, err
+		return HeartbeatResult{}, StateTransition{}, nil, nil, nil, err
 	}
 	if err := tx.Commit(); err != nil {
-		return HeartbeatResult{}, StateTransition{}, nil, err
+		return HeartbeatResult{}, StateTransition{}, nil, nil, nil, err
 	}
 	if promotedFrom != "" {
 		h.transferWaiterLocked(promotedFrom, sessionID)
 	}
-	ev := buildHeartbeatTransition(p, existing, sessionID, effTitle, effName, newPendingJSON, newStateChangedAt)
-	h.handleTransitionLocked(ev)
 	res, err := h.finishHeartbeatLocked(p.Device, sessionID, fullRaw, effName, effTitle, p.DrainInbox)
-	return res, ev, h.onTransition, err
+	if err != nil {
+		return HeartbeatResult{}, StateTransition{}, nil, nil, nil, err
+	}
+	tr := buildHeartbeatTransition(p, existing, sessionID, effTitle, effName, newPendingJSON, newStateChangedAt)
+	triggers := h.handleTransitionLocked(tr)
+	return res, tr, triggers, h.onTransition, h.onWatchTriggered, nil
 }
 
 func recordHeartbeatSessionPathLocked(tx *sql.Tx, p HeartbeatParams, existing *sessionRow, effRepo, nowISO string) error {
@@ -764,15 +771,40 @@ type ExitedSession struct {
 	GitStatus string
 }
 
-func exitedSessionFromRow(r *sessionRow) ExitedSession {
-	return ExitedSession{
-		SessionID: r.sessionID,
-		Device:    r.device,
-		Harness:   r.harness,
-		Name:      r.name,
-		Summary:   r.summary,
-		GitStatus: r.gitStatus,
+func (h *Hub) collectExitedRowsLocked(query string, args ...any) ([]*sessionRow, error) {
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		return nil, err
 	}
+	list, err := scanAllSessionDetailRows(rows)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*sessionRow, len(list))
+	for i := range list {
+		out[i] = &list[i]
+	}
+	return out, nil
+}
+
+func (h *Hub) emitExitedRowsLocked(rows []*sessionRow, nowISO string) ([]ExitedSession, []StateTransition, [][]watchTrigger) {
+	exited := make([]ExitedSession, 0, len(rows))
+	trs := make([]StateTransition, 0, len(rows))
+	trigs := make([][]watchTrigger, 0, len(rows))
+	for _, r := range rows {
+		exited = append(exited, ExitedSession{
+			SessionID: r.sessionID,
+			Device:    r.device,
+			Harness:   r.harness,
+			Name:      r.name,
+			Summary:   r.summary,
+			GitStatus: r.gitStatus,
+		})
+		tr := buildExitTransition(r, nowISO)
+		trs = append(trs, tr)
+		trigs = append(trigs, h.handleTransitionLocked(tr))
+	}
+	return exited, trs, trigs
 }
 
 // Deregister marks a session (or sessions matching harness+pid) as exited and wakes waiters.
@@ -786,53 +818,32 @@ func (h *Hub) DeregisterWithInfo(device string, sessionID, harness *string, pid 
 	if sessionID != nil && *sessionID != "" && !strings.HasPrefix(*sessionID, device+":") {
 		return nil, newAgentErr("session belongs to another device", 403)
 	}
-	h.mu.Lock()
-	exited, transitions, cb, err := h.deregisterWithInfoLocked(device, sessionID, harness, pid)
-	h.mu.Unlock()
-	if err == nil && cb != nil {
-		for _, ev := range transitions {
-			cb(ev)
-		}
-	}
-	return exited, err
-}
-
-func (h *Hub) deregisterWithInfoLocked(device string, sessionID, harness *string, pid *int) ([]ExitedSession, []StateTransition, func(StateTransition), error) {
-	if err := h.checkOpenLocked(); err != nil {
-		return nil, nil, nil, err
-	}
 	nowISO := registry.NowISO()
-	if sessionID != nil && *sessionID != "" {
-		row, _ := scanSessionDetailRow(h.db.QueryRow(
+	h.mu.Lock()
+	if err := h.checkOpenLocked(); err != nil {
+		h.mu.Unlock()
+		return nil, err
+	}
+	var exitedRows []*sessionRow
+	switch {
+	case sessionID != nil && *sessionID != "":
+		exitedRows, _ = h.collectExitedRowsLocked(
 			"SELECT "+sessionDetailCols+" FROM agent_sessions WHERE device = ? AND session_id = ? AND state != 'exited'",
 			device, *sessionID,
-		))
+		)
 		if _, err := h.db.Exec(
 			"UPDATE agent_sessions SET state = 'exited', state_changed_at = ?, pending_action_json = '', updated_at = ? WHERE device = ? AND session_id = ?",
 			nowISO, nowISO, device, *sessionID,
 		); err != nil {
-			return nil, nil, nil, err
-		}
-		var exited []ExitedSession
-		var transitions []StateTransition
-		if row != nil {
-			exited = append(exited, exitedSessionFromRow(row))
-			ev := buildExitTransition(row, nowISO)
-			_, _ = h.db.Exec("DELETE FROM agent_watches WHERE watcher_session = ?", row.sessionID)
-			h.handleTransitionLocked(ev)
-			transitions = append(transitions, ev)
+			h.mu.Unlock()
+			return nil, err
 		}
 		h.sessionSubs.notify(*sessionID)
-		return exited, transitions, h.onTransition, nil
-	}
-	if harness != nil && *harness != "" && pid != nil {
-		var prevRows []sessionRow
-		if qRows, qErr := h.db.Query(
+	case harness != nil && *harness != "" && pid != nil:
+		exitedRows, _ = h.collectExitedRowsLocked(
 			"SELECT "+sessionDetailCols+" FROM agent_sessions WHERE device = ? AND harness = ? AND pid = ? AND state != 'exited'",
 			device, *harness, *pid,
-		); qErr == nil {
-			prevRows, _ = scanAllSessionDetailRows(qRows)
-		}
+		)
 		sids, _ := h.collectStringsLocked(
 			"SELECT session_id FROM agent_sessions WHERE device = ? AND harness = ? AND pid = ?",
 			device, *harness, *pid,
@@ -841,23 +852,24 @@ func (h *Hub) deregisterWithInfoLocked(device string, sessionID, harness *string
 			"UPDATE agent_sessions SET state = 'exited', state_changed_at = ?, pending_action_json = '', updated_at = ? WHERE device = ? AND harness = ? AND pid = ?",
 			nowISO, nowISO, device, *harness, *pid,
 		); err != nil {
-			return nil, nil, nil, err
-		}
-		exited := make([]ExitedSession, 0, len(prevRows))
-		transitions := make([]StateTransition, 0, len(prevRows))
-		for i := range prevRows {
-			exited = append(exited, exitedSessionFromRow(&prevRows[i]))
-			ev := buildExitTransition(&prevRows[i], nowISO)
-			_, _ = h.db.Exec("DELETE FROM agent_watches WHERE watcher_session = ?", prevRows[i].sessionID)
-			h.handleTransitionLocked(ev)
-			transitions = append(transitions, ev)
+			h.mu.Unlock()
+			return nil, err
 		}
 		for _, s := range sids {
 			h.sessionSubs.notify(s)
 		}
-		return exited, transitions, h.onTransition, nil
+	default:
+		h.mu.Unlock()
+		return nil, newAgentErr("session_id or (harness, pid) is required", 400)
 	}
-	return nil, nil, nil, newAgentErr("session_id or (harness, pid) is required", 400)
+	exited, trs, trigs := h.emitExitedRowsLocked(exitedRows, nowISO)
+	trCb, watchCb := h.onTransition, h.onWatchTriggered
+	h.mu.Unlock()
+
+	for i, tr := range trs {
+		h.fireTransitionCallbacks(trCb, watchCb, tr, trigs[i])
+	}
+	return exited, nil
 }
 
 // DeregisterAny marks any session as exited and wakes waiters (for admin callers).
@@ -872,51 +884,45 @@ func (h *Hub) DeregisterAnyWithInfo(sessionID string) (*ExitedSession, error) {
 	if sessionID == "" {
 		return nil, newAgentErr("session_id is required", 400)
 	}
-	h.mu.Lock()
-	exited, ev, notify, cb, err := h.deregisterAnyWithInfoLocked(sessionID)
-	h.mu.Unlock()
-	if err == nil && notify && cb != nil {
-		cb(ev)
-	}
-	return exited, err
-}
-
-func (h *Hub) deregisterAnyWithInfoLocked(sessionID string) (*ExitedSession, StateTransition, bool, func(StateTransition), error) {
-	if err := h.checkOpenLocked(); err != nil {
-		return nil, StateTransition{}, false, nil, err
-	}
 	nowISO := registry.NowISO()
-	row, _ := scanSessionDetailRow(h.db.QueryRow(
+	h.mu.Lock()
+	if err := h.checkOpenLocked(); err != nil {
+		h.mu.Unlock()
+		return nil, err
+	}
+	exitedRows, _ := h.collectExitedRowsLocked(
 		"SELECT "+sessionDetailCols+" FROM agent_sessions WHERE session_id = ? AND state != 'exited'",
 		sessionID,
-	))
+	)
 	res, err := h.db.Exec(
 		"UPDATE agent_sessions SET state = 'exited', state_changed_at = ?, pending_action_json = '', updated_at = ? WHERE session_id = ?",
 		nowISO, nowISO, sessionID,
 	)
 	if err != nil {
-		return nil, StateTransition{}, false, nil, err
+		h.mu.Unlock()
+		return nil, err
 	}
 	affected, err := res.RowsAffected()
 	if err != nil {
-		return nil, StateTransition{}, false, nil, err
+		h.mu.Unlock()
+		return nil, err
 	}
 	if affected == 0 {
-		return nil, StateTransition{}, false, nil, newAgentErr(fmt.Sprintf("no agent session %q", sessionID), 404)
-	}
-	var exited *ExitedSession
-	var ev StateTransition
-	var notify bool
-	if row != nil {
-		ex := exitedSessionFromRow(row)
-		exited = &ex
-		ev = buildExitTransition(row, nowISO)
-		_, _ = h.db.Exec("DELETE FROM agent_watches WHERE watcher_session = ?", row.sessionID)
-		h.handleTransitionLocked(ev)
-		notify = true
+		h.mu.Unlock()
+		return nil, newAgentErr(fmt.Sprintf("no agent session %q", sessionID), 404)
 	}
 	h.sessionSubs.notify(sessionID)
-	return exited, ev, notify, h.onTransition, nil
+	exitedList, trs, trigs := h.emitExitedRowsLocked(exitedRows, nowISO)
+	trCb, watchCb := h.onTransition, h.onWatchTriggered
+	h.mu.Unlock()
+
+	for i, tr := range trs {
+		h.fireTransitionCallbacks(trCb, watchCb, tr, trigs[i])
+	}
+	if len(exitedList) > 0 {
+		return &exitedList[0], nil
+	}
+	return nil, nil
 }
 
 // ListSessions returns active (or all) agent sessions filtered by optional criteria.

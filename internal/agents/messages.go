@@ -151,6 +151,9 @@ func waitingActionDesc(sess *Session) string {
 }
 
 func (h *Hub) directDeliveryReportLocked(sid string, nowUTC, nowMono time.Time) (DeliveryReport, error) {
+	if strings.HasPrefix(sid, AssistantSessionPrefix) {
+		return DeliveryReport{Delivery: "immediate", WokeWaiters: 1}, nil
+	}
 	row, err := scanSessionListRow(h.db.QueryRow("SELECT "+sessionListCols+" FROM agent_sessions WHERE session_id = ?", sid))
 	if err != nil {
 		return DeliveryReport{}, err
@@ -295,13 +298,18 @@ func (h *Hub) sendMessageAndReportLocked(device, fromSession, to, body string, t
 // SendMessageWithReport sends a message and returns the message along with delivery diagnostics.
 func (h *Hub) SendMessageWithReport(device, fromSession, to, body string, threadID *string, replyTo *int64, knownDevices map[string]bool) (SendResult, error) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if err := h.checkOpenLocked(); err != nil {
+		h.mu.Unlock()
 		return SendResult{}, err
 	}
 	msg, report, err := h.sendMessageAndReportLocked(device, fromSession, to, body, threadID, replyTo, knownDevices)
+	cb := h.onAssistantMessage
+	h.mu.Unlock()
 	if err != nil {
 		return SendResult{}, err
+	}
+	if cb != nil && msg.ToSession != nil && strings.HasPrefix(*msg.ToSession, AssistantSessionPrefix) {
+		cb(msg)
 	}
 	return SendResult{Message: msg, DeliveryReport: report}, nil
 }

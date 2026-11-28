@@ -601,15 +601,17 @@ export async function renderChat(main, ctx, sub) {
     { className: "chat-model-select", "aria-label": "Model override" },
     ...MODEL_CHOICES.map((m, idx) => el("option", { value: m.value, text: idx === 0 ? defaultChoiceLabel : m.label })),
   );
+  const isEventsFeed = activeChannel === "events";
   const inputEl = el("textarea", {
     className: "chat-input",
     rows: "1",
-    placeholder: "Message assistant… (/haiku, /sol, /auto-approve)",
+    disabled: isEventsFeed,
+    placeholder: isEventsFeed ? "#events is a live zero-token Fleet event feed (read-only)" : "Message assistant… (/haiku, /sol, /auto-approve)",
   });
   const fileInput = el("input", { type: "file", multiple: true, className: "hidden" });
-  const attachBtn = el("button", { type: "button", className: "btn btn-sm", text: "📎", title: "Attach file(s) for sandbox", "aria-label": "Attach files" });
+  const attachBtn = el("button", { type: "button", className: "btn btn-sm", text: "📎", disabled: isEventsFeed, title: "Attach file(s) for sandbox", "aria-label": "Attach files" });
   const attachListEl = el("div", { className: "composer-attachments hidden" });
-  const sendBtn = el("button", { type: "button", className: "btn btn-sm btn-primary", text: "Send" });
+  const sendBtn = el("button", { type: "button", className: "btn btn-sm btn-primary", text: "Send", disabled: isEventsFeed });
   let pendingFiles = [];
 
   const renderPendingFiles = () => {
@@ -1088,7 +1090,7 @@ export async function renderChat(main, ctx, sub) {
         .catch(() => {});
       return;
     }
-    if (type === "message_created" || type === "message_done" || type === "approval" || type === "approval_decided" || type === "channel_reset" || type === "grant_updated") {
+    if (type === "message" || type === "message_created" || type === "message_done" || type === "approval" || type === "approval_decided" || type === "channel_reset" || type === "grant_updated") {
       if (d.channel_id === activeChannel) {
         cancelDeltaRAF();
         streamBox.classList.add("hidden");

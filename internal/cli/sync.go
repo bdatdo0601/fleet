@@ -550,6 +550,7 @@ func cmdMCPStatus(args []string, cio *IO) error {
 func cmdMCPServe(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("mcp serve", flag.ContinueOnError)
 	harness := fs.String("harness", "", "harness name")
+	profile := fs.String("profile", "core", "MCP tool profile (core|personal)")
 	pos, err := parseFlagsInterspersed(fs, args)
 	if err != nil {
 		return err
@@ -558,10 +559,11 @@ func cmdMCPServe(args []string, cio *IO) error {
 		return fmt.Errorf("unexpected arguments: %s", strings.Join(pos, " "))
 	}
 	if !paths.ValidHarness(*harness) {
-		return fmt.Errorf("usage: fleet mcp serve --harness claude|codex|antigravity")
+		return fmt.Errorf("usage: fleet mcp serve --harness claude|codex|antigravity [--profile core|personal]")
 	}
 	_, err = mcp.ServeStdio(mcp.ServeOpts{
 		Harness: *harness,
+		Profile: *profile,
 		Stdin:   cio.Stdin,
 		Stdout:  cio.Stdout,
 	})

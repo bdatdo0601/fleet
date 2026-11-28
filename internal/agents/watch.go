@@ -35,7 +35,7 @@ type StateTransition struct {
 	ChangedAt     string            `json:"changed_at"`
 }
 
-// Watch represents a persistent subscription pushing state transitions to a watching session's inbox.
+// Watch represents a persistent subscription pushing state transitions to a watching session or assistant channel.
 type Watch struct {
 	ID             string   `json:"id"`
 	WatcherSession string   `json:"watcher_session"`
@@ -79,10 +79,36 @@ type WatchWaitResult struct {
 	Event    *StateTransition `json:"event,omitempty"`
 }
 
+type watchTrigger struct {
+	Watch Watch
+	Event StateTransition
+}
+
 // SetOnTransition registers an optional callback invoked outside Hub's lock on state transitions.
 func (h *Hub) SetOnTransition(fn func(StateTransition)) {
 	h.mu.Lock()
 	h.onTransition = fn
+	h.mu.Unlock()
+}
+
+// SetOnWatchTriggered registers an optional callback invoked outside Hub's lock when an assistant watch fires.
+func (h *Hub) SetOnWatchTriggered(fn func(Watch, StateTransition)) {
+	h.mu.Lock()
+	h.onWatchTriggered = fn
+	h.mu.Unlock()
+}
+
+// SetOnAssistantMessage registers an optional callback invoked outside Hub's lock when a peer messages assistant.
+func (h *Hub) SetOnAssistantMessage(fn func(Message)) {
+	h.mu.Lock()
+	h.onAssistantMessage = fn
+	h.mu.Unlock()
+}
+
+// SetOnUsage registers an optional callback invoked outside Hub's lock when harness usage updates.
+func (h *Hub) SetOnUsage(fn func(prev *HarnessUsage, cur HarnessUsage)) {
+	h.mu.Lock()
+	h.onUsage = fn
 	h.mu.Unlock()
 }
 
@@ -150,7 +176,7 @@ func buildHeartbeatTransition(p HeartbeatParams, existing *sessionRow, sessionID
 	if effTail == nil {
 		effTail = prevTail
 	}
-	stateChanged := existing == nil || existing.state != p.State || existing.name != effName || (IsWaitingState(p.State) && newPendingJSON != existing.pendingActionJSON)
+	stateChanged := existing == nil || existing.state != p.State || (IsWaitingState(p.State) && newPendingJSON != existing.pendingActionJSON)
 	return StateTransition{
 		SessionID:     sessionID,
 		Device:        p.Device,
@@ -264,7 +290,7 @@ func (h *Hub) resolveWatchTargetLocked(target, targetDevice, targetName string, 
 	return "", td, tn, nil
 }
 
-// CreateWatch registers or updates a state-transition subscription for a watching session.
+// CreateWatch registers or updates a state-transition subscription for a watching session or assistant channel.
 func (h *Hub) CreateWatch(p CreateWatchParams) (Watch, error) {
 	if p.WatcherSession == "" || !strings.HasPrefix(p.WatcherSession, p.WatcherDevice+":") {
 		return Watch{}, newAgentErr("watcher_session must belong to caller device", 403)
@@ -462,10 +488,10 @@ func (h *Hub) bindPendingWatchesLocked(ev StateTransition) {
 	)
 }
 
-func (h *Hub) handleTransitionLocked(ev StateTransition) {
+func (h *Hub) handleTransitionLocked(ev StateTransition) []watchTrigger {
 	h.bindPendingWatchesLocked(ev)
 	if !ev.StateChanged {
-		return
+		return nil
 	}
 	for ch := range h.watchSubs {
 		select {
@@ -479,14 +505,15 @@ func (h *Hub) handleTransitionLocked(ev StateTransition) {
 
 	rows, err := h.db.Query("SELECT "+watchSelectCols+" FROM agent_watches WHERE target_session = ?", ev.SessionID)
 	if err != nil {
-		return
+		return nil
 	}
 	watches, err := scanAllWatches(rows)
 	if err != nil || len(watches) == 0 {
-		return
+		return nil
 	}
 	dedupeKey := watchDedupeKey(ev)
 	nowISO := registry.NowISO()
+	var assistantTriggers []watchTrigger
 	for _, w := range watches {
 		if w.WatcherSession == ev.SessionID {
 			continue
@@ -500,17 +527,22 @@ func (h *Hub) handleTransitionLocked(ev StateTransition) {
 		if w.lastNotifiedKey == dedupeKey {
 			continue
 		}
-		body := formatWatchMessage(ev)
-		threadID := "watch-" + w.ID
-		if _, err := h.db.Exec(
-			"INSERT INTO agent_messages(thread_id, reply_to, from_session, from_device, to_device, to_session, to_repo, body, created_at) VALUES (?, NULL, ?, ?, ?, ?, NULL, ?, ?)",
-			threadID, ev.SessionID, ev.Device, w.WatcherDevice, w.WatcherSession, body, nowISO,
-		); err != nil {
-			continue
-		}
-		h.sessionSubs.notify(w.WatcherSession)
-		if key := deviceHarnessKey(w.WatcherSession); key != "" {
-			h.harnessSubs.notify(key)
+		isAssistantWatcher := w.WatcherDevice == AssistantDevice || strings.HasPrefix(w.WatcherSession, AssistantSessionPrefix)
+		if isAssistantWatcher {
+			assistantTriggers = append(assistantTriggers, watchTrigger{Watch: w.Watch, Event: ev})
+		} else {
+			body := formatWatchMessage(ev)
+			threadID := "watch-" + w.ID
+			if _, err := h.db.Exec(
+				"INSERT INTO agent_messages(thread_id, reply_to, from_session, from_device, to_device, to_session, to_repo, body, created_at) VALUES (?, NULL, ?, ?, ?, ?, NULL, ?, ?)",
+				threadID, ev.SessionID, ev.Device, w.WatcherDevice, w.WatcherSession, body, nowISO,
+			); err != nil {
+				continue
+			}
+			h.sessionSubs.notify(w.WatcherSession)
+			if key := deviceHarnessKey(w.WatcherSession); key != "" {
+				h.harnessSubs.notify(key)
+			}
 		}
 		if w.Once || ev.NewState == "exited" {
 			_, _ = h.db.Exec("DELETE FROM agent_watches WHERE id = ?", w.ID)
@@ -518,6 +550,71 @@ func (h *Hub) handleTransitionLocked(ev StateTransition) {
 			_, _ = h.db.Exec("UPDATE agent_watches SET last_notified_key = ?, updated_at = ? WHERE id = ?", dedupeKey, nowISO, w.ID)
 		}
 	}
+	return assistantTriggers
+}
+
+func (h *Hub) fireTransitionCallbacks(trCb func(StateTransition), watchCb func(Watch, StateTransition), ev StateTransition, triggers []watchTrigger) {
+	if trCb != nil && ev.StateChanged {
+		trCb(ev)
+	}
+	if watchCb != nil {
+		for _, trig := range triggers {
+			watchCb(trig.Watch, trig.Event)
+		}
+	}
+}
+
+// SweepStaleSessions marks non-live sessions as exited and fires state transition & watch callbacks.
+func (h *Hub) SweepStaleSessions(now time.Time) []StateTransition {
+	nowUTC := now.UTC().Truncate(time.Second)
+	nowISO := nowUTC.Format("2006-01-02T15:04:05+00:00")
+
+	h.mu.Lock()
+	if err := h.checkOpenLocked(); err != nil {
+		h.mu.Unlock()
+		return nil
+	}
+	rows, err := h.db.Query("SELECT " + sessionDetailCols + " FROM agent_sessions WHERE state != 'exited'")
+	if err != nil {
+		h.mu.Unlock()
+		return nil
+	}
+	allRows, err := scanAllSessionDetailRows(rows)
+	if err != nil {
+		h.mu.Unlock()
+		return nil
+	}
+	type pendingFire struct {
+		ev       StateTransition
+		triggers []watchTrigger
+	}
+	var fired []pendingFire
+	for i := range allRows {
+		r := &allRows[i]
+		age := max(int(nowUTC.Sub(parseTS(r.updatedAt)).Seconds()), 0)
+		if isLiveRow(r.state, age) {
+			continue
+		}
+		if _, uErr := h.db.Exec(
+			"UPDATE agent_sessions SET state = 'exited', state_changed_at = ?, pending_action_json = '', updated_at = ? WHERE session_id = ? AND state != 'exited'",
+			nowISO, nowISO, r.sessionID,
+		); uErr != nil {
+			continue
+		}
+		h.sessionSubs.notify(r.sessionID)
+		ev := buildExitTransition(r, nowISO)
+		triggers := h.handleTransitionLocked(ev)
+		fired = append(fired, pendingFire{ev: ev, triggers: triggers})
+	}
+	trCb, watchCb := h.onTransition, h.onWatchTriggered
+	h.mu.Unlock()
+
+	out := make([]StateTransition, 0, len(fired))
+	for _, f := range fired {
+		out = append(out, f.ev)
+		h.fireTransitionCallbacks(trCb, watchCb, f.ev, f.triggers)
+	}
+	return out
 }
 
 func transitionFromDetail(det SessionDetail) StateTransition {
@@ -583,10 +680,6 @@ func (h *Hub) WaitForSessionEvent(ctx context.Context, p WatchWaitParams) (Watch
 	deadline := time.Now().Add(time.Duration(timeout * float64(time.Second)))
 
 	h.mu.Lock()
-	if err := h.checkOpenLocked(); err != nil {
-		h.mu.Unlock()
-		return WatchWaitResult{}, err
-	}
 	subCh := make(chan StateTransition, 16)
 	h.watchSubs[subCh] = struct{}{}
 	defer func() {
@@ -608,7 +701,7 @@ func (h *Hub) WaitForSessionEvent(ctx context.Context, p WatchWaitParams) (Watch
 	}
 
 	for {
-		if h.closed {
+		if h.closed || h.db == nil {
 			return WatchWaitResult{TimedOut: true}, nil
 		}
 		remaining := time.Until(deadline)

@@ -26,7 +26,7 @@ Use your session ID (`--session <id>`) from the `SessionStart` hook when calling
 
 - **Send a message:**
   `fleet agents send TO --session SID [--reply-to MSG_ID] [--thread THREAD_ID] (--message TEXT | --stdin) [--json]`
-  (`TO` accepts a session target, `device:<name>`, `repo:<name>`, or `*`.)
+  (`TO` accepts a session target, `assistant` / `assistant:<channel>`, `device:<name>`, `repo:<name>`, or `*`.)
   When replying to a peer message, pass `--reply-to <id>` and `--thread <thread>` so `fleet agents ask` waiters receive the reply immediately.
 - **Check inbox:**
   `fleet agents inbox --session SID [--all] [--no-mark-read] [--json]`
@@ -38,7 +38,7 @@ Use your session ID (`--session <id>`) from the `SessionStart` hook when calling
 - **Check push-delivery listener status:**
   `fleet agents listen [--session SID] [--json]`
 
-## Watching & Wakeups
+## Watching, Assistant Peer & Event Bus
 
 - **Subscribe your session to push wakeups when a peer finishes, blocks on permission/input, or exits:**
   `fleet agents watch TARGET --session SID [--on idle,waiting,exited] [--once] [--device D] [--pending] [--json]`
@@ -46,8 +46,10 @@ Use your session ID (`--session <id>`) from the `SessionStart` hook when calling
 - **Block in a script/command until a target session transitions:**
   `fleet agents watch TARGET --wait [--on idle,waiting,exited] [--timeout S] [--include-current] [--device D] [--pending] [--json]`
 - **List or cancel active watches:**
-  `fleet agents watch ls [--session SID] [--all] [--json]`
-  `fleet agents watch rm ID_OR_TARGET [--session SID] [--json]`
+  `fleet agents watch ls [--session SID] [--all] [--json]` (or `fleet agents watches [--target TARGET] [--json]`)
+  `fleet agents watch rm ID_OR_TARGET [--session SID] [--json]` (or `fleet agents unwatch WATCH_ID_OR_TARGET [--json]`)
+- **MCP & Event Bus CLI:**
+  Use `fleet_watch_agent`, `fleet_events_emit`, `fleet_events_list` in MCP, or `fleet events [ls|tail|emit]` from the CLI. (`assistant` and `assistant:<channel>` work as direct peer targets for `send`/`ask`.)
 
 ## Spawning & Killing Agent Sessions
 

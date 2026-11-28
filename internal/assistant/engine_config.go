@@ -1,6 +1,7 @@
 package assistant
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"maps"
@@ -8,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bdatdo0601/fleet/internal/events"
 	"github.com/bdatdo0601/fleet/internal/memory"
 )
 
@@ -66,10 +68,18 @@ func isZeroTranscribeConfig(t TranscribeConfig) bool {
 	return !t.Enabled && t.Command == "" && t.ModelPath == "" && t.Language == "" && t.AutoTranscribe == nil
 }
 
+func isZeroEventsConfig(ev EventsConfig) bool {
+	return ev.Enabled == nil && ev.QuietHoursStart == "" && ev.QuietHoursEnd == "" &&
+		ev.Timezone == "" && ev.WaitingDwellMinutes == 0 && ev.EscalationCooldownMinutes == 0 && len(ev.Routes) == 0
+}
+
 func mergePreservedConfig(cur, next Config, clearAPIKey bool) Config {
 	if !clearAPIKey && strings.TrimSpace(next.APIKey) == "" && strings.TrimSpace(next.APIKeyOPRef) == "" {
 		next.APIKey = cur.APIKey
 		next.APIKeyOPRef = cur.APIKeyOPRef
+	}
+	if strings.TrimSpace(next.VaultExposure) == "" {
+		next.VaultExposure = cur.VaultExposure
 	}
 	if next.Credentials == nil {
 		next.Credentials = append([]CredentialPolicy(nil), cur.Credentials...)
@@ -82,11 +92,25 @@ func mergePreservedConfig(cur, next Config, clearAPIKey bool) Config {
 	if next.ExtraVaults == nil {
 		next.ExtraVaults = append([]VaultMount(nil), cur.ExtraVaults...)
 	}
+	if next.ObserverThresholdTokens <= 0 && cur.ObserverThresholdTokens > 0 {
+		next.ObserverThresholdTokens = cur.ObserverThresholdTokens
+	}
+	if next.ReflectorThresholdBytes <= 0 && cur.ReflectorThresholdBytes > 0 {
+		next.ReflectorThresholdBytes = cur.ReflectorThresholdBytes
+	}
+	mergeOptionalSubconfigs(cur, &next)
+	return NormalizeConfig(next)
+}
+
+func mergeOptionalSubconfigs(cur Config, next *Config) {
 	if isZeroNotificationsConfig(next.Notifications) {
 		next.Notifications = cur.Notifications
 	}
 	if next.Routing == (RoutingConfig{}) {
 		next.Routing = cur.Routing
+	}
+	if isZeroEventsConfig(next.Events) {
+		next.Events = cur.Events
 	}
 	if isZeroLocalLLMConfig(next.LocalLLM) {
 		next.LocalLLM = cur.LocalLLM
@@ -102,16 +126,9 @@ func mergePreservedConfig(cur, next Config, clearAPIKey bool) Config {
 	if isZeroSandboxConfig(next.Sandbox) {
 		next.Sandbox = cur.Sandbox
 	}
-	if next.ObserverThresholdTokens <= 0 && cur.ObserverThresholdTokens > 0 {
-		next.ObserverThresholdTokens = cur.ObserverThresholdTokens
-	}
-	if next.ReflectorThresholdBytes <= 0 && cur.ReflectorThresholdBytes > 0 {
-		next.ReflectorThresholdBytes = cur.ReflectorThresholdBytes
-	}
 	if isZeroDiscordConfig(next.Discord) {
 		next.Discord = cur.Discord
 	}
-	return NormalizeConfig(next)
 }
 
 func preserveMaskedMCPEnv(prev, next []MCPServerConfig) []MCPServerConfig {
@@ -183,6 +200,12 @@ func (e *Engine) updateConfigLocked(next Config, clearAPIKey bool) (ConfigView, 
 		}
 	}
 	if err := validateExtraVaults(next.ExtraVaults); err != nil {
+		return ConfigView{}, err
+	}
+	if err := ValidateExposure(next.VaultExposure, "vault_exposure"); err != nil {
+		return ConfigView{}, err
+	}
+	if err := ValidateEventsConfig(next.Events); err != nil {
 		return ConfigView{}, err
 	}
 	vaultRoot := ResolveVaultRoot(next.VaultPath, e.vaultDir)
@@ -404,6 +427,22 @@ func (e *Engine) CompleteMCPOAuth(ctx context.Context, serverName, state, code s
 		Authorized: true,
 		Scope:      tok.Scope,
 		ExpiresAt:  tok.ExpiresAt,
+	}
+	if e.deps != nil {
+		_, _, _ = e.deps.PublishEvent(events.Event{
+			Type:      "mcp.oauth",
+			Severity:  "info",
+			Source:    "assistant",
+			Subject:   srv.Name,
+			DedupeKey: fmt.Sprintf("mcp-oauth:%s:%d", srv.Name, time.Now().UTC().Unix()),
+			Title:     fmt.Sprintf("MCP OAuth connected: %s", srv.Name),
+			Summary:   fmt.Sprintf("Authorized OAuth tokens for MCP server %q (scope: %s).", srv.Name, cmp.Or(tok.Scope, "default")),
+			Payload: map[string]any{
+				"server":     srv.Name,
+				"scope":      tok.Scope,
+				"expires_at": tok.ExpiresAt,
+			},
+		})
 	}
 	if srv.Enabled {
 		tCtx, cancel := context.WithTimeout(ctx, 15*time.Second)

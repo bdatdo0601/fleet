@@ -15,7 +15,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/bdatdo0601/fleet/internal/memory"
 	"github.com/bdatdo0601/fleet/internal/registry"
@@ -68,6 +70,12 @@ const (
 	MCPApprovalPolicyAll        = "all"
 	MCPApprovalPolicyWritesOnly = "writes_only"
 	MCPApprovalPolicyNone       = "none"
+
+	ExposureAssistantOnly   = "assistant_only"
+	ExposurePersonalDevices = "personal_devices"
+
+	DefaultEventsWaitingDwellMins = 5
+	DefaultEventsCooldownMins     = 30
 )
 
 // AssistantError is an error carrying an HTTP status code for API handlers.
@@ -138,8 +146,20 @@ type MCPServerConfig struct {
 	HeaderRefs           map[string]string `json:"header_refs,omitempty"`
 	OAuth                *MCPOAuthConfig   `json:"oauth,omitempty"`
 	Enabled              bool              `json:"enabled"`
+	Exposure             string            `json:"exposure,omitempty"`
 	ApprovalPolicy       string            `json:"approval_policy,omitempty"`
 	RequireApprovalTools []string          `json:"require_approval_tools,omitempty"`
+}
+
+// EventsConfig controls the unified assistant event router, smart System-1 triage, quiet hours, and escalation cooldowns.
+type EventsConfig struct {
+	Enabled                   *bool             `json:"enabled,omitempty"`
+	QuietHoursStart           string            `json:"quiet_hours_start,omitempty"`
+	QuietHoursEnd             string            `json:"quiet_hours_end,omitempty"`
+	Timezone                  string            `json:"timezone,omitempty"`
+	WaitingDwellMinutes       int               `json:"waiting_dwell_minutes,omitempty"`
+	EscalationCooldownMinutes int               `json:"escalation_cooldown_minutes,omitempty"`
+	Routes                    map[string]string `json:"routes,omitempty"`
 }
 
 // NotificationsConfig configures outbound-only notifications (e.g. Discord Webhook into read-only alert channels).
@@ -184,6 +204,7 @@ type CredentialPolicy struct {
 type VaultMount struct {
 	Name          string   `json:"name"`
 	Path          string   `json:"path"`
+	Exposure      string   `json:"exposure,omitempty"`
 	ReadOnly      bool     `json:"read_only,omitempty"`
 	AutoWriteDirs []string `json:"auto_write_dirs,omitempty"`
 }
@@ -251,6 +272,7 @@ type Config struct {
 	AutoApprove              bool                `json:"auto_approve"`
 	DataCollection           string              `json:"data_collection,omitempty"`
 	VaultPath                string              `json:"vault_path,omitempty"`
+	VaultExposure            string              `json:"vault_exposure,omitempty"`
 	AutoWriteDirs            []string            `json:"auto_write_dirs,omitempty"`
 	ExtraVaults              []VaultMount        `json:"extra_vaults,omitempty"`
 	GitAutoCommit            bool                `json:"git_auto_commit"`
@@ -263,6 +285,7 @@ type Config struct {
 	Embeddings               memory.EmbedConfig  `json:"embeddings"`
 	Transcribe               TranscribeConfig    `json:"transcribe"`
 	Routing                  RoutingConfig       `json:"routing"`
+	Events                   EventsConfig        `json:"events"`
 	MCPServers               []MCPServerConfig   `json:"mcp_servers,omitempty"`
 	Credentials              []CredentialPolicy  `json:"credentials,omitempty"`
 	Notifications            NotificationsConfig `json:"notifications"`
@@ -292,6 +315,7 @@ type ConfigView struct {
 	AutoApprove              bool                `json:"auto_approve"`
 	DataCollection           string              `json:"data_collection"`
 	VaultPath                string              `json:"vault_path"`
+	VaultExposure            string              `json:"vault_exposure"`
 	EffectiveVaultPath       string              `json:"effective_vault_path"`
 	AutoWriteDirs            []string            `json:"auto_write_dirs"`
 	ExtraVaults              []VaultMount        `json:"extra_vaults"`
@@ -305,6 +329,7 @@ type ConfigView struct {
 	Embeddings               memory.EmbedConfig  `json:"embeddings"`
 	Transcribe               TranscribeConfig    `json:"transcribe"`
 	Routing                  RoutingConfig       `json:"routing"`
+	Events                   EventsConfig        `json:"events"`
 	MCPServers               []MCPServerConfig   `json:"mcp_servers"`
 	Credentials              []CredentialView    `json:"credentials"`
 	Notifications            NotificationsConfig `json:"notifications"`
@@ -346,12 +371,119 @@ var legacyAliasUpgrades = map[string]string{
 	"openai/gpt-5-nano":           "thinkingmachines/inkling-2-mini",
 }
 
+// NormalizeExposure normalizes an assistant capability exposure scope ("assistant_only" or "personal_devices").
+func NormalizeExposure(raw string) string {
+	if strings.EqualFold(strings.TrimSpace(raw), ExposurePersonalDevices) {
+		return ExposurePersonalDevices
+	}
+	return ExposureAssistantOnly
+}
+
+// ValidateExposure validates an optional exposure setting.
+func ValidateExposure(raw, label string) error {
+	clean := strings.ToLower(strings.TrimSpace(raw))
+	if clean == "" || clean == ExposureAssistantOnly || clean == ExposurePersonalDevices {
+		return nil
+	}
+	return newErr(fmt.Sprintf("%s invalid exposure %q (expected %s or %s)", label, raw, ExposureAssistantOnly, ExposurePersonalDevices), http.StatusBadRequest)
+}
+
+// DefaultEventsConfig returns default settings for the unified assistant event router.
+func DefaultEventsConfig() EventsConfig {
+	on := true
+	return EventsConfig{
+		Enabled:                   &on,
+		QuietHoursStart:           "23:00",
+		QuietHoursEnd:             "07:00",
+		Timezone:                  "Local",
+		WaitingDwellMinutes:       DefaultEventsWaitingDwellMins,
+		EscalationCooldownMinutes: DefaultEventsCooldownMins,
+	}
+}
+
+func normalizeEventsConfig(e EventsConfig) EventsConfig {
+	def := DefaultEventsConfig()
+	if e.Enabled == nil {
+		e.Enabled = def.Enabled
+	} else {
+		v := *e.Enabled
+		e.Enabled = &v
+	}
+	e.QuietHoursStart = cmp.Or(strings.TrimSpace(e.QuietHoursStart), def.QuietHoursStart)
+	e.QuietHoursEnd = cmp.Or(strings.TrimSpace(e.QuietHoursEnd), def.QuietHoursEnd)
+	e.Timezone = cmp.Or(strings.TrimSpace(e.Timezone), def.Timezone)
+	if e.WaitingDwellMinutes <= 0 {
+		e.WaitingDwellMinutes = def.WaitingDwellMinutes
+	}
+	if e.EscalationCooldownMinutes <= 0 {
+		e.EscalationCooldownMinutes = def.EscalationCooldownMinutes
+	}
+	if len(e.Routes) > 0 {
+		clean := make(map[string]string, len(e.Routes))
+		for k, v := range e.Routes {
+			ck := strings.ToLower(strings.TrimSpace(k))
+			cv := strings.ToLower(strings.TrimSpace(v))
+			if ck != "" && cv != "" {
+				clean[ck] = cv
+			}
+		}
+		e.Routes = clean
+	}
+	return e
+}
+
+func copyEventsConfig(e EventsConfig) EventsConfig {
+	cp := normalizeEventsConfig(e)
+	if len(e.Routes) > 0 {
+		cp.Routes = maps.Clone(cp.Routes)
+	}
+	return cp
+}
+
+func parseHHMM(raw string) (int, bool) {
+	parts := strings.Split(strings.TrimSpace(raw), ":")
+	if len(parts) != 2 {
+		return 0, false
+	}
+	hh, err1 := strconv.Atoi(parts[0])
+	mm, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil || hh < 0 || hh > 23 || mm < 0 || mm > 59 {
+		return 0, false
+	}
+	return hh*60 + mm, true
+}
+
+// ValidateEventsConfig validates EventsConfig fields.
+func ValidateEventsConfig(e EventsConfig) error {
+	e = normalizeEventsConfig(e)
+	if _, ok := parseHHMM(e.QuietHoursStart); !ok {
+		return newErr(fmt.Sprintf("events.quiet_hours_start %q must be HH:MM (00:00-23:59)", e.QuietHoursStart), http.StatusBadRequest)
+	}
+	if _, ok := parseHHMM(e.QuietHoursEnd); !ok {
+		return newErr(fmt.Sprintf("events.quiet_hours_end %q must be HH:MM (00:00-23:59)", e.QuietHoursEnd), http.StatusBadRequest)
+	}
+	if !strings.EqualFold(e.Timezone, "Local") && !strings.EqualFold(e.Timezone, "UTC") {
+		if _, err := time.LoadLocation(e.Timezone); err != nil {
+			return newErr(fmt.Sprintf("invalid events.timezone %q: %v", e.Timezone, err), http.StatusBadRequest)
+		}
+	}
+	for evType, route := range e.Routes {
+		switch route {
+		case "events_only", "ops_notify", "triage", "wake_ops", "escalate_general":
+		default:
+			return newErr(fmt.Sprintf("events.routes[%q] invalid action %q (expected events_only, ops_notify, triage, wake_ops, or escalate_general)", evType, route), http.StatusBadRequest)
+		}
+	}
+	return nil
+}
+
 // DefaultConfig returns a baseline assistant configuration with safe defaults.
 func DefaultConfig() Config {
 	return Config{
 		BaseURL:                  DefaultOpenRouterURL,
 		ZDR:                      true,
 		DataCollection:           "deny",
+		VaultExposure:            ExposureAssistantOnly,
 		AutoWriteDirs:            []string{"_agent", "_skills", "Daily", "Inbox"},
 		GitAutoCommit:            true,
 		HeartbeatIntervalMinutes: DefaultHeartbeatMins,
@@ -372,6 +504,7 @@ func DefaultConfig() Config {
 		Embeddings: normalizeAssistantEmbedConfig(memory.EmbedConfig{}),
 		Transcribe: normalizeTranscribeConfig(TranscribeConfig{}),
 		Routing:    normalizeRoutingConfig(RoutingConfig{Mode: DefaultRoutingMode}),
+		Events:     DefaultEventsConfig(),
 		Sandbox:    normalizeSandboxConfig(SandboxConfig{}),
 	}
 }
@@ -442,6 +575,7 @@ func NormalizeConfig(cfg Config) Config {
 		cfg.DataCollection = def.DataCollection
 	}
 	cfg.VaultPath = strings.TrimSpace(cfg.VaultPath)
+	cfg.VaultExposure = NormalizeExposure(cfg.VaultExposure)
 	if len(cfg.AutoWriteDirs) == 0 {
 		cfg.AutoWriteDirs = append([]string(nil), def.AutoWriteDirs...)
 	}
@@ -480,6 +614,7 @@ func NormalizeConfig(cfg Config) Config {
 	cfg.Embeddings = normalizeAssistantEmbedConfig(cfg.Embeddings)
 	cfg.Transcribe = normalizeTranscribeConfig(cfg.Transcribe)
 	cfg.Routing = normalizeRoutingConfig(cfg.Routing)
+	cfg.Events = normalizeEventsConfig(cfg.Events)
 	cfg.ExtraVaults = normalizeVaultMounts(cfg.ExtraVaults)
 	cfg.MCPServers = normalizeMCPServers(cfg.MCPServers)
 	cfg.Notifications = normalizeNotificationsConfig(cfg.Notifications)
@@ -657,6 +792,7 @@ func normalizeVaultMounts(mounts []VaultMount) []VaultMount {
 	for _, m := range mounts {
 		m.Name = strings.ToLower(strings.TrimSpace(m.Name))
 		m.Path = strings.TrimSpace(m.Path)
+		m.Exposure = NormalizeExposure(m.Exposure)
 		var dirs []string
 		for _, d := range m.AutoWriteDirs {
 			if clean := strings.Trim(strings.TrimSpace(d), "/"); clean != "" {
@@ -681,6 +817,9 @@ func validateExtraVaults(mounts []VaultMount) error {
 		seen[m.Name] = struct{}{}
 		if strings.TrimSpace(m.Path) == "" {
 			return newErr(fmt.Sprintf("extra vault %q path is required", m.Name), http.StatusBadRequest)
+		}
+		if err := ValidateExposure(m.Exposure, fmt.Sprintf("extra vault %q", m.Name)); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -877,6 +1016,7 @@ func NormalizeMCPServerConfig(srv MCPServerConfig) MCPServerConfig {
 	srv.Name = strings.ToLower(strings.TrimSpace(srv.Name))
 	srv.Command = strings.TrimSpace(srv.Command)
 	srv.URL = strings.TrimSpace(srv.URL)
+	srv.Exposure = NormalizeExposure(srv.Exposure)
 	srv.ApprovalPolicy = strings.ToLower(strings.TrimSpace(srv.ApprovalPolicy))
 	tr := strings.ToLower(strings.TrimSpace(srv.Transport))
 	if tr == "sse" || tr == "http" || (tr == "" && srv.URL != "") {
@@ -1041,6 +1181,9 @@ func ValidateMCPServerConfig(srv MCPServerConfig, selfSetup bool) error {
 	default:
 		return newErr(fmt.Sprintf("MCP %q invalid approval_policy %q (expected all, writes_only, or none)", srv.Name, srv.ApprovalPolicy), http.StatusBadRequest)
 	}
+	if err := ValidateExposure(srv.Exposure, fmt.Sprintf("MCP %q", srv.Name)); err != nil {
+		return err
+	}
 	return validateMCPOAuthConfig(srv, selfSetup)
 }
 
@@ -1118,6 +1261,7 @@ func (c Config) View(effectiveVault string) ConfigView {
 		AutoApprove:              c.AutoApprove,
 		DataCollection:           c.DataCollection,
 		VaultPath:                c.VaultPath,
+		VaultExposure:            NormalizeExposure(c.VaultExposure),
 		EffectiveVaultPath:       effectiveVault,
 		AutoWriteDirs:            append([]string(nil), c.AutoWriteDirs...),
 		ExtraVaults:              copyVaultMounts(c.ExtraVaults),
@@ -1131,6 +1275,7 @@ func (c Config) View(effectiveVault string) ConfigView {
 		Embeddings:               embView,
 		Transcribe:               normalizeTranscribeConfig(c.Transcribe),
 		Routing:                  normalizeRoutingConfig(c.Routing),
+		Events:                   copyEventsConfig(c.Events),
 		MCPServers:               redactMCPServers(c.MCPServers),
 		Credentials:              creds,
 		Notifications:            normalizeNotificationsConfig(c.Notifications),

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"cmp"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,16 +16,26 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/bdatdo0601/fleet/internal/events"
 )
 
 type fakeDeps struct {
-	sentSlack []string
-	spawned   []SpawnAgentRequest
-	killed    []string
-	lhWorker  LighthouseWorkerStatus
+	mu           sync.Mutex
+	sentSlack    []string
+	sentMessages []map[string]any
+	spawned      []SpawnAgentRequest
+	killed       []string
+	watches      []AgentWatchInfo
+	swept        int
+	events       []events.Event
+	eventSubs    map[chan events.Event]struct{}
+	lhWorker     LighthouseWorkerStatus
+	systemHealth map[string]any
 }
 
 func (f *fakeDeps) LighthouseWorkerStatus() LighthouseWorkerStatus {
@@ -39,8 +50,139 @@ func (f *fakeDeps) InspectAgent(target string) (any, error) {
 	return map[string]any{"target": target, "state": "idle"}, nil
 }
 
-func (f *fakeDeps) SendAgentMessage(fromDevice, to, body string) (any, error) {
-	return map[string]any{"from": fromDevice, "to": to, "body": body}, nil
+func (f *fakeDeps) SendAgentMessage(fromChannel, to, body, threadID string, replyTo *int64) (any, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	msg := map[string]any{"from_channel": fromChannel, "to": to, "body": body, "thread_id": threadID, "reply_to": replyTo}
+	f.sentMessages = append(f.sentMessages, msg)
+	return msg, nil
+}
+
+func (f *fakeDeps) AskAgent(_ context.Context, fromChannel, to, question string, _ float64) (any, error) {
+	return map[string]any{"from_channel": fromChannel, "to": to, "question": question, "reply": "ok"}, nil
+}
+
+func (f *fakeDeps) WatchAgent(req AgentWatchRequest) (AgentWatchInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	w := AgentWatchInfo{
+		ID:            fmt.Sprintf("w-%d", len(f.watches)+1),
+		ChannelID:     cmp.Or(req.ChannelID, "fleet-ops"),
+		TargetSession: req.Target,
+		Events:        req.Events,
+		Once:          req.Once,
+	}
+	f.watches = append(f.watches, w)
+	return w, nil
+}
+
+func (f *fakeDeps) ListWatches(channelID string) ([]AgentWatchInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if channelID == "" {
+		return append([]AgentWatchInfo(nil), f.watches...), nil
+	}
+	var out []AgentWatchInfo
+	for _, w := range f.watches {
+		if w.ChannelID == channelID {
+			out = append(out, w)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeDeps) DeleteWatch(channelID, idOrTarget string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var kept []AgentWatchInfo
+	deleted := 0
+	for _, w := range f.watches {
+		if (channelID == "" || w.ChannelID == channelID) && (w.ID == idOrTarget || w.TargetSession == idOrTarget) {
+			deleted++
+			continue
+		}
+		kept = append(kept, w)
+	}
+	f.watches = kept
+	return deleted, nil
+}
+
+func (f *fakeDeps) SweepStaleAgents(_ time.Time) {
+	f.mu.Lock()
+	f.swept++
+	f.mu.Unlock()
+}
+
+func (f *fakeDeps) SystemHealth() (map[string]any, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.systemHealth != nil {
+		return f.systemHealth, nil
+	}
+	return map[string]any{"devices_total": 2}, nil
+}
+
+func (f *fakeDeps) ListMemoryProposals(_ string, _ int) (any, error) {
+	return []map[string]any{}, nil
+}
+
+func (f *fakeDeps) DecideMemoryProposal(id int64, approve bool) (any, error) {
+	return map[string]any{"id": id, "approved": approve}, nil
+}
+
+func (f *fakeDeps) ListEvents(filter events.Filter) ([]events.Event, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []events.Event
+	for _, ev := range f.events {
+		if filter.TypePrefix != "" && !strings.HasPrefix(ev.Type, filter.TypePrefix) {
+			continue
+		}
+		if filter.Severity != "" && ev.Severity != filter.Severity {
+			continue
+		}
+		out = append(out, ev)
+	}
+	return out, nil
+}
+
+func (f *fakeDeps) PublishEvent(ev events.Event) (events.Event, bool, error) {
+	f.mu.Lock()
+	ev.ID = int64(len(f.events) + 1)
+	if ev.CreatedAt == "" {
+		ev.CreatedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	f.events = append(f.events, ev)
+	subs := make([]chan events.Event, 0, len(f.eventSubs))
+	for ch := range f.eventSubs {
+		subs = append(subs, ch)
+	}
+	f.mu.Unlock()
+	for _, ch := range subs {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
+	return ev, true, nil
+}
+
+func (f *fakeDeps) SubscribeEvents() chan events.Event {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.eventSubs == nil {
+		f.eventSubs = make(map[chan events.Event]struct{})
+	}
+	ch := make(chan events.Event, 32)
+	f.eventSubs[ch] = struct{}{}
+	return ch
+}
+
+func (f *fakeDeps) UnsubscribeEvents(ch chan events.Event) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.eventSubs, ch)
+	close(ch)
 }
 
 func (f *fakeDeps) ListPaths(device, query string, _ int) (any, error) {
@@ -1096,7 +1238,7 @@ func TestCronTimersDelegationLifecycleAndVaultGit(t *testing.T) {
 		t.Fatalf("UpsertTimer cron failed: %v", err)
 	}
 
-	// Phase 3: fleet_list_paths, fleet_spawn_agent (approval -> delegation), OnAgentHeartbeat wakeup, fleet_kill_agent.
+	// Phase 3: fleet_list_paths, fleet_spawn_agent (approval -> watch), agent.watch event wakeup, fleet_kill_agent.
 	tctx := &toolExecContext{ChannelID: "fleet-ops", Source: "chat", Config: eng.Config()}
 	pathsOut, err := eng.executeTool(t.Context(), ToolCall{ID: "p1", Type: "function", Function: ToolCallFunction{Name: "fleet_list_paths", Arguments: `{"device":"laptop"}`}}, tctx)
 	if err != nil || !strings.Contains(pathsOut, "/Users/datdo/workspace/fleet") {
@@ -1109,39 +1251,40 @@ func TestCronTimersDelegationLifecycleAndVaultGit(t *testing.T) {
 	}
 	tctxApproved := &toolExecContext{ChannelID: "fleet-ops", Source: "approval", Config: eng.Config(), BypassHITL: true}
 	spawnOut, err := eng.executeTool(t.Context(), ToolCall{ID: "sp1-ok", Type: "function", Function: ToolCallFunction{Name: "fleet_spawn_agent", Arguments: spawnArgs}}, tctxApproved)
-	if err != nil || !strings.Contains(spawnOut, "job-spawn-1") {
-		t.Fatalf("approved fleet_spawn_agent failed: %v (%s)", err, spawnOut)
+	if err != nil || !strings.Contains(spawnOut, "job-spawn-1") || len(deps.watches) != 1 {
+		t.Fatalf("approved fleet_spawn_agent failed: %v (%s watches=%+v)", err, spawnOut, deps.watches)
 	}
 
-	// Simulate Slacker launch receipt and agent heartbeat transition working -> waiting_permission.
-	eng.OnSlackerReceipt("job-spawn-1", "laptop", "fix-auth", "", "launched", "")
-	eng.OnAgentHeartbeat("laptop", "claude", "laptop:claude:abc1", "fix-auth", "working", "Editing auth.go", "", "", nil)
-	eng.OnAgentHeartbeat("laptop", "claude", "laptop:claude:abc1", "fix-auth", "waiting_permission", "Need bash approval", "M auth.go", "Ready to run tests", map[string]string{"tool": "Bash"})
+	eng.HandleBusEvent(t.Context(), events.Event{
+		Type:        "agent.watch",
+		Severity:    "warn",
+		Source:      "agents",
+		Actor:       "laptop:claude:abc1",
+		Subject:     "laptop:claude:abc1",
+		ChannelHint: "fleet-ops",
+		Title:       "Watched agent fix-auth: waiting_permission",
+		Summary:     "Watched claude session fix-auth transitioned to waiting_permission.",
+		Payload: map[string]any{
+			"watch_id":       deps.watches[0].ID,
+			"session_id":     "laptop:claude:abc1",
+			"device":         "laptop",
+			"harness":        "claude",
+			"name":           "fix-auth",
+			"new_state":      "waiting_permission",
+			"last_assistant": "Ready to run tests",
+		},
+	})
 
-	var foundDelegationEvent bool
+	var foundWatchEvent bool
 	for range 10 {
 		ev, err := eng.store.ClaimNextInbox()
-		if err == nil && ev != nil && ev.Source == "delegation" {
-			foundDelegationEvent = strings.Contains(ev.PayloadJSON, "Ready to run tests")
+		if err == nil && ev != nil && ev.Source == "agent_watch" {
+			foundWatchEvent = strings.Contains(ev.PayloadJSON, "Ready to run tests")
 			break
 		}
 	}
-	if !foundDelegationEvent {
-		t.Fatalf("expected delegation inbox event with lastAssistant after waiting_permission heartbeat")
-	}
-
-	// fleet_watch_agent watches an existing session and supports stop=true.
-	watchOut, err := eng.executeTool(t.Context(), ToolCall{
-		ID: "w1", Type: "function", Function: ToolCallFunction{Name: "fleet_watch_agent", Arguments: `{"agent_id":"laptop/auth-worker","note":"report PR status"}`},
-	}, tctx)
-	if err != nil || !strings.Contains(watchOut, `"status":"watching"`) {
-		t.Fatalf("fleet_watch_agent failed: %v (%s)", err, watchOut)
-	}
-	stopOut, err := eng.executeTool(t.Context(), ToolCall{
-		ID: "w2", Type: "function", Function: ToolCallFunction{Name: "fleet_watch_agent", Arguments: `{"agent_id":"laptop/auth-worker","stop":true}`},
-	}, tctx)
-	if err != nil || !strings.Contains(stopOut, `"status":"unwatched"`) {
-		t.Fatalf("fleet_watch_agent stop failed: %v (%s)", err, stopOut)
+	if !foundWatchEvent {
+		t.Fatalf("expected agent_watch inbox event after HandleBusEvent(agent.watch)")
 	}
 
 	// Vault git history, diff, and rollback.
@@ -1225,9 +1368,9 @@ func TestDiscordWebhookNotifierAndDoctor(t *testing.T) {
 	eng.SetOPReader(reader)
 	notifier := NewDiscordWebhookNotifier(cfg.Notifications, reader, nil)
 	notifier.allowInsecureTestURL = true
-	eng.delMu.Lock()
+	eng.notifyMu.Lock()
 	eng.notifier = notifier
-	eng.delMu.Unlock()
+	eng.notifyMu.Unlock()
 
 	if err := eng.TestNotification(t.Context()); err != nil {
 		t.Fatalf("TestNotification failed: %v", err)
@@ -1372,12 +1515,12 @@ func TestHybridAutoRoutingTopicGrantsAndModes(t *testing.T) {
 	defer func() { _ = eng.Close() }()
 
 	var discordSent atomic.Int32
-	eng.delMu.Lock()
+	eng.notifyMu.Lock()
 	eng.notifier = testNotifier(func(context.Context, Notification) error {
 		discordSent.Add(1)
 		return nil
 	})
-	eng.delMu.Unlock()
+	eng.notifyMu.Unlock()
 
 	cfg := DefaultConfig()
 	cfg.Enabled = true
@@ -2250,138 +2393,157 @@ func TestOpenRouterMidStreamError(t *testing.T) {
 	}
 }
 
-type listAgentsFakeDeps struct {
-	fakeDeps
-	listAgentsFn func() (any, error)
-}
-
-func (f *listAgentsFakeDeps) ListAgents(device, repo, harness, state string, includeStale bool) (any, error) {
-	if f.listAgentsFn != nil {
-		return f.listAgentsFn()
-	}
-	return f.fakeDeps.ListAgents(device, repo, harness, state, includeStale)
-}
-
-func drainDelegationInbox(t *testing.T, eng *Engine) []InboxEvent {
-	t.Helper()
-	var out []InboxEvent
-	for range 20 {
-		ev, err := eng.store.ClaimNextInbox()
-		if err != nil || ev == nil {
-			break
-		}
-		if ev.Source == "delegation" {
-			out = append(out, *ev)
-		}
-	}
-	return out
-}
-
-func TestDelegationLifecycleEdgeCasesAndReconciliation(t *testing.T) {
+func TestSchemaV2ResetEventRouterAndPersonalProxy(t *testing.T) {
 	tmp := t.TempDir()
-	deps := &listAgentsFakeDeps{}
-	eng, err := Open(filepath.Join(tmp, "assistant.db"), filepath.Join(tmp, "assistant.json"), filepath.Join(tmp, "vault"), deps)
+	dbPath := filepath.Join(tmp, "assistant.db")
+
+	// Seed a simulated v1 database with legacy assistant_delegations + old messages + preserved OAuth token.
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = rawDB.Exec(`
+		CREATE TABLE assistant_delegations(id TEXT PRIMARY KEY);
+		INSERT INTO assistant_delegations(id) VALUES ('del-legacy');
+		CREATE TABLE assistant_messages(id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id TEXT, role TEXT, content TEXT, created_at TEXT);
+		INSERT INTO assistant_messages(channel_id, role, content, created_at) VALUES ('general', 'user', 'old-v1', '2026-01-01T00:00:00Z');
+		CREATE TABLE assistant_mcp_oauth_tokens(
+			server_name TEXT PRIMARY KEY, access_token TEXT NOT NULL DEFAULT '', refresh_token TEXT NOT NULL DEFAULT '',
+			token_type TEXT NOT NULL DEFAULT 'Bearer', scope TEXT NOT NULL DEFAULT '', expires_at TEXT NOT NULL DEFAULT '',
+			token_url TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
+		);
+		INSERT INTO assistant_mcp_oauth_tokens(server_name, access_token, updated_at) VALUES ('gcal', 'tok-keep', '2026-01-01T00:00:00Z');
+	`)
+	_ = rawDB.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var triageAction atomic.Value
+	triageAction.Store("ops_turn")
+	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/alpha/decisions" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"answers":{"action":{"type":"choice","choice":%q}}}`, triageAction.Load().(string))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer mockLLM.Close()
+
+	deps := &fakeDeps{}
+	eng, err := Open(dbPath, filepath.Join(tmp, "assistant.json"), filepath.Join(tmp, "vault"), deps)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = eng.Close() }()
 
-	// 1. queued -> idle direct completion + slugified name matching ("Fix_Auth" == "fix-auth").
-	d1, err := eng.store.CreateDelegation(Delegation{
-		JobID: "job-1", ChannelID: "general", TargetDevice: "laptop", Harness: "codex", SessionName: "Fix_Auth", Status: "queued",
-	})
-	if err != nil {
+	// Confirm OAuth token preserved and v1 legacy table dropped + 4 channels seeded.
+	tok, ok, err := eng.store.GetMCPOAuthToken("gcal")
+	if err != nil || !ok || tok.AccessToken != "tok-keep" {
+		t.Fatalf("expected OAuth token preserved across v2 reset, got ok=%v tok=%+v err=%v", ok, tok, err)
+	}
+	channels, err := eng.store.ListChannels()
+	if err != nil || len(channels) != 4 || channels[3].ID != "events" {
+		t.Fatalf("expected 4 default channels including #events, got %+v (%v)", channels, err)
+	}
+	oldMsgs, _ := eng.store.ListMessages("general", 10)
+	if len(oldMsgs) != 0 {
+		t.Fatalf("expected legacy v1 messages cleared by v2 reset, got %d", len(oldMsgs))
+	}
+
+	cfg := DefaultConfig()
+	cfg.Enabled = true
+	cfg.BaseURL = mockLLM.URL
+	cfg.APIKey = "sk-test"
+	cfg.VaultExposure = ExposureAssistantOnly
+	cfg.Events.QuietHoursStart = "00:00"
+	cfg.Events.QuietHoursEnd = "00:00"
+	cfg.MCPServers = []MCPServerConfig{
+		{
+			Name:           "secret_srv",
+			Transport:      "stdio",
+			Command:        os.Args[0],
+			Args:           []string{"-test.run=TestHelperMCPProcess"},
+			Env:            map[string]string{"GO_WANT_MCP_HELPER": "1"},
+			Enabled:        true,
+			Exposure:       ExposureAssistantOnly,
+			ApprovalPolicy: MCPApprovalPolicyNone,
+		},
+		{
+			Name:           "personal_srv",
+			Transport:      "stdio",
+			Command:        os.Args[0],
+			Args:           []string{"-test.run=TestHelperMCPProcess"},
+			Env:            map[string]string{"GO_WANT_MCP_HELPER": "1"},
+			Enabled:        true,
+			Exposure:       ExposurePersonalDevices,
+			ApprovalPolicy: MCPApprovalPolicyAll,
+		},
+	}
+	if _, err := eng.UpdateConfig(cfg, false); err != nil {
 		t.Fatal(err)
 	}
-	eng.refreshDelegationsFlag()
-	eng.OnAgentHeartbeat("laptop", "codex", "laptop:codex:s1", "fix-auth", "idle", "All tests passed", "", "", nil)
-	evs := drainDelegationInbox(t, eng)
-	if len(evs) != 1 || !strings.Contains(evs[0].PayloadJSON, `"state":"idle"`) {
-		t.Fatalf("expected 1 idle delegation event for queued->idle with slugified name, got %+v", evs)
-	}
 
-	// 2. Multi-turn follow-up: idle -> working (resets last_notified_state) -> idle wakes again.
-	eng.OnAgentHeartbeat("laptop", "codex", "laptop:codex:s1", "renamed-later", "working", "Follow-up turn", "", "", nil)
-	if evs = drainDelegationInbox(t, eng); len(evs) != 0 {
-		t.Fatalf("expected no wakeup on working, got %+v", evs)
-	}
-	eng.OnAgentHeartbeat("laptop", "codex", "laptop:codex:s1", "renamed-later", "idle", "Second turn done", "", "", nil)
-	if evs = drainDelegationInbox(t, eng); len(evs) != 1 || !strings.Contains(evs[0].PayloadJSON, `"state":"idle"`) {
-		t.Fatalf("expected second idle wakeup after working reset, got %+v", evs)
-	}
-
-	// 3. Closing an already-idle session (idle -> exited) marks exited silently without waking.
-	eng.OnAgentHeartbeat("laptop", "codex", "laptop:codex:s1", "renamed-later", "exited", "", "", "", nil)
-	if evs = drainDelegationInbox(t, eng); len(evs) != 0 {
-		t.Fatalf("expected no wakeup on idle->exited, got %+v", evs)
-	}
-	allDels, _ := eng.store.ListDelegations(10)
-	if allDels[0].Status != "exited" {
-		t.Fatalf("expected d1 status exited, got %+v", allDels[0])
-	}
-
-	// 4. OnSlackerReceipt binds sessionID so subsequent heartbeats match even if name changes,
-	// and working -> exited wakes the assistant.
-	_, err = eng.store.CreateDelegation(Delegation{
-		JobID: "job-2", ChannelID: "general", TargetDevice: "office", Harness: "antigravity", SessionName: "ui-agy-abc", Status: "queued",
+	// 1. memory.proposal -> logged to #events with Observed=true (0-token), nothing in #general or #fleet-ops.
+	eng.HandleBusEvent(t.Context(), events.Event{
+		Type: "memory.proposal", Severity: "info", Source: "memory", Subject: "global/k", Title: "Proposal k", Summary: "body",
 	})
-	if err != nil {
-		t.Fatal(err)
+	evMsgs, _ := eng.store.ListMessages("events", 10)
+	if len(evMsgs) != 1 || !evMsgs[0].Observed {
+		t.Fatalf("expected 1 observed message in #events, got %+v", evMsgs)
 	}
-	eng.refreshDelegationsFlag()
-	eng.OnSlackerReceipt("job-2", "office", "ui-agy-abc", "office:antigravity:conv1234", "launched", "")
-	eng.OnAgentHeartbeat("office", "antigravity", "office:antigravity:conv1234", "unrelated-title", "working", "Working", "", "", nil)
-	eng.OnAgentHeartbeat("office", "antigravity", "office:antigravity:conv1234", "unrelated-title", "exited", "Process exited", "", "", nil)
-	evs = drainDelegationInbox(t, eng)
-	if len(evs) != 1 || !strings.Contains(evs[0].PayloadJSON, `"state":"exited"`) {
-		t.Fatalf("expected 1 exited delegation event after working->exited via bound session_id, got %+v", evs)
+	if unobs, _ := eng.store.ListUnobservedMessages("events", 10); len(unobs) != 0 {
+		t.Fatalf("expected 0 unobserved messages in #events, got %d", len(unobs))
 	}
 
-	// 5. Reconciler: catches missed idle, stale live:false -> exited, and 3m queued timeout.
-	_, _ = eng.store.CreateDelegation(Delegation{
-		JobID: "job-3", ChannelID: "general", TargetDevice: "laptop", Harness: "claude", SessionName: "miss-idle", Status: "working",
+	// 2. slacker.job failure triggers Stage-1 triage ("ops_turn") -> wakes #fleet-ops.
+	eng.HandleBusEvent(t.Context(), events.Event{
+		Type: "slacker.job", Severity: "error", Source: "slacker", Subject: "job-9", Title: "Slacker failed", Summary: "boom",
+		Payload: map[string]any{"status": "failed"},
 	})
-	_, _ = eng.store.CreateDelegation(Delegation{
-		JobID: "job-4", ChannelID: "general", TargetDevice: "laptop", Harness: "claude", SessionName: "stale-dead", Status: "working",
-	})
-	_, _ = eng.store.CreateDelegation(Delegation{
-		JobID: "job-5", ChannelID: "general", TargetDevice: "mini", Harness: "agy", SessionName: "stuck-queue", Status: "queued",
-		CreatedAt: time.Now().UTC().Add(-4 * time.Minute).Format(time.RFC3339),
-	})
-	eng.refreshDelegationsFlag()
+	inbox, _ := eng.store.ListInbox("queued", 10)
+	if len(inbox) == 0 || inbox[0].ChannelID != "fleet-ops" {
+		t.Fatalf("expected queued inbox wakeup on fleet-ops from Stage-1 triage, got %+v", inbox)
+	}
 
-	liveFalse := false
-	deps.listAgentsFn = func() (any, error) {
-		return []agentSnapshot{
-			{SessionID: "laptop:claude:m3", Device: "laptop", Harness: "claude", Name: "miss-idle", State: "idle", Summary: "Done"},
-			{SessionID: "laptop:claude:s4", Device: "laptop", Harness: "claude", Name: "stale-dead", State: "working", Live: &liveFalse},
-		}, nil
+	// 3. Critical outage escalates to #general, and non-critical repeat respects cooldown.
+	eng.HandleBusEvent(t.Context(), events.Event{
+		Type: "infra.tls_error", Severity: "error", Source: "tls", Subject: "renew", Title: "TLS renewal failed", Summary: "dns error",
+	})
+	genMsgs, _ := eng.store.ListMessages("general", 10)
+	if len(genMsgs) != 1 || !strings.Contains(genMsgs[0].Content, "TLS renewal failed") {
+		t.Fatalf("expected escalated alert in #general, got %+v", genMsgs)
 	}
-	eng.reconcileActiveDelegations(time.Now().UTC())
-	evs = drainDelegationInbox(t, eng)
-	if len(evs) != 3 {
-		t.Fatalf("expected 3 reconciliation events (idle, exited, queued_timeout), got %d: %+v", len(evs), evs)
+	// Repeat within cooldown -> suppressed from #general, logged to #fleet-ops instead.
+	eng.HandleBusEvent(t.Context(), events.Event{
+		Type: "infra.tls_error", Severity: "error", Source: "tls", Subject: "renew", Title: "TLS renewal failed", Summary: "dns error 2",
+	})
+	genMsgs2, _ := eng.store.ListMessages("general", 10)
+	if len(genMsgs2) != 1 {
+		t.Fatalf("expected cooldown to suppress second #general escalation, got %d", len(genMsgs2))
 	}
-	var gotIdle, gotExited, gotTimeout bool
-	for _, ev := range evs {
-		if strings.Contains(ev.PayloadJSON, `"state":"idle"`) {
-			gotIdle = true
-		}
-		if strings.Contains(ev.PayloadJSON, `"state":"exited"`) {
-			gotExited = true
-		}
-		if strings.Contains(ev.PayloadJSON, `"status":"queued_timeout"`) {
-			gotTimeout = true
+
+	// 4. Personal proxy exposure checks: personal_srv tools listed, secret_srv excluded, vault assistant_only rejected.
+	pTools := eng.ListPersonalMCPTools(t.Context())
+	for _, pt := range pTools {
+		if pt.ServerName == "secret_srv" {
+			t.Fatalf("assistant_only server leaked into ListPersonalMCPTools: %+v", pt)
 		}
 	}
-	if !gotIdle || !gotExited || !gotTimeout {
-		t.Fatalf("missing expected reconciliation events: idle=%v exited=%v timeout=%v", gotIdle, gotExited, gotTimeout)
+	if _, err := eng.CallPersonalMCPTool(t.Context(), "laptop", "mcp__secret_srv__echo_secret", nil); err == nil {
+		t.Fatalf("expected CallPersonalMCPTool to reject assistant_only server")
 	}
-
-	// Ensure reconciler handles nil or non-slice ListAgents responses cleanly without panicking.
-	deps.listAgentsFn = func() (any, error) { return nil, nil }
-	eng.reconcileActiveDelegations(time.Now().UTC())
-	deps.listAgentsFn = func() (any, error) { return map[string]any{"unexpected": true}, nil }
-	eng.reconcileActiveDelegations(time.Now().UTC())
-	_ = d1
+	if len(pTools) > 0 {
+		aprRes, err := eng.CallPersonalMCPTool(t.Context(), "laptop", pTools[0].FullName, map[string]any{"msg": "hi"})
+		if err != nil {
+			t.Fatalf("expected personal_srv approval queue, got %v", err)
+		}
+		if m, _ := aprRes.(map[string]any); m["status"] != "approval_required" || m["channel_id"] != "fleet-ops" {
+			t.Fatalf("unexpected personal approval result: %+v", aprRes)
+		}
+	}
+	if _, err := eng.PersonalVaultSearch(t.Context(), "test", "", 5); err == nil {
+		t.Fatalf("expected PersonalVaultSearch to reject when vault_exposure=assistant_only")
+	}
 }
