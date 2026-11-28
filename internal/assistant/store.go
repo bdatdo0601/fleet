@@ -164,6 +164,17 @@ CREATE TABLE IF NOT EXISTS assistant_discord_state (
   last_message_id    TEXT NOT NULL DEFAULT '',
   updated_at         TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS assistant_mcp_oauth_tokens (
+  server_name   TEXT PRIMARY KEY,
+  access_token  TEXT NOT NULL DEFAULT '',
+  refresh_token TEXT NOT NULL DEFAULT '',
+  token_type    TEXT NOT NULL DEFAULT 'Bearer',
+  scope         TEXT NOT NULL DEFAULT '',
+  expires_at    TEXT NOT NULL DEFAULT '',
+  token_url     TEXT NOT NULL DEFAULT '',
+  updated_at    TEXT NOT NULL
+);
 `
 
 // Channel represents one persistent assistant conversation stream.
@@ -320,6 +331,18 @@ type AssistantFile struct {
 	URL         string `json:"url,omitempty"`
 	IsImage     bool   `json:"is_image,omitempty"`
 	CreatedAt   string `json:"created_at"`
+}
+
+// MCPOAuthToken stores cached OAuth access/refresh tokens for an HTTP MCP server.
+type MCPOAuthToken struct {
+	ServerName   string `json:"server_name"`
+	AccessToken  string `json:"-"`
+	RefreshToken string `json:"-"`
+	TokenType    string `json:"token_type,omitempty"`
+	Scope        string `json:"scope,omitempty"`
+	ExpiresAt    string `json:"expires_at,omitempty"`
+	TokenURL     string `json:"token_url,omitempty"`
+	UpdatedAt    string `json:"updated_at,omitempty"`
 }
 
 // Store wraps SQLite persistence in ~/.fleet/assistant.db.
@@ -1587,4 +1610,70 @@ func (s *Store) AttachFilesToMessage(channelID string, msgID int64, fileIDs []st
 		}
 	}
 	return nil
+}
+
+// GetMCPOAuthToken loads the stored OAuth token record for serverName.
+func (s *Store) GetMCPOAuthToken(serverName string) (MCPOAuthToken, bool, error) {
+	clean := strings.ToLower(strings.TrimSpace(serverName))
+	if clean == "" {
+		return MCPOAuthToken{}, false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var tok MCPOAuthToken
+	err := s.db.QueryRow(
+		`SELECT server_name, access_token, refresh_token, token_type, scope, expires_at, token_url, updated_at
+		 FROM assistant_mcp_oauth_tokens WHERE server_name = ?`,
+		clean,
+	).Scan(&tok.ServerName, &tok.AccessToken, &tok.RefreshToken, &tok.TokenType, &tok.Scope, &tok.ExpiresAt, &tok.TokenURL, &tok.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return MCPOAuthToken{}, false, nil
+	}
+	if err != nil {
+		return MCPOAuthToken{}, false, err
+	}
+	return tok, true, nil
+}
+
+// UpsertMCPOAuthToken saves or updates the OAuth token record for an HTTP MCP server.
+func (s *Store) UpsertMCPOAuthToken(tok MCPOAuthToken) error {
+	clean := strings.ToLower(strings.TrimSpace(tok.ServerName))
+	if clean == "" {
+		return errors.New("server_name is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(
+		`INSERT INTO assistant_mcp_oauth_tokens(server_name, access_token, refresh_token, token_type, scope, expires_at, token_url, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(server_name) DO UPDATE SET
+		   access_token = excluded.access_token,
+		   refresh_token = excluded.refresh_token,
+		   token_type = excluded.token_type,
+		   scope = excluded.scope,
+		   expires_at = excluded.expires_at,
+		   token_url = excluded.token_url,
+		   updated_at = excluded.updated_at`,
+		clean,
+		strings.TrimSpace(tok.AccessToken),
+		strings.TrimSpace(tok.RefreshToken),
+		cmp.Or(strings.TrimSpace(tok.TokenType), "Bearer"),
+		strings.TrimSpace(tok.Scope),
+		strings.TrimSpace(tok.ExpiresAt),
+		strings.TrimSpace(tok.TokenURL),
+		registry.NowISO(),
+	)
+	return err
+}
+
+// DeleteMCPOAuthToken removes any stored OAuth token for serverName.
+func (s *Store) DeleteMCPOAuthToken(serverName string) error {
+	clean := strings.ToLower(strings.TrimSpace(serverName))
+	if clean == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`DELETE FROM assistant_mcp_oauth_tokens WHERE server_name = ?`, clean)
+	return err
 }

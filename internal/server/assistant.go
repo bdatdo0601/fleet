@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"encoding/json"
 	"fmt"
+	"html"
 	"mime"
 	"net/http"
 	"strconv"
@@ -169,6 +170,7 @@ func registerAssistantRoutes(
 	registerAssistantSkillRoutes(mux, fleet, route)
 	registerAssistantVaultRoutes(mux, fleet, route)
 	registerAssistantSandboxRoutes(mux, fleet, route)
+	registerAssistantMCPRoutes(mux, fleet, route)
 }
 
 func registerAssistantAdminRoutes(
@@ -822,6 +824,107 @@ func registerAssistantSandboxRoutes(
 			return err
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "channel": ch, "clear_output": req.ClearOutput})
+		return nil
+	}))
+}
+
+func writeMCPOAuthCallbackHTML(w http.ResponseWriter, status int, title, detail string, payload map[string]any) {
+	payloadJSON, _ := json.Marshal(payload)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'")
+	w.WriteHeader(status)
+	_, _ = fmt.Fprintf(w, `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>%s</title>
+<style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:520px;margin:48px auto;padding:0 16px;color:#0f172a;background:#f8fafc;}@media(prefers-color-scheme:dark){body{color:#f1f5f9;background:#0f172a;}.card{background:#1e293b;border-color:#334155;}}.card{background:#fff;border:1px solid #cbd5e1;border-radius:10px;padding:20px;}h2{margin-top:0;font-size:18px;}p{line-height:1.5;word-break:break-word;}</style>
+</head><body><div class="card"><h2>%s</h2><p>%s</p><p>You can close this window and return to Fleet Console.</p></div>
+<script>try{if(window.opener){window.opener.postMessage(%s,window.location.origin);}}catch(_){}</script>
+</body></html>`,
+		html.EscapeString(title),
+		html.EscapeString(title),
+		html.EscapeString(detail),
+		string(payloadJSON),
+	)
+}
+
+func registerAssistantMCPRoutes(
+	mux *http.ServeMux,
+	fleet *core.Fleet,
+	route func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc,
+) {
+	mux.HandleFunc("GET /v1/assistant/mcp", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		servers, statuses := fleet.Assistant.ListMCPStatuses(r.Context())
+		writeJSON(w, http.StatusOK, map[string]any{"servers": servers, "statuses": statuses})
+		return nil
+	}))
+	mux.HandleFunc("POST /v1/assistant/mcp/{name}/oauth/start", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		var req struct {
+			RedirectURI string `json:"redirect_uri"`
+		}
+		if err := readJSONBody(r, &req); err != nil {
+			return err
+		}
+		res, err := fleet.Assistant.StartMCPOAuth(r.Context(), r.PathValue("name"), req.RedirectURI)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, res)
+		return nil
+	}))
+	mux.HandleFunc("POST /v1/assistant/mcp/{name}/oauth/exchange", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		var req struct {
+			State string `json:"state"`
+			Code  string `json:"code"`
+		}
+		if err := readJSONBody(r, &req); err != nil {
+			return err
+		}
+		res, err := fleet.Assistant.CompleteMCPOAuth(r.Context(), r.PathValue("name"), req.State, req.Code)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, res)
+		return nil
+	}))
+	mux.HandleFunc("DELETE /v1/assistant/mcp/{name}/oauth", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		if err := fleet.Assistant.RevokeMCPOAuth(r.PathValue("name")); err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return nil
+	}))
+	mux.HandleFunc("GET /v1/assistant/mcp/oauth/callback", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		q := r.URL.Query()
+		if oauthErr := strings.TrimSpace(q.Get("error")); oauthErr != "" {
+			detail := cmp.Or(strings.TrimSpace(q.Get("error_description")), oauthErr)
+			writeMCPOAuthCallbackHTML(w, http.StatusBadRequest, "MCP OAuth Authorization Failed", detail, map[string]any{
+				"type":  "fleet-mcp-oauth-done",
+				"ok":    false,
+				"error": detail,
+			})
+			return nil
+		}
+		res, err := fleet.Assistant.CompleteMCPOAuthByState(r.Context(), q.Get("state"), q.Get("code"))
+		if err != nil {
+			writeMCPOAuthCallbackHTML(w, http.StatusBadRequest, "MCP OAuth Authorization Failed", err.Error(), map[string]any{
+				"type":  "fleet-mcp-oauth-done",
+				"ok":    false,
+				"error": err.Error(),
+			})
+			return nil
+		}
+		detail := fmt.Sprintf("Authorized %s (%d tool(s) ready).", res.ServerName, res.ToolCount)
+		if res.TestError != "" {
+			detail = fmt.Sprintf("Authorized %s, but handshake test returned: %s", res.ServerName, res.TestError)
+		}
+		writeMCPOAuthCallbackHTML(w, http.StatusOK, "MCP OAuth Connected", detail, map[string]any{
+			"type":       "fleet-mcp-oauth-done",
+			"ok":         true,
+			"server":     res.ServerName,
+			"tool_count": res.ToolCount,
+			"test_error": res.TestError,
+		})
 		return nil
 	}))
 }

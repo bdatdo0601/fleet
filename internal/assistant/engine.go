@@ -133,6 +133,8 @@ func Open(dbPath, configPath, defaultVaultDir string, deps FleetDeps) (*Engine, 
 		opTokenPath = filepath.Join(stateRoot, "op-service-account.token")
 	}
 	opReader := NewOPReader(opTokenPath)
+	mcpMgr := NewMCPManager(cfg.MCPServers, opReader)
+	mcpMgr.SetOAuthStore(store)
 	e := &Engine{
 		store:           store,
 		configPath:      configPath,
@@ -141,7 +143,7 @@ func Open(dbPath, configPath, defaultVaultDir string, deps FleetDeps) (*Engine, 
 		filesDir:        filepath.Join(stateRoot, "assistant-files"),
 		deps:            deps,
 		llm:             newOpenRouterClient(),
-		mcp:             NewMCPManager(cfg.MCPServers, opReader),
+		mcp:             mcpMgr,
 		sandbox:         NewSandboxManager(filepath.Join(stateRoot, "sandbox"), NewSocketSandboxRunner(paths.SandboxSocketPath(stateRoot), NewAppleContainerRunner())),
 		opReader:        opReader,
 		cfg:             cfg,
@@ -495,9 +497,111 @@ func preserveMaskedMCPEnv(prev, next []MCPServerConfig) []MCPServerConfig {
 			}
 			srv.Headers = restoredH
 		}
+		if ok && srv.OAuth != nil && ps.OAuth != nil && srv.OAuth.ClientSecret != "" && srv.OAuth.ClientSecret == maskSecret(ps.OAuth.ClientSecret) {
+			cp := copyMCPOAuthConfig(srv.OAuth)
+			cp.ClientSecret = ps.OAuth.ClientSecret
+			srv.OAuth = cp
+		}
 		out = append(out, srv)
 	}
 	return out
+}
+
+func (e *Engine) findMCPServer(name string) (MCPServerConfig, error) {
+	clean := strings.ToLower(strings.TrimSpace(name))
+	if clean == "" {
+		return MCPServerConfig{}, newErr("MCP server name is required", http.StatusBadRequest)
+	}
+	for _, srv := range e.Config().MCPServers {
+		if strings.EqualFold(srv.Name, clean) {
+			return NormalizeMCPServerConfig(srv), nil
+		}
+	}
+	return MCPServerConfig{}, newErr(fmt.Sprintf("MCP server %q not found", clean), http.StatusNotFound)
+}
+
+// ListMCPStatuses returns redacted MCP server configs alongside live connection/OAuth status.
+func (e *Engine) ListMCPStatuses(ctx context.Context) ([]MCPServerConfig, []MCPServerStatus) {
+	cfg := e.Config()
+	var statuses []MCPServerStatus
+	if e.mcp != nil {
+		statuses = e.mcp.ListServerStatuses(ctx, cfg.MCPServers)
+	}
+	return redactMCPServers(cfg.MCPServers), statuses
+}
+
+// StartMCPOAuth initiates an OAuth 2.0/2.1 PKCE authorization flow for a configured HTTP MCP server.
+func (e *Engine) StartMCPOAuth(ctx context.Context, serverName, redirectURI string) (MCPOAuthStartResult, error) {
+	if e.mcp == nil || e.mcp.OAuth() == nil {
+		return MCPOAuthStartResult{}, newErr("MCP manager unavailable", http.StatusServiceUnavailable)
+	}
+	srv, err := e.findMCPServer(serverName)
+	if err != nil {
+		return MCPOAuthStartResult{}, err
+	}
+	return e.mcp.OAuth().StartAuth(ctx, srv, e.opReader, redirectURI)
+}
+
+// CompleteMCPOAuth exchanges an authorization code for OAuth tokens and tests the MCP server handshake.
+func (e *Engine) CompleteMCPOAuth(ctx context.Context, serverName, state, code string) (MCPOAuthCompleteResult, error) {
+	if e.mcp == nil || e.mcp.OAuth() == nil {
+		return MCPOAuthCompleteResult{}, newErr("MCP manager unavailable", http.StatusServiceUnavailable)
+	}
+	srv, err := e.findMCPServer(serverName)
+	if err != nil {
+		return MCPOAuthCompleteResult{}, err
+	}
+	tok, err := e.mcp.OAuth().ExchangeCode(ctx, srv, e.opReader, state, code)
+	if err != nil {
+		return MCPOAuthCompleteResult{}, err
+	}
+	e.mcp.ResetServer(srv.Name)
+	res := MCPOAuthCompleteResult{
+		ServerName: srv.Name,
+		Authorized: true,
+		Scope:      tok.Scope,
+		ExpiresAt:  tok.ExpiresAt,
+	}
+	if srv.Enabled {
+		tCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		tools, tErr := e.mcp.TestServer(tCtx, srv)
+		if tErr != nil {
+			res.TestError = tErr.Error()
+		} else {
+			res.ToolCount = len(tools)
+			res.Tools = make([]string, 0, len(tools))
+			for _, t := range tools {
+				res.Tools = append(res.Tools, t.RemoteName)
+			}
+		}
+	}
+	return res, nil
+}
+
+// CompleteMCPOAuthByState completes an OAuth callback using only state and code.
+func (e *Engine) CompleteMCPOAuthByState(ctx context.Context, state, code string) (MCPOAuthCompleteResult, error) {
+	if e.mcp == nil || e.mcp.OAuth() == nil {
+		return MCPOAuthCompleteResult{}, newErr("MCP manager unavailable", http.StatusServiceUnavailable)
+	}
+	srvName, err := e.mcp.OAuth().LookupPendingServer(state)
+	if err != nil {
+		return MCPOAuthCompleteResult{}, err
+	}
+	return e.CompleteMCPOAuth(ctx, srvName, state, code)
+}
+
+// RevokeMCPOAuth clears stored OAuth tokens and closes any cached connection for serverName.
+func (e *Engine) RevokeMCPOAuth(serverName string) error {
+	if e.mcp == nil || e.mcp.OAuth() == nil {
+		return nil
+	}
+	clean := strings.ToLower(strings.TrimSpace(serverName))
+	if err := e.mcp.OAuth().Revoke(clean); err != nil {
+		return err
+	}
+	e.mcp.ResetServer(clean)
+	return nil
 }
 
 // TestConnection verifies OpenRouter connectivity and model response.
@@ -1375,7 +1479,7 @@ func (e *Engine) buildOPPromptSection(ctx context.Context) string {
 		b.WriteString("Accessible vaults: " + strings.Join(names, ", ") + "\n")
 	}
 	b.WriteString("Use `onepassword_list_items`, `onepassword_get_item_meta`, `http_request_with_credential`, and `onepassword_store_item` to inspect item metadata/op:// references and inject credentials at runtime without ever requesting or displaying plaintext secrets.\n")
-	b.WriteString("For external or internal MCP setup, use `mcp_list`, `mcp_configure` (approval-gated; pass secrets via `op://` in `env_refs`/`header_refs`, never plaintext), and `mcp_test`.\n")
+	b.WriteString("For external or internal MCP setup, use `mcp_list`, `mcp_configure` (approval-gated; pass secrets via `op://` in `env_refs`, `header_refs`, or `oauth.client_secret_op_ref`, never plaintext; for official Google Workspace MCPs set `oauth: {\"enabled\":true,\"provider\":\"google\",\"client_id\":\"...\",\"client_secret_op_ref\":\"op://...\",\"scopes\":[...]}`), `mcp_oauth_connect` (attaches an interactive sign-in card in `#chat` whenever OAuth sign-in or re-authorization is needed), and `mcp_test`.\n")
 	return b.String()
 }
 
@@ -1389,6 +1493,7 @@ func buildGenerativeUIPromptSection() string {
   - ` + "`agents`" + `: ` + "`{\"agents\":[{\"name\":\"...\",\"device\":\"...\",\"state\":\"...\"}]}`" + `
   - ` + "`agenda`" + `: ` + "`{\"items\":[{\"time\":\"09:00\",\"title\":\"...\"}]}`" + `
   - ` + "`markdown`" + `: ` + "`{\"markdown\":\"...\"}`" + `
+  - ` + "`mcp_oauth`" + `: ` + "`{\"server\":\"...\"}`" + ` (prefer calling ` + "`mcp_oauth_connect`" + ` so server metadata and scopes are populated automatically)
 - ` + "`render_widget`" + ` rules (sandboxed iframe, strict CSP ` + "`default-src 'none'`" + `):
   - Self-contained HTML with inline ` + "`<style>`" + `, ` + "`<svg viewBox=\"...\">`" + ` or ` + "`<canvas>`" + `, and inline ` + "`<script>`" + ` only (never wrap ` + "`html`" + ` in markdown code fences); external URLs/CDNs/Chart.js/D3/Plotly/fonts are blocked and rejected (only ` + "`data:`" + ` images work).
   - Style with host CSS variables (` + "`--text`" + `, ` + "`--muted`" + `, ` + "`--border`" + `, ` + "`--accent`" + `, ` + "`--surface`" + `) so light and dark themes adapt cleanly.

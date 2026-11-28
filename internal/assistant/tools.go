@@ -180,11 +180,11 @@ func (e *Engine) buildToolSpecs(ctx context.Context) []ToolSpec {
 			"title": strProp("Short title"), "body": strProp("Notification body"), "priority": strProp("low|normal|urgent"),
 		}, "body")),
 		makeToolSpec("render_card", "Attach a typed native UI card to this reply. Prefer this over render_widget for structured mobile cards.", schemaObj(map[string]any{
-			"kind":  strProp("choices | key_value | agents | agenda | markdown"),
+			"kind":  strProp("choices | key_value | agents | agenda | markdown | mcp_oauth"),
 			"title": strProp("Card title"),
 			"data": map[string]any{
 				"type":        "object",
-				"description": "Payload matching kind: choices={choices:[{label,value}]}, key_value={key:val}, agents={agents:[{name,device,state}]}, agenda={items:[{time,title}]}, markdown={markdown}",
+				"description": "Payload matching kind: choices={choices:[{label,value}]}, key_value={key:val}, agents={agents:[{name,device,state}]}, agenda={items:[{time,title}]}, markdown={markdown}, mcp_oauth={server,provider,url,scopes,authorized,cli_command}",
 			},
 		}, "kind", "data")),
 		makeToolSpec("render_widget", "Attach an interactive sandboxed HTML/CSS/SVG Generative UI widget to this reply (no external URLs; use CSS vars --text/--muted/--border/--accent/--surface and data-fleet-action=\"...\" for clickable prompts).", schemaObj(map[string]any{
@@ -233,22 +233,42 @@ func credentialAndMCPToolSpecs() []ToolSpec {
 		makeToolSpec("mcp_test", "Run an initialize + tools/list handshake test on a configured MCP server.", schemaObj(map[string]any{
 			"name": strProp("Configured MCP server name"),
 		}, "name")),
-		makeToolSpec("mcp_configure", "Add or update an external/internal stdio or HTTP/SSE MCP server in assistant.json (approval-gated; use op:// in env_refs/header_refs for secrets).", schemaObj(map[string]any{
-			"name":                   strProp("Server slug ([a-z0-9][a-z0-9_-]*)"),
-			"transport":              strProp("stdio or http"),
-			"command":                strProp("Executable command for stdio transport"),
-			"args":                   map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Command arguments"},
-			"env":                    map[string]any{"type": "object", "description": "Non-secret environment variables"},
-			"env_refs":               map[string]any{"type": "object", "description": "Secret env var -> op://Vault/Item/field mapping"},
-			"url":                    strProp("Endpoint URL for http/sse transport"),
-			"headers":                map[string]any{"type": "object", "description": "Non-secret HTTP headers"},
-			"header_refs":            map[string]any{"type": "object", "description": "Secret HTTP header -> op://Vault/Item/field mapping"},
+		makeToolSpec("mcp_configure", "Add or update an external/internal stdio or HTTP/SSE MCP server in assistant.json (approval-gated; use op:// in env_refs/header_refs/oauth.client_secret_op_ref for secrets, and optional oauth for Google Workspace or OAuth 2.0/2.1 MCP servers).", schemaObj(map[string]any{
+			"name":        strProp("Server slug ([a-z0-9][a-z0-9_-]*)"),
+			"transport":   strProp("stdio or http"),
+			"command":     strProp("Executable command for stdio transport"),
+			"args":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Command arguments"},
+			"env":         map[string]any{"type": "object", "description": "Non-secret environment variables"},
+			"env_refs":    map[string]any{"type": "object", "description": "Secret env var -> op://Vault/Item/field mapping"},
+			"url":         strProp("Endpoint URL for http/sse transport"),
+			"headers":     map[string]any{"type": "object", "description": "Non-secret HTTP headers"},
+			"header_refs": map[string]any{"type": "object", "description": "Secret HTTP header -> op://Vault/Item/field mapping"},
+			"oauth": map[string]any{
+				"type":        "object",
+				"description": "Optional OAuth 2.0/2.1 PKCE config for HTTP MCP servers (supports provider=\"google\" for *.googleapis.com)",
+				"properties": map[string]any{
+					"enabled":              boolProp("Enable OAuth 2.0/2.1"),
+					"provider":             strProp("Optional preset: google (auto-detected for *.googleapis.com)"),
+					"client_id":            strProp("OAuth client_id (public or marked AI-powered agent for Google)"),
+					"client_id_op_ref":     strProp("1Password op:// ref for client_id"),
+					"client_secret_op_ref": strProp("1Password op:// ref for client_secret"),
+					"refresh_token_op_ref": strProp("Optional 1Password op:// ref for pre-seeded refresh_token"),
+					"scopes":               map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "OAuth scopes"},
+					"auth_url":             strProp("Optional explicit authorization endpoint URL"),
+					"token_url":            strProp("Optional explicit token endpoint URL"),
+					"redirect_uri":         strProp("Optional default OAuth redirect URI"),
+					"extra_auth_params":    map[string]any{"type": "object", "description": "Optional extra query params for authorize URL"},
+				},
+			},
 			"enabled":                boolProp("Enable server (default true)"),
 			"approval_policy":        strProp("Optional approval policy: all (gate every tool), writes_only (auto-allow tools declaring MCP annotations.readOnlyHint=true; gate writes/unannotated tools), or none (auto-allow unless listed in require_approval_tools)"),
 			"require_approval_tools": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Tool names requiring HITL approval (defaults to [\"*\"] for new servers unless approval_policy is set)"},
 		}, "name")),
 		makeToolSpec("mcp_remove", "Remove a configured MCP server from assistant.json (approval-gated).", schemaObj(map[string]any{
 			"name": strProp("MCP server name to remove"),
+		}, "name")),
+		makeToolSpec("mcp_oauth_connect", "Attach an interactive OAuth sign-in card in #chat for a configured OAuth HTTP MCP server (e.g. Google Workspace) so the user can connect or re-authorize directly from chat.", schemaObj(map[string]any{
+			"name": strProp("Configured OAuth MCP server name"),
 		}, "name")),
 	}
 }
@@ -320,7 +340,7 @@ func (e *Engine) dispatchTool(ctx context.Context, name string, args map[string]
 	if name == "credential_list_aliases" || name == "http_request_with_credential" || strings.HasPrefix(name, "onepassword_") {
 		return e.dispatchCredentialTool(ctx, name, args, rawArgs, tctx)
 	}
-	if name == "mcp_list" || name == "mcp_test" || name == "mcp_configure" || name == "mcp_remove" {
+	if name == "mcp_list" || name == "mcp_test" || name == "mcp_configure" || name == "mcp_remove" || name == "mcp_oauth_connect" {
 		return e.dispatchMCPManageTool(ctx, name, args, rawArgs, tctx)
 	}
 	if strings.HasPrefix(name, "sandbox_") {
@@ -544,7 +564,7 @@ func dispatchUITool(name string, args map[string]any, tctx *toolExecContext) (an
 	if name == "render_card" {
 		kind := strings.ToLower(cmp.Or(strArg(args, "kind"), "markdown"))
 		switch kind {
-		case "agents", "agenda", "choices", "key_value", "markdown":
+		case "agents", "agenda", "choices", "key_value", "markdown", "mcp_oauth":
 		default:
 			return nil, newErr(fmt.Sprintf("unsupported render_card kind %q", kind), http.StatusBadRequest)
 		}
@@ -738,6 +758,31 @@ func strMapArg(m map[string]any, key string) map[string]string {
 	return out
 }
 
+func parseMCPOAuthFromArgs(raw any) *MCPOAuthConfig {
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return nil
+	}
+	o := &MCPOAuthConfig{
+		Enabled:           true,
+		Provider:          strArg(m, "provider"),
+		AuthURL:           strArg(m, "auth_url"),
+		TokenURL:          strArg(m, "token_url"),
+		ClientID:          strArg(m, "client_id"),
+		ClientIDOPRef:     strArg(m, "client_id_op_ref"),
+		ClientSecret:      strArg(m, "client_secret"),
+		ClientSecretOPRef: strArg(m, "client_secret_op_ref"),
+		RefreshTokenOPRef: strArg(m, "refresh_token_op_ref"),
+		Scopes:            strSliceArg(m, "scopes"),
+		RedirectURI:       strArg(m, "redirect_uri"),
+		ExtraAuthParams:   strMapArg(m, "extra_auth_params"),
+	}
+	if en, hasEn := m["enabled"].(bool); hasEn {
+		o.Enabled = en
+	}
+	return o
+}
+
 func parseMCPServerFromArgs(args map[string]any, existing *MCPServerConfig) MCPServerConfig {
 	srv := MCPServerConfig{
 		Name:                 strArg(args, "name"),
@@ -752,6 +797,11 @@ func parseMCPServerFromArgs(args map[string]any, existing *MCPServerConfig) MCPS
 		Enabled:              true,
 		ApprovalPolicy:       strArg(args, "approval_policy"),
 		RequireApprovalTools: strSliceArg(args, "require_approval_tools"),
+	}
+	if rawOAuth, hasOAuth := args["oauth"]; hasOAuth {
+		srv.OAuth = parseMCPOAuthFromArgs(rawOAuth)
+	} else if existing != nil && existing.OAuth != nil {
+		srv.OAuth = copyMCPOAuthConfig(existing.OAuth)
 	}
 	if en, ok := args["enabled"].(bool); ok {
 		srv.Enabled = en
@@ -802,9 +852,62 @@ func (e *Engine) dispatchMCPManageTool(ctx context.Context, name string, args ma
 		return e.execMCPConfigureTool(ctx, args, rawArgs, tctx)
 	case "mcp_remove":
 		return e.execMCPRemoveTool(args, rawArgs, tctx)
+	case "mcp_oauth_connect":
+		return e.execMCPOAuthConnectTool(args, tctx)
 	default:
 		return nil, newErr("unknown MCP tool "+name, http.StatusBadRequest)
 	}
+}
+
+func buildMCPOAuthWidget(srv MCPServerConfig, st MCPOAuthStatus) WidgetPayload {
+	provider := ""
+	var scopes []string
+	redirectURI := ""
+	if srv.OAuth != nil {
+		provider = srv.OAuth.Provider
+		scopes = append([]string(nil), srv.OAuth.Scopes...)
+		redirectURI = srv.OAuth.RedirectURI
+	}
+	return WidgetPayload{
+		Kind:  "mcp_oauth",
+		Title: "Connect " + srv.Name,
+		Data: map[string]any{
+			"server":       srv.Name,
+			"provider":     provider,
+			"url":          srv.URL,
+			"scopes":       scopes,
+			"redirect_uri": redirectURI,
+			"authorized":   st.Authorized,
+			"expires_at":   st.ExpiresAt,
+			"cli_command":  "fleet assistant mcp-auth " + srv.Name,
+		},
+	}
+}
+
+func (e *Engine) execMCPOAuthConnectTool(args map[string]any, tctx *toolExecContext) (any, error) {
+	srv, err := e.findMCPServer(strArg(args, "name"))
+	if err != nil {
+		return nil, err
+	}
+	if srv.OAuth == nil || !srv.OAuth.Enabled {
+		return nil, newErr(fmt.Sprintf("MCP server %q does not have OAuth enabled", srv.Name), http.StatusBadRequest)
+	}
+	var st MCPOAuthStatus
+	if e.mcp != nil && e.mcp.OAuth() != nil {
+		st = e.mcp.OAuth().TokenStatus(srv.Name)
+	}
+	if tctx != nil && tctx.Widgets != nil {
+		*tctx.Widgets = append(*tctx.Widgets, buildMCPOAuthWidget(srv, st))
+	}
+	return map[string]any{
+		"attached":    true,
+		"server":      srv.Name,
+		"provider":    srv.OAuth.Provider,
+		"authorized":  st.Authorized,
+		"expires_at":  st.ExpiresAt,
+		"scopes":      srv.OAuth.Scopes,
+		"cli_command": "fleet assistant mcp-auth " + srv.Name,
+	}, nil
 }
 
 func (e *Engine) execMCPConfigureTool(ctx context.Context, args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {
@@ -853,20 +956,34 @@ func (e *Engine) execMCPConfigureTool(ctx context.Context, args map[string]any, 
 	}
 	tctx.Config = e.Config()
 	res := map[string]any{"status": "saved", "server": redactMCPServers([]MCPServerConfig{srv})[0]}
-	if srv.Enabled && e.mcp != nil {
-		tCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		defer cancel()
-		if tools, tErr := e.mcp.TestServer(tCtx, srv); tErr != nil {
-			res["test_error"] = tErr.Error()
-		} else {
-			names := make([]string, 0, len(tools))
-			for _, t := range tools {
-				names = append(names, t.RemoteName)
-			}
-			res["discovered_tools"] = names
-		}
-	}
+	e.populateConfiguredMCPResult(ctx, srv, tctx, res)
 	return res, nil
+}
+
+func (e *Engine) populateConfiguredMCPResult(ctx context.Context, srv MCPServerConfig, tctx *toolExecContext, res map[string]any) {
+	if !srv.Enabled || e.mcp == nil {
+		return
+	}
+	if srv.OAuth != nil && srv.OAuth.Enabled && e.mcp.OAuth() != nil && !e.mcp.OAuth().TokenStatus(srv.Name).Authorized && srv.OAuth.RefreshTokenOPRef == "" {
+		res["oauth_required"] = true
+		res["next_step"] = fmt.Sprintf("Use the in-chat Connect OAuth card, click Connect OAuth in Settings, or run 'fleet assistant mcp-auth %s' on your Mac.", srv.Name)
+		if tctx != nil && tctx.Widgets != nil {
+			*tctx.Widgets = append(*tctx.Widgets, buildMCPOAuthWidget(srv, MCPOAuthStatus{}))
+		}
+		return
+	}
+	tCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	tools, tErr := e.mcp.TestServer(tCtx, srv)
+	if tErr != nil {
+		res["test_error"] = tErr.Error()
+		return
+	}
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
+		names = append(names, t.RemoteName)
+	}
+	res["discovered_tools"] = names
 }
 
 func (e *Engine) execMCPRemoveTool(args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {
@@ -895,6 +1012,7 @@ func (e *Engine) execMCPRemoveTool(args map[string]any, rawArgs string, tctx *to
 	if _, err := e.UpdateConfig(cur, false); err != nil {
 		return nil, err
 	}
+	_ = e.RevokeMCPOAuth(name)
 	tctx.Config = e.Config()
 	return map[string]any{"status": "removed", "name": name}, nil
 }

@@ -296,7 +296,215 @@ function renderWidgetNode(w, sendPromptFn, onRetryFrontier, msgID) {
     card.appendChild(list);
     return card;
   }
+  if (w.kind === "mcp_oauth" && data && typeof data === "object") {
+    return renderMCPOAuthCard(card, data, sendPromptFn);
+  }
   card.appendChild(el("pre", { className: "code-block" }, el("code", { text: JSON.stringify(data, null, 2) })));
+  return card;
+}
+
+function parseMCPOAuthPaste(raw) {
+  const txt = String(raw || "").trim();
+  if (!txt) {
+    return { code: "" };
+  }
+  try {
+    const u = new URL(txt);
+    const err = (u.searchParams.get("error") || "").trim();
+    const errDesc = (u.searchParams.get("error_description") || "").trim();
+    if (err) {
+      return { error: errDesc || err };
+    }
+    const code = (u.searchParams.get("code") || "").trim();
+    const state = (u.searchParams.get("state") || "").trim();
+    if (code) {
+      return { code, state };
+    }
+  } catch {
+    // Raw authorization code entered directly.
+  }
+  return { code: txt };
+}
+
+function renderMCPOAuthCard(card, data, sendPromptFn) {
+  const server = String(data.server || "").trim();
+  const provider = String(data.provider || "").toLowerCase();
+  const scopes = Array.isArray(data.scopes) ? data.scopes : [];
+  const cliCmd = data.cli_command || (server ? `fleet assistant mcp-auth ${server}` : "");
+  let authorized = Boolean(data.authorized);
+  let activeState = "";
+
+  card.dataset.mcpOauthServer = server;
+  const statusBadge = badge(authorized ? "Authorized" : "Not connected", authorized ? "ok" : "warn");
+  const providerBadge = badge(provider === "google" ? "Google OAuth" : "OAuth 2.0", "info");
+  const header = el(
+    "div",
+    { className: "gen-mini-row" },
+    el("span", { className: "mono", text: server || "mcp" }),
+    providerBadge,
+    statusBadge,
+  );
+  card.appendChild(header);
+  if (data.url) {
+    card.appendChild(el("div", { className: "small muted mono", text: data.url }));
+  }
+  if (scopes.length > 0) {
+    card.appendChild(el("div", { className: "small muted", text: `Scopes: ${scopes.join(", ")}` }));
+  }
+
+  const detailLine = el("div", { className: "small muted" });
+  if (data.expires_at) {
+    detailLine.textContent = `Expires: ${data.expires_at}`;
+  }
+  card.appendChild(detailLine);
+
+  const linkRow = el("div", { className: "actions-row mt-1", style: "display:none" });
+  const openLink = el("a", { className: "btn btn-sm", target: "_blank", rel: "noopener noreferrer", text: "Open Sign-In Tab ↗" });
+  linkRow.appendChild(openLink);
+
+  const manualBox = el("div", { className: "stack-sm mt-1", style: "display:none" });
+  const pasteIn = el("input", { type: "text", placeholder: "Paste redirected URL (http://127.0.0.1:.../oauth2callback?code=...) or code" });
+  const completeBtn = el("button", { type: "button", className: "btn btn-sm btn-primary", text: "Complete Sign-In" });
+  manualBox.append(pasteIn, el("div", { className: "actions-row" }, completeBtn));
+
+  const connectBtn = el("button", { type: "button", className: "btn btn-sm btn-primary" });
+  const pasteToggleBtn = el("button", {
+    type: "button",
+    className: "btn btn-sm",
+    text: "Paste callback / code",
+    onclick: () => {
+      manualBox.style.display = manualBox.style.display === "none" ? "" : "none";
+    },
+  });
+  const verifyBtn = el("button", {
+    type: "button",
+    className: "btn btn-sm btn-primary",
+    text: "Verify & Continue",
+    onclick: () => {
+      if (sendPromptFn && server) {
+        sendPromptFn(`I've completed OAuth sign-in for MCP server ${server}. Please verify with mcp_test and continue.`);
+      }
+    },
+  });
+  const disconnectBtn = el("button", { type: "button", className: "btn btn-sm", text: "Disconnect" });
+
+  const syncButtons = () => {
+    connectBtn.textContent = authorized ? "Reconnect" : provider === "google" ? "Connect with Google" : "Connect OAuth";
+    statusBadge.textContent = authorized ? "Authorized" : "Not connected";
+    statusBadge.className = `badge badge-${authorized ? "ok" : "warn"}`;
+    verifyBtn.style.display = authorized ? "" : "none";
+    disconnectBtn.style.display = authorized ? "" : "none";
+  };
+  syncButtons();
+
+  connectBtn.onclick = async () => {
+    if (!server) {
+      toast("MCP server name is missing", "error");
+      return;
+    }
+    const isHTTPS = window.location.protocol === "https:";
+    const isLocal = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1";
+    const redir = data.redirect_uri || (isHTTPS || isLocal ? `${window.location.origin}/v1/assistant/mcp/oauth/callback` : "http://127.0.0.1:8765/oauth2callback");
+    const popup = window.open("", "_blank");
+    connectBtn.disabled = true;
+    try {
+      const startRes = await api("POST", `/v1/assistant/mcp/${encodeURIComponent(server)}/oauth/start`, { redirect_uri: redir });
+      activeState = startRes.state || "";
+      openLink.href = startRes.authorize_url;
+      linkRow.style.display = "";
+      if (popup) {
+        popup.location.href = startRes.authorize_url;
+      }
+      if (!isHTTPS && !isLocal && !data.redirect_uri) {
+        manualBox.style.display = "";
+        detailLine.textContent = `Opened sign-in with Desktop loopback redirect. After signing in, paste the redirected URL (or code) below — or run: ${cliCmd}`;
+      } else {
+        detailLine.textContent = "Complete sign-in in the opened browser tab; status will update automatically.";
+      }
+    } catch (err) {
+      if (popup) {
+        popup.close();
+      }
+      toast(err.message, "error");
+    } finally {
+      connectBtn.disabled = false;
+    }
+  };
+
+  completeBtn.onclick = async () => {
+    const parsed = parseMCPOAuthPaste(pasteIn.value);
+    if (parsed.error) {
+      toast(parsed.error, "error");
+      return;
+    }
+    if (!parsed.code) {
+      toast("Paste the redirected URL or authorization code", "error");
+      return;
+    }
+    const stateToUse = parsed.state || activeState;
+    if (!stateToUse) {
+      toast("Click Connect first to initialize an OAuth state", "error");
+      return;
+    }
+    completeBtn.disabled = true;
+    try {
+      const res = await api("POST", `/v1/assistant/mcp/${encodeURIComponent(server)}/oauth/exchange`, {
+        state: stateToUse,
+        code: parsed.code,
+      });
+      authorized = Boolean(res.authorized);
+      manualBox.style.display = "none";
+      linkRow.style.display = "none";
+      detailLine.textContent = res.test_error
+        ? `Authorized, but handshake test failed: ${res.test_error}`
+        : `Authorized · ${res.tool_count || 0} tool(s) ready`;
+      syncButtons();
+      toast(`Connected OAuth for ${server} (${res.tool_count || 0} tools)`, "ok");
+    } catch (err) {
+      toast(err.message, "error");
+    } finally {
+      completeBtn.disabled = false;
+    }
+  };
+
+  disconnectBtn.onclick = async () => {
+    disconnectBtn.disabled = true;
+    try {
+      await api("DELETE", `/v1/assistant/mcp/${encodeURIComponent(server)}/oauth`);
+      authorized = false;
+      detailLine.textContent = "Disconnected.";
+      syncButtons();
+      toast(`Disconnected OAuth for ${server}`, "ok");
+    } catch (err) {
+      toast(err.message, "error");
+    } finally {
+      disconnectBtn.disabled = false;
+    }
+  };
+
+  card._onMCPOAuthDone = (payload) => {
+    if (!payload) {
+      return;
+    }
+    if (payload.ok) {
+      authorized = true;
+      manualBox.style.display = "none";
+      linkRow.style.display = "none";
+      detailLine.textContent = payload.test_error
+        ? `Authorized, but handshake test failed: ${payload.test_error}`
+        : `Authorized · ${payload.tool_count || 0} tool(s) ready`;
+      syncButtons();
+    } else if (payload.error) {
+      detailLine.textContent = `Authorization failed: ${payload.error}`;
+    }
+  };
+
+  card.append(
+    el("div", { className: "actions-row mt-1" }, connectBtn, pasteToggleBtn, verifyBtn, disconnectBtn),
+    linkRow,
+    manualBox,
+    cliCmd ? el("div", { className: "small muted mono mt-1", text: `CLI alternative: ${cliCmd}` }) : null,
+  );
   return card;
 }
 
@@ -480,6 +688,99 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
     placeholder: `[{"name":"personal","path":"~/personal-vault","read_only":false,"auto_write_dirs":["Inbox"]}]`,
   });
   const mcpIn = el("textarea", { rows: "5", className: "mono", value: JSON.stringify(cfg.mcp_servers || [], null, 2) });
+  const mcpStatusBox = el("div", { className: "stack-sm" });
+  const loadMCPStatus = async () => {
+    clear(mcpStatusBox);
+    try {
+      const res = await api("GET", "/v1/assistant/mcp");
+      const servers = res.servers || [];
+      const byName = new Map((res.statuses || []).map((st) => [st.name, st]));
+      if (servers.length === 0) {
+        return;
+      }
+      for (const srv of servers) {
+        const st = byName.get(srv.name) || {};
+        const oauthOn = Boolean(srv.oauth && srv.oauth.enabled);
+        const actions = [];
+        if (oauthOn) {
+          actions.push(
+            el("button", {
+              type: "button",
+              className: "btn btn-sm",
+              text: st.oauth_authorized ? "Reconnect OAuth" : "Connect OAuth",
+              onclick: async () => {
+                const isHTTPS = window.location.protocol === "https:";
+                const isLocal = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1";
+                const redir = (srv.oauth && srv.oauth.redirect_uri) || `${window.location.origin}/v1/assistant/mcp/oauth/callback`;
+                if (!isHTTPS && !isLocal && !(srv.oauth && srv.oauth.redirect_uri)) {
+                  toast(`Google Web OAuth requires an HTTPS fleet tls domain, or run: fleet assistant mcp-auth ${srv.name}`, "warn");
+                }
+                try {
+                  const startRes = await api("POST", `/v1/assistant/mcp/${encodeURIComponent(srv.name)}/oauth/start`, { redirect_uri: redir });
+                  window.open(startRes.authorize_url, "_blank");
+                } catch (err) {
+                  toast(err.message, "error");
+                }
+              },
+            }),
+          );
+          if (st.oauth_authorized) {
+            actions.push(
+              el("button", {
+                type: "button",
+                className: "btn btn-sm",
+                text: "Disconnect",
+                onclick: async () => {
+                  try {
+                    await api("DELETE", `/v1/assistant/mcp/${encodeURIComponent(srv.name)}/oauth`);
+                    toast(`Disconnected OAuth for ${srv.name}`, "ok");
+                    await loadMCPStatus();
+                  } catch (err) {
+                    toast(err.message, "error");
+                  }
+                },
+              }),
+            );
+          }
+        }
+        const detail = st.error
+          ? st.error
+          : srv.enabled
+            ? `${st.tool_count || 0} tool(s) ready`
+            : "Disabled";
+        mcpStatusBox.appendChild(
+          el(
+            "div",
+            { className: "gen-native-card" },
+            el(
+              "div",
+              { className: "gen-mini-row" },
+              el("strong", { text: srv.name }),
+              badge(srv.transport || "stdio", "neutral"),
+              oauthOn ? badge(st.oauth_authorized ? "OAuth: Authorized" : "OAuth: Not connected", st.oauth_authorized ? "ok" : "warn") : null,
+            ),
+            el("div", { className: "small muted", text: detail }),
+            actions.length > 0 ? el("div", { className: "actions-row mt-1" }, ...actions) : null,
+          ),
+        );
+      }
+    } catch (err) {
+      mcpStatusBox.appendChild(el("div", { className: "small muted", text: `Failed to load MCP status: ${err.message}` }));
+    }
+  };
+  void loadMCPStatus();
+  const onMCPOAuthMessage = (ev) => {
+    if (ev.origin !== window.location.origin || !ev.data || ev.data.type !== "fleet-mcp-oauth-done") {
+      return;
+    }
+    if (ev.data.ok) {
+      toast(`Connected OAuth for ${ev.data.server || "MCP"} (${ev.data.tool_count || 0} tools)`, "ok");
+    } else {
+      toast(ev.data.error || "MCP OAuth failed", "error");
+    }
+    void loadMCPStatus();
+  };
+  window.addEventListener("message", onMCPOAuthMessage);
   const credsIn = el("textarea", {
     rows: "4",
     className: "mono",
@@ -578,6 +879,7 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
       field("Daily Spend Soft Cap ($, 0=off)", dailyCapIn),
     ),
     field("External stdio / HTTP MCP Servers (JSON)", mcpIn),
+    mcpStatusBox,
     field("Replace 1Password Credential Aliases (optional JSON)", credsIn),
     el("h4", { className: "mt-2", text: "Outbound Discord Notifications (Read-Only Alerts)" }),
     el("div", { className: "small muted", text: "Optional if Two-Way Discord Bot is enabled below (bot already delivers interactive approvals & outbox alerts to mapped channels)." }),
@@ -921,7 +1223,9 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
           ),
         ),
   );
-  openModal("Assistant Settings", body);
+  openModal("Assistant Settings", body, {
+    onClose: () => window.removeEventListener("message", onMCPOAuthMessage),
+  });
 }
 
 export async function renderChat(main, ctx, sub) {
@@ -1483,6 +1787,18 @@ export async function renderChat(main, ctx, sub) {
       }
     } else if (ev.data.type === "fleet-widget-action" && ev.data.action) {
       sendMessage(String(ev.data.action));
+    } else if (ev.data.type === "fleet-mcp-oauth-done" && ev.origin === window.location.origin) {
+      const targetSrv = String(ev.data.server || "");
+      for (const card of msgListEl.querySelectorAll("[data-mcp-oauth-server]")) {
+        if ((!targetSrv || card.dataset.mcpOauthServer === targetSrv) && typeof card._onMCPOAuthDone === "function") {
+          card._onMCPOAuthDone(ev.data);
+        }
+      }
+      if (ev.data.ok) {
+        toast(`Connected OAuth for ${targetSrv || "MCP"} (${ev.data.tool_count || 0} tools)`, "ok");
+      } else if (ev.data.error) {
+        toast(ev.data.error, "error");
+      }
     }
   };
   window.addEventListener("message", onWindowMsg);

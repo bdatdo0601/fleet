@@ -51,12 +51,16 @@ func mcpToolRequiresApproval(cfg MCPServerConfig, remoteName string, readOnlyHin
 
 // MCPServerStatus summarizes one configured MCP server and its discovered tools.
 type MCPServerStatus struct {
-	Name      string   `json:"name"`
-	Transport string   `json:"transport"`
-	Enabled   bool     `json:"enabled"`
-	ToolCount int      `json:"tool_count"`
-	Tools     []string `json:"tools,omitempty"`
-	Error     string   `json:"error,omitempty"`
+	Name            string   `json:"name"`
+	Transport       string   `json:"transport"`
+	Enabled         bool     `json:"enabled"`
+	ToolCount       int      `json:"tool_count"`
+	Tools           []string `json:"tools,omitempty"`
+	Error           string   `json:"error,omitempty"`
+	OAuthEnabled    bool     `json:"oauth_enabled,omitempty"`
+	OAuthAuthorized bool     `json:"oauth_authorized,omitempty"`
+	OAuthExpiresAt  string   `json:"oauth_expires_at,omitempty"`
+	OAuthScope      string   `json:"oauth_scope,omitempty"`
 }
 
 type mcpClientConn struct {
@@ -65,6 +69,7 @@ type mcpClientConn struct {
 	stdin      io.WriteCloser
 	reader     *bufio.Reader
 	httpClient *http.Client
+	oauth      *MCPOAuthManager
 	sessionID  string
 	mu         sync.Mutex
 	nextID     atomic.Int64
@@ -79,18 +84,65 @@ type MCPManager struct {
 	configs    map[string]MCPServerConfig
 	reader     OPReaderFunc
 	httpClient *http.Client
+	oauth      *MCPOAuthManager
 }
 
 // NewMCPManager creates an MCPManager configured from cfg.MCPServers.
 func NewMCPManager(servers []MCPServerConfig, reader OPReaderFunc) *MCPManager {
+	httpCli := &http.Client{Timeout: 30 * time.Second}
 	m := &MCPManager{
 		conns:      make(map[string]*mcpClientConn),
 		configs:    make(map[string]MCPServerConfig),
 		reader:     reader,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		httpClient: httpCli,
+		oauth:      NewMCPOAuthManager(nil, httpCli),
 	}
 	m.Reload(servers)
 	return m
+}
+
+// SetOAuthStore attaches persistent token storage for OAuth-enabled HTTP MCP servers.
+func (m *MCPManager) SetOAuthStore(store MCPOAuthTokenStore) {
+	if m.oauth != nil {
+		m.oauth.SetStore(store)
+	}
+}
+
+// SetHTTPClient sets the HTTP client used for HTTP MCP calls and OAuth exchanges.
+func (m *MCPManager) SetHTTPClient(cli *http.Client) {
+	if cli == nil {
+		return
+	}
+	m.mu.Lock()
+	m.httpClient = cli
+	for _, conn := range m.conns {
+		conn.mu.Lock()
+		conn.httpClient = cli
+		conn.mu.Unlock()
+	}
+	m.mu.Unlock()
+	if m.oauth != nil {
+		m.oauth.SetHTTPClient(cli)
+	}
+}
+
+// OAuth returns the underlying MCPOAuthManager.
+func (m *MCPManager) OAuth() *MCPOAuthManager {
+	return m.oauth
+}
+
+// ResetServer closes and evicts any cached connection for name so the next call re-initializes cleanly.
+func (m *MCPManager) ResetServer(name string) {
+	clean := strings.ToLower(strings.TrimSpace(name))
+	m.mu.Lock()
+	conn, ok := m.conns[clean]
+	if ok {
+		delete(m.conns, clean)
+	}
+	m.mu.Unlock()
+	if ok && conn != nil {
+		conn.close()
+	}
 }
 
 func mcpConfigEqual(a, b MCPServerConfig) bool {
@@ -140,7 +192,7 @@ func (m *MCPManager) ensureConn(ctx context.Context, name string) (*mcpClientCon
 	}
 	conn, exists := m.conns[name]
 	if !exists {
-		conn = &mcpClientConn{cfg: cfg, httpClient: m.httpClient}
+		conn = &mcpClientConn{cfg: cfg, httpClient: m.httpClient, oauth: m.oauth}
 		m.conns[name] = conn
 	}
 	reader := m.reader
@@ -161,8 +213,9 @@ func (m *MCPManager) TestServer(ctx context.Context, srv MCPServerConfig) ([]Ext
 	m.mu.Lock()
 	reader := m.reader
 	httpCli := m.httpClient
+	oauthMgr := m.oauth
 	m.mu.Unlock()
-	conn := &mcpClientConn{cfg: norm, httpClient: httpCli}
+	conn := &mcpClientConn{cfg: norm, httpClient: httpCli, oauth: oauthMgr}
 	defer conn.close()
 	if err := conn.ensureStarted(ctx, reader); err != nil {
 		return nil, err
@@ -176,7 +229,21 @@ func (m *MCPManager) ListServerStatuses(ctx context.Context, servers []MCPServer
 	for _, raw := range servers {
 		srv := NormalizeMCPServerConfig(raw)
 		st := MCPServerStatus{Name: srv.Name, Transport: srv.Transport, Enabled: srv.Enabled}
+		if srv.OAuth != nil && srv.OAuth.Enabled {
+			st.OAuthEnabled = true
+			if m.oauth != nil {
+				ost := m.oauth.TokenStatus(srv.Name)
+				st.OAuthAuthorized = ost.Authorized
+				st.OAuthExpiresAt = ost.ExpiresAt
+				st.OAuthScope = ost.Scope
+			}
+		}
 		if !srv.Enabled {
+			out = append(out, st)
+			continue
+		}
+		if st.OAuthEnabled && !st.OAuthAuthorized && srv.OAuth.RefreshTokenOPRef == "" {
+			st.Error = fmt.Sprintf("OAuth authorization required: run 'fleet assistant mcp-auth %s' or connect in Settings", srv.Name)
 			out = append(out, st)
 			continue
 		}
@@ -339,7 +406,7 @@ func (c *mcpClientConn) startStdioLocked(ctx context.Context, opReader OPReaderF
 
 func (c *mcpClientConn) handshakeLocked(ctx context.Context, opReader OPReaderFunc) error {
 	if _, err := c.rpcCallLocked(ctx, opReader, "initialize", map[string]any{
-		"protocolVersion": "2024-11-05",
+		"protocolVersion": "2025-03-26",
 		"capabilities":    map[string]any{},
 		"clientInfo":      map[string]string{"name": "fleet-assistant", "version": "1.0.0"},
 	}); err != nil {
@@ -348,51 +415,63 @@ func (c *mcpClientConn) handshakeLocked(ctx context.Context, opReader OPReaderFu
 	if err := c.notifyLocked(ctx, opReader, "notifications/initialized"); err != nil {
 		return err
 	}
-	rawTools, err := c.rpcCallLocked(ctx, opReader, "tools/list", map[string]any{})
-	if err != nil {
-		return err
-	}
-	var res struct {
-		Tools []struct {
-			Name        string         `json:"name"`
-			Description string         `json:"description"`
-			InputSchema map[string]any `json:"inputSchema"`
-			Annotations *struct {
-				ReadOnlyHint    *bool `json:"readOnlyHint"`
-				DestructiveHint *bool `json:"destructiveHint"`
-			} `json:"annotations"`
-		} `json:"tools"`
-	}
-	if err := json.Unmarshal(rawTools, &res); err != nil {
-		return err
-	}
-	c.tools = make([]ExternalTool, 0, len(res.Tools))
-	for _, t := range res.Tools {
-		schema := t.InputSchema
-		if schema == nil {
-			schema = map[string]any{"type": "object", "properties": map[string]any{}}
+	c.tools = nil
+	cursor := ""
+	for range 20 {
+		params := map[string]any{}
+		if cursor != "" {
+			params["cursor"] = cursor
 		}
-		var readOnlyHint *bool
-		var readOnly, destructive bool
-		if t.Annotations != nil {
-			readOnlyHint = t.Annotations.ReadOnlyHint
-			if t.Annotations.ReadOnlyHint != nil {
-				readOnly = *t.Annotations.ReadOnlyHint
-			}
-			if t.Annotations.DestructiveHint != nil {
-				destructive = *t.Annotations.DestructiveHint
-			}
+		rawTools, err := c.rpcCallLocked(ctx, opReader, "tools/list", params)
+		if err != nil {
+			return err
 		}
-		c.tools = append(c.tools, ExternalTool{
-			FullName:        "mcp__" + c.cfg.Name + "__" + t.Name,
-			ServerName:      c.cfg.Name,
-			RemoteName:      t.Name,
-			Description:     cmp.Or(t.Description, "External MCP tool "+t.Name),
-			InputSchema:     schema,
-			RequireApproval: mcpToolRequiresApproval(c.cfg, t.Name, readOnlyHint),
-			ReadOnly:        readOnly,
-			Destructive:     destructive,
-		})
+		var res struct {
+			Tools []struct {
+				Name        string         `json:"name"`
+				Description string         `json:"description"`
+				InputSchema map[string]any `json:"inputSchema"`
+				Annotations *struct {
+					ReadOnlyHint    *bool `json:"readOnlyHint"`
+					DestructiveHint *bool `json:"destructiveHint"`
+				} `json:"annotations"`
+			} `json:"tools"`
+			NextCursor string `json:"nextCursor"`
+		}
+		if err := json.Unmarshal(rawTools, &res); err != nil {
+			return err
+		}
+		for _, t := range res.Tools {
+			schema := t.InputSchema
+			if schema == nil {
+				schema = map[string]any{"type": "object", "properties": map[string]any{}}
+			}
+			var readOnlyHint *bool
+			var readOnly, destructive bool
+			if t.Annotations != nil {
+				readOnlyHint = t.Annotations.ReadOnlyHint
+				if t.Annotations.ReadOnlyHint != nil {
+					readOnly = *t.Annotations.ReadOnlyHint
+				}
+				if t.Annotations.DestructiveHint != nil {
+					destructive = *t.Annotations.DestructiveHint
+				}
+			}
+			c.tools = append(c.tools, ExternalTool{
+				FullName:        "mcp__" + c.cfg.Name + "__" + t.Name,
+				ServerName:      c.cfg.Name,
+				RemoteName:      t.Name,
+				Description:     cmp.Or(t.Description, "External MCP tool "+t.Name),
+				InputSchema:     schema,
+				RequireApproval: mcpToolRequiresApproval(c.cfg, t.Name, readOnlyHint),
+				ReadOnly:        readOnly,
+				Destructive:     destructive,
+			})
+		}
+		if strings.TrimSpace(res.NextCursor) == "" {
+			break
+		}
+		cursor = strings.TrimSpace(res.NextCursor)
 	}
 	return nil
 }
@@ -472,7 +551,7 @@ func (c *mcpClientConn) rpcCallLocked(ctx context.Context, opReader OPReaderFunc
 	}
 }
 
-func (c *mcpClientConn) resolveHTTPHeadersLocked(ctx context.Context, opReader OPReaderFunc) (http.Header, []string, error) {
+func (c *mcpClientConn) resolveHTTPHeadersLocked(ctx context.Context, opReader OPReaderFunc, forceRefresh bool) (http.Header, []string, error) {
 	hdr := make(http.Header)
 	var secrets []string
 	for k, v := range c.cfg.Headers {
@@ -485,6 +564,17 @@ func (c *mcpClientConn) resolveHTTPHeadersLocked(ctx context.Context, opReader O
 		}
 		hdr.Set(k, val)
 		secrets = append(secrets, val)
+	}
+	if c.cfg.OAuth != nil && c.cfg.OAuth.Enabled && c.oauth != nil {
+		tok, oauthSecrets, err := c.oauth.GetAccessToken(ctx, c.cfg, opReader, forceRefresh)
+		secrets = append(secrets, oauthSecrets...)
+		if err != nil {
+			return nil, secrets, errors.New(scrubAllSecrets(err.Error(), secrets))
+		}
+		if tok != "" {
+			hdr.Set("Authorization", "Bearer "+tok)
+			secrets = append(secrets, tok)
+		}
 	}
 	return hdr, secrets, nil
 }
@@ -500,18 +590,14 @@ func scrubAllSecrets(text string, secrets []string) string {
 	return out
 }
 
-func (c *mcpClientConn) httpPostLocked(ctx context.Context, opReader OPReaderFunc, payload any, wantID int64) (json.RawMessage, error) {
-	hdrs, secrets, err := c.resolveHTTPHeadersLocked(ctx, opReader)
+func (c *mcpClientConn) doHTTPPostOnceLocked(ctx context.Context, opReader OPReaderFunc, raw []byte, forceRefresh bool) (int, http.Header, []byte, []string, error) {
+	hdrs, secrets, err := c.resolveHTTPHeadersLocked(ctx, opReader, forceRefresh)
 	if err != nil {
-		return nil, err
-	}
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return nil, err
+		return 0, nil, nil, secrets, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.URL, bytes.NewReader(raw))
 	if err != nil {
-		return nil, errors.New(scrubAllSecrets(err.Error(), secrets))
+		return 0, nil, nil, secrets, errors.New(scrubAllSecrets(err.Error(), secrets))
 	}
 	for k, vals := range hdrs {
 		for _, v := range vals {
@@ -525,7 +611,7 @@ func (c *mcpClientConn) httpPostLocked(ctx context.Context, opReader OPReaderFun
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, errors.New(scrubAllSecrets(err.Error(), secrets))
+		return 0, nil, nil, secrets, errors.New(scrubAllSecrets(err.Error(), secrets))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if sid := strings.TrimSpace(resp.Header.Get("Mcp-Session-Id")); sid != "" {
@@ -533,18 +619,37 @@ func (c *mcpClientConn) httpPostLocked(ctx context.Context, opReader OPReaderFun
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, mcpMaxHTTPResponseBytes+1))
 	if err != nil {
-		return nil, errors.New(scrubAllSecrets(err.Error(), secrets))
+		return 0, nil, nil, secrets, errors.New(scrubAllSecrets(err.Error(), secrets))
+	}
+	return resp.StatusCode, resp.Header.Clone(), body, secrets, nil
+}
+
+func (c *mcpClientConn) httpPostLocked(ctx context.Context, opReader OPReaderFunc, payload any, wantID int64) (json.RawMessage, error) {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	status, respHdr, body, secrets, err := c.doHTTPPostOnceLocked(ctx, opReader, raw, false)
+	if err != nil {
+		return nil, err
+	}
+	if status == http.StatusUnauthorized && c.cfg.OAuth != nil && c.cfg.OAuth.Enabled && c.oauth != nil {
+		c.sessionID = ""
+		status, respHdr, body, secrets, err = c.doHTTPPostOnceLocked(ctx, opReader, raw, true)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if len(body) > mcpMaxHTTPResponseBytes {
 		return nil, fmt.Errorf("MCP HTTP response exceeded %d byte limit", mcpMaxHTTPResponseBytes)
 	}
-	if resp.StatusCode >= 400 {
-		return nil, errors.New(scrubAllSecrets(fmt.Sprintf("MCP HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body))), secrets))
+	if status >= 400 {
+		return nil, errors.New(scrubAllSecrets(fmt.Sprintf("MCP HTTP %d: %s", status, strings.TrimSpace(string(body))), secrets))
 	}
 	if wantID == 0 {
 		return nil, nil
 	}
-	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	ct := strings.ToLower(respHdr.Get("Content-Type"))
 	if strings.Contains(ct, "text/event-stream") {
 		res, sErr := extractSSEJSONRPC(body, wantID)
 		if sErr != nil {

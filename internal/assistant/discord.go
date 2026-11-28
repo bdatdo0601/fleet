@@ -876,6 +876,12 @@ func widgetToDiscordEmbed(w WidgetPayload) (map[string]any, bool) {
 			}
 			desc = strings.Join(rows, "\n")
 		}
+	case "mcp_oauth":
+		return map[string]any{
+			"title":       title,
+			"description": truncateText(mcpOAuthEmbedDesc(dataMap), 1500),
+			"color":       0x0284c7,
+		}, true
 	}
 	if strings.TrimSpace(desc) == "" {
 		return nil, false
@@ -885,6 +891,41 @@ func widgetToDiscordEmbed(w WidgetPayload) (map[string]any, bool) {
 		"description": truncateText(strings.TrimSpace(desc), 1500),
 		"color":       0x0284c7,
 	}, false
+}
+
+func mcpOAuthEmbedDesc(dataMap map[string]any) string {
+	srvName := fmt.Sprint(cmp.Or(dataMap["server"], "mcp"))
+	provider := fmt.Sprint(cmp.Or(dataMap["provider"], "oauth2"))
+	status := "Not connected"
+	if auth, _ := dataMap["authorized"].(bool); auth {
+		status = "Authorized"
+	}
+	lines := []string{
+		fmt.Sprintf("**Server:** `%s` (%s)", srvName, provider),
+		fmt.Sprintf("**Status:** %s", status),
+	}
+	if scopes := stringListFromAny(dataMap["scopes"]); len(scopes) > 0 {
+		lines = append(lines, fmt.Sprintf("**Scopes:** %s", strings.Join(scopes, ", ")))
+	}
+	if cliCmd := fmt.Sprint(cmp.Or(dataMap["cli_command"], "")); cliCmd != "" {
+		lines = append(lines, fmt.Sprintf("**CLI:** `%s`", cliCmd))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func stringListFromAny(v any) []string {
+	switch raw := v.(type) {
+	case []string:
+		return raw
+	case []any:
+		out := make([]string, 0, len(raw))
+		for _, it := range raw {
+			out = append(out, fmt.Sprint(it))
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 func widgetsToDiscordEmbeds(widgets []WidgetPayload) ([]map[string]any, bool) {

@@ -6,6 +6,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -371,5 +372,109 @@ func TestAssistantFilesAndSandboxRoutes(t *testing.T) {
 		if st != http.StatusForbidden {
 			t.Fatalf("managed %s %s expected 403, got %d", tc.method, tc.path, st)
 		}
+	}
+}
+
+func TestAssistantMCPOAuthRoutes(t *testing.T) {
+	oauthSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"access_token":  "srv-access-tok",
+				"refresh_token": "srv-refresh-tok",
+				"expires_in":    3600,
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer oauthSrv.Close()
+
+	mcpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer srv-access-tok" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		var req struct {
+			ID     int64  `json:"id"`
+			Method string `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Content-Type", "application/json")
+		switch req.Method {
+		case "initialize":
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{"protocolVersion": "2025-03-26"}})
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/list":
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{"tools": []map[string]any{{"name": "list_events"}}}})
+		}
+	}))
+	defer mcpSrv.Close()
+
+	f, srv, _ := setupTestServer(t)
+	cfg := assistant.DefaultConfig()
+	cfg.MCPServers = []assistant.MCPServerConfig{{
+		Name:      "gcal",
+		Transport: "http",
+		URL:       mcpSrv.URL,
+		Enabled:   true,
+		OAuth: &assistant.MCPOAuthConfig{
+			Enabled:      true,
+			Provider:     "google",
+			AuthURL:      oauthSrv.URL + "/auth",
+			TokenURL:     oauthSrv.URL + "/token",
+			ClientID:     "test-client-id",
+			ClientSecret: "test-client-secret",
+			Scopes:       []string{"https://www.googleapis.com/auth/calendar"},
+		},
+	}}
+	if _, err := f.Assistant.UpdateConfig(cfg, false); err != nil {
+		t.Fatal(err)
+	}
+
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/mcp", http.MethodGet, "", nil, ""); st != http.StatusOK || !strings.Contains(string(b), `"oauth_enabled":true`) || strings.Contains(string(b), `"oauth_authorized":true`) {
+		t.Fatalf("GET /v1/assistant/mcp unexpected: %d %s", st, string(b))
+	}
+
+	// Start -> Callback (via browser redirect) -> Authorized.
+	st, _, startBody := doRawReq(t, srv.URL+"/v1/assistant/mcp/gcal/oauth/start", http.MethodPost, `{"redirect_uri":"`+srv.URL+`/v1/assistant/mcp/oauth/callback"}`, nil, "")
+	if st != http.StatusOK {
+		t.Fatalf("POST /oauth/start expected 200, got %d (%s)", st, string(startBody))
+	}
+	var startRes assistant.MCPOAuthStartResult
+	if err := json.Unmarshal(startBody, &startRes); err != nil || startRes.State == "" {
+		t.Fatalf("unexpected start response: %s", string(startBody))
+	}
+
+	cbURL := srv.URL + "/v1/assistant/mcp/oauth/callback?state=" + url.QueryEscape(startRes.State) + "&code=good-code"
+	if st, hdr, cbBody := doRawReq(t, cbURL, http.MethodGet, "", nil, ""); st != http.StatusOK || !strings.Contains(hdr.Get("Content-Type"), "text/html") || !strings.Contains(string(cbBody), "fleet-mcp-oauth-done") || !strings.Contains(string(cbBody), "Authorized gcal (1 tool(s) ready)") {
+		t.Fatalf("GET /oauth/callback unexpected: %d %+v %s", st, hdr, string(cbBody))
+	}
+
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/mcp", http.MethodGet, "", nil, ""); st != http.StatusOK || !strings.Contains(string(b), `"oauth_authorized":true`) || !strings.Contains(string(b), `"list_events"`) {
+		t.Fatalf("GET /v1/assistant/mcp after auth unexpected: %d %s", st, string(b))
+	}
+
+	// Callback escapes HTML in error parameter.
+	errCB := srv.URL + "/v1/assistant/mcp/oauth/callback?error=" + url.QueryEscape("<script>alert(1)</script>")
+	if st, _, b := doRawReq(t, errCB, http.MethodGet, "", nil, ""); st != http.StatusBadRequest || strings.Contains(string(b), "<script>alert(1)</script>") || !strings.Contains(string(b), "&lt;script&gt;") {
+		t.Fatalf("expected escaped HTML error on callback, got %d %s", st, string(b))
+	}
+
+	// Start + manual /oauth/exchange endpoint.
+	_, _, startBody2 := doRawReq(t, srv.URL+"/v1/assistant/mcp/gcal/oauth/start", http.MethodPost, `{"redirect_uri":"http://127.0.0.1:8765/oauth2callback"}`, nil, "")
+	var startRes2 assistant.MCPOAuthStartResult
+	_ = json.Unmarshal(startBody2, &startRes2)
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/mcp/gcal/oauth/exchange", http.MethodPost, `{"state":"`+startRes2.State+`","code":"manual-code"}`, nil, ""); st != http.StatusOK || !strings.Contains(string(b), `"authorized":true`) {
+		t.Fatalf("POST /oauth/exchange expected 200, got %d %s", st, string(b))
+	}
+
+	// DELETE revokes token.
+	if st, _, _ := doRawReq(t, srv.URL+"/v1/assistant/mcp/gcal/oauth", http.MethodDelete, "", nil, ""); st != http.StatusOK {
+		t.Fatalf("DELETE /oauth expected 200, got %d", st)
+	}
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/mcp", http.MethodGet, "", nil, ""); st != http.StatusOK || strings.Contains(string(b), `"oauth_authorized":true`) {
+		t.Fatalf("GET /v1/assistant/mcp after revoke unexpected: %d %s", st, string(b))
 	}
 }

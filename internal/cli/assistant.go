@@ -42,6 +42,7 @@ Subcommands:
   sandbox-uninstall (lighthouse) stop & remove sandbox LaunchAgent bridge
   sandbox-build   build the sandbox OCI image and offline network on lighthouse
   sandbox-reset   stop/remove a channel's sandbox micro-VM (optionally clearing /work/out)
+  mcp-auth        authorize or revoke OAuth 2.0/2.1 for an HTTP MCP server (e.g. Google Workspace)
 `
 }
 
@@ -69,6 +70,7 @@ func cmdAssistant(args []string, cio *IO) error {
 		"sandbox-agent":     cmdAssistantSandboxAgent,
 		"sandbox-build":     cmdAssistantSandboxBuild,
 		"sandbox-reset":     cmdAssistantSandboxReset,
+		"mcp-auth":          cmdAssistantMCPAuth,
 	}
 	sub, rest := args[0], args[1:]
 	fn, ok := handlers[sub]

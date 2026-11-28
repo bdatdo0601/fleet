@@ -88,7 +88,37 @@ Managed in `internal/assistant/store.go`:
 - **Lighthouse Service Account:** `fleet assistant op-setup` delivers a scoped `OP_SERVICE_ACCOUNT_TOKEN` (limited to your `Fleet-Agent` vault) over Nebula into `~/.fleet/op-service-account.token` (`0600`).
 - **OpenRouter key without plaintext on disk:** Passing `--api-key-op-ref "op://Fleet-Agent/OpenRouter/credential"` stores only the `op://` reference in `assistant.json` and resolves the key into memory (5-minute cache).
 - **1Password HTTP proxy (`http_request_with_credential`):** Looks up a configured `CredentialPolicy` alias, validates URL host against `allowed_hosts`, injects the header in memory, and scrubs the secret (and URL-encoded variant) from any response or error before returning to the LLM.
-- **Stdio MCP Manager (`internal/assistant/mcpclient.go`):** Spawns enabled servers from `mcp_servers` lazily, resolving `env_refs` (`op://...`) straight into the child process `Env`, and exposes tools as `mcp__<server>__<tool>` (with optional per-tool HITL approval gating via `require_approval_tools`).
+- **Stdio & HTTP MCP Manager (`internal/assistant/mcpclient.go`, `mcp_oauth.go`):** Spawns stdio servers or connects to Streamable HTTP/SSE servers (`2025-03-26`, cursor-paginated `tools/list`) from `mcp_servers` lazily, resolving `env_refs`/`header_refs` (`op://...`) in memory and supporting OAuth 2.0/2.1 Authorization Code + PKCE (`S256`) with automatic token refresh + `401` retry (persisting tokens in `assistant_mcp_oauth_tokens` and scrubbing all secrets from errors). Exposes tools as `mcp__<server>__<tool>` (with optional per-tool HITL approval gating via `require_approval_tools`).
+
+#### Google Workspace Official MCP Setup
+Google's official hosted Workspace MCP servers (`https://workspacemcp.googleapis.com/mcp/v1self`, `https://gmailmcp.googleapis.com/mcp/v1`, `https://calendarmcp.googleapis.com/mcp/v1`, etc.; use `/mcp/v1self` when form elicitation is not needed) require a Google Cloud OAuth 2.0 Client ID with **"Use this client for an AI-powered agent"** enabled under **Google Auth Platform → Clients**:
+1. Store your OAuth client secret in 1Password (e.g. `op://Fleet-Agent/Google-MCP/client_secret`).
+2. Configure the server in `#chat` → **Settings** (or via `mcp_configure`), using `"provider": "google"` (auto-detected for `*.googleapis.com` when `auth_url`/`token_url` are omitted, defaulting `access_type=offline&prompt=consent`):
+   ```json
+   [
+     {
+       "name": "gworkspace",
+       "transport": "http",
+       "url": "https://workspacemcp.googleapis.com/mcp/v1self",
+       "enabled": true,
+       "oauth": {
+         "enabled": true,
+         "provider": "google",
+         "client_id": "<YOUR_AGENT_CLIENT_ID>.apps.googleusercontent.com",
+         "client_secret_op_ref": "op://Fleet-Agent/Google-MCP/client_secret",
+         "scopes": [
+           "https://www.googleapis.com/auth/gmail.modify",
+           "https://www.googleapis.com/auth/calendar"
+         ]
+       },
+       "require_approval_tools": ["*"]
+     }
+   ]
+   ```
+3. Complete the one-time consent flow:
+   - **In-chat interactive card (recommended):** Ask the assistant to configure or connect the server (`mcp_configure` / `mcp_oauth_connect`); it attaches a native `mcp_oauth` Generative UI card directly in `#chat` supporting 1-click browser sign-in, automatic callback updates, and inline callback URL/code paste (for Desktop loopback clients) plus a **Verify & Continue** button.
+   - **Desktop OAuth client (CLI):** run `fleet assistant mcp-auth gworkspace` on your Mac (uses a local `http://127.0.0.1:<port>/oauth2callback` redirect while exchanging tokens on the lighthouse).
+   - **Web OAuth client (with `fleet tls` HTTPS):** add `https://<your-fleet-domain>/v1/assistant/mcp/oauth/callback` as an authorized redirect URI in Google Cloud Console and click **Connect with Google** in `#chat` (or **Connect OAuth** in `#chat` → **Settings**).
 
 ---
 

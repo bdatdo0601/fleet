@@ -325,7 +325,13 @@ func opRequiredByConfig(cfg Config) bool {
 		return true
 	}
 	for _, s := range cfg.MCPServers {
-		if s.Enabled && (len(s.EnvRefs) > 0 || len(s.HeaderRefs) > 0) {
+		if !s.Enabled {
+			continue
+		}
+		if len(s.EnvRefs) > 0 || len(s.HeaderRefs) > 0 {
+			return true
+		}
+		if s.OAuth != nil && s.OAuth.Enabled && (s.OAuth.ClientIDOPRef != "" || s.OAuth.ClientSecretOPRef != "" || s.OAuth.RefreshTokenOPRef != "") {
 			return true
 		}
 	}
@@ -364,27 +370,61 @@ func (e *Engine) checkOPDoctor(ctx context.Context, cfg Config) DoctorCheck {
 
 func (e *Engine) checkMCPDoctor(ctx context.Context, cfg Config) DoctorCheck {
 	enabled := 0
+	byName := make(map[string]MCPServerConfig, len(cfg.MCPServers))
 	for _, s := range cfg.MCPServers {
-		if s.Enabled {
+		norm := NormalizeMCPServerConfig(s)
+		byName[norm.Name] = norm
+		if norm.Enabled {
 			enabled++
 		}
 	}
 	if enabled == 0 {
-		return DoctorCheck{Name: "mcp_servers", Status: "ok", Detail: "In-process Fleet/Vault/Skill tools active (0 external stdio servers)"}
+		return DoctorCheck{Name: "mcp_servers", Status: "ok", Detail: "In-process Fleet/Vault/Skill tools active (0 external servers)"}
 	}
-	tools := e.mcp.ListTools(ctx)
-	if len(tools) == 0 {
+	statuses := e.mcp.ListServerStatuses(ctx, cfg.MCPServers)
+	totalTools := 0
+	var needAuth []string
+	var errMsgs []string
+	for _, st := range statuses {
+		if !st.Enabled {
+			continue
+		}
+		totalTools += st.ToolCount
+		srv := byName[st.Name]
+		if st.OAuthEnabled && !st.OAuthAuthorized && (srv.OAuth == nil || srv.OAuth.RefreshTokenOPRef == "") {
+			needAuth = append(needAuth, st.Name)
+		} else if st.Error != "" {
+			errMsgs = append(errMsgs, fmt.Sprintf("%s: %s", st.Name, st.Error))
+		}
+	}
+	if len(needAuth) > 0 {
+		cmds := make([]string, 0, len(needAuth))
+		for _, n := range needAuth {
+			cmds = append(cmds, "fleet assistant mcp-auth "+n)
+		}
 		return DoctorCheck{
 			Name:   "mcp_servers",
 			Status: "warn",
-			Detail: fmt.Sprintf("%d external MCP server(s) enabled, 0 tools discovered", enabled),
-			Hint:   "Check command path and env_refs for configured MCP servers",
+			Detail: fmt.Sprintf("%d enabled MCP server(s) awaiting OAuth sign-in (%s); %d tool(s) ready", len(needAuth), strings.Join(needAuth, ", "), totalTools),
+			Hint:   "Authorize via `" + strings.Join(cmds, "` / `") + "` or Fleet Console Settings",
+		}
+	}
+	if totalTools == 0 || len(errMsgs) > 0 {
+		detail := fmt.Sprintf("%d external MCP server(s) enabled, %d tool(s) discovered", enabled, totalTools)
+		if len(errMsgs) > 0 {
+			detail = strings.Join(errMsgs, "; ")
+		}
+		return DoctorCheck{
+			Name:   "mcp_servers",
+			Status: "warn",
+			Detail: detail,
+			Hint:   "Check URL/command, OAuth credentials, and 1Password env_refs/header_refs for configured MCP servers",
 		}
 	}
 	return DoctorCheck{
 		Name:   "mcp_servers",
 		Status: "ok",
-		Detail: fmt.Sprintf("%d external MCP server(s) enabled, %d tool(s) ready", enabled, len(tools)),
+		Detail: fmt.Sprintf("%d external MCP server(s) enabled, %d tool(s) ready", enabled, totalTools),
 	}
 }
 

@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -98,6 +100,22 @@ type RoutingConfig struct {
 	DecisionTimeoutMS int     `json:"decision_timeout_ms,omitempty"`
 }
 
+// MCPOAuthConfig configures OAuth 2.0 / 2.1 Authorization Code + PKCE for an HTTP MCP server.
+type MCPOAuthConfig struct {
+	Enabled           bool              `json:"enabled"`
+	Provider          string            `json:"provider,omitempty"`
+	AuthURL           string            `json:"auth_url,omitempty"`
+	TokenURL          string            `json:"token_url,omitempty"`
+	ClientID          string            `json:"client_id,omitempty"`
+	ClientIDOPRef     string            `json:"client_id_op_ref,omitempty"`
+	ClientSecret      string            `json:"client_secret,omitempty"`
+	ClientSecretOPRef string            `json:"client_secret_op_ref,omitempty"`
+	RefreshTokenOPRef string            `json:"refresh_token_op_ref,omitempty"`
+	Scopes            []string          `json:"scopes,omitempty"`
+	RedirectURI       string            `json:"redirect_uri,omitempty"`
+	ExtraAuthParams   map[string]string `json:"extra_auth_params,omitempty"`
+}
+
 // MCPServerConfig describes one external stdio or Streamable HTTP/SSE MCP server managed by the assistant.
 type MCPServerConfig struct {
 	Name                 string            `json:"name"`
@@ -109,6 +127,7 @@ type MCPServerConfig struct {
 	URL                  string            `json:"url,omitempty"`
 	Headers              map[string]string `json:"headers,omitempty"`
 	HeaderRefs           map[string]string `json:"header_refs,omitempty"`
+	OAuth                *MCPOAuthConfig   `json:"oauth,omitempty"`
 	Enabled              bool              `json:"enabled"`
 	ApprovalPolicy       string            `json:"approval_policy,omitempty"`
 	RequireApprovalTools []string          `json:"require_approval_tools,omitempty"`
@@ -598,6 +617,21 @@ func maskSecret(s string) string {
 	return s[:4] + "..." + s[len(s)-4:]
 }
 
+func copyMCPOAuthConfig(o *MCPOAuthConfig) *MCPOAuthConfig {
+	if o == nil {
+		return nil
+	}
+	cp := *o
+	if len(o.Scopes) > 0 {
+		cp.Scopes = append([]string(nil), o.Scopes...)
+	}
+	if len(o.ExtraAuthParams) > 0 {
+		cp.ExtraAuthParams = make(map[string]string, len(o.ExtraAuthParams))
+		maps.Copy(cp.ExtraAuthParams, o.ExtraAuthParams)
+	}
+	return &cp
+}
+
 func redactMCPServers(servers []MCPServerConfig) []MCPServerConfig {
 	out := make([]MCPServerConfig, 0, len(servers))
 	for _, srv := range servers {
@@ -614,9 +648,73 @@ func redactMCPServers(servers []MCPServerConfig) []MCPServerConfig {
 				copySrv.Headers[k] = maskSecret(v)
 			}
 		}
+		if srv.OAuth != nil {
+			copySrv.OAuth = copyMCPOAuthConfig(srv.OAuth)
+			if copySrv.OAuth.ClientSecret != "" {
+				copySrv.OAuth.ClientSecret = maskSecret(copySrv.OAuth.ClientSecret)
+			}
+		}
 		out = append(out, copySrv)
 	}
 	return out
+}
+
+func isGoogleAPIHost(rawURL string) bool {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	return host == "googleapis.com" || strings.HasSuffix(host, ".googleapis.com")
+}
+
+func normalizeMCPOAuthConfig(o *MCPOAuthConfig, serverURL string) *MCPOAuthConfig {
+	if o == nil {
+		return nil
+	}
+	cp := &MCPOAuthConfig{
+		Enabled:           o.Enabled,
+		Provider:          strings.ToLower(strings.TrimSpace(o.Provider)),
+		AuthURL:           strings.TrimSpace(o.AuthURL),
+		TokenURL:          strings.TrimSpace(o.TokenURL),
+		ClientID:          strings.TrimSpace(o.ClientID),
+		ClientIDOPRef:     strings.TrimSpace(o.ClientIDOPRef),
+		ClientSecret:      strings.TrimSpace(o.ClientSecret),
+		ClientSecretOPRef: strings.TrimSpace(o.ClientSecretOPRef),
+		RefreshTokenOPRef: strings.TrimSpace(o.RefreshTokenOPRef),
+		RedirectURI:       strings.TrimSpace(o.RedirectURI),
+	}
+	if len(o.Scopes) > 0 {
+		seen := make(map[string]struct{}, len(o.Scopes))
+		scopes := make([]string, 0, len(o.Scopes))
+		for _, raw := range o.Scopes {
+			for part := range strings.FieldsSeq(raw) {
+				if _, ok := seen[part]; ok {
+					continue
+				}
+				seen[part] = struct{}{}
+				scopes = append(scopes, part)
+			}
+		}
+		cp.Scopes = scopes
+	}
+	if len(o.ExtraAuthParams) > 0 {
+		clean := make(map[string]string, len(o.ExtraAuthParams))
+		for k, v := range o.ExtraAuthParams {
+			ck := strings.TrimSpace(k)
+			cv := strings.TrimSpace(v)
+			if ck != "" && cv != "" {
+				clean[ck] = cv
+			}
+		}
+		if len(clean) > 0 {
+			cp.ExtraAuthParams = clean
+		}
+	}
+	if cp.Enabled && cp.Provider == "" && cp.AuthURL == "" && cp.TokenURL == "" && isGoogleAPIHost(serverURL) {
+		cp.Provider = "google"
+	}
+	return cp
 }
 
 // NormalizeMCPServerConfig cleans fields and defaults transport on an MCPServerConfig.
@@ -631,6 +729,7 @@ func NormalizeMCPServerConfig(srv MCPServerConfig) MCPServerConfig {
 	} else {
 		srv.Transport = "stdio"
 	}
+	srv.OAuth = normalizeMCPOAuthConfig(srv.OAuth, srv.URL)
 	return srv
 }
 
@@ -786,6 +885,55 @@ func ValidateMCPServerConfig(srv MCPServerConfig, selfSetup bool) error {
 	case "", MCPApprovalPolicyAll, MCPApprovalPolicyWritesOnly, MCPApprovalPolicyNone:
 	default:
 		return newErr(fmt.Sprintf("MCP %q invalid approval_policy %q (expected all, writes_only, or none)", srv.Name, srv.ApprovalPolicy), http.StatusBadRequest)
+	}
+	return validateMCPOAuthConfig(srv, selfSetup)
+}
+
+func validateHTTPURLField(raw, label string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+		return newErr(fmt.Sprintf("%s must be a valid http:// or https:// URL", label), http.StatusBadRequest)
+	}
+	return nil
+}
+
+func validateMCPOAuthConfig(srv MCPServerConfig, selfSetup bool) error {
+	o := srv.OAuth
+	if o == nil || !o.Enabled {
+		return nil
+	}
+	if srv.Transport != "http" {
+		return newErr(fmt.Sprintf("MCP %q oauth requires transport \"http\"", srv.Name), http.StatusBadRequest)
+	}
+	if o.Provider != "" && o.Provider != "google" {
+		return newErr(fmt.Sprintf("MCP %q unsupported oauth.provider %q (supported: \"\", \"google\")", srv.Name, o.Provider), http.StatusBadRequest)
+	}
+	for field, ref := range map[string]string{
+		"oauth.client_id_op_ref":     o.ClientIDOPRef,
+		"oauth.client_secret_op_ref": o.ClientSecretOPRef,
+		"oauth.refresh_token_op_ref": o.RefreshTokenOPRef,
+	} {
+		if ref != "" && !strings.HasPrefix(ref, "op://") {
+			return newErr(fmt.Sprintf("MCP %q %s must be an op:// reference", srv.Name, field), http.StatusBadRequest)
+		}
+	}
+	if o.ClientID == "" && o.ClientIDOPRef == "" {
+		return newErr(fmt.Sprintf("MCP %q oauth requires client_id or client_id_op_ref", srv.Name), http.StatusBadRequest)
+	}
+	for label, rawURL := range map[string]string{
+		fmt.Sprintf("MCP %q oauth.auth_url", srv.Name):     o.AuthURL,
+		fmt.Sprintf("MCP %q oauth.token_url", srv.Name):    o.TokenURL,
+		fmt.Sprintf("MCP %q oauth.redirect_uri", srv.Name): o.RedirectURI,
+	} {
+		if err := validateHTTPURLField(rawURL, label); err != nil {
+			return err
+		}
+	}
+	if selfSetup && o.ClientSecret != "" {
+		return newErr("plain oauth.client_secret rejected during self-setup: store secret in 1Password and use oauth.client_secret_op_ref", http.StatusBadRequest)
 	}
 	return nil
 }
