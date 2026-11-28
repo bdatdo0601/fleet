@@ -19,6 +19,12 @@ const MODEL_CHOICES = [
   { value: "openai/gpt-6.2-astra", label: "GPT-6.2 Astra (Peak)" },
 ];
 
+function shortModelName(slug) {
+  const s = String(slug || "").trim();
+  const idx = s.indexOf("/");
+  return idx >= 0 ? s.slice(idx + 1) : s;
+}
+
 function currentTheme() {
   const explicit = document.documentElement.getAttribute("data-theme");
   if (explicit === "dark" || explicit === "light") {
@@ -106,7 +112,7 @@ function renderMarkdownDOM(raw) {
   return wrap;
 }
 
-function renderWidgetNode(w, sendPromptFn) {
+function renderWidgetNode(w, sendPromptFn, onRetryFrontier, msgID) {
   if (!w) {
     return null;
   }
@@ -209,11 +215,112 @@ function renderWidgetNode(w, sendPromptFn) {
     }
     return card;
   }
+  if (w.kind === "frontier_retry") {
+    const modelSlug = data.frontier_model || "frontier";
+    const shortName = shortModelName(modelSlug);
+    const pct = typeof data.probability === "number" ? `${Math.round(data.probability * 100)}%` : "";
+    const bar = el("div", { className: "frontier-retry-bar" });
+    bar.appendChild(el("span", { className: "small muted", text: pct ? `Borderline complexity (${pct})` : "Borderline complexity" }));
+    const row = el("div", { className: "actions-row" });
+    const retryBtn = el("button", {
+      type: "button",
+      className: "btn btn-sm",
+      text: `Retry with ${shortName}`,
+      onclick: async () => {
+        retryBtn.disabled = true;
+        topicBtn.disabled = true;
+        if (onRetryFrontier) {
+          await onRetryFrontier(msgID, data.prompt || "", false);
+        }
+      },
+    });
+    const topicBtn = el("button", {
+      type: "button",
+      className: "btn btn-sm btn-primary",
+      text: "Retry + unlock topic",
+      onclick: async () => {
+        retryBtn.disabled = true;
+        topicBtn.disabled = true;
+        if (onRetryFrontier) {
+          await onRetryFrontier(msgID, data.prompt || "", true);
+        }
+      },
+    });
+    row.append(retryBtn, topicBtn);
+    bar.appendChild(row);
+    return bar;
+  }
   card.appendChild(el("pre", { className: "code-block" }, el("code", { text: JSON.stringify(data, null, 2) })));
   return card;
 }
 
 function renderApprovalCard(apr, onDecided) {
+  const isEscalation = apr.tool_name === "frontier_escalation";
+  let escArgs = {};
+  if (isEscalation) {
+    try {
+      escArgs = JSON.parse(apr.args_json || "{}");
+    } catch {
+      escArgs = {};
+    }
+  }
+  const decide = async (decision, scope = "") => {
+    try {
+      await api("POST", `/v1/assistant/approvals/${encodeURIComponent(apr.id)}/decide`, { decision, scope });
+      const msg = isEscalation
+        ? decision === "approve"
+          ? scope === "topic"
+            ? "Frontier unlocked for this topic"
+            : "Running Frontier once"
+          : "Using default chat model"
+        : decision === "approve"
+          ? "Approved — resuming"
+          : "Denied";
+      toast(msg, decision === "approve" ? "ok" : "info");
+      if (onDecided) {
+        await onDecided();
+      }
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  };
+  if (isEscalation) {
+    const shortFrontier = shortModelName(escArgs.frontier_model || "frontier");
+    const shortFallback = shortModelName(escArgs.fallback_model || "Haiku");
+    const metaParts = [];
+    if (escArgs.topic_hint) {
+      metaParts.push(`Topic: ${escArgs.topic_hint}`);
+    }
+    metaParts.push(`Topic grant: up to ${escArgs.grant_max_turns || 5} turns / $${Number(escArgs.grant_max_cost || 0.25).toFixed(2)}`);
+    if (escArgs.daily_spend_usd > 0) {
+      metaParts.push(`Today: $${Number(escArgs.daily_spend_usd).toFixed(2)}`);
+    }
+    const card = el(
+      "div",
+      { className: "approval-card" },
+      el(
+        "div",
+        { className: "approval-head" },
+        badge("frontier", "warn"),
+        el("strong", { text: apr.summary || `Use ${shortFrontier} for this request?` }),
+      ),
+      el("div", { className: "small muted mb-1", text: metaParts.join(" · ") }),
+    );
+    if (apr.status !== "pending") {
+      card.appendChild(badge(apr.status, apr.status === "executed" || apr.status === "approved" ? "ok" : "danger"));
+      return card;
+    }
+    card.appendChild(
+      el(
+        "div",
+        { className: "actions-row" },
+        el("button", { type: "button", className: "btn btn-sm btn-primary", text: `Use ${shortFrontier} (this topic)`, onclick: () => decide("approve", "topic") }),
+        el("button", { type: "button", className: "btn btn-sm", text: "Once", onclick: () => decide("approve", "once") }),
+        el("button", { type: "button", className: "btn btn-sm", text: `Use ${shortFallback}`, onclick: () => decide("deny") }),
+      ),
+    );
+    return card;
+  }
   const card = el(
     "div",
     { className: "approval-card" },
@@ -229,17 +336,6 @@ function renderApprovalCard(apr, onDecided) {
     card.appendChild(badge(apr.status, apr.status === "executed" || apr.status === "approved" ? "ok" : "danger"));
     return card;
   }
-  const decide = async (decision) => {
-    try {
-      await api("POST", `/v1/assistant/approvals/${encodeURIComponent(apr.id)}/decide`, { decision });
-      toast(decision === "approve" ? "Approved — resuming" : "Denied", decision === "approve" ? "ok" : "info");
-      if (onDecided) {
-        await onDecided();
-      }
-    } catch (err) {
-      toast(err.message, "error");
-    }
-  };
   card.appendChild(
     el(
       "div",
@@ -277,6 +373,7 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
   }
   const cfg = cfgData.config || {};
   const models = cfg.models || {};
+  const routing = cfg.routing || {};
   const enabledChk = el("input", { type: "checkbox", checked: Boolean(cfg.enabled) });
   const zdrChk = el("input", { type: "checkbox", checked: cfg.zdr !== false });
   const apiKeyIn = el("input", { type: "password", placeholder: cfg.api_key_hint ? `Current: ${cfg.api_key_hint}` : "sk-or-v1-..." });
@@ -287,6 +384,20 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
   const decisionIn = el("input", { type: "text", value: models.decision || "" });
   const observerIn = el("input", { type: "text", value: models.observer || "" });
   const hbIn = el("input", { type: "number", value: String(cfg.heartbeat_interval_minutes ?? 30), min: "0" });
+  const routingModeSel = el(
+    "select",
+    null,
+    ...[
+      { value: "hybrid", label: "Hybrid (Auto + 1-tap Retry + HITL)" },
+      { value: "gate", label: "HITL Gate Only (Complex asks first)" },
+      { value: "auto", label: "Unattended Auto (No HITL)" },
+      { value: "off", label: "Off (Always Default Chat Model)" },
+    ].map((opt) => el("option", { value: opt.value, text: opt.label, selected: (routing.mode || "hybrid") === opt.value })),
+  );
+  const grantTurnsIn = el("input", { type: "number", value: String(routing.grant_max_turns ?? 5), min: "1", max: "50" });
+  const grantCostIn = el("input", { type: "number", step: "0.05", min: "0.05", value: String(routing.grant_max_cost_usd ?? 0.25) });
+  const grantIdleIn = el("input", { type: "number", value: String(routing.grant_idle_minutes ?? 25), min: "1", max: "240" });
+  const dailyCapIn = el("input", { type: "number", step: "0.25", min: "0", value: String(routing.daily_soft_cap_usd ?? 0) });
   const extraVaultsIn = el("textarea", {
     rows: "4",
     className: "mono",
@@ -355,6 +466,16 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
       field("Observer / Reflector Model", observerIn),
       field("Heartbeat Interval (mins, 0=off)", hbIn),
     ),
+    el("h4", { className: "mt-2", text: "Frontier Auto-Routing & Topic Grants" }),
+    el(
+      "div",
+      { className: "grid-2" },
+      field("Routing Mode", routingModeSel),
+      field("Topic Grant Max Turns", grantTurnsIn),
+      field("Topic Grant Budget ($)", grantCostIn),
+      field("Topic Grant Idle Timeout (mins)", grantIdleIn),
+      field("Daily Spend Soft Cap ($, 0=off)", dailyCapIn),
+    ),
     field("External stdio / HTTP MCP Servers (JSON)", mcpIn),
     field("Replace 1Password Credential Aliases (optional JSON)", credsIn),
     el("h4", { className: "mt-2", text: "Outbound Discord Notifications (Read-Only Alerts)" }),
@@ -421,6 +542,14 @@ async function openAssistantSettingsModal(onSaved, onNavigate) {
               decision: decisionIn.value.trim(),
               observer: observerIn.value.trim(),
               reflector: observerIn.value.trim(),
+            },
+            routing: {
+              ...routing,
+              mode: routingModeSel.value,
+              grant_max_turns: Number.parseInt(grantTurnsIn.value || "5", 10) || 5,
+              grant_max_cost_usd: Number.parseFloat(grantCostIn.value || "0.25") || 0.25,
+              grant_idle_minutes: Number.parseInt(grantIdleIn.value || "25", 10) || 25,
+              daily_soft_cap_usd: Math.max(0, Number.parseFloat(dailyCapIn.value || "0") || 0),
             },
             mcp_servers: mcpServers,
             notifications: {
@@ -601,6 +730,11 @@ export async function renderChat(main, ctx, sub) {
   const msgInnerEl = el("div", { className: "chat-messages-inner" }, emptyBox, msgItemsEl, approvalsBox, streamBox);
   const msgListEl = el("div", { className: "chat-messages" }, msgInnerEl);
   const statusPill = badge("connecting", "neutral");
+  const grantPill = el("button", {
+    type: "button",
+    className: "badge badge-info grant-pill hidden",
+    title: "Active frontier topic grant — click to revoke",
+  });
 
   const channelSelect = el(
     "select",
@@ -647,10 +781,21 @@ export async function renderChat(main, ctx, sub) {
     ctx.navigate(`#chat/${channelSelect.value}`);
   });
 
+  const chObj = channels.find((c) => c.id === activeChannel) || {};
+  const routingMode = (cfgView.routing && cfgView.routing.mode) || "hybrid";
+  const defaultChoiceLabel = chObj.model
+    ? `Channel Default (${shortModelName(chObj.model)})`
+    : routingMode === "hybrid"
+      ? "Auto (Hybrid)"
+      : routingMode === "gate"
+        ? "Auto (HITL Gate)"
+        : routingMode === "auto"
+          ? "Auto (Unattended)"
+          : "Channel / Default";
   const modelSelect = el(
     "select",
     { className: "chat-model-select", "aria-label": "Model override" },
-    ...MODEL_CHOICES.map((m) => el("option", { value: m.value, text: m.label })),
+    ...MODEL_CHOICES.map((m, idx) => el("option", { value: m.value, text: idx === 0 ? defaultChoiceLabel : m.label })),
   );
   const inputEl = el("textarea", {
     className: "chat-input",
@@ -670,13 +815,47 @@ export async function renderChat(main, ctx, sub) {
   };
 
   let pendingApprovals = [];
+  const updateGrantPill = (grant) => {
+    if (!grant) {
+      grantPill.classList.add("hidden");
+      grantPill.textContent = "";
+      return;
+    }
+    const cost = Number(grant.cost_usd || 0).toFixed(2);
+    grantPill.textContent = `Frontier topic (${grant.turns_used || 0}/${grant.max_turns || 5} · $${cost}) ×`;
+    grantPill.classList.remove("hidden");
+  };
   const loadChannelData = async () => {
     const [msgRes, aprRes] = await Promise.all([
       api("GET", `/v1/assistant/messages?channel=${encodeURIComponent(activeChannel)}&limit=100`),
       api("GET", "/v1/assistant/approvals?status=pending&limit=20"),
     ]);
     pendingApprovals = (aprRes.approvals || []).filter((a) => a.channel_id === activeChannel);
+    updateGrantPill(msgRes.grant || null);
     renderMessages(msgRes.messages || []);
+  };
+  grantPill.addEventListener("click", async () => {
+    try {
+      await api("DELETE", `/v1/assistant/channels/${encodeURIComponent(activeChannel)}/grant`);
+      toast("Frontier topic grant revoked", "info");
+      await loadChannelData();
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  });
+  const retryWithFrontier = async (replaceMsgID, prompt, grantTopic) => {
+    if (!prompt) {
+      return;
+    }
+    try {
+      await api("POST", `/v1/assistant/channels/${encodeURIComponent(activeChannel)}/retry-frontier`, {
+        replace_message_id: typeof replaceMsgID === "number" ? replaceMsgID : 0,
+        prompt,
+        grant_topic: Boolean(grantTopic),
+      });
+    } catch (err) {
+      toast(err.message, "error");
+    }
   };
 
   const sendMessage = async (overrideText = null) => {
@@ -706,7 +885,7 @@ export async function renderChat(main, ctx, sub) {
     bubble.appendChild(renderMarkdownDOM(m.content));
     if (Array.isArray(m.widgets)) {
       for (const w of m.widgets) {
-        const wNode = renderWidgetNode(w, (act) => sendMessage(act));
+        const wNode = renderWidgetNode(w, (act) => sendMessage(act), retryWithFrontier, m.id);
         if (wNode) {
           bubble.appendChild(wNode);
         }
@@ -791,6 +970,7 @@ export async function renderChat(main, ctx, sub) {
       }),
       channelSelect,
       statusPill,
+      grantPill,
     ),
     el(
       "div",
@@ -904,7 +1084,8 @@ export async function renderChat(main, ctx, sub) {
         return;
       }
       streamText = "";
-      streamMeta.textContent = `Running (${(d.data && d.data.model) || ""})…`;
+      const gt = d.data && d.data.grant_turn ? ` · topic ${d.data.grant_turn}/${d.data.grant_max_turns || 5}` : "";
+      streamMeta.textContent = `Running (${(d.data && d.data.model) || ""}${gt})…`;
       clear(streamBody);
       streamBox.classList.remove("hidden");
       scrollMessagesToBottom();
@@ -926,7 +1107,7 @@ export async function renderChat(main, ctx, sub) {
       scrollMessagesToBottom();
       return;
     }
-    if (type === "message_created" || type === "message_done" || type === "approval" || type === "approval_decided" || type === "channel_reset") {
+    if (type === "message_created" || type === "message_done" || type === "approval" || type === "approval_decided" || type === "channel_reset" || type === "grant_updated") {
       if (d.channel_id === activeChannel) {
         streamBox.classList.add("hidden");
         streamText = "";

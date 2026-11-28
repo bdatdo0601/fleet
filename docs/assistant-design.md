@@ -59,12 +59,15 @@ Managed in `internal/assistant/store.go`:
 1. Browser subscribes to `GET /v1/assistant/stream` (SSE with 25s `: keepalive` comments; `sw.js` bypasses cache for `/v1/assistant/stream`).
 2. User submits a prompt via `POST /v1/assistant/messages` (optionally selecting a model in the picker or prefixing `/astra`, `/opus`, `/sonnet`, `/muse`, `/deepseek`, `/nano`, `/auto`).
 3. `Engine.EnqueueUserMessage` persists the user message, broadcasts `message_created`, enqueues an `inbox` item, and wakes `runWorker`.
-4. `Engine.resolveModel` applies the 5-level override hierarchy:
+4. `Engine.resolveTurnRoute` applies the 5-level override hierarchy:
    1. Leading slash alias in message (`/astra ...`, etc. — stripped from prompt text)
    2. Explicit UI/CLI `model` override
    3. Matching skill `SKILL.md` frontmatter `model:`
    4. Channel default `model` (`general`, `fleet-ops`, `briefing`, or custom)
-   5. System role default (`default_chat` or `heartbeat`); if resolved to `auto`, queries OpenRouter `/decisions` (`google/gemini-decision-1`) for `fast` | `balanced` | `frontier` (falling back safely to `default_chat` on error).
+   5. System role default (`heartbeat` uses `models.heartbeat`; interactive `chat` defaults to **Hybrid** auto-routing via `routing.mode`: `hybrid` | `gate` | `auto` | `off`). When auto-routing runs, OpenRouter `/api/alpha/decisions` (`google/gemini-decision-1` with a 2s timeout and `provider: {zdr, data_collection}` when on `openrouter.ai`) evaluates `needs_frontier` (and `same_topic` when a Topic Grant is active) over the prompt + recent tail:
+      - `< borderline_prob` (`0.60`): runs immediately on `default_chat` (`claude-haiku-5.5`).
+      - `borderline_prob .. gate_prob` (`0.60–0.80`, `hybrid` mode): runs immediately on `default_chat` and attaches a 1-tap `frontier_retry` bar (`Retry with <frontier>` / `Retry + unlock topic`).
+      - `>= gate_prob` (`0.80`): auto-approves Frontier if a context-scoped **Topic Grant** is active (same topic, within `grant_max_turns`, `grant_max_cost_usd`, `grant_idle_minutes`, and `daily_soft_cap_usd`); otherwise pauses with an inline HITL escalation card (`Use Frontier (this topic)` / `Once` / `Use Haiku`, no Discord alert). In `auto` mode it escalates unattended; on Decisions API error/timeout it fails open to `default_chat`.
 5. `openRouterClient.StreamChat` sends the cache-ordered prompt (`SOUL.md` + skill catalog + Fleet standing memory → `REFLECTIONS.md` + `OBSERVATIONS.md` with `cache_control: ephemeral` → active tail) with `zdr: true`, streaming `delta`, `tool_start`, `tool_done`, `approval`, and `message_done` SSE events.
 
 ### B. Generative UI & Sandboxed Widgets

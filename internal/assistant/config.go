@@ -29,6 +29,20 @@ const (
 	DefaultHeartbeatMins = 30
 	DefaultObserveTokens = 12000
 	DefaultReflectBytes  = 24000
+
+	RoutingModeOff     = "off"
+	RoutingModeHybrid  = "hybrid"
+	RoutingModeGate    = "gate"
+	RoutingModeAuto    = "auto"
+	DefaultRoutingMode = RoutingModeHybrid
+
+	DefaultFrontierBorderlineProb   = 0.60
+	DefaultFrontierGateProb         = 0.80
+	DefaultSameTopicProb            = 0.55
+	DefaultFrontierGrantMaxTurns    = 5
+	DefaultFrontierGrantMaxCostUSD  = 0.25
+	DefaultFrontierGrantIdleMinutes = 25
+	DefaultDecisionTimeoutMS        = 2000
 )
 
 // AssistantError is an error carrying an HTTP status code for API handlers.
@@ -56,6 +70,18 @@ type ModelConfig struct {
 	Reflector   string            `json:"reflector"`
 	Heartbeat   string            `json:"heartbeat"`
 	Aliases     map[string]string `json:"aliases,omitempty"`
+}
+
+// RoutingConfig controls automatic frontier escalation, hybrid retry, and topic-scoped HITL grants.
+type RoutingConfig struct {
+	Mode              string  `json:"mode"`
+	BorderlineProb    float64 `json:"borderline_prob,omitempty"`
+	GateProb          float64 `json:"gate_prob,omitempty"`
+	GrantMaxTurns     int     `json:"grant_max_turns,omitempty"`
+	GrantMaxCostUSD   float64 `json:"grant_max_cost_usd,omitempty"`
+	GrantIdleMinutes  int     `json:"grant_idle_minutes,omitempty"`
+	DailySoftCapUSD   float64 `json:"daily_soft_cap_usd,omitempty"`
+	DecisionTimeoutMS int     `json:"decision_timeout_ms,omitempty"`
 }
 
 // MCPServerConfig describes one external stdio or Streamable HTTP/SSE MCP server managed by the assistant.
@@ -114,20 +140,21 @@ func IsValidVaultName(name string) bool {
 
 // Config holds persistent configuration for the lighthouse assistant.
 type Config struct {
-	Enabled                  bool               `json:"enabled"`
-	BaseURL                  string             `json:"base_url"`
-	APIKey                   string             `json:"api_key,omitempty"`
-	APIKeyOPRef              string             `json:"api_key_op_ref,omitempty"`
-	ZDR                      bool               `json:"zdr"`
-	DataCollection           string             `json:"data_collection,omitempty"`
-	VaultPath                string             `json:"vault_path,omitempty"`
-	AutoWriteDirs            []string           `json:"auto_write_dirs,omitempty"`
-	ExtraVaults              []VaultMount       `json:"extra_vaults,omitempty"`
-	GitAutoCommit            bool               `json:"git_auto_commit"`
-	HeartbeatIntervalMinutes int                `json:"heartbeat_interval_minutes"`
-	ObserverThresholdTokens  int                `json:"observer_threshold_tokens"`
-	ReflectorThresholdBytes  int                `json:"reflector_threshold_bytes"`
+	Enabled                  bool                `json:"enabled"`
+	BaseURL                  string              `json:"base_url"`
+	APIKey                   string              `json:"api_key,omitempty"`
+	APIKeyOPRef              string              `json:"api_key_op_ref,omitempty"`
+	ZDR                      bool                `json:"zdr"`
+	DataCollection           string              `json:"data_collection,omitempty"`
+	VaultPath                string              `json:"vault_path,omitempty"`
+	AutoWriteDirs            []string            `json:"auto_write_dirs,omitempty"`
+	ExtraVaults              []VaultMount        `json:"extra_vaults,omitempty"`
+	GitAutoCommit            bool                `json:"git_auto_commit"`
+	HeartbeatIntervalMinutes int                 `json:"heartbeat_interval_minutes"`
+	ObserverThresholdTokens  int                 `json:"observer_threshold_tokens"`
+	ReflectorThresholdBytes  int                 `json:"reflector_threshold_bytes"`
 	Models                   ModelConfig         `json:"models"`
+	Routing                  RoutingConfig       `json:"routing"`
 	MCPServers               []MCPServerConfig   `json:"mcp_servers,omitempty"`
 	Credentials              []CredentialPolicy  `json:"credentials,omitempty"`
 	Notifications            NotificationsConfig `json:"notifications"`
@@ -146,22 +173,23 @@ type CredentialView struct {
 
 // ConfigView exposes non-secret assistant configuration to CLI and web clients.
 type ConfigView struct {
-	Enabled                  bool              `json:"enabled"`
-	Configured               bool              `json:"configured"`
-	BaseURL                  string            `json:"base_url"`
-	APIKeyHint               string            `json:"api_key_hint"`
-	APIKeyOPRef              string            `json:"api_key_op_ref,omitempty"`
-	ZDR                      bool              `json:"zdr"`
-	DataCollection           string            `json:"data_collection"`
-	VaultPath                string            `json:"vault_path"`
-	EffectiveVaultPath       string            `json:"effective_vault_path"`
-	AutoWriteDirs            []string          `json:"auto_write_dirs"`
-	ExtraVaults              []VaultMount      `json:"extra_vaults"`
-	GitAutoCommit            bool              `json:"git_auto_commit"`
-	HeartbeatIntervalMinutes int               `json:"heartbeat_interval_minutes"`
-	ObserverThresholdTokens  int               `json:"observer_threshold_tokens"`
-	ReflectorThresholdBytes  int               `json:"reflector_threshold_bytes"`
+	Enabled                  bool                `json:"enabled"`
+	Configured               bool                `json:"configured"`
+	BaseURL                  string              `json:"base_url"`
+	APIKeyHint               string              `json:"api_key_hint"`
+	APIKeyOPRef              string              `json:"api_key_op_ref,omitempty"`
+	ZDR                      bool                `json:"zdr"`
+	DataCollection           string              `json:"data_collection"`
+	VaultPath                string              `json:"vault_path"`
+	EffectiveVaultPath       string              `json:"effective_vault_path"`
+	AutoWriteDirs            []string            `json:"auto_write_dirs"`
+	ExtraVaults              []VaultMount        `json:"extra_vaults"`
+	GitAutoCommit            bool                `json:"git_auto_commit"`
+	HeartbeatIntervalMinutes int                 `json:"heartbeat_interval_minutes"`
+	ObserverThresholdTokens  int                 `json:"observer_threshold_tokens"`
+	ReflectorThresholdBytes  int                 `json:"reflector_threshold_bytes"`
 	Models                   ModelConfig         `json:"models"`
+	Routing                  RoutingConfig       `json:"routing"`
 	MCPServers               []MCPServerConfig   `json:"mcp_servers"`
 	Credentials              []CredentialView    `json:"credentials"`
 	Notifications            NotificationsConfig `json:"notifications"`
@@ -221,7 +249,52 @@ func DefaultConfig() Config {
 			Heartbeat:   DefaultFastModel,
 			Aliases:     DefaultAliases(),
 		},
+		Routing: normalizeRoutingConfig(RoutingConfig{Mode: DefaultRoutingMode}),
 	}
+}
+
+func normalizeRoutingConfig(r RoutingConfig) RoutingConfig {
+	switch strings.ToLower(strings.TrimSpace(r.Mode)) {
+	case RoutingModeOff, RoutingModeHybrid, RoutingModeGate, RoutingModeAuto:
+		r.Mode = strings.ToLower(strings.TrimSpace(r.Mode))
+	default:
+		r.Mode = DefaultRoutingMode
+	}
+	if r.BorderlineProb <= 0 || r.BorderlineProb >= 1 {
+		r.BorderlineProb = DefaultFrontierBorderlineProb
+	}
+	if r.GateProb <= 0 || r.GateProb >= 1 {
+		r.GateProb = DefaultFrontierGateProb
+	}
+	if r.BorderlineProb >= r.GateProb {
+		r.BorderlineProb = max(0.05, r.GateProb-0.15)
+	}
+	if r.GrantMaxTurns <= 0 {
+		r.GrantMaxTurns = DefaultFrontierGrantMaxTurns
+	}
+	if r.GrantMaxCostUSD <= 0 {
+		r.GrantMaxCostUSD = DefaultFrontierGrantMaxCostUSD
+	}
+	if r.GrantIdleMinutes <= 0 {
+		r.GrantIdleMinutes = DefaultFrontierGrantIdleMinutes
+	}
+	if r.DailySoftCapUSD < 0 {
+		r.DailySoftCapUSD = 0
+	}
+	if r.DecisionTimeoutMS <= 0 {
+		r.DecisionTimeoutMS = DefaultDecisionTimeoutMS
+	} else {
+		r.DecisionTimeoutMS = min(max(r.DecisionTimeoutMS, 500), 10000)
+	}
+	return r
+}
+
+func concreteDefaultChat(cfg Config) string {
+	chat := strings.TrimSpace(cfg.Models.DefaultChat)
+	if chat == "" || strings.EqualFold(chat, "auto") {
+		return DefaultChatModel
+	}
+	return chat
 }
 
 // NormalizeConfig fills missing defaults and cleans fields.
@@ -262,6 +335,7 @@ func NormalizeConfig(cfg Config) Config {
 		}
 	}
 	cfg.Models.Aliases = aliases
+	cfg.Routing = normalizeRoutingConfig(cfg.Routing)
 	cfg.ExtraVaults = normalizeVaultMounts(cfg.ExtraVaults)
 	cfg.MCPServers = normalizeMCPServers(cfg.MCPServers)
 	cfg.Notifications = normalizeNotificationsConfig(cfg.Notifications)
@@ -530,6 +604,7 @@ func (c Config) View(effectiveVault string) ConfigView {
 		ObserverThresholdTokens:  c.ObserverThresholdTokens,
 		ReflectorThresholdBytes:  c.ReflectorThresholdBytes,
 		Models:                   c.Models,
+		Routing:                  normalizeRoutingConfig(c.Routing),
 		MCPServers:               redactMCPServers(c.MCPServers),
 		Credentials:              creds,
 		Notifications:            normalizeNotificationsConfig(c.Notifications),

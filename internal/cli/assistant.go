@@ -81,6 +81,7 @@ func cmdAssistantSetup(args []string, cio *IO) error {
 	apiKey := fs.String("api-key", "", "OpenRouter API key")
 	vaultPath := fs.String("vault", "", "Obsidian vault path on lighthouse")
 	model := fs.String("model", "", "default chat model")
+	routingMode := fs.String("routing-mode", "", "auto frontier routing mode (hybrid|gate|auto|off)")
 	decisionModel := fs.String("decision-model", "", "decision model slug")
 	observerModel := fs.String("observer-model", "", "observer/reflector model slug")
 	zdr := fs.Bool("zdr", true, "enforce OpenRouter Zero Data Retention")
@@ -127,6 +128,15 @@ func cmdAssistantSetup(args []string, cio *IO) error {
 	if *model != "" {
 		cfg.Models.DefaultChat = *model
 	}
+	if *routingMode != "" {
+		m := strings.ToLower(strings.TrimSpace(*routingMode))
+		switch m {
+		case assistant.RoutingModeHybrid, assistant.RoutingModeGate, assistant.RoutingModeAuto, assistant.RoutingModeOff:
+			cfg.Routing.Mode = m
+		default:
+			return fmt.Errorf("invalid --routing-mode %q (expected hybrid, gate, auto, or off)", *routingMode)
+		}
+	}
 	if *decisionModel != "" {
 		cfg.Models.Decision = *decisionModel
 	}
@@ -156,6 +166,7 @@ func cmdAssistantSetup(args []string, cio *IO) error {
 		"observer_threshold_tokens":  cfg.ObserverThresholdTokens,
 		"reflector_threshold_bytes":  cfg.ReflectorThresholdBytes,
 		"models":                     cfg.Models,
+		"routing":                    cfg.Routing,
 		"notifications":              cfg.Notifications,
 		"test":                       !*noTest && (cfg.APIKey != "" || cfg.APIKeyOPRef != ""),
 	}
@@ -384,6 +395,7 @@ func cmdAssistantStatus(args []string, cio *IO) error {
 		cio.printf("extra vault %-5s  %s (%s)\n", m.Name+":", m.Path, mode)
 	}
 	cio.printf("default model:     %s (decision=%s, observer=%s)\n", res.Config.Models.DefaultChat, res.Config.Models.Decision, res.Config.Models.Observer)
+	cio.printf("auto routing:      %s (frontier=%s, grant=%d turns / $%.2f)\n", res.Config.Routing.Mode, res.Config.Models.Frontier, res.Config.Routing.GrantMaxTurns, res.Config.Routing.GrantMaxCostUSD)
 	cio.printf("channels/timers:   %d channels, %d timers, %d pending approvals\n", res.Summary.Channels, res.Summary.EnabledTimers, res.Summary.PendingApprovals)
 	return nil
 }
@@ -447,6 +459,7 @@ func cmdAssistantApprovals(args []string, cio *IO) error {
 func cmdAssistantDecide(args []string, approve bool, cio *IO) error {
 	fs := flag.NewFlagSet("assistant decide", flag.ContinueOnError)
 	note := fs.String("note", "", "optional decision note")
+	scope := fs.String("scope", "", "approval scope for frontier escalations (once|topic)")
 	pos, err := parseFlagsInterspersed(fs, args)
 	if err != nil {
 		return err
@@ -467,6 +480,7 @@ func cmdAssistantDecide(args []string, approve bool, cio *IO) error {
 	}
 	if err := client.Call(api, http.MethodPost, "/v1/assistant/approvals/"+url.PathEscape(pos[0])+"/decide", map[string]string{
 		"decision": dec,
+		"scope":    *scope,
 		"note":     *note,
 	}, 15*time.Second, nil, &out); err != nil {
 		return err

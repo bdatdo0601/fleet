@@ -103,6 +103,7 @@ func buildAssistantSummary(fleet *core.Fleet) map[string]any {
 		"enabled":           view.Enabled,
 		"configured":        view.Configured,
 		"default_model":     view.Models.DefaultChat,
+		"routing_mode":      view.Routing.Mode,
 		"zdr":               view.ZDR,
 		"channels":          sc.Channels,
 		"pending_approvals": sc.PendingApprovals,
@@ -300,7 +301,11 @@ func registerAssistantChatRoutes(
 		if err != nil {
 			return err
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"channel": ch, "messages": msgs})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"channel":  ch,
+			"messages": msgs,
+			"grant":    fleet.Assistant.ActiveFrontierGrant(ch),
+		})
 		return nil
 	}))
 	mux.HandleFunc("POST /v1/assistant/messages", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
@@ -320,7 +325,38 @@ func registerAssistantChatRoutes(
 		return nil
 	}))
 	mux.HandleFunc("GET /v1/assistant/stream", route(true, handleAssistantSSE(fleet)))
+	registerAssistantRoutingRoutes(mux, fleet, route)
 	registerAssistantActionRoutes(mux, fleet, route)
+}
+
+func registerAssistantRoutingRoutes(
+	mux *http.ServeMux,
+	fleet *core.Fleet,
+	route func(bool, func(http.ResponseWriter, *http.Request, *registry.Device) error) http.HandlerFunc,
+) {
+	mux.HandleFunc("POST /v1/assistant/channels/{id}/retry-frontier", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		var req struct {
+			ReplaceMessageID int64  `json:"replace_message_id"`
+			Prompt           string `json:"prompt"`
+			GrantTopic       bool   `json:"grant_topic"`
+		}
+		if err := readJSONBody(r, &req); err != nil {
+			return err
+		}
+		ev, err := fleet.Assistant.RetryWithFrontier(r.PathValue("id"), req.ReplaceMessageID, req.Prompt, req.GrantTopic)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{"event": ev})
+		return nil
+	}))
+	mux.HandleFunc("DELETE /v1/assistant/channels/{id}/grant", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
+		if err := fleet.Assistant.RevokeFrontierGrant(r.PathValue("id")); err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return nil
+	}))
 }
 
 func handleAssistantSSE(fleet *core.Fleet) func(http.ResponseWriter, *http.Request, *registry.Device) error {
@@ -378,6 +414,7 @@ func registerAssistantActionRoutes(
 	mux.HandleFunc("POST /v1/assistant/approvals/{id}/decide", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
 		var req struct {
 			Decision string `json:"decision"`
+			Scope    string `json:"scope"`
 			Note     string `json:"note"`
 		}
 		if err := readJSONBody(r, &req); err != nil {
@@ -387,7 +424,7 @@ func registerAssistantActionRoutes(
 		if dec != "approve" && dec != "deny" && dec != "approved" && dec != "denied" {
 			return &core.FleetError{Msg: "decision must be approve or deny", Status: http.StatusBadRequest}
 		}
-		apr, err := fleet.Assistant.DecideApproval(r.PathValue("id"), dec == "approve" || dec == "approved", req.Note)
+		apr, err := fleet.Assistant.DecideApprovalWithScope(r.PathValue("id"), dec == "approve" || dec == "approved", req.Scope, req.Note)
 		if err != nil {
 			return err
 		}

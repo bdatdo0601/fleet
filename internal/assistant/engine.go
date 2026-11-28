@@ -13,7 +13,36 @@ import (
 	"time"
 )
 
-const maxToolRounds = 8
+const (
+	maxToolRounds = 8
+
+	// FrontierEscalationTool is the synthetic HITL approval tool name used when gating frontier model escalation.
+	FrontierEscalationTool = "frontier_escalation"
+)
+
+type frontierEscalationArgs struct {
+	OriginalPrompt string  `json:"original_prompt"`
+	FrontierModel  string  `json:"frontier_model"`
+	FallbackModel  string  `json:"fallback_model"`
+	Probability    float64 `json:"probability"`
+	TopicHint      string  `json:"topic_hint"`
+	DailySpendUSD  float64 `json:"daily_spend_usd,omitempty"`
+	GrantMaxTurns  int     `json:"grant_max_turns,omitempty"`
+	GrantMaxCost   float64 `json:"grant_max_cost,omitempty"`
+}
+
+type turnOptions struct {
+	RetryReplaceMsgID int64
+	TrackGrant        bool
+}
+
+type turnRoute struct {
+	Model          string
+	CleanText      string
+	Escalate       *frontierEscalationArgs
+	BorderlineProb float64
+	UsedGrant      *FrontierGrant
+}
 
 // StreamEvent is pushed over SSE to open Fleet Console #chat sessions.
 type StreamEvent struct {
@@ -267,6 +296,9 @@ func (e *Engine) UpdateConfig(next Config, clearAPIKey bool) (ConfigView, error)
 	if next.Notifications.NotifyApprovals == nil && !next.Notifications.Enabled && next.Notifications.DiscordWebhookOPRef == "" && len(next.Notifications.DiscordChannelOPRefs) == 0 && next.Notifications.FleetBaseURL == "" && next.Notifications.MinPriority == "" {
 		next.Notifications = cur.Notifications
 	}
+	if next.Routing == (RoutingConfig{}) {
+		next.Routing = cur.Routing
+	}
 	next = NormalizeConfig(next)
 	for _, srv := range next.MCPServers {
 		if err := ValidateMCPServerConfig(srv, false); err != nil {
@@ -464,6 +496,7 @@ func (e *Engine) EnqueueUserMessage(channelID, content, modelOverride string) (M
 		return Message{}, InboxEvent{}, err
 	}
 	e.publishEvent(StreamEvent{Type: "message_created", ChannelID: channelID, Data: msg})
+	_ = e.store.CancelPendingApprovalsByTool(channelID, FrontierEscalationTool)
 
 	ev, _, err := e.store.EnqueueInbox(channelID, "chat", "", map[string]any{
 		"message_id": msg.ID,
@@ -478,7 +511,20 @@ func (e *Engine) EnqueueUserMessage(channelID, content, modelOverride string) (M
 
 // DecideApproval resolves a pending HITL approval and queues worker resumption.
 func (e *Engine) DecideApproval(id string, approve bool, note string) (Approval, error) {
-	apr, err := e.store.DecideApproval(id, approve, note)
+	return e.DecideApprovalWithScope(id, approve, "", note)
+}
+
+// DecideApprovalWithScope resolves a pending HITL approval with an optional scope ("once" or "topic").
+func (e *Engine) DecideApprovalWithScope(id string, approve bool, scope, note string) (Approval, error) {
+	cleanScope := strings.ToLower(strings.TrimSpace(scope))
+	if cleanScope != "topic" {
+		cleanScope = "once"
+	}
+	storedNote := strings.TrimSpace(note)
+	if approve && cleanScope == "topic" && storedNote == "" {
+		storedNote = "scope:topic"
+	}
+	apr, err := e.store.DecideApproval(id, approve, storedNote)
 	if err != nil {
 		return Approval{}, err
 	}
@@ -486,12 +532,77 @@ func (e *Engine) DecideApproval(id string, approve bool, note string) (Approval,
 	_, _, err = e.store.EnqueueInbox(apr.ChannelID, "approval", "apr:"+apr.ID, map[string]any{
 		"approval_id": apr.ID,
 		"approved":    approve,
+		"scope":       cleanScope,
 	}, "")
 	if err != nil {
 		return Approval{}, err
 	}
 	e.notify()
 	return apr, nil
+}
+
+// ActiveFrontierGrant returns the currently valid frontier topic grant for channelID, if any.
+func (e *Engine) ActiveFrontierGrant(channelID string) *FrontierGrant {
+	ch, err := e.store.GetChannel(cmp.Or(strings.TrimSpace(channelID), "general"))
+	if err != nil {
+		return nil
+	}
+	g, err := e.store.GetActiveFrontierGrant(ch.ID, ch.ContextEpoch, time.Now().UTC())
+	if err != nil {
+		return nil
+	}
+	return g
+}
+
+// RevokeFrontierGrant clears any active frontier topic grant on channelID and notifies SSE clients.
+func (e *Engine) RevokeFrontierGrant(channelID string) error {
+	clean := cmp.Or(strings.TrimSpace(channelID), "general")
+	if err := e.store.DeleteFrontierGrant(clean); err != nil {
+		return err
+	}
+	e.publishEvent(StreamEvent{Type: "grant_updated", ChannelID: clean})
+	return nil
+}
+
+// RetryWithFrontier re-runs a borderline prompt directly on the configured frontier model, optionally granting the topic.
+func (e *Engine) RetryWithFrontier(channelID string, replaceMsgID int64, prompt string, grantTopic bool) (InboxEvent, error) {
+	channelID = cmp.Or(strings.TrimSpace(channelID), "general")
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return InboxEvent{}, newErr("prompt is required", http.StatusBadRequest)
+	}
+	ch, err := e.store.GetChannel(channelID)
+	if err != nil {
+		return InboxEvent{}, err
+	}
+	_ = e.store.CancelPendingApprovalsByTool(ch.ID, FrontierEscalationTool)
+	cfg := e.Config()
+	if grantTopic {
+		exp := time.Now().UTC().Add(time.Duration(cfg.Routing.GrantIdleMinutes) * time.Minute).Format(time.RFC3339)
+		if _, gErr := e.store.UpsertFrontierGrant(FrontierGrant{
+			ChannelID:    ch.ID,
+			ContextEpoch: ch.ContextEpoch,
+			TopicSummary: truncateText(prompt, 160),
+			TurnsUsed:    0,
+			MaxTurns:     cfg.Routing.GrantMaxTurns,
+			CostUSD:      0,
+			MaxCostUSD:   cfg.Routing.GrantMaxCostUSD,
+			ExpiresAt:    exp,
+		}); gErr != nil {
+			return InboxEvent{}, gErr
+		}
+		e.publishEvent(StreamEvent{Type: "grant_updated", ChannelID: ch.ID})
+	}
+	ev, _, err := e.store.EnqueueInbox(ch.ID, "chat", "", map[string]any{
+		"content":              prompt,
+		"retry_replace_msg_id": replaceMsgID,
+		"use_grant":            grantTopic,
+	}, cfg.Models.Frontier)
+	if err != nil {
+		return InboxEvent{}, err
+	}
+	e.notify()
+	return ev, nil
 }
 
 // ResetChannel starts a fresh context epoch and optionally clears channel message history,
@@ -608,7 +719,15 @@ func (e *Engine) processInboxEvent(ctx context.Context, ev InboxEvent) error {
 			Content:      fmt.Sprintf("[%s] %s", prefix, userText),
 		})
 	}
-	return e.runAgentTurn(ctx, cfg, *ch, ev.Source, userText, ev.ModelOverride)
+	var retryReplaceID int64
+	if rawID, ok := payload["retry_replace_msg_id"].(float64); ok && rawID > 0 {
+		retryReplaceID = int64(rawID)
+	}
+	useGrant, _ := payload["use_grant"].(bool)
+	return e.runAgentTurn(ctx, cfg, *ch, ev.Source, userText, ev.ModelOverride, turnOptions{
+		RetryReplaceMsgID: retryReplaceID,
+		TrackGrant:        useGrant,
+	})
 }
 
 func (e *Engine) handleApprovalResume(ctx context.Context, cfg Config, ch Channel, payload map[string]any) error {
@@ -616,6 +735,9 @@ func (e *Engine) handleApprovalResume(ctx context.Context, cfg Config, ch Channe
 	apr, err := e.store.GetApproval(aprID)
 	if err != nil {
 		return err
+	}
+	if apr.ToolName == FrontierEscalationTool {
+		return e.handleFrontierEscalationResume(ctx, cfg, ch, apr, payload)
 	}
 	var toolSummary string
 	if apr.Status == "approved" {
@@ -641,7 +763,36 @@ func (e *Engine) handleApprovalResume(ctx context.Context, cfg Config, ch Channe
 		Role:         "user",
 		Content:      "[approval_result] " + toolSummary,
 	})
-	return e.runAgentTurn(ctx, cfg, ch, "approval", toolSummary, "")
+	resumeModel := e.store.GetMessageModel(apr.MessageID)
+	return e.runAgentTurn(ctx, cfg, ch, "approval", toolSummary, resumeModel, turnOptions{})
+}
+
+func (e *Engine) handleFrontierEscalationResume(ctx context.Context, cfg Config, ch Channel, apr *Approval, payload map[string]any) error {
+	var args frontierEscalationArgs
+	_ = json.Unmarshal([]byte(apr.ArgsJSON), &args)
+	fallback := cmp.Or(args.FallbackModel, concreteDefaultChat(cfg))
+	if apr.Status != "approved" {
+		return e.runAgentTurn(ctx, cfg, ch, "chat", args.OriginalPrompt, fallback, turnOptions{})
+	}
+	scope, _ := payload["scope"].(string)
+	isTopic := strings.EqualFold(scope, "topic") || strings.Contains(apr.DecisionNote, "scope:topic")
+	frontierModel := cmp.Or(args.FrontierModel, cfg.Models.Frontier)
+	if isTopic {
+		exp := time.Now().UTC().Add(time.Duration(cfg.Routing.GrantIdleMinutes) * time.Minute).Format(time.RFC3339)
+		_, _ = e.store.UpsertFrontierGrant(FrontierGrant{
+			ChannelID:    ch.ID,
+			ContextEpoch: ch.ContextEpoch,
+			TopicSummary: cmp.Or(args.TopicHint, truncateText(args.OriginalPrompt, 160)),
+			TurnsUsed:    0,
+			MaxTurns:     cfg.Routing.GrantMaxTurns,
+			CostUSD:      0,
+			MaxCostUSD:   cfg.Routing.GrantMaxCostUSD,
+			ExpiresAt:    exp,
+		})
+		e.publishEvent(StreamEvent{Type: "grant_updated", ChannelID: ch.ID})
+	}
+	_ = e.store.SetApprovalResult(apr.ID, "executed", "Approved model: "+frontierModel)
+	return e.runAgentTurn(ctx, cfg, ch, "chat", args.OriginalPrompt, frontierModel, turnOptions{TrackGrant: isTopic})
 }
 
 func parseSlashModelOverride(text string, aliases map[string]string) (model string, cleaned string) {
@@ -657,7 +808,7 @@ func parseSlashModelOverride(text string, aliases map[string]string) (model stri
 	return "", text
 }
 
-func (e *Engine) resolveModel(ctx context.Context, cfg Config, ch Channel, source, userText, explicit string, skills []Skill) string {
+func (e *Engine) resolveTurnRoute(ctx context.Context, cfg Config, ch Channel, source, userText, explicit string, tail []Message, skills []Skill) turnRoute {
 	slashModel, cleanText := parseSlashModelOverride(userText, cfg.Models.Aliases)
 	chosen := cmp.Or(slashModel, strings.TrimSpace(explicit))
 	if chosen == "" {
@@ -672,36 +823,161 @@ func (e *Engine) resolveModel(ctx context.Context, cfg Config, ch Channel, sourc
 		chosen = strings.TrimSpace(ch.Model)
 	}
 	if chosen == "" {
-		if source == "heartbeat" {
+		switch {
+		case source == "heartbeat":
 			chosen = cfg.Models.Heartbeat
-		} else {
-			chosen = cfg.Models.DefaultChat
+		case source == "chat" && cfg.Routing.Mode != RoutingModeOff:
+			chosen = "auto"
+		default:
+			chosen = concreteDefaultChat(cfg)
 		}
 	}
 	if alias, ok := cfg.Models.Aliases[strings.ToLower(chosen)]; ok {
 		chosen = alias
 	}
-	if strings.EqualFold(chosen, "auto") {
-		if ans, err := e.llm.Decide(ctx, cfg, cleanText, []DecisionQuestion{{
-			ID:           "tier",
-			Type:         "choice",
-			Instructions: "Choose model capability tier needed for this user request.",
-			Criteria: map[string]string{
-				"fast":     "Simple question, greeting, reminder, or single-step status lookup",
-				"balanced": "Normal assistant work, tool orchestration, summarization, or multi-step chat",
-				"frontier": "Complex planning, deep reasoning, architecture design, or subtle analysis",
-			},
-		}}); err == nil {
-			switch ans["tier"].Value {
-			case "fast":
-				return cfg.Models.Fast
-			case "frontier":
-				return cfg.Models.Frontier
-			}
-		}
-		return cfg.Models.DefaultChat
+	if !strings.EqualFold(chosen, "auto") {
+		return turnRoute{Model: chosen, CleanText: cleanText}
 	}
-	return chosen
+	if source != "chat" {
+		return turnRoute{Model: e.decideLegacyTier(ctx, cfg, cleanText), CleanText: cleanText}
+	}
+	return e.routeInteractiveChat(ctx, cfg, ch, cleanText, userText, tail)
+}
+
+func (e *Engine) decideLegacyTier(ctx context.Context, cfg Config, cleanText string) string {
+	fallback := concreteDefaultChat(cfg)
+	ans, err := e.llm.Decide(ctx, cfg, cleanText, []DecisionQuestion{{
+		ID:           "tier",
+		Type:         "choice",
+		Instructions: "Choose model capability tier needed for this user request.",
+		Criteria: map[string]string{
+			"fast":     "Simple question, greeting, reminder, or single-step status lookup",
+			"balanced": "Normal assistant work, tool orchestration, summarization, or multi-step chat",
+			"frontier": "Complex planning, deep reasoning, architecture design, or subtle analysis",
+		},
+	}})
+	if err != nil {
+		return fallback
+	}
+	switch ans["tier"].Value {
+	case "fast":
+		return cfg.Models.Fast
+	case "frontier":
+		return cfg.Models.Frontier
+	default:
+		return fallback
+	}
+}
+
+func buildRoutingState(chID, cleanText, rawUserText string, tail []Message, activeGrant *FrontierGrant) map[string]any {
+	state := map[string]any{
+		"input":        cleanText,
+		"user_message": cleanText,
+		"channel":      chID,
+	}
+	hist := tail
+	if len(hist) > 0 && hist[len(hist)-1].Role == "user" {
+		lastContent := strings.TrimSpace(hist[len(hist)-1].Content)
+		if lastContent == strings.TrimSpace(rawUserText) || lastContent == strings.TrimSpace(cleanText) {
+			hist = hist[:len(hist)-1]
+		}
+	}
+	if len(hist) > 4 {
+		hist = hist[len(hist)-4:]
+	}
+	if len(hist) > 0 {
+		recent := make([]string, 0, len(hist))
+		for _, m := range hist {
+			if m.Role != "user" && m.Role != "assistant" {
+				continue
+			}
+			recent = append(recent, m.Role+": "+truncateText(m.Content, 300))
+		}
+		if len(recent) > 0 {
+			state["recent_context"] = recent
+		}
+	}
+	if activeGrant != nil && strings.TrimSpace(activeGrant.TopicSummary) != "" {
+		state["active_frontier_topic"] = activeGrant.TopicSummary
+	}
+	return state
+}
+
+func (e *Engine) routeInteractiveChat(ctx context.Context, cfg Config, ch Channel, cleanText, rawUserText string, tail []Message) turnRoute {
+	fallback := concreteDefaultChat(cfg)
+	routing := normalizeRoutingConfig(cfg.Routing)
+	effMode := routing.Mode
+	if effMode == RoutingModeOff {
+		effMode = RoutingModeAuto
+	}
+	now := time.Now().UTC()
+	activeGrant, _ := e.store.GetActiveFrontierGrant(ch.ID, ch.ContextEpoch, now)
+	questions := []DecisionQuestion{{
+		ID:   "needs_frontier",
+		Type: "noul",
+		Instructions: "Does this turn require a frontier reasoning model (complex architecture, subtle debugging, multi-step planning, deep trade-off analysis) " +
+			"rather than a fast balanced assistant model (routine questions, status checks, simple edits, summarization)?",
+		Criteria: map[string]string{
+			"true":  "Requires deep reasoning, complex planning, architecture design, or subtle analysis",
+			"false": "Routine chat, lookups, greetings, simple tool calls, or straightforward summarization",
+		},
+	}}
+	if activeGrant != nil {
+		questions = append(questions, DecisionQuestion{
+			ID:           "same_topic",
+			Type:         "noul",
+			Instructions: "Is the latest user message continuing the same task/topic as active_frontier_topic and recent_context, rather than pivoting to a new unrelated topic?",
+			Criteria: map[string]string{
+				"true":  "Continuation or follow-up on the active frontier topic",
+				"false": "New or unrelated topic pivot",
+			},
+		})
+	}
+	state := buildRoutingState(ch.ID, cleanText, rawUserText, tail, activeGrant)
+	ans, err := e.llm.DecideState(ctx, cfg, state, questions)
+	if err != nil {
+		return turnRoute{Model: fallback, CleanText: cleanText}
+	}
+	pFrontier := ans["needs_frontier"].Prob("true")
+	if _, hasNF := ans["needs_frontier"]; !hasNF {
+		if tAns, hasTier := ans["tier"]; hasTier {
+			pFrontier = tAns.Prob("frontier")
+		}
+	}
+	if activeGrant != nil {
+		if ans["same_topic"].Prob("true") < DefaultSameTopicProb {
+			_ = e.store.DeleteFrontierGrant(ch.ID)
+			e.publishEvent(StreamEvent{Type: "grant_updated", ChannelID: ch.ID})
+			activeGrant = nil
+		}
+	}
+	if pFrontier >= routing.GateProb {
+		if effMode == RoutingModeAuto {
+			return turnRoute{Model: cfg.Models.Frontier, CleanText: cleanText}
+		}
+		todayStart := now.Format("2006-01-02") + "T00:00:00+00:00"
+		dailySpend := e.store.DailySpendUSD(todayStart)
+		if activeGrant != nil && (routing.DailySoftCapUSD <= 0 || dailySpend < routing.DailySoftCapUSD) {
+			return turnRoute{Model: cfg.Models.Frontier, CleanText: cleanText, UsedGrant: activeGrant}
+		}
+		return turnRoute{
+			CleanText: cleanText,
+			Escalate: &frontierEscalationArgs{
+				OriginalPrompt: cleanText,
+				FrontierModel:  cfg.Models.Frontier,
+				FallbackModel:  fallback,
+				Probability:    pFrontier,
+				TopicHint:      truncateText(cleanText, 160),
+				DailySpendUSD:  dailySpend,
+				GrantMaxTurns:  routing.GrantMaxTurns,
+				GrantMaxCost:   routing.GrantMaxCostUSD,
+			},
+		}
+	}
+	if effMode == RoutingModeHybrid && pFrontier >= routing.BorderlineProb {
+		return turnRoute{Model: fallback, CleanText: cleanText, BorderlineProb: pFrontier}
+	}
+	return turnRoute{Model: fallback, CleanText: cleanText}
 }
 
 func (e *Engine) buildPromptMessages(ctx context.Context, ch Channel, tail []Message, slashAliases map[string]string) []ChatMessage {
@@ -831,21 +1107,57 @@ func buildGenerativeUIPromptSection() string {
 `
 }
 
-func (e *Engine) runAgentTurn(ctx context.Context, cfg Config, ch Channel, source, userText, explicitModel string) error {
-	v, _ := e.vault()
+func (e *Engine) loadTurnTail(ch Channel, opts turnOptions) ([]Message, error) {
+	tail, err := e.store.ListContextMessages(ch.ID, ch.ContextEpoch, 40)
+	if err != nil {
+		return nil, err
+	}
+	if opts.RetryReplaceMsgID <= 0 {
+		return tail, nil
+	}
+	filtered := make([]Message, 0, len(tail))
+	for _, m := range tail {
+		if m.ID < opts.RetryReplaceMsgID {
+			filtered = append(filtered, m)
+		}
+	}
+	return filtered, nil
+}
+
+func (e *Engine) buildRunStartData(chID, model string, route turnRoute, opts turnOptions) map[string]any {
+	startData := map[string]any{"model": model}
+	grantForMeta := route.UsedGrant
+	if grantForMeta == nil && opts.TrackGrant {
+		grantForMeta = e.ActiveFrontierGrant(chID)
+	}
+	if grantForMeta != nil {
+		startData["grant_turn"] = grantForMeta.TurnsUsed + 1
+		startData["grant_max_turns"] = grantForMeta.MaxTurns
+	}
+	return startData
+}
+
+func (e *Engine) runAgentTurn(ctx context.Context, cfg Config, ch Channel, source, userText, explicitModel string, opts turnOptions) error {
 	var skills []Skill
-	if v != nil {
+	if v, err := e.vault(); err == nil && v != nil {
 		skills, _ = v.ListSkills()
 	}
-	model := e.resolveModel(ctx, cfg, ch, source, userText, explicitModel, skills)
-	tail, err := e.store.ListContextMessages(ch.ID, ch.ContextEpoch, 40)
+	tail, err := e.loadTurnTail(ch, opts)
 	if err != nil {
 		return err
 	}
+	route := e.resolveTurnRoute(ctx, cfg, ch, source, userText, explicitModel, tail, skills)
+	if route.Escalate != nil {
+		return e.pauseForFrontierEscalation(ch, route.Escalate)
+	}
+	model := route.Model
 	msgs := e.buildPromptMessages(ctx, ch, tail, cfg.Models.Aliases)
+	if opts.RetryReplaceMsgID > 0 && (len(msgs) <= 1 || msgs[len(msgs)-1].Role != "user") && strings.TrimSpace(userText) != "" {
+		msgs = append(msgs, ChatMessage{Role: "user", Content: userText})
+	}
 	tools := e.buildToolSpecs(ctx)
 
-	e.publishEvent(StreamEvent{Type: "run_start", ChannelID: ch.ID, Data: map[string]any{"model": model}})
+	e.publishEvent(StreamEvent{Type: "run_start", ChannelID: ch.ID, Data: e.buildRunStartData(ch.ID, model, route, opts)})
 	var widgets []WidgetPayload
 	tctx := &toolExecContext{ChannelID: ch.ID, Source: source, Config: cfg, Widgets: &widgets}
 
@@ -863,7 +1175,14 @@ func (e *Engine) runAgentTurn(ctx context.Context, cfg Config, ch Channel, sourc
 		totalUsage.CostUSD += turn.Usage.CostUSD
 
 		if len(turn.ToolCalls) == 0 {
-			return e.finishTurnSuccess(ctx, cfg, ch, model, turn.Content, totalUsage, widgets)
+			if route.BorderlineProb > 0 {
+				widgets = append(widgets, buildFrontierRetryWidget(route.CleanText, cfg.Models.Frontier, route.BorderlineProb))
+			}
+			if err := e.finishTurnSuccess(ctx, cfg, ch, model, turn.Content, totalUsage, widgets); err != nil {
+				return err
+			}
+			e.recordTurnGrantUsage(cfg, ch.ID, totalUsage.CostUSD, route.UsedGrant != nil || opts.TrackGrant)
+			return nil
 		}
 		msgs = append(msgs, ChatMessage{Role: "assistant", Content: turn.Content, ToolCalls: turn.ToolCalls})
 		for _, tc := range turn.ToolCalls {
@@ -879,7 +1198,52 @@ func (e *Engine) runAgentTurn(ctx context.Context, cfg Config, ch Channel, sourc
 			msgs = append(msgs, ChatMessage{Role: "tool", ToolCallID: tc.ID, Content: outStr})
 		}
 	}
-	return e.finishTurnSuccess(ctx, cfg, ch, model, "Stopped after reaching max tool rounds.", totalUsage, widgets)
+	if err := e.finishTurnSuccess(ctx, cfg, ch, model, "Stopped after reaching max tool rounds.", totalUsage, widgets); err != nil {
+		return err
+	}
+	e.recordTurnGrantUsage(cfg, ch.ID, totalUsage.CostUSD, route.UsedGrant != nil || opts.TrackGrant)
+	return nil
+}
+
+func buildFrontierRetryWidget(prompt, frontierModel string, prob float64) WidgetPayload {
+	return WidgetPayload{
+		Kind:  "frontier_retry",
+		Title: fmt.Sprintf("Borderline complexity (%.0f%%)", prob*100),
+		Data: map[string]any{
+			"prompt":         prompt,
+			"frontier_model": frontierModel,
+			"probability":    prob,
+		},
+	}
+}
+
+func (e *Engine) recordTurnGrantUsage(cfg Config, channelID string, costUSD float64, track bool) {
+	if !track {
+		return
+	}
+	exp := time.Now().UTC().Add(time.Duration(normalizeRoutingConfig(cfg.Routing).GrantIdleMinutes) * time.Minute).Format(time.RFC3339)
+	if err := e.store.RecordFrontierGrantUsage(channelID, costUSD, exp); err == nil {
+		e.publishEvent(StreamEvent{Type: "grant_updated", ChannelID: channelID})
+	}
+}
+
+func (e *Engine) pauseForFrontierEscalation(ch Channel, esc *frontierEscalationArgs) error {
+	rawArgs, err := json.Marshal(esc)
+	if err != nil {
+		return err
+	}
+	apr, err := e.store.CreateApproval(Approval{
+		ChannelID: ch.ID,
+		ToolName:  FrontierEscalationTool,
+		ArgsJSON:  string(rawArgs),
+		Summary:   fmt.Sprintf("Escalate to %s (%.0f%% complex)", esc.FrontierModel, esc.Probability*100),
+		RiskLevel: "model",
+	})
+	if err != nil {
+		return err
+	}
+	e.publishEvent(StreamEvent{Type: "approval", ChannelID: ch.ID, Data: apr})
+	return nil
 }
 
 func (e *Engine) finishTurnSuccess(ctx context.Context, cfg Config, ch Channel, model, content string, usage StreamUsage, widgets []WidgetPayload) error {

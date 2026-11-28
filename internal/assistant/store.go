@@ -128,6 +128,19 @@ CREATE TABLE IF NOT EXISTS assistant_delegations (
 );
 CREATE INDEX IF NOT EXISTS idx_assistant_delegations_active
   ON assistant_delegations(status, target_device, session_name);
+
+CREATE TABLE IF NOT EXISTS assistant_frontier_grants (
+  channel_id    TEXT PRIMARY KEY,
+  context_epoch INTEGER NOT NULL,
+  topic_summary TEXT NOT NULL DEFAULT '',
+  turns_used    INTEGER NOT NULL DEFAULT 0,
+  max_turns     INTEGER NOT NULL DEFAULT 5,
+  cost_usd      REAL NOT NULL DEFAULT 0,
+  max_cost_usd  REAL NOT NULL DEFAULT 0.25,
+  expires_at    TEXT NOT NULL,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL
+);
 `
 
 // Channel represents one persistent assistant conversation stream.
@@ -244,6 +257,20 @@ type Delegation struct {
 	LastNotifiedState string `json:"last_notified_state,omitempty"`
 	CreatedAt         string `json:"created_at"`
 	UpdatedAt         string `json:"updated_at"`
+}
+
+// FrontierGrant represents a context-scoped auto-approval grant for frontier model turns on a channel topic.
+type FrontierGrant struct {
+	ChannelID    string  `json:"channel_id"`
+	ContextEpoch int     `json:"context_epoch"`
+	TopicSummary string  `json:"topic_summary"`
+	TurnsUsed    int     `json:"turns_used"`
+	MaxTurns     int     `json:"max_turns"`
+	CostUSD      float64 `json:"cost_usd"`
+	MaxCostUSD   float64 `json:"max_cost_usd"`
+	ExpiresAt    string  `json:"expires_at"`
+	CreatedAt    string  `json:"created_at"`
+	UpdatedAt    string  `json:"updated_at"`
 }
 
 // SummaryCounts reports live assistant queue/approval counts for overview UI.
@@ -409,6 +436,9 @@ func (s *Store) ResetChannelContext(id string, clearHistory bool) (Channel, erro
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return Channel{}, newErr(fmt.Sprintf("channel %q not found", id), http.StatusNotFound)
+	}
+	if _, err := s.db.Exec(`DELETE FROM assistant_frontier_grants WHERE channel_id = ?`, cleanID); err != nil {
+		return Channel{}, err
 	}
 	if clearHistory {
 		if _, err := s.db.Exec(`DELETE FROM assistant_messages WHERE channel_id = ?`, cleanID); err != nil {
@@ -1055,6 +1085,129 @@ func (s *Store) SetApprovalResult(id, status, resultJSON string) error {
 		`UPDATE assistant_approvals SET status = ?, result_json = ? WHERE id = ?`,
 		status, resultJSON, id,
 	)
+	return err
+}
+
+// CancelPendingApprovalsByTool cancels pending approvals for a given tool on a channel.
+func (s *Store) CancelPendingApprovalsByTool(channelID, toolName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(
+		`UPDATE assistant_approvals SET status = 'cancelled', decided_at = ?
+		 WHERE channel_id = ? AND tool_name = ? AND status = 'pending'`,
+		registry.NowISO(), strings.TrimSpace(channelID), strings.TrimSpace(toolName),
+	)
+	return err
+}
+
+// GetMessageModel returns the recorded model slug for a stored message ID.
+func (s *Store) GetMessageModel(id int64) string {
+	if id <= 0 {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var model string
+	_ = s.db.QueryRow(`SELECT model FROM assistant_messages WHERE id = ?`, id).Scan(&model)
+	return strings.TrimSpace(model)
+}
+
+// DailySpendUSD returns total assistant message cost_usd recorded at or after sinceISO.
+func (s *Store) DailySpendUSD(sinceISO string) float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var total float64
+	_ = s.db.QueryRow(`SELECT COALESCE(SUM(cost_usd), 0) FROM assistant_messages WHERE created_at >= ?`, sinceISO).Scan(&total)
+	return total
+}
+
+// UpsertFrontierGrant saves or replaces a topic-scoped frontier auto-approval grant for a channel.
+func (s *Store) UpsertFrontierGrant(g FrontierGrant) (FrontierGrant, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := registry.NowISO()
+	g.ChannelID = cmp.Or(strings.TrimSpace(g.ChannelID), "general")
+	g.ContextEpoch = max(g.ContextEpoch, 1)
+	g.MaxTurns = max(g.MaxTurns, 1)
+	if g.MaxCostUSD <= 0 {
+		g.MaxCostUSD = DefaultFrontierGrantMaxCostUSD
+	}
+	g.CreatedAt = cmp.Or(g.CreatedAt, now)
+	g.UpdatedAt = now
+	if _, err := s.db.Exec(
+		`INSERT INTO assistant_frontier_grants(
+			channel_id, context_epoch, topic_summary, turns_used, max_turns,
+			cost_usd, max_cost_usd, expires_at, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(channel_id) DO UPDATE SET
+			context_epoch = excluded.context_epoch,
+			topic_summary = excluded.topic_summary,
+			turns_used = excluded.turns_used,
+			max_turns = excluded.max_turns,
+			cost_usd = excluded.cost_usd,
+			max_cost_usd = excluded.max_cost_usd,
+			expires_at = excluded.expires_at,
+			created_at = excluded.created_at,
+			updated_at = excluded.updated_at`,
+		g.ChannelID, g.ContextEpoch, g.TopicSummary, g.TurnsUsed, g.MaxTurns,
+		g.CostUSD, g.MaxCostUSD, g.ExpiresAt, g.CreatedAt, g.UpdatedAt,
+	); err != nil {
+		return FrontierGrant{}, err
+	}
+	return g, nil
+}
+
+// GetActiveFrontierGrant returns the active frontier topic grant if valid for epoch, time, turns, and cost.
+func (s *Store) GetActiveFrontierGrant(channelID string, epoch int, now time.Time) (*FrontierGrant, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var g FrontierGrant
+	err := s.db.QueryRow(
+		`SELECT channel_id, context_epoch, topic_summary, turns_used, max_turns,
+		        cost_usd, max_cost_usd, expires_at, created_at, updated_at
+		 FROM assistant_frontier_grants WHERE channel_id = ?`,
+		strings.TrimSpace(channelID),
+	).Scan(
+		&g.ChannelID, &g.ContextEpoch, &g.TopicSummary, &g.TurnsUsed, &g.MaxTurns,
+		&g.CostUSD, &g.MaxCostUSD, &g.ExpiresAt, &g.CreatedAt, &g.UpdatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if g.ContextEpoch != max(epoch, 1) || g.TurnsUsed >= g.MaxTurns || g.CostUSD >= g.MaxCostUSD {
+		return nil, nil
+	}
+	exp, pErr := time.Parse(time.RFC3339, g.ExpiresAt)
+	if pErr != nil || !now.UTC().Before(exp.UTC()) {
+		return nil, nil
+	}
+	return &g, nil
+}
+
+// RecordFrontierGrantUsage increments turns_used and cost_usd and slides expires_at forward.
+func (s *Store) RecordFrontierGrantUsage(channelID string, addCostUSD float64, newExpiresAt string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(
+		`UPDATE assistant_frontier_grants
+		 SET turns_used = turns_used + 1,
+		     cost_usd = cost_usd + ?,
+		     expires_at = CASE WHEN ? != '' THEN ? ELSE expires_at END,
+		     updated_at = ?
+		 WHERE channel_id = ?`,
+		max(addCostUSD, 0.0), newExpiresAt, newExpiresAt, registry.NowISO(), strings.TrimSpace(channelID),
+	)
+	return err
+}
+
+// DeleteFrontierGrant removes any frontier topic grant for channelID.
+func (s *Store) DeleteFrontierGrant(channelID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`DELETE FROM assistant_frontier_grants WHERE channel_id = ?`, strings.TrimSpace(channelID))
 	return err
 }
 

@@ -170,3 +170,85 @@ func TestAssistantRoutesSecurityAndFlow(t *testing.T) {
 		_ = json.Unmarshal(b, &errBody)
 	}
 }
+
+func TestAssistantRoutingEndpoints(t *testing.T) {
+	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/alpha/decisions":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"answers":{"needs_frontier":{"type":"noul","noul":0.93}}}`))
+		case "/chat/completions":
+			var req struct {
+				Model string `json:"model"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"model=" + req.Model + "\"}}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"cost\":0.01}}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		}
+	}))
+	defer mockLLM.Close()
+
+	f, srv, _ := setupTestServer(t)
+	f.Assistant.Start(t.Context())
+	defer f.Assistant.Stop()
+
+	cfg := assistant.DefaultConfig()
+	cfg.Enabled = true
+	cfg.BaseURL = mockLLM.URL
+	cfg.APIKey = "sk-or-test"
+	if _, err := f.Assistant.UpdateConfig(cfg, false); err != nil {
+		t.Fatal(err)
+	}
+
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/messages", http.MethodPost, `{"channel":"general","content":"design system"}`, nil, ""); st != http.StatusAccepted {
+		t.Fatalf("POST message expected 202, got %d: %s", st, string(b))
+	}
+
+	var aprID string
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) && aprID == "" {
+		var res struct {
+			Approvals []assistant.Approval `json:"approvals"`
+		}
+		if err := client.Call(srv.URL, http.MethodGet, "/v1/assistant/approvals?status=pending", nil, 3*time.Second, nil, &res); err == nil && len(res.Approvals) > 0 {
+			aprID = res.Approvals[0].ID
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	if aprID == "" {
+		t.Fatalf("expected pending frontier_escalation approval")
+	}
+
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/approvals/"+aprID+"/decide", http.MethodPost, `{"decision":"approve","scope":"topic"}`, nil, ""); st != http.StatusOK {
+		t.Fatalf("POST approve scope=topic failed: %d (%s)", st, string(b))
+	}
+
+	var hasGrant bool
+	deadline2 := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline2) && !hasGrant {
+		var msgRes struct {
+			Messages []assistant.Message      `json:"messages"`
+			Grant    *assistant.FrontierGrant `json:"grant"`
+		}
+		if err := client.Call(srv.URL, http.MethodGet, "/v1/assistant/messages?channel=general", nil, 3*time.Second, nil, &msgRes); err == nil {
+			if msgRes.Grant != nil && msgRes.Grant.TurnsUsed >= 1 {
+				hasGrant = true
+				break
+			}
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	if !hasGrant {
+		t.Fatalf("expected active grant returned by GET /v1/assistant/messages")
+	}
+
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/channels/general/grant", http.MethodDelete, "", nil, ""); st != http.StatusOK || !strings.Contains(string(b), `"ok":true`) {
+		t.Fatalf("DELETE grant failed: %d (%s)", st, string(b))
+	}
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/channels/general/retry-frontier", http.MethodPost, `{"replace_message_id":0,"prompt":"retry me","grant_topic":true}`, nil, ""); st != http.StatusAccepted || !strings.Contains(string(b), `"event"`) {
+		t.Fatalf("POST retry-frontier failed: %d (%s)", st, string(b))
+	}
+}

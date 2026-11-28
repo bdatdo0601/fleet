@@ -90,6 +90,27 @@ type DecisionAnswer struct {
 	Probabilities map[string]float64 `json:"probabilities,omitempty"`
 }
 
+// Prob returns the probability for key (case-insensitive), falling back to Confidence when Value matches.
+func (a DecisionAnswer) Prob(key string) float64 {
+	if len(a.Probabilities) > 0 {
+		if p, ok := a.Probabilities[key]; ok {
+			return p
+		}
+		for k, p := range a.Probabilities {
+			if strings.EqualFold(k, key) {
+				return p
+			}
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(a.Value), strings.TrimSpace(key)) {
+		if a.Confidence > 0 {
+			return a.Confidence
+		}
+		return 1.0
+	}
+	return 0
+}
+
 type openRouterClient struct {
 	http *http.Client
 }
@@ -391,19 +412,42 @@ func buildDecisionQuestionsMap(questions []DecisionQuestion) map[string]any {
 	return qMap
 }
 
-// Decide evaluates typed System-1 decisions via OpenRouter's Decisions API with a short timeout.
+func buildDecisionsRequestBody(cfg Config, state map[string]any, questions []DecisionQuestion) map[string]any {
+	payload := map[string]any{
+		"model":     cfg.Models.Decision,
+		"state":     state,
+		"questions": buildDecisionQuestionsMap(questions),
+	}
+	if strings.Contains(strings.ToLower(cfg.BaseURL), "openrouter.ai") {
+		prov := map[string]any{}
+		if cfg.ZDR {
+			prov["zdr"] = true
+		}
+		if cfg.DataCollection != "" {
+			prov["data_collection"] = cfg.DataCollection
+		}
+		if len(prov) > 0 {
+			payload["provider"] = prov
+		}
+	}
+	return payload
+}
+
+// Decide evaluates typed System-1 decisions for a single text input via OpenRouter's Decisions API.
 func (c *openRouterClient) Decide(ctx context.Context, cfg Config, input string, questions []DecisionQuestion) (map[string]DecisionAnswer, error) {
+	return c.DecideState(ctx, cfg, map[string]any{"input": input}, questions)
+}
+
+// DecideState evaluates typed System-1 decisions for structured state via OpenRouter's Decisions API.
+func (c *openRouterClient) DecideState(ctx context.Context, cfg Config, state map[string]any, questions []DecisionQuestion) (map[string]DecisionAnswer, error) {
 	if strings.TrimSpace(cfg.APIKey) == "" || strings.TrimSpace(cfg.Models.Decision) == "" {
 		return nil, errors.New("decision model not configured")
 	}
-	dCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	timeout := time.Duration(normalizeRoutingConfig(cfg.Routing).DecisionTimeoutMS) * time.Millisecond
+	dCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	payload := map[string]any{
-		"model":     cfg.Models.Decision,
-		"state":     map[string]any{"input": input},
-		"questions": buildDecisionQuestionsMap(questions),
-	}
+	payload := buildDecisionsRequestBody(cfg, state, questions)
 	rawBody, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
@@ -426,6 +470,10 @@ func (c *openRouterClient) Decide(ctx context.Context, cfg Config, input string,
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("decisions HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBytes)))
 	}
+	return parseDecisionAnswers(respBytes)
+}
+
+func parseDecisionAnswers(respBytes []byte) (map[string]DecisionAnswer, error) {
 	var parsed struct {
 		Answers map[string]struct {
 			Type          string          `json:"type"`
@@ -442,18 +490,27 @@ func (c *openRouterClient) Decide(ctx context.Context, cfg Config, input string,
 	out := make(map[string]DecisionAnswer, len(parsed.Answers))
 	for id, a := range parsed.Answers {
 		val := a.Choice
-		if val == "" && a.Noul != nil {
-			if *a.Noul >= 0.5 {
-				val = "true"
-			} else {
-				val = "false"
+		probs := parseDecisionProbabilities(a.Probabilities)
+		conf := a.Confidence
+		if a.Noul != nil {
+			pTrue := *a.Noul
+			if val == "" {
+				if pTrue >= 0.5 {
+					val = "true"
+				} else {
+					val = "false"
+				}
+			}
+			if probs == nil {
+				probs = map[string]float64{"true": pTrue, "false": 1 - pTrue}
+			}
+			if conf == 0 {
+				conf = max(pTrue, 1-pTrue)
 			}
 		}
 		if val == "" && a.Value != nil {
 			val = fmt.Sprint(a.Value)
 		}
-		probs := parseDecisionProbabilities(a.Probabilities)
-		conf := a.Confidence
 		if val == "" && len(probs) > 0 {
 			bestProb := -1.0
 			for k, p := range probs {

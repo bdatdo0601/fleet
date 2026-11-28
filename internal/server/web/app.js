@@ -398,6 +398,7 @@ const SSE_EVENT_TYPES = [
   "approval",
   "approval_decided",
   "channel_reset",
+  "grant_updated",
   "outbox",
   "delegation",
   "error",
@@ -535,7 +536,11 @@ function ensureAssistantSSE() {
           state.overview.assistant.pending_approvals = curApr + 1;
         }
         updateAppBadgeCount(curApr + 1);
-        if (!document.hidden) {
+        if (apr.tool_name === "frontier_escalation") {
+          if (!document.hidden && state.route !== "chat") {
+            toast(`Frontier check (#${ch}): ${apr.summary || "Approve model escalation?"}`, "info");
+          }
+        } else if (!document.hidden) {
           toast(`Approval needed (#${ch}): ${apr.summary || apr.tool_name || "tool"}`, "warn");
         } else {
           showBrowserAlert(`Approval needed (#${ch})`, apr.summary || apr.tool_name || "", ch);

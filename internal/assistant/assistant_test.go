@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1186,5 +1187,382 @@ func TestDiscordWebhookNotifierAndDoctor(t *testing.T) {
 	}})
 	if dcPass.Status != "ok" {
 		t.Fatalf("expected notifications doctor ok for valid https://discord.com/api/webhooks/ URL, got %+v", dcPass)
+	}
+}
+
+type mockTestDecision struct {
+	NeedsFrontier float64
+	SameTopic     float64
+	ToolCall      bool
+	CostUSD       float64
+}
+
+type testNotifier func(context.Context, Notification) error
+
+func (f testNotifier) Send(ctx context.Context, n Notification) error { return f(ctx, n) }
+
+func TestHybridAutoRoutingTopicGrantsAndModes(t *testing.T) {
+	def := DefaultConfig()
+	if def.Routing.Mode != RoutingModeHybrid {
+		t.Fatalf("expected default routing mode %q, got %q", RoutingModeHybrid, def.Routing.Mode)
+	}
+	orBody := buildDecisionsRequestBody(Config{
+		BaseURL:        DefaultOpenRouterURL,
+		ZDR:            true,
+		DataCollection: "deny",
+		Models:         ModelConfig{Decision: DefaultDecisionModel},
+	}, map[string]any{"input": "hi"}, nil)
+	prov, _ := orBody["provider"].(map[string]any)
+	if prov["zdr"] != true || prov["data_collection"] != "deny" {
+		t.Fatalf("expected ZDR provider policy on OpenRouter decisions request, got %+v", orBody)
+	}
+
+	var decisionCount atomic.Int32
+	var nextDecision atomic.Value
+	nextDecision.Store(mockTestDecision{NeedsFrontier: 0.15, SameTopic: 0.90, CostUSD: 0.01})
+	var recordedChatReqs []struct {
+		Model    string
+		Messages []ChatMessage
+	}
+
+	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/alpha/decisions":
+			decisionCount.Add(1)
+			d := nextDecision.Load().(mockTestDecision)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w,
+				`{"answers":{"needs_frontier":{"type":"noul","noul":%v},"same_topic":{"type":"noul","noul":%v}}}`,
+				d.NeedsFrontier, d.SameTopic,
+			)
+		case "/chat/completions":
+			var req struct {
+				Model    string        `json:"model"`
+				Messages []ChatMessage `json:"messages"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			recordedChatReqs = append(recordedChatReqs, struct {
+				Model    string
+				Messages []ChatMessage
+			}{Model: req.Model, Messages: req.Messages})
+			d := nextDecision.Load().(mockTestDecision)
+			w.Header().Set("Content-Type", "text/event-stream")
+			if d.ToolCall {
+				// Trigger protected vault write on first call of tool test, then stop.
+				nextDecision.Store(mockTestDecision{NeedsFrontier: d.NeedsFrontier, SameTopic: d.SameTopic, ToolCall: false, CostUSD: d.CostUSD})
+				_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tc_f1\",\"type\":\"function\",\"function\":{\"name\":\"vault_write\",\"arguments\":\"{\\\"path\\\":\\\"Projects/Arch.md\\\",\\\"content\\\":\\\"# Arch\\\"}\"}}]}}]}\n\n"))
+				_, _ = fmt.Fprintf(w, "data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10,\"cost\":%v}}\n\n", d.CostUSD)
+				_, _ = w.Write([]byte("data: [DONE]\n\n"))
+				return
+			}
+			lastUser := ""
+			for _, m := range slices.Backward(req.Messages) {
+				if m.Role == "user" {
+					if s, ok := m.Content.(string); ok {
+						lastUser = s
+						break
+					}
+				}
+			}
+			_, _ = fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":\"reply-from-%s:%s\"}}]}\n\n", req.Model, lastUser)
+			_, _ = fmt.Fprintf(w, "data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10,\"cost\":%v}}\n\n", d.CostUSD)
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		}
+	}))
+	defer mockLLM.Close()
+
+	tmp := t.TempDir()
+	eng, err := Open(filepath.Join(tmp, "assistant.db"), filepath.Join(tmp, "assistant.json"), filepath.Join(tmp, "vault"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = eng.Close() }()
+
+	var discordSent atomic.Int32
+	eng.delMu.Lock()
+	eng.notifier = testNotifier(func(context.Context, Notification) error {
+		discordSent.Add(1)
+		return nil
+	})
+	eng.delMu.Unlock()
+
+	cfg := DefaultConfig()
+	cfg.Enabled = true
+	cfg.BaseURL = mockLLM.URL
+	cfg.APIKey = "sk-or-test"
+	cfg.Notifications.Enabled = true
+	cfg.Routing.GrantMaxTurns = 3
+	cfg.Routing.GrantMaxCostUSD = 0.50
+	if _, err := eng.UpdateConfig(cfg, false); err != nil {
+		t.Fatal(err)
+	}
+
+	eng.Start(t.Context())
+	sub := eng.Subscribe()
+	defer eng.Unsubscribe(sub)
+
+	waitDone := func() Message {
+		t.Helper()
+		deadline := time.After(5 * time.Second)
+		for {
+			select {
+			case ev := <-sub:
+				if ev.Type == "message_done" {
+					m, _ := ev.Data.(Message)
+					return m
+				}
+			case <-deadline:
+				t.Fatalf("timed out waiting for message_done")
+			}
+		}
+	}
+	waitApproval := func() Approval {
+		t.Helper()
+		deadline := time.After(5 * time.Second)
+		for {
+			select {
+			case ev := <-sub:
+				if ev.Type == "approval" {
+					a, _ := ev.Data.(Approval)
+					return a
+				}
+			case <-deadline:
+				t.Fatalf("timed out waiting for approval")
+			}
+		}
+	}
+
+	// 1. Low complexity (0.15) -> Haiku, no retry widget.
+	nextDecision.Store(mockTestDecision{NeedsFrontier: 0.15, CostUSD: 0.001})
+	if _, _, err := eng.EnqueueUserMessage("general", "hello there", ""); err != nil {
+		t.Fatal(err)
+	}
+	m1 := waitDone()
+	if m1.Model != DefaultChatModel || len(m1.Widgets) != 0 {
+		t.Fatalf("expected Haiku without widgets for low complexity, got %+v", m1)
+	}
+
+	// 2. Borderline complexity (0.72) -> Haiku + frontier_retry widget; RetryWithFrontier runs Frontier cleanly without duplicating user prompt or leaking Haiku reply.
+	nextDecision.Store(mockTestDecision{NeedsFrontier: 0.72, CostUSD: 0.002})
+	if _, _, err := eng.EnqueueUserMessage("general", "compare caching approaches", ""); err != nil {
+		t.Fatal(err)
+	}
+	m2 := waitDone()
+	if m2.Model != DefaultChatModel || len(m2.Widgets) != 1 || m2.Widgets[0].Kind != "frontier_retry" {
+		t.Fatalf("expected Haiku + frontier_retry widget, got %+v", m2)
+	}
+	if _, err := eng.RetryWithFrontier("general", m2.ID, "compare caching approaches", false); err != nil {
+		t.Fatal(err)
+	}
+	m2Retry := waitDone()
+	if m2Retry.Model != DefaultFrontierModel {
+		t.Fatalf("expected Frontier retry model %s, got %s", DefaultFrontierModel, m2Retry.Model)
+	}
+	lastReq := recordedChatReqs[len(recordedChatReqs)-1]
+	if lastReq.Messages[len(lastReq.Messages)-1].Role != "user" {
+		t.Fatalf("expected final message in Frontier retry to be user, got %+v", lastReq.Messages)
+	}
+	var compareCount int
+	for _, cm := range lastReq.Messages {
+		if s, ok := cm.Content.(string); ok {
+			if strings.Contains(s, "compare caching approaches") {
+				compareCount++
+			}
+			if cm.Role == "assistant" && cm.Content == m2.Content {
+				t.Fatalf("borderline Haiku reply leaked into Frontier retry context: %+v", lastReq.Messages)
+			}
+		}
+	}
+	if compareCount != 1 {
+		t.Fatalf("expected user prompt once in Frontier retry, got %d (%+v)", compareCount, lastReq.Messages)
+	}
+
+	// 3. High complexity (0.92) -> creates frontier_escalation HITL card (no Discord alert), approve with scope="topic".
+	nextDecision.Store(mockTestDecision{NeedsFrontier: 0.92, SameTopic: 0.90, CostUSD: 0.02})
+	if _, _, err := eng.EnqueueUserMessage("general", "design multi-region consensus architecture", ""); err != nil {
+		t.Fatal(err)
+	}
+	apr := waitApproval()
+	if apr.ToolName != FrontierEscalationTool || discordSent.Load() != 0 {
+		t.Fatalf("expected frontier_escalation approval with 0 Discord alerts, got %+v discord=%d", apr, discordSent.Load())
+	}
+	if _, err := eng.DecideApprovalWithScope(apr.ID, true, "topic", ""); err != nil {
+		t.Fatal(err)
+	}
+	m3 := waitDone()
+	if m3.Model != DefaultFrontierModel {
+		t.Fatalf("expected Frontier model after topic approval, got %s", m3.Model)
+	}
+	grant := eng.ActiveFrontierGrant("general")
+	if grant == nil || grant.TurnsUsed != 1 || grant.MaxTurns != 3 {
+		t.Fatalf("expected active grant with turns_used=1/3, got %+v", grant)
+	}
+
+	// 4. Same-topic complex follow-up auto-approves without HITL (turns_used -> 2).
+	nextDecision.Store(mockTestDecision{NeedsFrontier: 0.91, SameTopic: 0.90, CostUSD: 0.02})
+	if _, _, err := eng.EnqueueUserMessage("general", "now detail failover fencing tokens", ""); err != nil {
+		t.Fatal(err)
+	}
+	m4 := waitDone()
+	if m4.Model != DefaultFrontierModel {
+		t.Fatalf("expected auto-approved Frontier on same topic, got %s", m4.Model)
+	}
+	if g2 := eng.ActiveFrontierGrant("general"); g2 == nil || g2.TurnsUsed != 2 {
+		t.Fatalf("expected turns_used=2, got %+v", g2)
+	}
+
+	// 5. Same-topic simple follow-up drops to Haiku while preserving grant.
+	nextDecision.Store(mockTestDecision{NeedsFrontier: 0.20, SameTopic: 0.85, CostUSD: 0.001})
+	if _, _, err := eng.EnqueueUserMessage("general", "save a quick note in Daily", ""); err != nil {
+		t.Fatal(err)
+	}
+	m5 := waitDone()
+	if m5.Model != DefaultChatModel || eng.ActiveFrontierGrant("general") == nil {
+		t.Fatalf("expected Haiku drop-down while preserving grant, got model=%s grant=%+v", m5.Model, eng.ActiveFrontierGrant("general"))
+	}
+
+	// 6. Topic shift revokes active grant.
+	nextDecision.Store(mockTestDecision{NeedsFrontier: 0.20, SameTopic: 0.10, CostUSD: 0.001})
+	if _, _, err := eng.EnqueueUserMessage("general", "what is the weather in Tokyo?", ""); err != nil {
+		t.Fatal(err)
+	}
+	_ = waitDone()
+	if eng.ActiveFrontierGrant("general") != nil {
+		t.Fatalf("expected topic shift to revoke active grant")
+	}
+
+	// 7. Deny escalation -> runs Haiku.
+	nextDecision.Store(mockTestDecision{NeedsFrontier: 0.94, CostUSD: 0.001})
+	if _, _, err := eng.EnqueueUserMessage("general", "deep formal proof of raft safety", ""); err != nil {
+		t.Fatal(err)
+	}
+	aprDeny := waitApproval()
+	if _, err := eng.DecideApprovalWithScope(aprDeny.ID, false, "", "too expensive"); err != nil {
+		t.Fatal(err)
+	}
+	mDeny := waitDone()
+	if mDeny.Model != DefaultChatModel {
+		t.Fatalf("expected fallback Haiku on denied escalation, got %s", mDeny.Model)
+	}
+
+	// 8. Tool approval inside a Frontier turn preserves Frontier model on resume.
+	nextDecision.Store(mockTestDecision{NeedsFrontier: 0.94, ToolCall: true, CostUSD: 0.01})
+	if _, _, err := eng.EnqueueUserMessage("general", "write architecture doc", ""); err != nil {
+		t.Fatal(err)
+	}
+	aprEsc := waitApproval()
+	if _, err := eng.DecideApprovalWithScope(aprEsc.ID, true, "topic", ""); err != nil {
+		t.Fatal(err)
+	}
+	aprTool := waitApproval()
+	if aprTool.ToolName != "vault_write" {
+		t.Fatalf("expected vault_write tool approval, got %+v", aprTool)
+	}
+	if _, err := eng.DecideApproval(aprTool.ID, true, ""); err != nil {
+		t.Fatal(err)
+	}
+	mToolDone := waitDone()
+	if mToolDone.Model != DefaultFrontierModel {
+		t.Fatalf("expected Frontier model preserved across tool approval resume, got %s", mToolDone.Model)
+	}
+
+	// ResetChannel clears active grant.
+	if eng.ActiveFrontierGrant("general") == nil {
+		t.Fatalf("expected active grant before ResetChannel")
+	}
+	if _, err := eng.ResetChannel("general", false); err != nil {
+		t.Fatal(err)
+	}
+	if eng.ActiveFrontierGrant("general") != nil {
+		t.Fatalf("expected ResetChannel to clear active grant")
+	}
+
+	// 9. Mode comparisons: gate (no borderline widget), auto (no HITL), off (no Decisions call), and daily soft cap.
+	cfg.Routing.Mode = RoutingModeGate
+	if _, err := eng.UpdateConfig(cfg, false); err != nil {
+		t.Fatal(err)
+	}
+	nextDecision.Store(mockTestDecision{NeedsFrontier: 0.72, CostUSD: 0.001})
+	if _, _, err := eng.EnqueueUserMessage("general", "borderline in gate mode", ""); err != nil {
+		t.Fatal(err)
+	}
+	mGate := waitDone()
+	if mGate.Model != DefaultChatModel || len(mGate.Widgets) != 0 {
+		t.Fatalf("expected no borderline widget in gate mode, got %+v", mGate)
+	}
+
+	cfg.Routing.Mode = RoutingModeAuto
+	if _, err := eng.UpdateConfig(cfg, false); err != nil {
+		t.Fatal(err)
+	}
+	nextDecision.Store(mockTestDecision{NeedsFrontier: 0.95, CostUSD: 0.01})
+	if _, _, err := eng.EnqueueUserMessage("general", "complex in auto mode", ""); err != nil {
+		t.Fatal(err)
+	}
+	mAuto := waitDone()
+	if mAuto.Model != DefaultFrontierModel {
+		t.Fatalf("expected unattended Frontier in auto mode, got %s", mAuto.Model)
+	}
+
+	cfg.Routing.Mode = RoutingModeOff
+	if _, err := eng.UpdateConfig(cfg, false); err != nil {
+		t.Fatal(err)
+	}
+	beforeOff := decisionCount.Load()
+	if _, _, err := eng.EnqueueUserMessage("general", "routine in off mode", ""); err != nil {
+		t.Fatal(err)
+	}
+	mOff := waitDone()
+	if mOff.Model != DefaultChatModel || decisionCount.Load() != beforeOff {
+		t.Fatalf("expected off mode to skip Decisions API and use %s, got model=%s calls=%d->%d", DefaultChatModel, mOff.Model, beforeOff, decisionCount.Load())
+	}
+
+	// 10. Grant expiry by max_turns and daily_soft_cap_usd + background non-HITL safety.
+	cfg.Routing.Mode = RoutingModeHybrid
+	cfg.Routing.GrantMaxTurns = 1
+	cfg.Routing.DailySoftCapUSD = 0.01
+	if _, err := eng.UpdateConfig(cfg, false); err != nil {
+		t.Fatal(err)
+	}
+	// Seed an exhausted grant (turns_used=1/1) -> must gate with HITL even though grant exists.
+	_, _ = eng.store.UpsertFrontierGrant(FrontierGrant{
+		ChannelID: "general", ContextEpoch: 2, TopicSummary: "arch", TurnsUsed: 1, MaxTurns: 1, MaxCostUSD: 0.50,
+		ExpiresAt: time.Now().UTC().Add(10 * time.Minute).Format(time.RFC3339),
+	})
+	nextDecision.Store(mockTestDecision{NeedsFrontier: 0.95, SameTopic: 0.95})
+	if _, _, err := eng.EnqueueUserMessage("general", "more arch work", ""); err != nil {
+		t.Fatal(err)
+	}
+	aprCap := waitApproval()
+	if aprCap.ToolName != FrontierEscalationTool {
+		t.Fatalf("expected HITL escalation once max_turns exhausted, got %+v", aprCap)
+	}
+	_, _ = eng.DecideApproval(aprCap.ID, false, "")
+	_ = waitDone()
+
+	// Seed fresh grant under daily_soft_cap_usd (already > $0.01 today) -> forces HITL.
+	_, _ = eng.store.UpsertFrontierGrant(FrontierGrant{
+		ChannelID: "general", ContextEpoch: 2, TopicSummary: "arch", TurnsUsed: 0, MaxTurns: 5, MaxCostUSD: 0.50,
+		ExpiresAt: time.Now().UTC().Add(10 * time.Minute).Format(time.RFC3339),
+	})
+	if _, _, err := eng.EnqueueUserMessage("general", "another arch turn over daily soft cap", ""); err != nil {
+		t.Fatal(err)
+	}
+	aprDaily := waitApproval()
+	if aprDaily.ToolName != FrontierEscalationTool {
+		t.Fatalf("expected HITL escalation when daily_soft_cap_usd reached, got %+v", aprDaily)
+	}
+	_, _ = eng.DecideApproval(aprDaily.ID, false, "")
+	_ = waitDone()
+
+	// Background heartbeat never triggers HITL even when Decisions returns frontier.
+	nextDecision.Store(mockTestDecision{NeedsFrontier: 0.99})
+	if _, _, err := eng.store.EnqueueInbox("briefing", "heartbeat", "hb:test-no-hitl", map[string]any{"prompt": "check fleet"}, "auto"); err != nil {
+		t.Fatal(err)
+	}
+	eng.notify()
+	mHB := waitDone()
+	if mHB.Model != DefaultFrontierModel && mHB.Model != DefaultChatModel {
+		t.Fatalf("unexpected heartbeat model %s", mHB.Model)
 	}
 }
