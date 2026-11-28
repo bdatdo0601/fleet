@@ -812,7 +812,10 @@ func (m *SandboxManager) BuildImages(ctx context.Context, cfg SandboxConfig, reb
 	if _, err := m.runner.EnsureNetwork(ctx, norm.Network, DefaultSandboxSubnet); err != nil {
 		return SandboxBuildResult{}, err
 	}
-	tmpDir, err := os.MkdirTemp("", "fleet-sandbox-build-*")
+	if err := os.MkdirAll(m.rootDir, 0o755); err != nil {
+		return SandboxBuildResult{}, err
+	}
+	tmpDir, err := os.MkdirTemp(m.rootDir, ".build-*")
 	if err != nil {
 		return SandboxBuildResult{}, err
 	}

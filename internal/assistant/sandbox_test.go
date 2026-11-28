@@ -410,3 +410,98 @@ func TestSandboxManagerAndAssistantTools(t *testing.T) {
 		t.Fatalf("expected persisted custom packages & rebuild, got %s cfg=%+v", instRaw, eng.Config().Sandbox)
 	}
 }
+
+func TestSocketSandboxRunnerBridge(t *testing.T) {
+	tmp := t.TempDir()
+	sockDir := tmp
+	if len(filepath.Join(sockDir, "sandbox.sock")) > 96 {
+		var mkErr error
+		sockDir, mkErr = os.MkdirTemp("", "fsb-")
+		if mkErr != nil {
+			t.Fatal(mkErr)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
+	}
+	sockPath := filepath.Join(sockDir, "sandbox.sock")
+
+	directFail := newMockSandboxRunner()
+	directFail.binPath = ""
+	directFail.statusErr = newErr("container system is not running: apiserver is not running and not registered with launchd", http.StatusServiceUnavailable)
+	directFail.networkReady = false
+	directFail.imageExists = map[string]bool{}
+
+	// 1. Without socket, SystemStatus falls back to direct and appends sandbox-install guidance.
+	sockRunner := NewSocketSandboxRunner(sockPath, directFail)
+	if err := sockRunner.SystemStatus(t.Context()); err == nil || !strings.Contains(err.Error(), "sandbox-install") {
+		t.Fatalf("expected sandbox-install hint when direct fails with launchd mismatch, got %v", err)
+	}
+
+	// 2. Start RunSandboxAgent with a healthy gui/<uid> runner and verify all 8 methods route over the 0600 socket.
+	guiRunner := newMockSandboxRunner()
+	guiRunner.execFn = func(opts SandboxExecOpts) (SandboxRawResult, error) {
+		return SandboxRawResult{ExitCode: 0, Stdout: "via-socket:" + strings.Join(opts.Command, " ")}, nil
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- RunSandboxAgent(ctx, sockPath, guiRunner)
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		select {
+		case aErr := <-errCh:
+			t.Fatalf("RunSandboxAgent exited early (sock=%s): %v", sockPath, aErr)
+		default:
+		}
+		if err := PingSandboxAgent(t.Context(), sockPath); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sandbox agent socket %s did not become ready", sockPath)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	info, err := os.Stat(sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("expected 0600 socket permissions, got %o", perm)
+	}
+
+	if err := sockRunner.SystemStatus(t.Context()); err != nil {
+		t.Fatalf("expected SystemStatus via socket to succeed even though direct fails: %v", err)
+	}
+	if !sockRunner.NetworkExists(t.Context(), DefaultSandboxNetwork) {
+		t.Fatalf("expected NetworkExists true via socket")
+	}
+	if gw, err := sockRunner.EnsureNetwork(t.Context(), DefaultSandboxNetwork, DefaultSandboxSubnet); err != nil || gw == "" {
+		t.Fatalf("expected EnsureNetwork via socket to succeed, gw=%q err=%v", gw, err)
+	}
+	if !sockRunner.ImageExists(t.Context(), DefaultSandboxImage) {
+		t.Fatalf("expected ImageExists true via socket")
+	}
+	cfPath := filepath.Join(tmp, "Containerfile")
+	_ = os.WriteFile(cfPath, []byte("FROM scratch\n"), 0o644)
+	if out, err := sockRunner.BuildImage(t.Context(), "test:latest", cfPath, tmp, 2, 1024); err != nil || !strings.Contains(out, "built test:latest") {
+		t.Fatalf("BuildImage via socket failed: out=%q err=%v", out, err)
+	}
+	if err := sockRunner.StartContainer(t.Context(), SandboxStartOpts{Name: "sb-test", Image: DefaultSandboxImage}); err != nil {
+		t.Fatalf("StartContainer via socket failed: %v", err)
+	}
+	execRes, err := sockRunner.ExecContainer(t.Context(), SandboxExecOpts{Name: "sb-test", Command: []string{"echo", "hi"}})
+	if err != nil || execRes.Stdout != "via-socket:echo hi" {
+		t.Fatalf("ExecContainer via socket unexpected: res=%+v err=%v", execRes, err)
+	}
+	if err := sockRunner.StopRemoveContainer(t.Context(), "sb-test"); err != nil {
+		t.Fatalf("StopRemoveContainer via socket failed: %v", err)
+	}
+
+	cancel()
+	if aErr := <-errCh; aErr != nil {
+		t.Fatalf("RunSandboxAgent returned unexpected error on shutdown: %v", aErr)
+	}
+}

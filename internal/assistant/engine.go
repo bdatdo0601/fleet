@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/bdatdo0601/fleet/internal/paths"
 )
 
 const (
@@ -130,7 +132,7 @@ func Open(dbPath, configPath, defaultVaultDir string, deps FleetDeps) (*Engine, 
 		deps:            deps,
 		llm:             newOpenRouterClient(),
 		mcp:             NewMCPManager(cfg.MCPServers, opReader),
-		sandbox:         NewSandboxManager(filepath.Join(stateRoot, "sandbox"), nil),
+		sandbox:         NewSandboxManager(filepath.Join(stateRoot, "sandbox"), NewSocketSandboxRunner(paths.SandboxSocketPath(stateRoot), NewAppleContainerRunner())),
 		opReader:        opReader,
 		cfg:             cfg,
 		subscribers:     make(map[chan StreamEvent]struct{}),
@@ -305,6 +307,17 @@ func (e *Engine) Status() map[string]any {
 	}
 }
 
+func isZeroNotificationsConfig(n NotificationsConfig) bool {
+	return n.NotifyApprovals == nil && !n.Enabled && n.DiscordWebhookOPRef == "" &&
+		len(n.DiscordChannelOPRefs) == 0 && n.FleetBaseURL == "" && n.MinPriority == ""
+}
+
+func isZeroDiscordConfig(d DiscordConfig) bool {
+	return d.AllowApprovals == nil && d.MirrorWebTurns == nil && d.AutoSyncChannels == nil &&
+		!d.Enabled && d.BotTokenOPRef == "" && d.AuthorizedUserID == "" &&
+		d.GuildID == "" && d.CategoryName == "" && len(d.Channels) == 0 && d.FleetBaseURL == ""
+}
+
 func mergePreservedConfig(cur, next Config, clearAPIKey bool) Config {
 	if !clearAPIKey && strings.TrimSpace(next.APIKey) == "" && strings.TrimSpace(next.APIKeyOPRef) == "" {
 		next.APIKey = cur.APIKey
@@ -321,7 +334,7 @@ func mergePreservedConfig(cur, next Config, clearAPIKey bool) Config {
 	if next.ExtraVaults == nil {
 		next.ExtraVaults = append([]VaultMount(nil), cur.ExtraVaults...)
 	}
-	if next.Notifications.NotifyApprovals == nil && !next.Notifications.Enabled && next.Notifications.DiscordWebhookOPRef == "" && len(next.Notifications.DiscordChannelOPRefs) == 0 && next.Notifications.FleetBaseURL == "" && next.Notifications.MinPriority == "" {
+	if isZeroNotificationsConfig(next.Notifications) {
 		next.Notifications = cur.Notifications
 	}
 	if next.Routing == (RoutingConfig{}) {
@@ -330,7 +343,7 @@ func mergePreservedConfig(cur, next Config, clearAPIKey bool) Config {
 	if isZeroSandboxConfig(next.Sandbox) {
 		next.Sandbox = cur.Sandbox
 	}
-	if next.Discord.AllowApprovals == nil && next.Discord.MirrorWebTurns == nil && next.Discord.AutoSyncChannels == nil && !next.Discord.Enabled && next.Discord.BotTokenOPRef == "" && next.Discord.AuthorizedUserID == "" && next.Discord.GuildID == "" && next.Discord.CategoryName == "" && len(next.Discord.Channels) == 0 && next.Discord.FleetBaseURL == "" {
+	if isZeroDiscordConfig(next.Discord) {
 		next.Discord = cur.Discord
 	}
 	return NormalizeConfig(next)

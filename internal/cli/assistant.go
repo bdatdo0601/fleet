@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -8,8 +9,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/bdatdo0601/fleet/internal/assistant"
@@ -35,6 +38,8 @@ Subcommands:
   timers          list scheduled timers
   notify-test     send a test Discord webhook notification via 1Password ref
   discord-sync    auto-create/adopt Discord channels under Fleet Assistant and save mappings
+  sandbox-install (lighthouse) install & start gui/<uid> sandbox LaunchAgent bridge for Apple container
+  sandbox-uninstall (lighthouse) stop & remove sandbox LaunchAgent bridge
   sandbox-build   build the sandbox OCI image and offline network on lighthouse
   sandbox-reset   stop/remove a channel's sandbox micro-VM (optionally clearing /work/out)
 `
@@ -45,56 +50,47 @@ func cmdAssistant(args []string, cio *IO) error {
 		cio.printf("%s", assistantUsageText())
 		return nil
 	}
+	handlers := map[string]func([]string, *IO) error{
+		"setup":             cmdAssistantSetup,
+		"doctor":            cmdAssistantDoctor,
+		"op-setup":          cmdAssistantOPSetup,
+		"sync-install":      cmdAssistantSyncInstall,
+		"sync-uninstall":    cmdAssistantSyncUninstall,
+		"status":            cmdAssistantStatus,
+		"ask":               cmdAssistantAsk,
+		"approvals":         cmdAssistantApprovals,
+		"approve":           func(a []string, c *IO) error { return cmdAssistantDecide(a, true, c) },
+		"deny":              func(a []string, c *IO) error { return cmdAssistantDecide(a, false, c) },
+		"timers":            cmdAssistantTimers,
+		"notify-test":       cmdAssistantNotifyTest,
+		"discord-sync":      cmdAssistantDiscordSync,
+		"sandbox-install":   cmdAssistantSandboxInstall,
+		"sandbox-uninstall": cmdAssistantSandboxUninstall,
+		"sandbox-agent":     cmdAssistantSandboxAgent,
+		"sandbox-build":     cmdAssistantSandboxBuild,
+		"sandbox-reset":     cmdAssistantSandboxReset,
+	}
 	sub, rest := args[0], args[1:]
-	switch sub {
-	case "setup":
-		return cmdAssistantSetup(rest, cio)
-	case "doctor":
-		return cmdAssistantDoctor(rest, cio)
-	case "op-setup":
-		return cmdAssistantOPSetup(rest, cio)
-	case "sync-install":
-		return cmdAssistantSyncInstall(rest, cio)
-	case "sync-uninstall":
-		return cmdAssistantSyncUninstall(rest, cio)
-	case "status":
-		return cmdAssistantStatus(rest, cio)
-	case "ask":
-		return cmdAssistantAsk(rest, cio)
-	case "approvals":
-		return cmdAssistantApprovals(rest, cio)
-	case "approve":
-		return cmdAssistantDecide(rest, true, cio)
-	case "deny":
-		return cmdAssistantDecide(rest, false, cio)
-	case "timers":
-		return cmdAssistantTimers(rest, cio)
-	case "notify-test":
-		return cmdAssistantNotifyTest(rest, cio)
-	case "discord-sync":
-		return cmdAssistantDiscordSync(rest, cio)
-	case "sandbox-build":
-		return cmdAssistantSandboxBuild(rest, cio)
-	case "sandbox-reset":
-		return cmdAssistantSandboxReset(rest, cio)
-	default:
+	fn, ok := handlers[sub]
+	if !ok {
 		return fmt.Errorf("unknown assistant subcommand %q\n\n%s", sub, assistantUsageText())
 	}
+	return fn(rest, cio)
 }
 
 type assistantSetupFlags struct {
-	opRef          string
-	apiKeyOPRef    string
-	apiKey         string
-	vaultPath      string
-	model          string
-	routingMode    string
-	decisionModel  string
-	observerModel  string
-	zdr            bool
-	enable         bool
-	discordRef     string
-	fleetURL       string
+	opRef             string
+	apiKeyOPRef       string
+	apiKey            string
+	vaultPath         string
+	model             string
+	routingMode       string
+	decisionModel     string
+	observerModel     string
+	zdr               bool
+	enable            bool
+	discordRef        string
+	fleetURL          string
 	discordBotRef     string
 	discordUserID     string
 	discordGuildID    string
@@ -699,4 +695,65 @@ func cmdAssistantSandboxReset(args []string, cio *IO) error {
 	}
 	cio.info(fmt.Sprintf("reset sandbox for #%s (clear_output=%v)", *ch, *clearOut))
 	return nil
+}
+
+func cmdAssistantSandboxInstall(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("assistant sandbox-install", flag.ContinueOnError)
+	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+		return err
+	}
+	fleetBin := paths.InstalledBinaryPath()
+	if _, err := os.Stat(fleetBin); err != nil {
+		if exe, exeErr := os.Executable(); exeErr == nil && exe != "" {
+			fleetBin = exe
+		}
+	}
+	stateDir := paths.StateDir()
+	sockPath := paths.SandboxSocketPath(stateDir)
+	logPath := filepath.Join(stateDir, "sandbox-agent.log")
+	if err := system.InstallUserAgent(system.AgentOpts{
+		Label:     paths.SandboxAgentLabel,
+		Args:      []string{fleetBin, "assistant", "sandbox-agent", "--socket", sockPath},
+		KeepAlive: true,
+		LogPath:   logPath,
+		WorkDir:   stateDir,
+	}); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		err := assistant.PingSandboxAgent(ctx, sockPath)
+		cancel()
+		if err == nil {
+			cio.info(fmt.Sprintf("installed & started %s (socket=%s)", paths.SandboxAgentLabel, sockPath))
+			return nil
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	return fmt.Errorf("installed %s, but %s did not become ready (check %s)", paths.SandboxAgentLabel, sockPath, logPath)
+}
+
+func cmdAssistantSandboxUninstall(args []string, cio *IO) error {
+	fs := flag.NewFlagSet("assistant sandbox-uninstall", flag.ContinueOnError)
+	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+		return err
+	}
+	if err := system.UninstallUserAgent(paths.SandboxAgentLabel); err != nil {
+		return err
+	}
+	_ = os.Remove(paths.SandboxSocketPath(paths.StateDir()))
+	cio.info("uninstalled " + paths.SandboxAgentLabel)
+	return nil
+}
+
+func cmdAssistantSandboxAgent(args []string, _ *IO) error {
+	fs := flag.NewFlagSet("assistant sandbox-agent", flag.ContinueOnError)
+	sock := fs.String("socket", paths.SandboxSocketPath(paths.StateDir()), "Unix socket path")
+	if _, err := parseFlagsInterspersed(fs, args); err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return assistant.RunSandboxAgent(ctx, *sock, nil)
 }

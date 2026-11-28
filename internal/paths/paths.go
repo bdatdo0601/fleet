@@ -30,6 +30,7 @@ const (
 	SlackerWorkerLabel = LabelPrefix + ".slacker-worker"
 	AgentRelayLabel    = LabelPrefix + ".agent-relay"
 	ObsidianSyncLabel  = LabelPrefix + ".obsidian-sync"
+	SandboxAgentLabel  = LabelPrefix + ".sandbox-agent"
 	EdgeLabel          = LabelPrefix + ".edge"
 
 	SyncIntervalSeconds = 300
@@ -87,6 +88,11 @@ func TLSDir(stateDir string) string {
 // EdgeTokenPath returns the shared secret file authenticating loopback edge proxy requests.
 func EdgeTokenPath(stateDir string) string {
 	return filepath.Join(stateDir, "edge.token")
+}
+
+// SandboxSocketPath returns the Unix domain socket path for the gui/<uid> sandbox LaunchAgent bridge.
+func SandboxSocketPath(stateDir string) string {
+	return filepath.Join(stateDir, "sandbox.sock")
 }
 
 func homeDir() string {

@@ -517,11 +517,15 @@ func (e *Engine) checkSandboxDoctor(ctx context.Context, cfg Config) DoctorCheck
 		}
 	}
 	if err := runner.SystemStatus(ctx); err != nil {
+		hint := "Run `container system kernel set --recommended && brew services start container` (or `container system start`) on the lighthouse"
+		if strings.Contains(err.Error(), launchdMismatchNeedle) {
+			hint = "Run `fleet assistant sandbox-install` on the lighthouse to bridge Apple container from your gui/<uid> session (or `container system start` if stopped)"
+		}
 		return DoctorCheck{
 			Name:   "sandbox",
 			Status: "fail",
 			Detail: err.Error(),
-			Hint:   "Run `container system kernel set --recommended && brew services start container` (or `container system start`) on the lighthouse",
+			Hint:   hint,
 		}
 	}
 	if !runner.NetworkExists(ctx, sb.Network) {
