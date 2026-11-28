@@ -23,10 +23,13 @@ const assistantWidgetHTML = `<!doctype html>
 <style>
 :root { color-scheme: light dark; --bg: transparent; --text: #0f172a; --muted: #475569; --border: #cbd5e1; --accent: #0284c7; --surface: #f8fafc; }
 :root[data-theme="dark"] { --text: #f1f5f9; --muted: #94a3b8; --border: #334155; --accent: #38bdf8; --surface: #0f172a; }
-html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 13px; line-height: 1.45; }
-#root { padding: 8px 10px; }
-button { font: inherit; cursor: pointer; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); color: var(--text); padding: 4px 10px; }
+*, *::before, *::after { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 13px; line-height: 1.45; overflow-wrap: anywhere; word-break: break-word; }
+#root { padding: 8px 10px; max-width: 100%; overflow-x: auto; }
+button { font: inherit; cursor: pointer; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); color: var(--text); padding: 4px 10px; max-width: 100%; }
 button:hover { border-color: var(--accent); }
+pre, code { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; max-width: 100%; }
+img, svg, canvas { max-width: 100%; height: auto; }
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--border); }
 .widget-err { color: #ef4444; font-size: 12px; padding: 6px 8px; border: 1px solid #ef4444; border-radius: 6px; }

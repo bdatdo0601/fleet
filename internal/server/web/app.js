@@ -536,12 +536,15 @@ function ensureAssistantSSE() {
           state.overview.assistant.pending_approvals = curApr + 1;
         }
         updateAppBadgeCount(curApr + 1);
+        const viewingChannel = state.route === "chat" && state.activeChatChannel === ch;
         if (apr.tool_name === "frontier_escalation") {
-          if (!document.hidden && state.route !== "chat") {
+          if (!document.hidden && !viewingChannel) {
             toast(`Frontier check (#${ch}): ${apr.summary || "Approve model escalation?"}`, "info");
           }
         } else if (!document.hidden) {
-          toast(`Approval needed (#${ch}): ${apr.summary || apr.tool_name || "tool"}`, "warn");
+          if (!viewingChannel) {
+            toast(`Approval needed (#${ch}): ${apr.summary || apr.tool_name || "tool"}`, "warn");
+          }
         } else {
           showBrowserAlert(`Approval needed (#${ch})`, apr.summary || apr.tool_name || "", ch);
         }

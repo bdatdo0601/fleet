@@ -184,7 +184,7 @@ function renderWidgetNode(w, sendPromptFn, onRetryFrontier, msgID) {
     const kv = el("div", { className: "kv-list" });
     for (const [k, v] of Object.entries(data)) {
       kv.appendChild(el("div", { className: "kv-label", text: k }));
-      kv.appendChild(el("div", { className: "kv-val", text: typeof v === "string" ? v : JSON.stringify(v) }));
+      kv.appendChild(el("div", { className: "kv-value", text: typeof v === "string" ? v : JSON.stringify(v) }));
     }
     card.appendChild(kv);
     return card;
@@ -250,9 +250,6 @@ function renderWidgetNode(w, sendPromptFn, onRetryFrontier, msgID) {
     bar.appendChild(row);
     return bar;
   }
-    card.appendChild(el("pre", { className: "code-block" }, el("code", { text: JSON.stringify(data, null, 2) })));
-    return card;
-  }
   if (w.kind === "files" && Array.isArray(data.files)) {
     const list = el("div", { className: "file-card-list" });
     for (const f of data.files) {
@@ -287,6 +284,17 @@ function renderWidgetNode(w, sendPromptFn, onRetryFrontier, msgID) {
   return card;
 }
 
+function formatApprovalArgs(toolName, argsJSON) {
+  const raw = String(argsJSON || "{}").trim() || "{}";
+  let formatted = raw;
+  try {
+    formatted = JSON.stringify(JSON.parse(raw), null, 2);
+  } catch {
+    formatted = raw;
+  }
+  return `${toolName}(${formatted})`;
+}
+
 function renderApprovalCard(apr, onDecided) {
   const isEscalation = apr.tool_name === "frontier_escalation";
   let escArgs = {};
@@ -297,7 +305,22 @@ function renderApprovalCard(apr, onDecided) {
       escArgs = {};
     }
   }
+  let deciding = false;
+  let actionsRow = null;
+  const setButtonsDisabled = (disabled) => {
+    if (!actionsRow) {
+      return;
+    }
+    for (const btn of actionsRow.querySelectorAll("button")) {
+      btn.disabled = disabled;
+    }
+  };
   const decide = async (decision, scope = "") => {
+    if (deciding) {
+      return;
+    }
+    deciding = true;
+    setButtonsDisabled(true);
     try {
       await api("POST", `/v1/assistant/approvals/${encodeURIComponent(apr.id)}/decide`, { decision, scope });
       const msg = isEscalation
@@ -314,6 +337,8 @@ function renderApprovalCard(apr, onDecided) {
         await onDecided();
       }
     } catch (err) {
+      deciding = false;
+      setButtonsDisabled(false);
       toast(err.message, "error");
     }
   };
@@ -330,28 +355,27 @@ function renderApprovalCard(apr, onDecided) {
     }
     const card = el(
       "div",
-      { className: "approval-card" },
+      { className: "approval-card approval-card-escalation" },
       el(
         "div",
         { className: "approval-head" },
         badge("frontier", "warn"),
         el("strong", { text: apr.summary || `Use ${shortFrontier} for this request?` }),
       ),
-      el("div", { className: "small muted mb-1", text: metaParts.join(" · ") }),
+      el("div", { className: "small muted approval-meta", text: metaParts.join(" · ") }),
     );
     if (apr.status !== "pending") {
-      card.appendChild(badge(apr.status, apr.status === "executed" || apr.status === "approved" ? "ok" : "danger"));
+      card.appendChild(el("div", { className: "approval-status" }, badge(apr.status, apr.status === "executed" || apr.status === "approved" ? "ok" : "danger")));
       return card;
     }
-    card.appendChild(
-      el(
-        "div",
-        { className: "actions-row" },
-        el("button", { type: "button", className: "btn btn-sm btn-primary", text: `Use ${shortFrontier} (this topic)`, onclick: () => decide("approve", "topic") }),
-        el("button", { type: "button", className: "btn btn-sm", text: "Once", onclick: () => decide("approve", "once") }),
-        el("button", { type: "button", className: "btn btn-sm", text: `Use ${shortFallback}`, onclick: () => decide("deny") }),
-      ),
+    actionsRow = el(
+      "div",
+      { className: "actions-row" },
+      el("button", { type: "button", className: "btn btn-sm btn-primary", text: `Use ${shortFrontier} (this topic)`, onclick: () => decide("approve", "topic") }),
+      el("button", { type: "button", className: "btn btn-sm", text: "Once", onclick: () => decide("approve", "once") }),
+      el("button", { type: "button", className: "btn btn-sm", text: `Use ${shortFallback}`, onclick: () => decide("deny") }),
     );
+    card.appendChild(actionsRow);
     return card;
   }
   const card = el(
@@ -363,20 +387,19 @@ function renderApprovalCard(apr, onDecided) {
       badge(apr.risk_level || "approval", "warn"),
       el("strong", { text: apr.summary || apr.tool_name }),
     ),
-    el("pre", { className: "code-block small" }, el("code", { text: `${apr.tool_name}(${apr.args_json || "{}"})` })),
+    el("pre", { className: "code-block small approval-args" }, el("code", { text: formatApprovalArgs(apr.tool_name, apr.args_json) })),
   );
   if (apr.status !== "pending") {
-    card.appendChild(badge(apr.status, apr.status === "executed" || apr.status === "approved" ? "ok" : "danger"));
+    card.appendChild(el("div", { className: "approval-status" }, badge(apr.status, apr.status === "executed" || apr.status === "approved" ? "ok" : "danger")));
     return card;
   }
-  card.appendChild(
-    el(
-      "div",
-      { className: "actions-row" },
-      el("button", { type: "button", className: "btn btn-sm btn-primary", text: "Approve", onclick: () => decide("approve") }),
-      el("button", { type: "button", className: "btn btn-sm btn-danger", text: "Deny", onclick: () => decide("deny") }),
-    ),
+  actionsRow = el(
+    "div",
+    { className: "actions-row" },
+    el("button", { type: "button", className: "btn btn-sm btn-primary", text: "Approve", onclick: () => decide("approve") }),
+    el("button", { type: "button", className: "btn btn-sm btn-danger", text: "Deny", onclick: () => decide("deny") }),
   );
+  card.appendChild(actionsRow);
   return card;
 }
 
@@ -860,6 +883,7 @@ export async function renderChat(main, ctx, sub) {
     activeChannel = channels[0].id;
   }
   localStorage.setItem("fleet_chat_channel", activeChannel);
+  state.activeChatChannel = activeChannel;
 
   const emptyBox = el("div", {
     className: "chat-empty muted small hidden",
@@ -1410,6 +1434,7 @@ export async function renderChat(main, ctx, sub) {
       clearTimeout(id);
     }
     kbTimers.clear();
+    state.activeChatChannel = "";
     document.documentElement.classList.remove("kb-open");
   };
 }

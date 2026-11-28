@@ -3,6 +3,7 @@ export const state = {
   caller: null,
   isAdmin: false,
   route: "overview",
+  activeChatChannel: "",
   modalOpen: false,
   editing: false,
 };
@@ -175,15 +176,35 @@ export function clear(node) {
 
 export function toast(message, kind = "info") {
   const container = document.getElementById("toast-container");
-  if (!container) {
+  const text = String(message ?? "").trim();
+  if (!container || !text) {
     return;
   }
+  while (container.children.length >= 3) {
+    container.firstElementChild.remove();
+  }
   const cls = kind === "ok" ? "toast toast-ok" : kind === "warn" ? "toast toast-warn" : kind === "error" ? "toast toast-error" : "toast";
-  const box = el("div", { className: cls, text: message });
-  container.appendChild(box);
-  setTimeout(() => {
+  let timer = null;
+  const box = el("div", { className: cls });
+  const dismiss = () => {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
     box.remove();
-  }, 4000);
+  };
+  box.append(
+    el("span", { className: "toast-msg", text }),
+    el("button", {
+      type: "button",
+      className: "toast-close",
+      "aria-label": "Dismiss notification",
+      text: "×",
+      onclick: dismiss,
+    }),
+  );
+  container.appendChild(box);
+  timer = setTimeout(dismiss, kind === "error" ? 5000 : 4000);
 }
 
 export async function copyText(text, triggerBtn) {
