@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -22,11 +21,11 @@ const (
 	PrimaryVaultName = "agent"
 
 	DefaultOpenRouterURL = "https://openrouter.ai/api/v1"
-	DefaultChatModel     = "meta/muse-spark-open"
-	DefaultFastModel     = "openai/gpt-5-nano"
-	DefaultFrontierModel = "anthropic/claude-sonnet-4.6"
+	DefaultChatModel     = "anthropic/claude-haiku-5.5"
+	DefaultFastModel     = "thinkingmachines/inkling-2-mini"
+	DefaultFrontierModel = "openai/gpt-6.2-sol"
 	DefaultDecisionModel = "google/gemini-decision-1"
-	DefaultObserverModel = "openai/gpt-6-luna"
+	DefaultObserverModel = "meta/muse-ember"
 	DefaultHeartbeatMins = 30
 	DefaultObserveTokens = 12000
 	DefaultReflectBytes  = 24000
@@ -156,16 +155,33 @@ type ConfigView struct {
 // DefaultAliases returns built-in model shortcuts selectable in chat or via /alias.
 func DefaultAliases() map[string]string {
 	return map[string]string{
-		"auto":     "auto",
-		"nano":     DefaultFastModel,
-		"luna":     DefaultObserverModel,
-		"deepseek": "deepseek/deepseek-chat",
-		"muse":     DefaultChatModel,
-		"haiku":    "anthropic/claude-haiku-4.5",
-		"sonnet":   DefaultFrontierModel,
-		"opus":     "anthropic/claude-opus-4.5",
-		"astra":    "openai/gpt-6-astra",
+		"auto":         "auto",
+		"mini":         DefaultFastModel,
+		"inkling-mini": DefaultFastModel,
+		"nano":         DefaultFastModel,
+		"inkling":      "thinkingmachines/inkling-2-small",
+		"ember":        DefaultObserverModel,
+		"muse":         "meta/muse-spark-open",
+		"luna":         "openai/gpt-6-luna",
+		"deepseek":     "deepseek/deepseek-v4.1-flash-1017",
+		"terra":        "openai/gpt-6.1-terra",
+		"haiku":        DefaultChatModel,
+		"sonnet":       "anthropic/claude-sonnet-5.5",
+		"sol":          DefaultFrontierModel,
+		"opus":         "anthropic/claude-opus-5.5",
+		"astra":        "openai/gpt-6.2-astra",
+		"gemini":       "google/gemini-4-hydrogen",
+		"neon":         "google/gemini-4-neon",
 	}
+}
+
+var legacyAliasUpgrades = map[string]string{
+	"openai/gpt-6-astra":          "openai/gpt-6.2-astra",
+	"anthropic/claude-sonnet-4.6": "anthropic/claude-sonnet-5.5",
+	"anthropic/claude-opus-4.5":   "anthropic/claude-opus-5.5",
+	"anthropic/claude-haiku-4.5":  "anthropic/claude-haiku-5.5",
+	"deepseek/deepseek-chat":      "deepseek/deepseek-v4.1-flash-1017",
+	"openai/gpt-5-nano":           "thinkingmachines/inkling-2-mini",
 }
 
 // DefaultConfig returns a baseline assistant configuration with safe defaults.
@@ -222,7 +238,13 @@ func NormalizeConfig(cfg Config) Config {
 	cfg.Models.Reflector = cmp.Or(strings.TrimSpace(cfg.Models.Reflector), def.Models.Reflector)
 	cfg.Models.Heartbeat = cmp.Or(strings.TrimSpace(cfg.Models.Heartbeat), def.Models.Heartbeat)
 	aliases := DefaultAliases()
-	maps.Copy(aliases, cfg.Models.Aliases)
+	for k, v := range cfg.Models.Aliases {
+		if upgraded, ok := legacyAliasUpgrades[v]; ok {
+			aliases[k] = upgraded
+		} else {
+			aliases[k] = v
+		}
+	}
 	cfg.Models.Aliases = aliases
 	cfg.ExtraVaults = normalizeVaultMounts(cfg.ExtraVaults)
 	return cfg

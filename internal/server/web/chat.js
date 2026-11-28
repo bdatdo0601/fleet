@@ -2,15 +2,21 @@ import { api, badge, clear, closeModal, el, field, openModal, section, state, to
 
 const MODEL_CHOICES = [
   { value: "", label: "Channel / Default" },
-  { value: "auto", label: "Auto (Decision Model)" },
-  { value: "meta/muse-spark-open", label: "Muse Spark Open" },
-  { value: "deepseek/deepseek-chat", label: "DeepSeek Chat" },
-  { value: "openai/gpt-5-nano", label: "GPT-5 Nano" },
+  { value: "auto", label: "Auto (Decision Router)" },
+  { value: "anthropic/claude-haiku-5.5", label: "Claude Haiku 5.5 (Fast Daily)" },
+  { value: "thinkingmachines/inkling-2-mini", label: "Inkling 2 Mini (Ultra-Cheap)" },
+  { value: "meta/muse-ember", label: "Muse Ember (Fast Agent)" },
+  { value: "thinkingmachines/inkling-2-small", label: "Inkling 2 Small (Coding/Agent)" },
+  { value: "deepseek/deepseek-v4.1-flash-1017", label: "DeepSeek V4.1 Flash (Low TTFT)" },
   { value: "openai/gpt-6-luna", label: "GPT-6 Luna" },
-  { value: "anthropic/claude-haiku-4.5", label: "Claude Haiku" },
-  { value: "anthropic/claude-sonnet-4.6", label: "Claude Sonnet" },
-  { value: "anthropic/claude-opus-4.5", label: "Claude Opus" },
-  { value: "openai/gpt-6-astra", label: "GPT-6 Astra" },
+  { value: "openai/gpt-6.1-terra", label: "GPT-6.1 Terra (Mid)" },
+  { value: "meta/muse-spark-open", label: "Muse Spark Open" },
+  { value: "google/gemini-4-hydrogen", label: "Gemini 4 Hydrogen" },
+  { value: "openai/gpt-6.2-sol", label: "GPT-6.2 Sol (Frontier Value)" },
+  { value: "anthropic/claude-sonnet-5.5", label: "Claude Sonnet 5.5" },
+  { value: "google/gemini-4-neon", label: "Gemini 4 Neon (Top Coding)" },
+  { value: "anthropic/claude-opus-5.5", label: "Claude Opus 5.5 (Peak)" },
+  { value: "openai/gpt-6.2-astra", label: "GPT-6.2 Astra (Peak)" },
 ];
 
 function currentTheme() {
@@ -536,7 +542,7 @@ export async function renderChat(main, ctx, sub) {
   const inputEl = el("textarea", {
     className: "chat-input",
     rows: "1",
-    placeholder: "Message assistant… (/astra, /opus, /sonnet, /muse, /deepseek)",
+    placeholder: "Message assistant… (/haiku, /mini, /sol, /sonnet, /neon)",
   });
   const sendBtn = el("button", { type: "button", className: "btn btn-sm btn-primary", text: "Send" });
 

@@ -155,6 +155,10 @@ func TestConfigMaskingAndPersistence(t *testing.T) {
 	upd := DefaultConfig()
 	upd.Enabled = true
 	upd.MCPServers = view1.MCPServers
+	upd.Models.Aliases = map[string]string{
+		"astra":  "openai/gpt-6-astra",
+		"custom": "meta/muse-spark-open",
+	}
 	if _, err := eng.UpdateConfig(upd, false); err != nil {
 		t.Fatal(err)
 	}
@@ -164,6 +168,9 @@ func TestConfigMaskingAndPersistence(t *testing.T) {
 	}
 	if len(got.MCPServers) != 1 || got.MCPServers[0].Env["GCAL_SECRET"] != "real-token-value-12345" {
 		t.Fatalf("expected masked MCP env secret preserved, got %+v", got.MCPServers)
+	}
+	if got.Models.Aliases["astra"] != "openai/gpt-6.2-astra" || got.Models.Aliases["custom"] != "meta/muse-spark-open" {
+		t.Fatalf("expected legacy alias upgraded and custom alias kept, got %+v", got.Models.Aliases)
 	}
 }
 
@@ -191,12 +198,12 @@ func TestVaultSafetySkillsAndSearch(t *testing.T) {
 		t.Fatalf("expected symlink dir escape rejection")
 	}
 
-	skillBody := "---\nname: morning-briefing\ndescription: Summarize waiting agents and calendar\nmodel: openai/gpt-6-astra\ntags: [daily, fleet]\n---\n# Steps\n1. Check agents.\n"
+	skillBody := "---\nname: morning-briefing\ndescription: Summarize waiting agents and calendar\nmodel: openai/gpt-6.2-astra\ntags: [daily, fleet]\n---\n# Steps\n1. Check agents.\n"
 	sk, err := v.SaveSkill("morning-briefing", skillBody)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sk.Model != "openai/gpt-6-astra" || len(sk.Tags) != 2 {
+	if sk.Model != "openai/gpt-6.2-astra" || len(sk.Tags) != 2 {
 		t.Fatalf("unexpected parsed frontmatter: %+v", sk)
 	}
 	skills, err := v.ListSkills()
@@ -364,8 +371,8 @@ func TestEngineStreamingRoutingApprovalsAndObservationalMemory(t *testing.T) {
 			t.Fatalf("timed out waiting for approval SSE event")
 		}
 	}
-	if len(seenModels) == 0 || seenModels[0] != "openai/gpt-6-astra" {
-		t.Fatalf("expected /astra override model openai/gpt-6-astra, got %v", seenModels)
+	if len(seenModels) == 0 || seenModels[0] != "openai/gpt-6.2-astra" {
+		t.Fatalf("expected /astra override model openai/gpt-6.2-astra, got %v", seenModels)
 	}
 	if !sawCacheControl.Load() {
 		t.Fatalf("expected cache_control breakpoint in system prompt")
