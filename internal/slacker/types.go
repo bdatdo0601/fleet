@@ -220,12 +220,13 @@ type Job struct {
 
 // Receipt is reported by a target Mac worker back to the lighthouse after launching or reconciling a job.
 type Receipt struct {
-	JobID       string `json:"job_id"`
-	ReceiptID   string `json:"receipt_id"`
-	SessionName string `json:"session_name"`
-	Backend     string `json:"backend"`
-	Status      string `json:"status"`
-	Error       string `json:"error,omitempty"`
+	JobID        string `json:"job_id"`
+	ReceiptID    string `json:"receipt_id"`
+	SessionName  string `json:"session_name"`
+	RawSessionID string `json:"raw_session_id,omitempty"`
+	Backend      string `json:"backend"`
+	Status       string `json:"status"`
+	Error        string `json:"error,omitempty"`
 }
 
 // RuntimeStatus tracks listener and per-device worker liveness in slacker.db.

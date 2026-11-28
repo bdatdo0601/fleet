@@ -398,6 +398,40 @@ func mergeLastAssistantMessage(tail []agents.TailItem, msg string, maxItems int)
 	return tail
 }
 
+// EnvSessionName returns the Fleet-assigned session name from the environment, if present.
+func EnvSessionName(harness string) string {
+	if v := strings.TrimSpace(os.Getenv("FLEET_SESSION_NAME")); v != "" {
+		return v
+	}
+	if harness == "antigravity" || harness == "agy" {
+		if v := strings.TrimSpace(os.Getenv("AGY_SESSION_NAME")); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func resolveHeartbeatIdentity(harness, rawID, title string, isExplicitName bool) (titlePtr, namePtr *string, explicitName bool) {
+	explicitName = isExplicitName
+	if title != "" {
+		titlePtr = &title
+		if isExplicitName {
+			namePtr = &title
+		}
+	}
+	if namePtr == nil {
+		fallback := EnvSessionName(harness)
+		if fallback == "" && harness == "antigravity" && rawID != "" {
+			fallback = session.LookupAppSessionName(harness, rawID)
+		}
+		if fallback != "" {
+			namePtr = &fallback
+			explicitName = true
+		}
+	}
+	return titlePtr, namePtr, explicitName
+}
+
 // RunHook processes a single lifecycle hook payload from stdin and writes harness JSON to stdout.
 func RunHook(harness string, stdin io.Reader, stdout io.Writer, apiURL string) (int, error) {
 	if !paths.ValidHarness(harness) {
@@ -449,13 +483,8 @@ func RunHook(harness string, stdin io.Reader, stdout io.Writer, apiURL string) (
 		case "codex":
 			pidPtr = new(os.Getppid())
 		}
-		var titlePtr, namePtr, sumPtr *string
-		if title != "" {
-			titlePtr = &title
-			if isExplicitName {
-				namePtr = &title
-			}
-		}
+		titlePtr, namePtr, explicitName := resolveHeartbeatIdentity(harness, rawID, title, isExplicitName)
+		var sumPtr *string
 		if summary != "" {
 			sumPtr = &summary
 		}
@@ -463,7 +492,7 @@ func RunHook(harness string, stdin io.Reader, stdout io.Writer, apiURL string) (
 		err := client.Call(api, "POST", "/v1/agents/heartbeat", agents.HeartbeatParams{
 			Harness: harness, RawID: rawID, PID: pidPtr, CWD: cwd, Repo: repo, Branch: branch,
 			State: state, PendingAction: pendingAction, Title: titlePtr, Name: namePtr,
-			ExplicitName: isExplicitName, Summary: sumPtr, GitStatus: &gitStatus, Tail: tail, DrainInbox: canInject,
+			ExplicitName: explicitName, Summary: sumPtr, GitStatus: &gitStatus, Tail: tail, DrainInbox: canInject,
 			IncludeMemory: event == "SessionStart", MemoryRepo: memRepo,
 		}, 2*time.Second, nil, &resp)
 		if err == nil {

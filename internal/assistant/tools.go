@@ -123,7 +123,7 @@ func (e *Engine) buildToolSpecs(ctx context.Context) []ToolSpec {
 		makeToolSpec("fleet_list_paths", "List known project directories and repositories tracked across Fleet Macs.", schemaObj(map[string]any{
 			"device": strProp("Optional device filter"), "query": strProp("Optional path/repo substring"), "limit": intProp("Max results"),
 		})),
-		makeToolSpec("fleet_spawn_agent", "Spawn a Claude, Codex, or Antigravity coding session on an awake Mac and watch for blockers/completion (approval-gated). Can also target the lighthouse device when its host worker is online to self-configure lighthouse dependencies/services (defaults to agy unless another harness is specified; always requires explicit approval; see lighthouse-self-config skill).", schemaObj(map[string]any{
+		makeToolSpec("fleet_spawn_agent", "Spawn a Claude, Codex, or Antigravity coding session on an awake Mac; spawned sessions automatically wake you on blockers, completion, or exit (approval-gated). Can also target the lighthouse device when its host worker is online to self-configure lighthouse dependencies/services (defaults to agy unless another harness is specified; always requires explicit approval; see lighthouse-self-config skill).", schemaObj(map[string]any{
 			"harness": strProp("agy | claude | codex (defaults to agy when targeting the lighthouse unless another harness is specified)"), "device": strProp("Optional target Mac (e.g. laptop, office)"),
 			"repo_path": strProp("Repo path, ~/path, or workspace subpath"), "prompt": strProp("Task prompt for the spawned coding agent"),
 			"name": strProp("Optional friendly session name"), "model": strProp("Optional model"),

@@ -1114,7 +1114,7 @@ func TestCronTimersDelegationLifecycleAndVaultGit(t *testing.T) {
 	}
 
 	// Simulate Slacker launch receipt and agent heartbeat transition working -> waiting_permission.
-	eng.OnSlackerReceipt("job-spawn-1", "laptop", "fix-auth", "launched", "")
+	eng.OnSlackerReceipt("job-spawn-1", "laptop", "fix-auth", "", "launched", "")
 	eng.OnAgentHeartbeat("laptop", "claude", "laptop:claude:abc1", "fix-auth", "working", "Editing auth.go", "", nil)
 	eng.OnAgentHeartbeat("laptop", "claude", "laptop:claude:abc1", "fix-auth", "waiting_permission", "Need bash approval", "M auth.go", map[string]string{"tool": "Bash"})
 
@@ -2234,4 +2234,140 @@ func TestOpenRouterMidStreamError(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "upstream provider reset") {
 		t.Fatalf("expected mid-stream SSE error to fail, got %v", err)
 	}
+}
+
+type listAgentsFakeDeps struct {
+	fakeDeps
+	listAgentsFn func() (any, error)
+}
+
+func (f *listAgentsFakeDeps) ListAgents(device, repo, harness, state string, includeStale bool) (any, error) {
+	if f.listAgentsFn != nil {
+		return f.listAgentsFn()
+	}
+	return f.fakeDeps.ListAgents(device, repo, harness, state, includeStale)
+}
+
+func drainDelegationInbox(t *testing.T, eng *Engine) []InboxEvent {
+	t.Helper()
+	var out []InboxEvent
+	for range 20 {
+		ev, err := eng.store.ClaimNextInbox()
+		if err != nil || ev == nil {
+			break
+		}
+		if ev.Source == "delegation" {
+			out = append(out, *ev)
+		}
+	}
+	return out
+}
+
+func TestDelegationLifecycleEdgeCasesAndReconciliation(t *testing.T) {
+	tmp := t.TempDir()
+	deps := &listAgentsFakeDeps{}
+	eng, err := Open(filepath.Join(tmp, "assistant.db"), filepath.Join(tmp, "assistant.json"), filepath.Join(tmp, "vault"), deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = eng.Close() }()
+
+	// 1. queued -> idle direct completion + slugified name matching ("Fix_Auth" == "fix-auth").
+	d1, err := eng.store.CreateDelegation(Delegation{
+		JobID: "job-1", ChannelID: "general", TargetDevice: "laptop", Harness: "codex", SessionName: "Fix_Auth", Status: "queued",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng.refreshDelegationsFlag()
+	eng.OnAgentHeartbeat("laptop", "codex", "laptop:codex:s1", "fix-auth", "idle", "All tests passed", "", nil)
+	evs := drainDelegationInbox(t, eng)
+	if len(evs) != 1 || !strings.Contains(evs[0].PayloadJSON, `"state":"idle"`) {
+		t.Fatalf("expected 1 idle delegation event for queued->idle with slugified name, got %+v", evs)
+	}
+
+	// 2. Multi-turn follow-up: idle -> working (resets last_notified_state) -> idle wakes again.
+	eng.OnAgentHeartbeat("laptop", "codex", "laptop:codex:s1", "renamed-later", "working", "Follow-up turn", "", nil)
+	if evs = drainDelegationInbox(t, eng); len(evs) != 0 {
+		t.Fatalf("expected no wakeup on working, got %+v", evs)
+	}
+	eng.OnAgentHeartbeat("laptop", "codex", "laptop:codex:s1", "renamed-later", "idle", "Second turn done", "", nil)
+	if evs = drainDelegationInbox(t, eng); len(evs) != 1 || !strings.Contains(evs[0].PayloadJSON, `"state":"idle"`) {
+		t.Fatalf("expected second idle wakeup after working reset, got %+v", evs)
+	}
+
+	// 3. Closing an already-idle session (idle -> exited) marks exited silently without waking.
+	eng.OnAgentHeartbeat("laptop", "codex", "laptop:codex:s1", "renamed-later", "exited", "", "", nil)
+	if evs = drainDelegationInbox(t, eng); len(evs) != 0 {
+		t.Fatalf("expected no wakeup on idle->exited, got %+v", evs)
+	}
+	allDels, _ := eng.store.ListDelegations(10)
+	if allDels[0].Status != "exited" {
+		t.Fatalf("expected d1 status exited, got %+v", allDels[0])
+	}
+
+	// 4. OnSlackerReceipt binds sessionID so subsequent heartbeats match even if name changes,
+	// and working -> exited wakes the assistant.
+	_, err = eng.store.CreateDelegation(Delegation{
+		JobID: "job-2", ChannelID: "general", TargetDevice: "office", Harness: "antigravity", SessionName: "ui-agy-abc", Status: "queued",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng.refreshDelegationsFlag()
+	eng.OnSlackerReceipt("job-2", "office", "ui-agy-abc", "office:antigravity:conv1234", "launched", "")
+	eng.OnAgentHeartbeat("office", "antigravity", "office:antigravity:conv1234", "unrelated-title", "working", "Working", "", nil)
+	eng.OnAgentHeartbeat("office", "antigravity", "office:antigravity:conv1234", "unrelated-title", "exited", "Process exited", "", nil)
+	evs = drainDelegationInbox(t, eng)
+	if len(evs) != 1 || !strings.Contains(evs[0].PayloadJSON, `"state":"exited"`) {
+		t.Fatalf("expected 1 exited delegation event after working->exited via bound session_id, got %+v", evs)
+	}
+
+	// 5. Reconciler: catches missed idle, stale live:false -> exited, and 3m queued timeout.
+	_, _ = eng.store.CreateDelegation(Delegation{
+		JobID: "job-3", ChannelID: "general", TargetDevice: "laptop", Harness: "claude", SessionName: "miss-idle", Status: "working",
+	})
+	_, _ = eng.store.CreateDelegation(Delegation{
+		JobID: "job-4", ChannelID: "general", TargetDevice: "laptop", Harness: "claude", SessionName: "stale-dead", Status: "working",
+	})
+	_, _ = eng.store.CreateDelegation(Delegation{
+		JobID: "job-5", ChannelID: "general", TargetDevice: "mini", Harness: "agy", SessionName: "stuck-queue", Status: "queued",
+		CreatedAt: time.Now().UTC().Add(-4 * time.Minute).Format(time.RFC3339),
+	})
+	eng.refreshDelegationsFlag()
+
+	liveFalse := false
+	deps.listAgentsFn = func() (any, error) {
+		return []agentSnapshot{
+			{SessionID: "laptop:claude:m3", Device: "laptop", Harness: "claude", Name: "miss-idle", State: "idle", Summary: "Done"},
+			{SessionID: "laptop:claude:s4", Device: "laptop", Harness: "claude", Name: "stale-dead", State: "working", Live: &liveFalse},
+		}, nil
+	}
+	eng.reconcileActiveDelegations(time.Now().UTC())
+	evs = drainDelegationInbox(t, eng)
+	if len(evs) != 3 {
+		t.Fatalf("expected 3 reconciliation events (idle, exited, queued_timeout), got %d: %+v", len(evs), evs)
+	}
+	var gotIdle, gotExited, gotTimeout bool
+	for _, ev := range evs {
+		if strings.Contains(ev.PayloadJSON, `"state":"idle"`) {
+			gotIdle = true
+		}
+		if strings.Contains(ev.PayloadJSON, `"state":"exited"`) {
+			gotExited = true
+		}
+		if strings.Contains(ev.PayloadJSON, `"status":"queued_timeout"`) {
+			gotTimeout = true
+		}
+	}
+	if !gotIdle || !gotExited || !gotTimeout {
+		t.Fatalf("missing expected reconciliation events: idle=%v exited=%v timeout=%v", gotIdle, gotExited, gotTimeout)
+	}
+
+	// Ensure reconciler handles nil or non-slice ListAgents responses cleanly without panicking.
+	deps.listAgentsFn = func() (any, error) { return nil, nil }
+	eng.reconcileActiveDelegations(time.Now().UTC())
+	deps.listAgentsFn = func() (any, error) { return map[string]any{"unexpected": true}, nil }
+	eng.reconcileActiveDelegations(time.Now().UTC())
+	_ = d1
 }

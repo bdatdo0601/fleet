@@ -407,7 +407,7 @@ func List(harness string, stdout io.Writer) error {
 		}
 	}
 	if spec.Name == HarnessAgy {
-		for _, st := range listAppSessionStates(HarnessAgy) {
+		for _, st := range listAppSessionStates() {
 			if _, ok := agyAppSessionActive(st.Name); ok {
 				_, _ = fmt.Fprintf(stdout, "%s (app)\n", st.Name)
 				found = true
@@ -511,7 +511,7 @@ func killAllRexSessions(spec Spec, stdout, stderr io.Writer) (found bool, deferr
 }
 
 func killAllAgyAppSessions(spec Spec, stdout, stderr io.Writer) bool {
-	appStates := listAppSessionStates(HarnessAgy)
+	appStates := listAppSessionStates()
 	if len(appStates) == 0 {
 		return false
 	}

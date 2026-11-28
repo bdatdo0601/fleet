@@ -1465,10 +1465,14 @@ func (s *Store) UpdateDelegationState(id, sessionID, status, lastNotified string
 		`UPDATE assistant_delegations
 		 SET session_id = CASE WHEN ? != '' THEN ? ELSE session_id END,
 		     status = CASE WHEN ? != '' THEN ? ELSE status END,
-		     last_notified_state = CASE WHEN ? != '' THEN ? ELSE last_notified_state END,
+		     last_notified_state = CASE
+		         WHEN ? != '' THEN ?
+		         WHEN ? = 'working' THEN ''
+		         ELSE last_notified_state
+		     END,
 		     updated_at = ?
 		 WHERE id = ?`,
-		sessionID, sessionID, status, status, lastNotified, lastNotified, registry.NowISO(), id,
+		sessionID, sessionID, status, status, lastNotified, lastNotified, status, registry.NowISO(), id,
 	)
 	return err
 }

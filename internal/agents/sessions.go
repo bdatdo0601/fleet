@@ -737,28 +737,69 @@ func (h *Hub) collectStringsLocked(query string, args ...any) ([]string, error) 
 	return out, rows.Err()
 }
 
+// ExitedSession describes a session transitioned to exited by DeregisterWithInfo or DeregisterAnyWithInfo.
+type ExitedSession struct {
+	SessionID string
+	Device    string
+	Harness   string
+	Name      string
+	Summary   string
+	GitStatus string
+}
+
+func (h *Hub) collectExitedSessionsLocked(query string, args ...any) ([]ExitedSession, error) {
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []ExitedSession
+	for rows.Next() {
+		var ex ExitedSession
+		if err := rows.Scan(&ex.SessionID, &ex.Device, &ex.Harness, &ex.Name, &ex.Summary, &ex.GitStatus); err != nil {
+			return nil, err
+		}
+		out = append(out, ex)
+	}
+	return out, rows.Err()
+}
+
 // Deregister marks a session (or sessions matching harness+pid) as exited and wakes waiters.
 func (h *Hub) Deregister(device string, sessionID, harness *string, pid *int) error {
+	_, err := h.DeregisterWithInfo(device, sessionID, harness, pid)
+	return err
+}
+
+// DeregisterWithInfo marks matching sessions as exited, wakes waiters, and returns sessions that transitioned from non-exited.
+func (h *Hub) DeregisterWithInfo(device string, sessionID, harness *string, pid *int) ([]ExitedSession, error) {
 	if sessionID != nil && *sessionID != "" && !strings.HasPrefix(*sessionID, device+":") {
-		return newAgentErr("session belongs to another device", 403)
+		return nil, newAgentErr("session belongs to another device", 403)
 	}
 	nowISO := registry.NowISO()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if err := h.checkOpenLocked(); err != nil {
-		return err
+		return nil, err
 	}
 	if sessionID != nil && *sessionID != "" {
+		exited, _ := h.collectExitedSessionsLocked(
+			"SELECT session_id, device, harness, name, summary, git_status FROM agent_sessions WHERE device = ? AND session_id = ? AND state != 'exited'",
+			device, *sessionID,
+		)
 		if _, err := h.db.Exec(
 			"UPDATE agent_sessions SET state = 'exited', state_changed_at = ?, pending_action_json = '', updated_at = ? WHERE device = ? AND session_id = ?",
 			nowISO, nowISO, device, *sessionID,
 		); err != nil {
-			return err
+			return nil, err
 		}
 		h.sessionSubs.notify(*sessionID)
-		return nil
+		return exited, nil
 	}
 	if harness != nil && *harness != "" && pid != nil {
+		exited, _ := h.collectExitedSessionsLocked(
+			"SELECT session_id, device, harness, name, summary, git_status FROM agent_sessions WHERE device = ? AND harness = ? AND pid = ? AND state != 'exited'",
+			device, *harness, *pid,
+		)
 		sids, _ := h.collectStringsLocked(
 			"SELECT session_id FROM agent_sessions WHERE device = ? AND harness = ? AND pid = ?",
 			device, *harness, *pid,
@@ -767,44 +808,57 @@ func (h *Hub) Deregister(device string, sessionID, harness *string, pid *int) er
 			"UPDATE agent_sessions SET state = 'exited', state_changed_at = ?, pending_action_json = '', updated_at = ? WHERE device = ? AND harness = ? AND pid = ?",
 			nowISO, nowISO, device, *harness, *pid,
 		); err != nil {
-			return err
+			return nil, err
 		}
 		for _, s := range sids {
 			h.sessionSubs.notify(s)
 		}
-		return nil
+		return exited, nil
 	}
-	return newAgentErr("session_id or (harness, pid) is required", 400)
+	return nil, newAgentErr("session_id or (harness, pid) is required", 400)
 }
 
 // DeregisterAny marks any session as exited and wakes waiters (for admin callers).
 func (h *Hub) DeregisterAny(sessionID string) error {
+	_, err := h.DeregisterAnyWithInfo(sessionID)
+	return err
+}
+
+// DeregisterAnyWithInfo marks any session as exited, wakes waiters, and returns its metadata if it transitioned from non-exited.
+func (h *Hub) DeregisterAnyWithInfo(sessionID string) (*ExitedSession, error) {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
-		return newAgentErr("session_id is required", 400)
+		return nil, newAgentErr("session_id is required", 400)
 	}
 	nowISO := registry.NowISO()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if err := h.checkOpenLocked(); err != nil {
-		return err
+		return nil, err
 	}
+	exitedList, _ := h.collectExitedSessionsLocked(
+		"SELECT session_id, device, harness, name, summary, git_status FROM agent_sessions WHERE session_id = ? AND state != 'exited'",
+		sessionID,
+	)
 	res, err := h.db.Exec(
 		"UPDATE agent_sessions SET state = 'exited', state_changed_at = ?, pending_action_json = '', updated_at = ? WHERE session_id = ?",
 		nowISO, nowISO, sessionID,
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	affected, err := res.RowsAffected()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if affected == 0 {
-		return newAgentErr(fmt.Sprintf("no agent session %q", sessionID), 404)
+		return nil, newAgentErr(fmt.Sprintf("no agent session %q", sessionID), 404)
 	}
 	h.sessionSubs.notify(sessionID)
-	return nil
+	if len(exitedList) > 0 {
+		return &exitedList[0], nil
+	}
+	return nil, nil
 }
 
 // ListSessions returns active (or all) agent sessions filtered by optional criteria.

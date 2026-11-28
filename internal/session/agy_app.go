@@ -325,8 +325,36 @@ func removeAppSessionState(name string) {
 	_ = os.Remove(appStatePath(HarnessAgy, name))
 }
 
-func listAppSessionStates(harness string) []appSessionState {
-	entries, err := os.ReadDir(appStateDir(harness))
+// AppSessionConversationID returns the stored Antigravity conversation ID for a named app session, if any.
+func AppSessionConversationID(harness, name string) string {
+	h, ok := NormalizeHarness(harness)
+	if !ok || h != HarnessAgy || strings.TrimSpace(name) == "" {
+		return ""
+	}
+	st, ok := readAppSessionState(HarnessAgy, strings.TrimSpace(name))
+	if !ok {
+		return ""
+	}
+	return st.ConversationID
+}
+
+// LookupAppSessionName returns the Fleet session name for an Antigravity app conversation ID, if tracked.
+func LookupAppSessionName(harness, conversationID string) string {
+	h, ok := NormalizeHarness(harness)
+	if !ok || h != HarnessAgy || strings.TrimSpace(conversationID) == "" {
+		return ""
+	}
+	id := strings.TrimSpace(conversationID)
+	for _, st := range listAppSessionStates() {
+		if st.ConversationID == id && st.Name != "" {
+			return st.Name
+		}
+	}
+	return ""
+}
+
+func listAppSessionStates() []appSessionState {
+	entries, err := os.ReadDir(appStateDir(HarnessAgy))
 	if err != nil {
 		return nil
 	}
@@ -336,7 +364,7 @@ func listAppSessionStates(harness string) []appSessionState {
 			continue
 		}
 		name := strings.TrimSuffix(ent.Name(), ".json")
-		if st, ok := readAppSessionState(harness, name); ok {
+		if st, ok := readAppSessionState(HarnessAgy, name); ok {
 			out = append(out, st)
 		}
 	}

@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ import (
 	"github.com/bdatdo0601/fleet/internal/assistant"
 	"github.com/bdatdo0601/fleet/internal/client"
 	"github.com/bdatdo0601/fleet/internal/registry"
+	"github.com/bdatdo0601/fleet/internal/slacker"
 )
 
 func TestAssistantRoutesSecurityAndFlow(t *testing.T) {
@@ -597,5 +599,131 @@ func TestAssistantAutoApproveRoutes(t *testing.T) {
 	}
 	if len(aprRes.Approvals) != 0 {
 		t.Fatalf("expected 0 pending approvals for auto_approve:true message, got %+v", aprRes.Approvals)
+	}
+}
+
+func TestDelegationReceiptBindAndDeregisterWakeup(t *testing.T) {
+	var step atomic.Int32
+	var gotExitWakeup atomic.Bool
+	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/alpha/decisions":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"answers":{"needs_frontier":{"type":"noul","noul":0.1}}}`))
+		case "/chat/completions":
+			bodyBytes, _ := io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "text/event-stream")
+			switch step.Add(1) {
+			case 1:
+				_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tc_sp\",\"type\":\"function\",\"function\":{\"name\":\"fleet_spawn_agent\",\"arguments\":\"{\\\"harness\\\":\\\"agy\\\",\\\"device\\\":\\\"office\\\",\\\"name\\\":\\\"ui-agy-srv1\\\",\\\"repo_path\\\":\\\"/tmp/repo\\\",\\\"prompt\\\":\\\"check\\\"}\"}}]}}]}\n\n"))
+				_, _ = w.Write([]byte("data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n"))
+			case 2:
+				_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"Spawned ui-agy-srv1.\"}}]}\n\n"))
+				_, _ = w.Write([]byte("data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n"))
+			default:
+				if strings.Contains(string(bodyBytes), "office:antigravity:conv-srv-123") && strings.Contains(string(bodyBytes), "exited") {
+					gotExitWakeup.Store(true)
+				}
+				_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"Delegated session exited.\"}}]}\n\n"))
+				_, _ = w.Write([]byte("data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n"))
+			}
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		}
+	}))
+	defer mockLLM.Close()
+
+	f, srv, tmp := setupTestServer(t)
+	_, office := approveTestDevice(t, f, tmp, "office", "mac", "managed")
+	f.Assistant.Start(t.Context())
+	defer f.Assistant.Stop()
+
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/config", http.MethodPost, `{"enabled":true,"base_url":"`+mockLLM.URL+`","api_key":"sk-or-test","auto_approve":true}`, nil, ""); st != http.StatusOK {
+		t.Fatalf("POST /v1/assistant/config failed: %d (%s)", st, string(b))
+	}
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/messages", http.MethodPost, `{"channel":"general","content":"spawn task","auto_approve":true}`, nil, ""); st != http.StatusAccepted {
+		t.Fatalf("POST /v1/assistant/messages failed: %d (%s)", st, string(b))
+	}
+
+	var del assistant.Delegation
+	dl := time.Now().Add(4 * time.Second)
+	for time.Now().Before(dl) {
+		var res struct {
+			Delegations []assistant.Delegation `json:"delegations"`
+		}
+		if err := client.Call(srv.URL, http.MethodGet, "/v1/assistant/delegations", nil, 3*time.Second, nil, &res); err == nil && len(res.Delegations) > 0 {
+			del = res.Delegations[0]
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if del.ID == "" || del.JobID == "" {
+		t.Fatalf("expected created delegation, got %+v", del)
+	}
+
+	// Simulate office worker polling job and posting launch receipt with raw_session_id.
+	f.IdentifyOverride = func(string) *registry.Device { return office }
+	var pollRes struct {
+		Job *slacker.Job `json:"job"`
+	}
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/slacker/worker/poll", map[string]any{"timeout": 0.2}, 3*time.Second, nil, &pollRes); err != nil || pollRes.Job == nil || pollRes.Job.ID != del.JobID {
+		t.Fatalf("worker poll failed: %+v (err=%v)", pollRes, err)
+	}
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/slacker/worker/receipt", slacker.Receipt{
+		JobID:        del.JobID,
+		ReceiptID:    "rcpt-srv-1",
+		SessionName:  del.SessionName,
+		RawSessionID: "conv-srv-123",
+		Backend:      "app",
+		Status:       "launched",
+	}, 3*time.Second, nil, nil); err != nil {
+		t.Fatalf("worker receipt failed: %v", err)
+	}
+	f.IdentifyOverride = nil
+
+	var delAfterReceipt assistant.Delegation
+	var res struct {
+		Delegations []assistant.Delegation `json:"delegations"`
+	}
+	if err := client.Call(srv.URL, http.MethodGet, "/v1/assistant/delegations", nil, 3*time.Second, nil, &res); err != nil || len(res.Delegations) == 0 {
+		t.Fatalf("GET /v1/assistant/delegations failed: %v", err)
+	}
+	delAfterReceipt = res.Delegations[0]
+	if delAfterReceipt.SessionID != "office:antigravity:conv-srv-123" || delAfterReceipt.Status != "launched" {
+		t.Fatalf("expected receipt to bind session_id=office:antigravity:conv-srv-123 and status=launched, got %+v", delAfterReceipt)
+	}
+
+	// Heartbeat working then deregister via POST /v1/agents/deregister -> assistant wakes with exited event.
+	f.IdentifyOverride = func(string) *registry.Device { return office }
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/agents/heartbeat", map[string]any{
+		"harness": "antigravity",
+		"raw_id":  "conv-srv-123",
+		"state":   "working",
+		"cwd":     "/tmp/repo",
+	}, 3*time.Second, nil, nil); err != nil {
+		t.Fatalf("heartbeat failed: %v", err)
+	}
+	if err := client.Call(srv.URL, http.MethodPost, "/v1/agents/deregister", map[string]any{
+		"session_id": "office:antigravity:conv-srv-123",
+	}, 3*time.Second, nil, nil); err != nil {
+		t.Fatalf("deregister failed: %v", err)
+	}
+	f.IdentifyOverride = nil
+
+	dl2 := time.Now().Add(4 * time.Second)
+	for time.Now().Before(dl2) && !gotExitWakeup.Load() {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !gotExitWakeup.Load() {
+		t.Fatalf("expected assistant to wake up on POST /v1/agents/deregister with exited delegation event")
+	}
+
+	var resAfterExit struct {
+		Delegations []assistant.Delegation `json:"delegations"`
+	}
+	if err := client.Call(srv.URL, http.MethodGet, "/v1/assistant/delegations", nil, 3*time.Second, nil, &resAfterExit); err != nil || len(resAfterExit.Delegations) == 0 {
+		t.Fatalf("GET /v1/assistant/delegations after exit failed: %v", err)
+	}
+	if resAfterExit.Delegations[0].Status != "exited" {
+		t.Fatalf("expected delegation status=exited after deregister, got %+v", resAfterExit.Delegations[0])
 	}
 }

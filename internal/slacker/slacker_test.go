@@ -538,6 +538,55 @@ func TestWorkerCrossDeviceRoutingSleepingMacRecoveryAndCleanup(t *testing.T) {
 	}
 }
 
+func TestProcessJobIncludesAppRawSessionID(t *testing.T) {
+	tmp := t.TempDir()
+	xdgState := filepath.Join(tmp, "xdg-state")
+	t.Setenv("XDG_STATE_HOME", xdgState)
+	t.Setenv("FLEET_SESSION_LEGACY_STATE", "")
+
+	appDir := filepath.Join(xdgState, "fleet-session", "agy", "app")
+	if err := os.MkdirAll(appDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "ui-agy-app2.json"), []byte(`{"name":"ui-agy-app2","conversation_id":"conv-uuid-1234"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotReceipt Receipt
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/slacker/worker/receipt":
+			_ = json.NewDecoder(r.Body).Decode(&gotReceipt)
+			_ = json.NewEncoder(w).Encode(map[string]any{"job": Job{ID: gotReceipt.JobID, Status: gotReceipt.Status}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	err := processJob(context.Background(), srv.URL, filepath.Join(tmp, "worker"), Job{
+		ID:           "job-app-1",
+		TargetDevice: "laptop",
+		RepoPath:     tmp,
+		Harness:      "agy",
+		SessionName:  "ui-agy-app2",
+		Prompt:       "run task",
+	}, WorkerOpts{
+		SessionExists: func(string, string) (bool, string) { return false, "" },
+		LaunchFn: func(Job, bool, io.Writer, io.Writer) (string, error) {
+			return "app", nil
+		},
+		Stdout: io.Discard,
+		Stderr: io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("processJob failed: %v", err)
+	}
+	if gotReceipt.RawSessionID != "conv-uuid-1234" || gotReceipt.Backend != "app" {
+		t.Fatalf("expected raw_session_id=conv-uuid-1234 on app receipt, got %+v", gotReceipt)
+	}
+}
+
 func TestWorkerRealGoLauncherEndToEndBothHarnesses(t *testing.T) {
 	realTmux, err := exec.LookPath("tmux")
 	if err != nil {

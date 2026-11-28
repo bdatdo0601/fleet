@@ -30,6 +30,7 @@ type LocalReceipt struct {
 	ReceiptID    string `json:"receipt_id"`
 	AttemptCount int    `json:"attempt_count,omitempty"`
 	SessionName  string `json:"session_name"`
+	RawSessionID string `json:"raw_session_id,omitempty"`
 	Harness      string `json:"harness"`
 	Backend      string `json:"backend"`
 	Status       string `json:"status"`
@@ -164,12 +165,13 @@ func saveLocalReceipt(path string, r LocalReceipt) error {
 
 func postReceipt(ctx context.Context, api string, r LocalReceipt) error {
 	return client.CallContext(ctx, api, http.MethodPost, "/v1/slacker/worker/receipt", Receipt{
-		JobID:       r.JobID,
-		ReceiptID:   r.ReceiptID,
-		SessionName: r.SessionName,
-		Backend:     r.Backend,
-		Status:      r.Status,
-		Error:       r.Error,
+		JobID:        r.JobID,
+		ReceiptID:    r.ReceiptID,
+		SessionName:  r.SessionName,
+		RawSessionID: r.RawSessionID,
+		Backend:      r.Backend,
+		Status:       r.Status,
+		Error:        r.Error,
 	}, 15*time.Second, nil, nil)
 }
 
@@ -221,6 +223,29 @@ func shouldShortCircuitReceipt(existing LocalReceipt, job Job) bool {
 	return existing.Status == "failed" && existing.AttemptCount >= job.AttemptCount
 }
 
+func processKillJob(ctx context.Context, api, rPath string, job Job, rec LocalReceipt, opts WorkerOpts) error {
+	killFn := opts.KillFn
+	if killFn == nil {
+		killFn = defaultKillJob
+	}
+	backend, err := killFn(job, opts.Stdout, opts.Stderr)
+	if err != nil {
+		rec.Status = "failed"
+		rec.Error = err.Error()
+	} else {
+		rec.Status = "launched"
+		rec.Backend = cmp.Or(backend, job.Reaction)
+	}
+	if err := saveLocalReceipt(rPath, rec); err != nil {
+		return err
+	}
+	if err := postReceipt(ctx, api, rec); err != nil {
+		return err
+	}
+	rec.Acked = true
+	return saveLocalReceipt(rPath, rec)
+}
+
 func processJob(ctx context.Context, api, localStateDir string, job Job, opts WorkerOpts) error {
 	rPath := receiptPath(localStateDir, job.ID)
 	if existing, ok := loadLocalReceipt(rPath); ok && shouldShortCircuitReceipt(existing, job) {
@@ -234,6 +259,19 @@ func processJob(ctx context.Context, api, localStateDir string, job Job, opts Wo
 		return nil
 	}
 
+	rec := LocalReceipt{
+		JobID:        job.ID,
+		ReceiptID:    fmt.Sprintf("rcpt-%s-%d", job.ID, time.Now().UnixNano()),
+		AttemptCount: job.AttemptCount,
+		SessionName:  job.SessionName,
+		Harness:      job.Harness,
+		CreatedAt:    registry.NowISO(),
+	}
+
+	if job.Reaction == "kill" || job.Reaction == "kill-all" {
+		return processKillJob(ctx, api, rPath, job, rec, opts)
+	}
+
 	existsFn := opts.SessionExists
 	if existsFn == nil {
 		existsFn = session.SessionExists
@@ -245,38 +283,6 @@ func processJob(ctx context.Context, api, localStateDir string, job Job, opts Wo
 		} else {
 			launchFn = defaultLaunchJob
 		}
-	}
-
-	rec := LocalReceipt{
-		JobID:        job.ID,
-		ReceiptID:    fmt.Sprintf("rcpt-%s-%d", job.ID, time.Now().UnixNano()),
-		AttemptCount: job.AttemptCount,
-		SessionName:  job.SessionName,
-		Harness:      job.Harness,
-		CreatedAt:    registry.NowISO(),
-	}
-
-	if job.Reaction == "kill" || job.Reaction == "kill-all" {
-		killFn := opts.KillFn
-		if killFn == nil {
-			killFn = defaultKillJob
-		}
-		backend, err := killFn(job, opts.Stdout, opts.Stderr)
-		if err != nil {
-			rec.Status = "failed"
-			rec.Error = err.Error()
-		} else {
-			rec.Status = "launched"
-			rec.Backend = cmp.Or(backend, job.Reaction)
-		}
-		if err := saveLocalReceipt(rPath, rec); err != nil {
-			return err
-		}
-		if err := postReceipt(ctx, api, rec); err != nil {
-			return err
-		}
-		rec.Acked = true
-		return saveLocalReceipt(rPath, rec)
 	}
 
 	if exists, backend := existsFn(job.Harness, job.SessionName); exists {
@@ -297,6 +303,9 @@ func processJob(ctx context.Context, api, localStateDir string, job Job, opts Wo
 			rec.Status = "launched"
 			rec.Backend = backend
 		}
+	}
+	if rec.Status == "launched" && rec.Backend == "app" && rec.RawSessionID == "" {
+		rec.RawSessionID = session.AppSessionConversationID(job.Harness, job.SessionName)
 	}
 
 	if err := saveLocalReceipt(rPath, rec); err != nil {

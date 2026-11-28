@@ -22,7 +22,7 @@ type KillTarget struct {
 }
 
 func killAgyAppByRawID(rawID string, stdout io.Writer) bool {
-	for _, st := range listAppSessionStates(HarnessAgy) {
+	for _, st := range listAppSessionStates() {
 		if st.ConversationID == rawID {
 			removeAppSessionState(st.Name)
 		}

@@ -273,10 +273,17 @@ func sendHeartbeat(apiURL, harness string, ppid int, cwd, knownFullID string) st
 	summary, tail := hooks.ReadTranscriptTail(harness, "", cwd, 20)
 	title, isExplicit := hooks.ReadSessionTitle(harness, knownFullID, "", "", "")
 	var titlePtr, namePtr, sumPtr *string
+	explicitName := isExplicit && title != ""
 	if title != "" {
 		titlePtr = &title
 		if isExplicit {
 			namePtr = &title
+		}
+	}
+	if namePtr == nil {
+		if envName := hooks.EnvSessionName(harness); envName != "" {
+			namePtr = &envName
+			explicitName = true
 		}
 	}
 	if summary != "" {
@@ -293,7 +300,7 @@ func sendHeartbeat(apiURL, harness string, ppid int, cwd, knownFullID string) st
 		State:        "working",
 		Title:        titlePtr,
 		Name:         namePtr,
-		ExplicitName: isExplicit && title != "",
+		ExplicitName: explicitName,
 		Summary:      sumPtr,
 		GitStatus:    &gitStatus,
 		Tail:         tail,

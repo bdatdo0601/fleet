@@ -446,7 +446,13 @@ func registerAgentRoutes(
 		writeJSON(w, http.StatusOK, res)
 		return nil
 	}))
-	mux.HandleFunc("POST /v1/agents/deregister", route(false, func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
+	mux.HandleFunc("POST /v1/agents/deregister", route(false, handleAgentDeregister(fleet)))
+	registerAgentMessageRoutes(mux, fleet, route)
+	registerAgentPathRoutes(mux, fleet, route)
+}
+
+func handleAgentDeregister(fleet *core.Fleet) func(http.ResponseWriter, *http.Request, *registry.Device) error {
+	return func(w http.ResponseWriter, r *http.Request, c *registry.Device) error {
 		var req struct {
 			SessionID *string `json:"session_id"`
 			Harness   *string `json:"harness"`
@@ -456,20 +462,28 @@ func registerAgentRoutes(
 			return err
 		}
 		if core.IsAdmin(c) && req.SessionID != nil && *req.SessionID != "" && !strings.HasPrefix(*req.SessionID, c.Name+":") {
-			if err := fleet.Agents.DeregisterAny(*req.SessionID); err != nil {
+			exited, err := fleet.Agents.DeregisterAnyWithInfo(*req.SessionID)
+			if err != nil {
 				return err
+			}
+			if fleet.Assistant != nil && exited != nil {
+				fleet.Assistant.OnAgentHeartbeat(exited.Device, exited.Harness, exited.SessionID, exited.Name, "exited", exited.Summary, exited.GitStatus, nil)
 			}
 			writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 			return nil
 		}
-		if err := fleet.Agents.Deregister(c.Name, req.SessionID, req.Harness, req.PID); err != nil {
+		exitedList, err := fleet.Agents.DeregisterWithInfo(c.Name, req.SessionID, req.Harness, req.PID)
+		if err != nil {
 			return err
+		}
+		if fleet.Assistant != nil {
+			for _, ex := range exitedList {
+				fleet.Assistant.OnAgentHeartbeat(ex.Device, ex.Harness, ex.SessionID, ex.Name, "exited", ex.Summary, ex.GitStatus, nil)
+			}
 		}
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return nil
-	}))
-	registerAgentMessageRoutes(mux, fleet, route)
-	registerAgentPathRoutes(mux, fleet, route)
+	}
 }
 
 func registerAgentMessageRoutes(

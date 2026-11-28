@@ -464,3 +464,86 @@ func TestReadTranscriptTailFinalAssistantCapAndDiscovery(t *testing.T) {
 		t.Fatalf("codex UUID match failed: got %q want %q", got, rolloutFile)
 	}
 }
+
+func TestRunHookEnvAndAppSessionNamePropagation(t *testing.T) {
+	tmp := t.TempDir()
+	xdgState := filepath.Join(tmp, "xdg-state")
+	t.Setenv("XDG_STATE_HOME", xdgState)
+	t.Setenv("FLEET_CACHE_DIR", filepath.Join(tmp, "cache"))
+	t.Setenv("FLEET_SESSION_LEGACY_STATE", "")
+
+	pubFile := filepath.Join(tmp, "mini.pub")
+	if err := pki.Keygen(filepath.Join(tmp, "mini.key"), pubFile); err != nil {
+		t.Skip("nebula-cert not installed")
+	}
+	miniPub, _ := os.ReadFile(pubFile)
+	f, err := core.Initialize(core.InitOpts{
+		Root: filepath.Join(tmp, "state"), Host: "h.example.com", Port: 443,
+		Passphrase: "correct horse battery staple", LighthousePubkey: string(miniPub),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	srv := httptest.NewServer(server.NewHandler(f, true))
+	t.Cleanup(srv.Close)
+
+	fire := func(harness string, payload map[string]any) {
+		t.Helper()
+		b, _ := json.Marshal(payload)
+		var out bytes.Buffer
+		rc, runErr := RunHook(harness, bytes.NewReader(b), &out, srv.URL)
+		if runErr != nil || rc != 0 {
+			t.Fatalf("RunHook %s failed: rc=%d err=%v", harness, rc, runErr)
+		}
+	}
+
+	// 1. FLEET_SESSION_NAME propagates as explicit Name when transcript has no explicit title.
+	t.Setenv("FLEET_SESSION_NAME", "ui-claude-99ab")
+	t.Setenv("AGY_SESSION_NAME", "")
+	fire("claude", map[string]any{"hook_event_name": "SessionStart", "session_id": "cl-env-1", "cwd": tmp})
+	s1, err := f.Agents.GetSession("cl-env-1")
+	if err != nil || s1.Name != "ui-claude-99ab" {
+		t.Fatalf("expected Name=ui-claude-99ab, got %+v (err=%v)", s1, err)
+	}
+
+	// 2. AGY_SESSION_NAME propagates for antigravity when FLEET_SESSION_NAME is unset.
+	t.Setenv("FLEET_SESSION_NAME", "")
+	t.Setenv("AGY_SESSION_NAME", "ui-agy-77cd")
+	fire("antigravity", map[string]any{"hookEventName": "SessionStart", "conversationId": "ag-env-1", "cwd": tmp})
+	s2, err := f.Agents.GetSession("ag-env-1")
+	if err != nil || s2.Name != "ui-agy-77cd" {
+		t.Fatalf("expected Name=ui-agy-77cd, got %+v (err=%v)", s2, err)
+	}
+
+	// 3. Antigravity app state fallback resolves Name by conversationId when env vars are empty.
+	t.Setenv("FLEET_SESSION_NAME", "")
+	t.Setenv("AGY_SESSION_NAME", "")
+	appDir := filepath.Join(xdgState, "fleet-session", "agy", "app")
+	if err := os.MkdirAll(appDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "ui-agy-app1.json"), []byte(`{"name":"ui-agy-app1","conversation_id":"conv-app-1"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fire("antigravity", map[string]any{"hookEventName": "SessionStart", "conversationId": "conv-app-1", "cwd": tmp})
+	s3, err := f.Agents.GetSession("conv-app-1")
+	if err != nil || s3.Name != "ui-agy-app1" {
+		t.Fatalf("expected Name=ui-agy-app1 via app state lookup, got %+v (err=%v)", s3, err)
+	}
+
+	// 4. Explicit transcript title takes precedence over FLEET_SESSION_NAME.
+	t.Setenv("FLEET_SESSION_NAME", "ignored-env-name")
+	claudeLog := filepath.Join(tmp, "explicit-title.jsonl")
+	_ = os.WriteFile(claudeLog, []byte(`{"type":"custom-title","customTitle":"Custom Claude Title"}`+"\n"), 0o644)
+	fire("claude", map[string]any{
+		"hook_event_name": "SessionStart",
+		"session_id":      "cl-title-1",
+		"cwd":             tmp,
+		"transcript_path": claudeLog,
+	})
+	s4, err := f.Agents.GetSession("cl-title-1")
+	if err != nil || s4.Name != "custom-claude-title" {
+		t.Fatalf("expected explicit transcript title custom-claude-title, got %+v (err=%v)", s4, err)
+	}
+}
