@@ -12,12 +12,15 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/bdatdo0601/fleet/internal/registry"
 )
 
 const (
+	PrimaryVaultName = "agent"
+
 	DefaultOpenRouterURL = "https://openrouter.ai/api/v1"
 	DefaultChatModel     = "meta/muse-spark-open"
 	DefaultFastModel     = "openai/gpt-5-nano"
@@ -77,6 +80,25 @@ type CredentialPolicy struct {
 	RequireApproval bool     `json:"require_approval"`
 }
 
+// VaultMount configures an additional named Obsidian vault mounted alongside the primary agent vault.
+type VaultMount struct {
+	Name          string   `json:"name"`
+	Path          string   `json:"path"`
+	ReadOnly      bool     `json:"read_only,omitempty"`
+	AutoWriteDirs []string `json:"auto_write_dirs,omitempty"`
+}
+
+var vaultNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
+
+// IsValidVaultName reports whether name is a valid mounted extra vault identifier.
+func IsValidVaultName(name string) bool {
+	clean := strings.ToLower(strings.TrimSpace(name))
+	if clean == "" || clean == PrimaryVaultName || clean == "all" {
+		return false
+	}
+	return vaultNameRE.MatchString(clean)
+}
+
 // Config holds persistent configuration for the lighthouse assistant.
 type Config struct {
 	Enabled                  bool               `json:"enabled"`
@@ -87,6 +109,7 @@ type Config struct {
 	DataCollection           string             `json:"data_collection,omitempty"`
 	VaultPath                string             `json:"vault_path,omitempty"`
 	AutoWriteDirs            []string           `json:"auto_write_dirs,omitempty"`
+	ExtraVaults              []VaultMount       `json:"extra_vaults,omitempty"`
 	GitAutoCommit            bool               `json:"git_auto_commit"`
 	HeartbeatIntervalMinutes int                `json:"heartbeat_interval_minutes"`
 	ObserverThresholdTokens  int                `json:"observer_threshold_tokens"`
@@ -119,6 +142,7 @@ type ConfigView struct {
 	VaultPath                string            `json:"vault_path"`
 	EffectiveVaultPath       string            `json:"effective_vault_path"`
 	AutoWriteDirs            []string          `json:"auto_write_dirs"`
+	ExtraVaults              []VaultMount      `json:"extra_vaults"`
 	GitAutoCommit            bool              `json:"git_auto_commit"`
 	HeartbeatIntervalMinutes int               `json:"heartbeat_interval_minutes"`
 	ObserverThresholdTokens  int               `json:"observer_threshold_tokens"`
@@ -200,7 +224,57 @@ func NormalizeConfig(cfg Config) Config {
 	aliases := DefaultAliases()
 	maps.Copy(aliases, cfg.Models.Aliases)
 	cfg.Models.Aliases = aliases
+	cfg.ExtraVaults = normalizeVaultMounts(cfg.ExtraVaults)
 	return cfg
+}
+
+func normalizeVaultMounts(mounts []VaultMount) []VaultMount {
+	if mounts == nil {
+		return nil
+	}
+	out := make([]VaultMount, 0, len(mounts))
+	for _, m := range mounts {
+		m.Name = strings.ToLower(strings.TrimSpace(m.Name))
+		m.Path = strings.TrimSpace(m.Path)
+		var dirs []string
+		for _, d := range m.AutoWriteDirs {
+			if clean := strings.Trim(strings.TrimSpace(d), "/"); clean != "" {
+				dirs = append(dirs, clean)
+			}
+		}
+		m.AutoWriteDirs = dirs
+		out = append(out, m)
+	}
+	return out
+}
+
+func validateExtraVaults(mounts []VaultMount) error {
+	seen := make(map[string]struct{}, len(mounts))
+	for _, m := range mounts {
+		if !IsValidVaultName(m.Name) {
+			return newErr(fmt.Sprintf("invalid extra vault name %q (must match [a-z0-9][a-z0-9_-]* and cannot be %q or \"all\")", m.Name, PrimaryVaultName), http.StatusBadRequest)
+		}
+		if _, dup := seen[m.Name]; dup {
+			return newErr(fmt.Sprintf("duplicate extra vault name %q", m.Name), http.StatusBadRequest)
+		}
+		seen[m.Name] = struct{}{}
+		if strings.TrimSpace(m.Path) == "" {
+			return newErr(fmt.Sprintf("extra vault %q path is required", m.Name), http.StatusBadRequest)
+		}
+	}
+	return nil
+}
+
+func copyVaultMounts(mounts []VaultMount) []VaultMount {
+	out := make([]VaultMount, 0, len(mounts))
+	for _, m := range mounts {
+		cp := m
+		if len(m.AutoWriteDirs) > 0 {
+			cp.AutoWriteDirs = append([]string(nil), m.AutoWriteDirs...)
+		}
+		out = append(out, cp)
+	}
+	return out
 }
 
 // LoadConfig reads assistant.json from path, returning defaults when absent.
@@ -294,6 +368,7 @@ func (c Config) View(effectiveVault string) ConfigView {
 		VaultPath:                c.VaultPath,
 		EffectiveVaultPath:       effectiveVault,
 		AutoWriteDirs:            append([]string(nil), c.AutoWriteDirs...),
+		ExtraVaults:              copyVaultMounts(c.ExtraVaults),
 		GitAutoCommit:            c.GitAutoCommit,
 		HeartbeatIntervalMinutes: c.HeartbeatIntervalMinutes,
 		ObserverThresholdTokens:  c.ObserverThresholdTokens,

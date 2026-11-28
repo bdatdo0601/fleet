@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -35,6 +37,21 @@ func TestAssistantRoutesSecurityAndFlow(t *testing.T) {
 	cfg.Enabled = true
 	cfg.BaseURL = mockLLM.URL
 	cfg.APIKey = "sk-or-test"
+	personalDir := filepath.Join(tmp, "personal-vault")
+	roDir := filepath.Join(tmp, "ref-vault")
+	if err := os.MkdirAll(filepath.Join(personalDir, "Notes"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(personalDir, "Notes", "Travel.md"), []byte("# Japan Trip\nKyoto itinerary"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(roDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg.ExtraVaults = []assistant.VaultMount{
+		{Name: "personal", Path: personalDir, AutoWriteDirs: []string{"Inbox"}},
+		{Name: "ref", Path: roDir, ReadOnly: true},
+	}
 	if _, err := f.Assistant.UpdateConfig(cfg, false); err != nil {
 		t.Fatal(err)
 	}
@@ -42,6 +59,18 @@ func TestAssistantRoutesSecurityAndFlow(t *testing.T) {
 	// Admin can load skills, create skill, schedule timer, and chat.
 	if st, _, _ := doRawReq(t, srv.URL+"/v1/assistant/skills/daily-check", http.MethodPut, `{"content":"---\nname: daily-check\ndescription: Check waiting agents\n---\nRun check.\n"}`, nil, ""); st != http.StatusOK {
 		t.Fatalf("PUT skill expected 200, got %d", st)
+	}
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/vault/search?vault=all&q=Kyoto", http.MethodGet, "", nil, ""); st != http.StatusOK || !strings.Contains(string(b), `"vault":"personal"`) {
+		t.Fatalf("GET /v1/assistant/vault/search?vault=all expected personal hit, got %d (%s)", st, string(b))
+	}
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/vault/file?vault=personal&path=Notes/Travel.md", http.MethodGet, "", nil, ""); st != http.StatusOK || !strings.Contains(string(b), "Kyoto itinerary") {
+		t.Fatalf("GET /v1/assistant/vault/file?vault=personal expected 200, got %d (%s)", st, string(b))
+	}
+	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/vault/file", http.MethodPut, `{"vault":"personal","path":"Inbox/Trip.md","content":"Packed"}`, nil, ""); st != http.StatusOK || !strings.Contains(string(b), `"vault":"personal"`) {
+		t.Fatalf("PUT /v1/assistant/vault/file personal expected 200, got %d (%s)", st, string(b))
+	}
+	if st, _, _ := doRawReq(t, srv.URL+"/v1/assistant/vault/file", http.MethodPut, `{"vault":"ref","path":"Readme.md","content":"nope"}`, nil, ""); st != http.StatusForbidden {
+		t.Fatalf("PUT /v1/assistant/vault/file read-only expected 403, got %d", st)
 	}
 	if st, _, _ := doRawReq(t, srv.URL+"/v1/assistant/vault/file?path=../bad.md", http.MethodGet, "", nil, ""); st != http.StatusBadRequest {
 		t.Fatalf("vault traversal expected 400, got %d", st)

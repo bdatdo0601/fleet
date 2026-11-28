@@ -30,6 +30,7 @@ type Skill struct {
 
 // VaultSearchHit represents one search match in the Obsidian vault.
 type VaultSearchHit struct {
+	Vault   string `json:"vault,omitempty"`
 	Path    string `json:"path"`
 	Title   string `json:"title"`
 	Snippet string `json:"snippet"`
@@ -79,6 +80,28 @@ func OpenVault(dir string) (*Vault, error) {
 		return nil, err
 	}
 	return v, nil
+}
+
+// OpenVaultNoScaffold opens an existing Obsidian vault directory without creating any agent files or folders.
+func OpenVaultNoScaffold(dir string) (*Vault, error) {
+	if strings.TrimSpace(dir) == "" {
+		return nil, newErr("vault path is required", http.StatusBadRequest)
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, err
+	}
+	fi, err := os.Stat(abs)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, newErr(fmt.Sprintf("vault directory %q not found", abs), http.StatusNotFound)
+		}
+		return nil, err
+	}
+	if !fi.IsDir() {
+		return nil, newErr(fmt.Sprintf("vault path %q is not a directory", abs), http.StatusBadRequest)
+	}
+	return &Vault{Root: abs}, nil
 }
 
 // ResolveRel validates and resolves a relative vault path without escaping Root.

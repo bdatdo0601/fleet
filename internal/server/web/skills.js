@@ -164,11 +164,28 @@ export async function renderSkills(main, ctx, sub) {
   }
 
   if (tab === "vault") {
+    let extraVaults = [];
+    try {
+      const cfgRes = await api("GET", "/v1/assistant/config");
+      extraVaults = (cfgRes.config && cfgRes.config.extra_vaults) || [];
+    } catch {
+      // fall back to primary vault if config lookup fails
+    }
+    const vaultSel = el(
+      "select",
+      { "aria-label": "Target vault" },
+      el("option", { value: "all", text: "All vaults" }),
+      el("option", { value: "agent", text: "agent (primary)" }),
+      ...extraVaults.map((m) => el("option", { value: m.name, text: `${m.name}${m.read_only ? " (read-only)" : ""}` })),
+    );
     const qIn = el("input", { type: "search", placeholder: "Search Obsidian Markdown notes…" });
     const hitsBox = el("div", { className: "stack" });
     const runSearch = async () => {
       try {
-        const res = await api("GET", `/v1/assistant/vault/search?q=${encodeURIComponent(qIn.value.trim())}&limit=25`);
+        const res = await api(
+          "GET",
+          `/v1/assistant/vault/search?vault=${encodeURIComponent(vaultSel.value)}&q=${encodeURIComponent(qIn.value.trim())}&limit=25`,
+        );
         clear(hitsBox);
         const hits = res.hits || [];
         if (hits.length === 0) {
@@ -176,19 +193,28 @@ export async function renderSkills(main, ctx, sub) {
           return;
         }
         for (const h of hits) {
+          const hitVault = h.vault || "agent";
           hitsBox.appendChild(
             el(
               "article",
               { className: "card" },
-              el("div", { className: "card-header" }, el("strong", { text: h.title }), el("span", { className: "mono small muted", text: h.path })),
+              el(
+                "div",
+                { className: "card-header" },
+                el("div", { className: "actions-row" }, badge(hitVault, hitVault === "agent" ? "neutral" : "info"), el("strong", { text: h.title })),
+                el("span", { className: "mono small muted", text: h.path }),
+              ),
               el("div", { className: "small muted mb-2", text: h.snippet }),
               el("button", {
                 type: "button",
                 className: "btn btn-sm",
                 text: "Open Note",
                 onclick: async () => {
-                  const file = await api("GET", `/v1/assistant/vault/file?path=${encodeURIComponent(h.path)}`);
-                  openModal(h.path, el("pre", { className: "code-block" }, el("code", { text: file.content || "" })));
+                  const file = await api(
+                    "GET",
+                    `/v1/assistant/vault/file?vault=${encodeURIComponent(hitVault)}&path=${encodeURIComponent(h.path)}`,
+                  );
+                  openModal(`${hitVault}:${h.path}`, el("pre", { className: "code-block" }, el("code", { text: file.content || "" })));
                 },
               }),
             ),
@@ -198,10 +224,12 @@ export async function renderSkills(main, ctx, sub) {
         toast(err.message, "error");
       }
     };
+    vaultSel.addEventListener("change", runSearch);
     body.appendChild(
       el(
         "div",
         { className: "actions-row" },
+        vaultSel,
         qIn,
         el("button", { type: "button", className: "btn btn-sm btn-primary", text: "Search", onclick: runSearch }),
       ),

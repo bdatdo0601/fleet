@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"slices"
 	"strconv"
+	"strings"
 )
 
 const (
@@ -239,4 +240,13 @@ func SlackerLocalStateDir() string {
 // AgentRelayStateDir returns the local agent relay state directory under LocalStateRoot.
 func AgentRelayStateDir() string {
 	return filepath.Join(LocalStateRoot(), "fleet-relay")
+}
+
+// ObsidianSyncLabelFor returns the LaunchAgent label for the primary ("agent") or a named extra vault.
+func ObsidianSyncLabelFor(name string) string {
+	clean := strings.ToLower(strings.TrimSpace(name))
+	if clean == "" || clean == "agent" {
+		return ObsidianSyncLabel
+	}
+	return ObsidianSyncLabel + "." + clean
 }

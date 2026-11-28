@@ -456,7 +456,7 @@ func registerAssistantVaultRoutes(
 ) {
 	mux.HandleFunc("GET /v1/assistant/vault/file", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
 		rel := r.URL.Query().Get("path")
-		v, err := fleet.Assistant.Vault()
+		v, mount, err := fleet.Assistant.ResolveVault(r.URL.Query().Get("vault"))
 		if err != nil {
 			return err
 		}
@@ -464,35 +464,35 @@ func registerAssistantVaultRoutes(
 		if err != nil {
 			return err
 		}
-		writeJSON(w, http.StatusOK, map[string]string{"path": rel, "content": content})
+		writeJSON(w, http.StatusOK, map[string]string{"vault": mount.Name, "path": rel, "content": content})
 		return nil
 	}))
 	mux.HandleFunc("PUT /v1/assistant/vault/file", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
 		var req struct {
+			Vault   string `json:"vault"`
 			Path    string `json:"path"`
 			Content string `json:"content"`
 		}
 		if err := readJSONBody(r, &req); err != nil {
 			return err
 		}
-		v, err := fleet.Assistant.Vault()
+		v, mount, err := fleet.Assistant.ResolveVault(req.Vault)
 		if err != nil {
 			return err
+		}
+		if mount.ReadOnly {
+			return &core.FleetError{Msg: fmt.Sprintf("vault %q is read-only", mount.Name), Status: http.StatusForbidden}
 		}
 		norm, err := v.WriteFile(req.Path, req.Content)
 		if err != nil {
 			return err
 		}
 		v.MaybeGitCommit(fleet.Assistant.Config().GitAutoCommit, "ui: update "+norm)
-		writeJSON(w, http.StatusOK, map[string]string{"path": norm, "status": "saved"})
+		writeJSON(w, http.StatusOK, map[string]string{"vault": mount.Name, "path": norm, "status": "saved"})
 		return nil
 	}))
 	mux.HandleFunc("GET /v1/assistant/vault/search", route(true, func(w http.ResponseWriter, r *http.Request, _ *registry.Device) error {
-		v, err := fleet.Assistant.Vault()
-		if err != nil {
-			return err
-		}
-		hits, err := v.Search(r.URL.Query().Get("q"), queryInt(r, "limit"))
+		hits, err := fleet.Assistant.SearchVaults(r.URL.Query().Get("vault"), r.URL.Query().Get("q"), queryInt(r, "limit"))
 		if err != nil {
 			return err
 		}

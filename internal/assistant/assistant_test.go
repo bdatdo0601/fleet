@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -576,5 +577,172 @@ func TestOPMetadataRedactionAndPromptAwareness(t *testing.T) {
 	rawPrompt, _ := json.Marshal(msgs[0])
 	if !strings.Contains(string(rawPrompt), "FleetAgent") || !strings.Contains(string(rawPrompt), "onepassword_list_items") {
 		t.Fatalf("expected 1Password Agent Vault section in system prompt, got %s", rawPrompt)
+	}
+}
+
+func TestMultiVaultToolsPolicyAndDoctor(t *testing.T) {
+	tmp := t.TempDir()
+	agentDir := filepath.Join(tmp, "agent-vault")
+	personalDir := filepath.Join(tmp, "personal-vault")
+	roDir := filepath.Join(tmp, "ref-vault")
+
+	if err := os.MkdirAll(filepath.Join(personalDir, "Notes"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(personalDir, "Notes", "Idea.md"), []byte("# Espresso\nDial in grinder\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(roDir, "Handbook"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(roDir, "Handbook", "Policy.md"), []byte("# Espresso Policy\nClean portafilter\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	eng, err := Open(filepath.Join(tmp, "assistant.db"), filepath.Join(tmp, "assistant.json"), agentDir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = eng.Close() }()
+
+	for _, bad := range []string{"agent", "all", "Bad Name!"} {
+		badCfg := DefaultConfig()
+		badCfg.ExtraVaults = []VaultMount{{Name: bad, Path: personalDir}}
+		if _, uErr := eng.UpdateConfig(badCfg, false); uErr == nil {
+			t.Fatalf("expected invalid vault name error for %q", bad)
+		}
+	}
+
+	cfg := DefaultConfig()
+	cfg.ExtraVaults = []VaultMount{
+		{Name: "personal", Path: personalDir, AutoWriteDirs: []string{"Inbox"}},
+		{Name: "ref", Path: roDir, ReadOnly: true},
+	}
+	view, err := eng.UpdateConfig(cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.ExtraVaults) != 2 {
+		t.Fatalf("expected 2 extra vaults in view, got %+v", view.ExtraVaults)
+	}
+
+	// Extra vaults must never be scaffolded with _agent or _skills.
+	for _, forbidden := range []string{"_agent", "_skills", "Daily"} {
+		if _, sErr := os.Stat(filepath.Join(personalDir, forbidden)); !os.IsNotExist(sErr) {
+			t.Fatalf("extra vault must not contain %s", forbidden)
+		}
+	}
+
+	// UpdateConfig with nil ExtraVaults must preserve existing mounts.
+	upd := DefaultConfig()
+	upd.Enabled = true
+	if _, err := eng.UpdateConfig(upd, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(eng.Config().ExtraVaults) != 2 {
+		t.Fatalf("expected omitted ExtraVaults preserved, got %+v", eng.Config().ExtraVaults)
+	}
+
+	// Cross-vault search and single-vault search tag hits by vault name.
+	allHits, err := eng.SearchVaults("all", "Espresso", 10)
+	if err != nil || len(allHits) != 2 {
+		t.Fatalf("expected 2 hits across extra vaults, got %+v (%v)", allHits, err)
+	}
+	personalHits, err := eng.SearchVaults("personal", "Espresso", 10)
+	if err != nil || len(personalHits) != 1 || personalHits[0].Vault != "personal" {
+		t.Fatalf("expected 1 personal hit, got %+v (%v)", personalHits, err)
+	}
+
+	tctx := &toolExecContext{ChannelID: "general", Source: "chat", Config: eng.Config()}
+
+	// vault_read from extra vault + traversal check.
+	readOut, err := eng.executeTool(t.Context(), ToolCall{
+		ID:       "r1",
+		Type:     "function",
+		Function: ToolCallFunction{Name: "vault_read", Arguments: `{"vault":"personal","path":"Notes/Idea.md"}`},
+	}, tctx)
+	if err != nil || !strings.Contains(readOut, "Dial in grinder") {
+		t.Fatalf("expected personal vault read, got %q (%v)", readOut, err)
+	}
+	if _, err := eng.executeTool(t.Context(), ToolCall{
+		ID:       "r2",
+		Type:     "function",
+		Function: ToolCallFunction{Name: "vault_read", Arguments: `{"vault":"personal","path":"../agent-vault/_agent/SOUL.md"}`},
+	}, tctx); err == nil {
+		t.Fatalf("expected traversal out of personal vault to fail")
+	}
+
+	// Read-only vault rejects writes.
+	_, roErr := eng.executeTool(t.Context(), ToolCall{
+		ID:       "w_ro",
+		Type:     "function",
+		Function: ToolCallFunction{Name: "vault_write", Arguments: `{"vault":"ref","path":"Handbook/New.md","content":"nope"}`},
+	}, tctx)
+	if roErr == nil {
+		t.Fatalf("expected read-only vault write error")
+	}
+
+	// Writable extra vault auto-writes inside Inbox/.
+	if _, err := eng.executeTool(t.Context(), ToolCall{
+		ID:       "w_inbox",
+		Type:     "function",
+		Function: ToolCallFunction{Name: "vault_write", Arguments: `{"vault":"personal","path":"Inbox/Capture.md","content":"hello"}`},
+	}, tctx); err != nil {
+		t.Fatalf("expected Inbox write in personal vault without approval, got %v", err)
+	}
+
+	// Write outside auto_write_dirs triggers HITL approval and resumes into personal vault.
+	protArgs := `{"vault":"personal","path":"Notes/Project.md","content":"# Project"}`
+	_, protErr := eng.executeTool(t.Context(), ToolCall{
+		ID:       "w_prot",
+		Type:     "function",
+		Function: ToolCallFunction{Name: "vault_write", Arguments: protArgs},
+	}, tctx)
+	aprErr, ok := errors.AsType[*approvalRequiredError](protErr)
+	if !ok || !strings.Contains(aprErr.Summary, "personal:Notes/Project.md") {
+		t.Fatalf("expected approvalRequiredError for personal:Notes/Project.md, got %v", protErr)
+	}
+	tctxApproved := &toolExecContext{ChannelID: "general", Source: "approval", Config: eng.Config(), BypassHITL: true}
+	if _, err := eng.executeTool(t.Context(), ToolCall{
+		ID:       "w_prot_ok",
+		Type:     "function",
+		Function: ToolCallFunction{Name: "vault_write", Arguments: aprErr.ArgsJSON},
+	}, tctxApproved); err != nil {
+		t.Fatalf("expected approved write to personal vault to succeed, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(personalDir, "Notes", "Project.md")); err != nil {
+		t.Fatalf("expected Notes/Project.md in personal vault: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(agentDir, "Notes", "Project.md")); !os.IsNotExist(err) {
+		t.Fatalf("write leaked into primary agent vault")
+	}
+
+	// System prompt announces mounted vaults and policies.
+	msgs := eng.buildPromptMessages(t.Context(), Channel{ID: "general"}, nil, DefaultAliases())
+	rawPrompt, _ := json.Marshal(msgs[0])
+	if !strings.Contains(string(rawPrompt), "Mounted Obsidian Vaults") || !strings.Contains(string(rawPrompt), "personal") {
+		t.Fatalf("expected Mounted Obsidian Vaults section in prompt, got %s", rawPrompt)
+	}
+
+	// Doctor checks primary + extra vaults and named sync status.
+	_ = os.MkdirAll(filepath.Join(agentDir, ".obsidian"), 0o755)
+	_ = os.MkdirAll(filepath.Join(personalDir, ".obsidian"), 0o755)
+	_ = os.MkdirAll(filepath.Join(roDir, ".obsidian"), 0o755)
+	eng.Probes = DoctorProbes{
+		FindOB: func() string { return "/opt/homebrew/bin/ob" },
+		OBRunningFor: func(name, _ string) bool {
+			return name == "" || name == "personal"
+		},
+	}
+	rep := eng.Doctor(t.Context())
+	byName := map[string]DoctorCheck{}
+	for _, c := range rep.Checks {
+		byName[c.Name] = c
+	}
+	if byName["vault:personal"].Status != "ok" || byName["obsidian_sync:personal"].Status != "ok" {
+		t.Fatalf("expected personal vault and sync ok, got %+v", byName)
+	}
+	if byName["vault:ref"].Status != "ok" || byName["obsidian_sync:ref"].Status != "warn" {
+		t.Fatalf("expected ref vault ok and sync warn, got %+v", byName)
 	}
 }

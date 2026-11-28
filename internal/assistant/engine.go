@@ -138,6 +138,88 @@ func (e *Engine) vault() (*Vault, error) {
 	return OpenVault(ResolveVaultRoot(cfg.VaultPath, e.vaultDir))
 }
 
+// ResolveVault opens either the primary "agent" vault (default) or a mounted extra vault without scaffolding it.
+func (e *Engine) ResolveVault(name string) (*Vault, VaultMount, error) {
+	cfg := e.Config()
+	target := strings.ToLower(strings.TrimSpace(name))
+	if target == "" || target == PrimaryVaultName {
+		v, err := e.vault()
+		if err != nil {
+			return nil, VaultMount{}, err
+		}
+		return v, VaultMount{
+			Name:          PrimaryVaultName,
+			Path:          v.Root,
+			AutoWriteDirs: append([]string(nil), cfg.AutoWriteDirs...),
+		}, nil
+	}
+	for _, m := range cfg.ExtraVaults {
+		if m.Name == target {
+			resolved := ResolveVaultRoot(m.Path, "")
+			v, err := OpenVaultNoScaffold(resolved)
+			if err != nil {
+				return nil, VaultMount{}, err
+			}
+			return v, VaultMount{
+				Name:          m.Name,
+				Path:          v.Root,
+				ReadOnly:      m.ReadOnly,
+				AutoWriteDirs: append([]string(nil), m.AutoWriteDirs...),
+			}, nil
+		}
+	}
+	return nil, VaultMount{}, newErr(fmt.Sprintf("unknown vault %q", name), http.StatusNotFound)
+}
+
+// SearchVaults searches Markdown notes across a specific vault or all mounted vaults ("all" or empty).
+func (e *Engine) SearchVaults(vaultName, query string, limit int) ([]VaultSearchHit, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 20
+	}
+	target := strings.ToLower(strings.TrimSpace(vaultName))
+	if target != "" && target != "all" {
+		v, mount, err := e.ResolveVault(target)
+		if err != nil {
+			return nil, err
+		}
+		hits, err := v.Search(query, limit)
+		if err != nil {
+			return nil, err
+		}
+		for i := range hits {
+			hits[i].Vault = mount.Name
+		}
+		return hits, nil
+	}
+	var out []VaultSearchHit
+	if pv, err := e.vault(); err == nil {
+		if hits, sErr := pv.Search(query, limit); sErr == nil {
+			for i := range hits {
+				hits[i].Vault = PrimaryVaultName
+			}
+			out = append(out, hits...)
+		}
+	}
+	for _, m := range e.Config().ExtraVaults {
+		if len(out) >= limit {
+			break
+		}
+		v, err := OpenVaultNoScaffold(ResolveVaultRoot(m.Path, ""))
+		if err != nil {
+			continue
+		}
+		hits, sErr := v.Search(query, limit-len(out))
+		if sErr != nil {
+			continue
+		}
+		for i := range hits {
+			hits[i].Vault = m.Name
+		}
+		out = append(out, hits...)
+	}
+	return out, nil
+}
+
 // Config returns a copy of the current assistant Config.
 func (e *Engine) Config() Config {
 	e.cfgMu.RLock()
@@ -174,7 +256,13 @@ func (e *Engine) UpdateConfig(next Config, clearAPIKey bool) (ConfigView, error)
 	} else {
 		next.MCPServers = preserveMaskedMCPEnv(cur.MCPServers, next.MCPServers)
 	}
+	if next.ExtraVaults == nil {
+		next.ExtraVaults = append([]VaultMount(nil), cur.ExtraVaults...)
+	}
 	next = NormalizeConfig(next)
+	if err := validateExtraVaults(next.ExtraVaults); err != nil {
+		return ConfigView{}, err
+	}
 	vaultRoot := ResolveVaultRoot(next.VaultPath, e.vaultDir)
 	if _, err := OpenVault(vaultRoot); err != nil {
 		return ConfigView{}, err
@@ -599,6 +687,9 @@ func (e *Engine) buildPromptMessages(ctx context.Context, ch Channel, tail []Mes
 	if fleetCtx != "" {
 		sysStatic.WriteString("\n## Fleet Standing Memory\n" + fleetCtx + "\n")
 	}
+	if vaultsSection := e.buildVaultsPromptSection(); vaultsSection != "" {
+		sysStatic.WriteString(vaultsSection)
+	}
 	if opSection := e.buildOPPromptSection(ctx); opSection != "" {
 		sysStatic.WriteString(opSection)
 	}
@@ -633,6 +724,27 @@ func (e *Engine) buildPromptMessages(ctx context.Context, ch Channel, tail []Mes
 		out = append(out, ChatMessage{Role: m.Role, Content: txt})
 	}
 	return out
+}
+
+func (e *Engine) buildVaultsPromptSection() string {
+	cfg := e.Config()
+	var b strings.Builder
+	b.WriteString("\n## Mounted Obsidian Vaults\n")
+	fmt.Fprintf(&b, "- %s (primary): _agent/, _skills/, Observational Memory; auto-write: [%s]; approval required elsewhere\n", PrimaryVaultName, strings.Join(cfg.AutoWriteDirs, ", "))
+	for _, m := range cfg.ExtraVaults {
+		var policy string
+		switch {
+		case m.ReadOnly:
+			policy = "read-only"
+		case len(m.AutoWriteDirs) > 0:
+			policy = fmt.Sprintf("auto-write: [%s]; approval required elsewhere", strings.Join(m.AutoWriteDirs, ", "))
+		default:
+			policy = "read anywhere; all writes require human approval"
+		}
+		fmt.Fprintf(&b, "- %s (%s): %s\n", m.Name, m.Path, policy)
+	}
+	b.WriteString("Use `vault_search` (with optional `vault`: \"all\", \"agent\", or a mounted vault name) and pass optional `vault` to `vault_read`, `vault_write`, and `vault_append`.\n")
+	return b.String()
 }
 
 func (e *Engine) buildOPPromptSection(ctx context.Context) string {

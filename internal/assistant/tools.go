@@ -111,17 +111,21 @@ func (e *Engine) buildToolSpecs(ctx context.Context) []ToolSpec {
 		makeToolSpec("skill_write", "Create or update a SKILL.md playbook (direct user chat only).", schemaObj(map[string]any{
 			"name": strProp("Skill slug (lowercase alphanumeric, - or _)"), "content": strProp("Full SKILL.md markdown including YAML frontmatter"),
 		}, "name", "content")),
-		makeToolSpec("vault_search", "Search Markdown notes across the Obsidian vault.", schemaObj(map[string]any{
+		makeToolSpec("vault_search", "Search Markdown notes across the primary agent vault and any mounted Obsidian vaults.", schemaObj(map[string]any{
 			"query": strProp("Search query terms"), "limit": intProp("Max results"),
+			"vault": strProp("Optional vault name (\"all\" searches agent + mounted vaults, or specify \"agent\" / mounted vault name)"),
 		}, "query")),
 		makeToolSpec("vault_read", "Read one Markdown file from the Obsidian vault.", schemaObj(map[string]any{
-			"path": strProp("Relative path inside vault"),
+			"path":  strProp("Relative path inside vault"),
+			"vault": strProp("Optional vault name (default \"agent\")"),
 		}, "path")),
 		makeToolSpec("vault_append", "Append text to a Markdown file in the vault (requires approval outside auto-write folders).", schemaObj(map[string]any{
 			"path": strProp("Relative path inside vault"), "content": strProp("Markdown text to append"),
+			"vault": strProp("Optional vault name (default \"agent\")"),
 		}, "path", "content")),
 		makeToolSpec("vault_write", "Write a Markdown file in the vault (requires approval outside auto-write folders).", schemaObj(map[string]any{
 			"path": strProp("Relative path inside vault"), "content": strProp("Full Markdown content"),
+			"vault": strProp("Optional vault name (default \"agent\")"),
 		}, "path", "content")),
 		makeToolSpec("timer_schedule", "Create a one-shot or recurring timer wakeup for the assistant.", schemaObj(map[string]any{
 			"name": strProp("Short timer name"), "channel_id": strProp("Target channel (default briefing)"),
@@ -289,18 +293,26 @@ func (e *Engine) dispatchFleetTool(ctx context.Context, name string, args map[st
 }
 
 func (e *Engine) dispatchVaultTool(name string, args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {
-	v, err := e.vault()
-	if err != nil {
-		return nil, err
-	}
 	switch name {
 	case "skill_list":
+		v, err := e.vault()
+		if err != nil {
+			return nil, err
+		}
 		return v.ListSkills()
 	case "skill_read":
+		v, err := e.vault()
+		if err != nil {
+			return nil, err
+		}
 		return v.GetSkill(strArg(args, "name"))
 	case "skill_write":
 		if tctx.Source != "chat" && tctx.Source != "approval" && !tctx.BypassHITL {
 			return nil, newErr("skill_write is only allowed during direct user chat", http.StatusForbidden)
+		}
+		v, err := e.vault()
+		if err != nil {
+			return nil, err
 		}
 		sk, err := v.SaveSkill(strArg(args, "name"), strArg(args, "content"))
 		if err != nil {
@@ -309,38 +321,54 @@ func (e *Engine) dispatchVaultTool(name string, args map[string]any, rawArgs str
 		v.MaybeGitCommit(tctx.Config.GitAutoCommit, "assistant: update skill "+sk.Name)
 		return sk, nil
 	case "vault_search":
-		return v.Search(strArg(args, "query"), intArg(args, "limit", 15))
+		return e.SearchVaults(strArg(args, "vault"), strArg(args, "query"), intArg(args, "limit", 15))
 	case "vault_read":
-		content, err := v.ReadFile(strArg(args, "path"))
+		v, mount, err := e.ResolveVault(strArg(args, "vault"))
 		if err != nil {
 			return nil, err
 		}
-		return map[string]string{"path": strArg(args, "path"), "content": content}, nil
-	case "vault_append", "vault_write":
 		rel := strArg(args, "path")
-		if !tctx.BypassHITL && !IsAutoWritable(rel, tctx.Config.AutoWriteDirs) {
-			return nil, &approvalRequiredError{
-				ToolName:  name,
-				Summary:   fmt.Sprintf("Modify protected vault note %s", rel),
-				RiskLevel: "vault_write",
-				ArgsJSON:  cmp.Or(rawArgs, "{}"),
-			}
+		content, err := v.ReadFile(rel)
+		if err != nil {
+			return nil, err
 		}
-		var norm string
-		var wErr error
-		if name == "vault_append" {
-			norm, wErr = v.AppendFile(rel, strArg(args, "content"))
-		} else {
-			norm, wErr = v.WriteFile(rel, strArg(args, "content"))
-		}
-		if wErr != nil {
-			return nil, wErr
-		}
-		v.MaybeGitCommit(tctx.Config.GitAutoCommit, "assistant: update "+norm)
-		return map[string]string{"path": norm, "status": "saved"}, nil
+		return map[string]string{"vault": mount.Name, "path": rel, "content": content}, nil
+	case "vault_append", "vault_write":
+		return e.execVaultWriteTool(name, args, rawArgs, tctx)
 	default:
 		return nil, newErr("unknown vault tool "+name, http.StatusBadRequest)
 	}
+}
+
+func (e *Engine) execVaultWriteTool(name string, args map[string]any, rawArgs string, tctx *toolExecContext) (any, error) {
+	v, mount, err := e.ResolveVault(strArg(args, "vault"))
+	if err != nil {
+		return nil, err
+	}
+	if mount.ReadOnly {
+		return nil, newErr(fmt.Sprintf("vault %q is read-only", mount.Name), http.StatusForbidden)
+	}
+	rel := strArg(args, "path")
+	if !tctx.BypassHITL && !IsAutoWritable(rel, mount.AutoWriteDirs) {
+		return nil, &approvalRequiredError{
+			ToolName:  name,
+			Summary:   fmt.Sprintf("Modify protected note %s:%s", mount.Name, rel),
+			RiskLevel: "vault_write",
+			ArgsJSON:  cmp.Or(rawArgs, "{}"),
+		}
+	}
+	var norm string
+	var wErr error
+	if name == "vault_append" {
+		norm, wErr = v.AppendFile(rel, strArg(args, "content"))
+	} else {
+		norm, wErr = v.WriteFile(rel, strArg(args, "content"))
+	}
+	if wErr != nil {
+		return nil, wErr
+	}
+	v.MaybeGitCommit(tctx.Config.GitAutoCommit, "assistant: update "+norm)
+	return map[string]string{"vault": mount.Name, "path": norm, "status": "saved"}, nil
 }
 
 func (e *Engine) dispatchAutomationTool(name string, args map[string]any, tctx *toolExecContext) (any, error) {

@@ -258,6 +258,12 @@ async function openAssistantSettingsModal(onSaved) {
   const decisionIn = el("input", { type: "text", value: models.decision || "" });
   const observerIn = el("input", { type: "text", value: models.observer || "" });
   const hbIn = el("input", { type: "number", value: String(cfg.heartbeat_interval_minutes ?? 30), min: "0" });
+  const extraVaultsIn = el("textarea", {
+    rows: "4",
+    className: "mono",
+    value: JSON.stringify(cfg.extra_vaults || [], null, 2),
+    placeholder: `[{"name":"personal","path":"~/personal-vault","read_only":false,"auto_write_dirs":["Inbox"]}]`,
+  });
   const mcpIn = el("textarea", { rows: "5", className: "mono", value: JSON.stringify(cfg.mcp_servers || [], null, 2) });
   const credsIn = el("textarea", {
     rows: "4",
@@ -289,6 +295,11 @@ async function openAssistantSettingsModal(onSaved) {
     el("label", { className: "check-row" }, zdrChk, el("span", { text: "Enforce OpenRouter Zero Data Retention (ZDR)" })),
     field("OpenRouter API Key (leave blank to keep current)", apiKeyIn),
     field("Obsidian Vault Path on Lighthouse", vaultIn, el("div", { className: "small muted", text: `Active: ${cfg.effective_vault_path || ""}` })),
+    field(
+      "Mounted Extra Vaults (JSON)",
+      extraVaultsIn,
+      el("div", { className: "small muted", text: "Extra vaults are never scaffolded; writes outside auto_write_dirs require approval." }),
+    ),
     el(
       "div",
       { className: "grid-2" },
@@ -316,6 +327,16 @@ async function openAssistantSettingsModal(onSaved) {
             toast("Invalid MCP servers JSON", "error");
             return;
           }
+          let extraVaults = cfg.extra_vaults || [];
+          try {
+            extraVaults = JSON.parse(extraVaultsIn.value || "[]");
+            if (!Array.isArray(extraVaults)) {
+              throw new Error("extra_vaults must be a JSON array");
+            }
+          } catch {
+            toast("Invalid extra vaults JSON", "error");
+            return;
+          }
           const payload = {
             enabled: enabledChk.checked,
             zdr: zdrChk.checked,
@@ -323,6 +344,7 @@ async function openAssistantSettingsModal(onSaved) {
             data_collection: cfg.data_collection,
             vault_path: vaultIn.value.trim(),
             auto_write_dirs: cfg.auto_write_dirs,
+            extra_vaults: extraVaults,
             git_auto_commit: cfg.git_auto_commit !== false,
             heartbeat_interval_minutes: Number.parseInt(hbIn.value || "0", 10) || 0,
             models: {

@@ -25,8 +25,8 @@ Subcommands:
   setup           configure OpenRouter, vault path, and models (--check runs doctor)
   doctor          verify OpenRouter, Decisions, Vault, obsidian-headless, 1Password, and MCP on lighthouse
   op-setup        send a 1Password Service Account token to the lighthouse (~/.fleet/op-service-account.token)
-  sync-install    (lighthouse) install & start obsidian-headless continuous LaunchAgent
-  sync-uninstall  (lighthouse) stop & remove obsidian-headless LaunchAgent
+  sync-install    (lighthouse) install & start obsidian-headless LaunchAgent (--name for extra vaults)
+  sync-uninstall  (lighthouse) stop & remove obsidian-headless LaunchAgent (--name for extra vaults)
   status          show assistant status, models, and pending counts
   ask             send a prompt to an assistant channel
   approvals       list pending or recent tool approvals
@@ -258,10 +258,15 @@ func resolveOBBinary(explicit string) (string, error) {
 
 func cmdAssistantSyncInstall(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("assistant sync-install", flag.ContinueOnError)
-	vaultPath := fs.String("vault", "", "local vault directory (defaults to assistant effective_vault_path)")
+	mountName := fs.String("name", "", "mounted vault name (omit for primary agent vault; e.g. personal)")
+	vaultPath := fs.String("vault", "", "local vault directory (defaults to configured vault path)")
 	obBinFlag := fs.String("ob-bin", "", "path to `ob` binary")
 	if _, err := parseFlagsInterspersed(fs, args); err != nil {
 		return err
+	}
+	cleanName := strings.ToLower(strings.TrimSpace(*mountName))
+	if cleanName != "" && cleanName != assistant.PrimaryVaultName && !assistant.IsValidVaultName(cleanName) {
+		return fmt.Errorf("invalid vault name %q (must match [a-z0-9][a-z0-9_-]*)", *mountName)
 	}
 	obBin, err := resolveOBBinary(*obBinFlag)
 	if err != nil {
@@ -279,15 +284,32 @@ func cmdAssistantSyncInstall(args []string, cio *IO) error {
 		if err := client.Call(api, http.MethodGet, "/v1/assistant/config", nil, 15*time.Second, nil, &cfgRes); err != nil {
 			return err
 		}
-		vaultDir = cfgRes.Config.EffectiveVaultPath
+		if cleanName == "" || cleanName == assistant.PrimaryVaultName {
+			vaultDir = cfgRes.Config.EffectiveVaultPath
+		} else {
+			for _, m := range cfgRes.Config.ExtraVaults {
+				if m.Name == cleanName {
+					vaultDir = m.Path
+					break
+				}
+			}
+			if vaultDir == "" {
+				return fmt.Errorf("extra vault %q is not configured yet (pass --vault or add it in extra_vaults)", cleanName)
+			}
+		}
 	}
 	vaultDir = assistant.ResolveVaultRoot(vaultDir, filepath.Join(paths.StateDir(), "assistant-vault"))
 	if _, err := os.Stat(filepath.Join(vaultDir, ".obsidian")); err != nil {
 		return fmt.Errorf("vault %s is not linked to Obsidian Sync yet (missing .obsidian; run `cd %s && ob login && ob sync-setup --vault \"<Name>\"`)", vaultDir, vaultDir)
 	}
-	logPath := filepath.Join(paths.StateDir(), "obsidian-sync.log")
+	label := paths.ObsidianSyncLabelFor(cleanName)
+	logName := "obsidian-sync.log"
+	if cleanName != "" && cleanName != assistant.PrimaryVaultName {
+		logName = fmt.Sprintf("obsidian-sync-%s.log", cleanName)
+	}
+	logPath := filepath.Join(paths.StateDir(), logName)
 	if err := system.InstallUserAgent(system.AgentOpts{
-		Label:     paths.ObsidianSyncLabel,
+		Label:     label,
 		Args:      []string{obBin, "sync", "--continuous"},
 		KeepAlive: true,
 		LogPath:   logPath,
@@ -295,19 +317,25 @@ func cmdAssistantSyncInstall(args []string, cio *IO) error {
 	}); err != nil {
 		return err
 	}
-	cio.info(fmt.Sprintf("installed & started %s (%s sync --continuous in %s)", paths.ObsidianSyncLabel, obBin, vaultDir))
+	cio.info(fmt.Sprintf("installed & started %s (%s sync --continuous in %s)", label, obBin, vaultDir))
 	return nil
 }
 
 func cmdAssistantSyncUninstall(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("assistant sync-uninstall", flag.ContinueOnError)
+	mountName := fs.String("name", "", "mounted vault name (omit for primary agent vault)")
 	if _, err := parseFlagsInterspersed(fs, args); err != nil {
 		return err
 	}
-	if err := system.UninstallUserAgent(paths.ObsidianSyncLabel); err != nil {
+	cleanName := strings.ToLower(strings.TrimSpace(*mountName))
+	if cleanName != "" && cleanName != assistant.PrimaryVaultName && !assistant.IsValidVaultName(cleanName) {
+		return fmt.Errorf("invalid vault name %q (must match [a-z0-9][a-z0-9_-]*)", *mountName)
+	}
+	label := paths.ObsidianSyncLabelFor(cleanName)
+	if err := system.UninstallUserAgent(label); err != nil {
 		return err
 	}
-	cio.info("uninstalled " + paths.ObsidianSyncLabel)
+	cio.info("uninstalled " + label)
 	return nil
 }
 
@@ -333,6 +361,15 @@ func cmdAssistantStatus(args []string, cio *IO) error {
 	}
 	cio.printf("enabled:           %v (configured=%v, zdr=%v)\n", res.Config.Enabled, res.Config.Configured, res.Config.ZDR)
 	cio.printf("vault:             %s\n", res.Config.EffectiveVaultPath)
+	for _, m := range res.Config.ExtraVaults {
+		mode := "approval-writes"
+		if m.ReadOnly {
+			mode = "read-only"
+		} else if len(m.AutoWriteDirs) > 0 {
+			mode = "auto-write:" + strings.Join(m.AutoWriteDirs, ",")
+		}
+		cio.printf("extra vault %-5s  %s (%s)\n", m.Name+":", m.Path, mode)
+	}
 	cio.printf("default model:     %s (decision=%s, observer=%s)\n", res.Config.Models.DefaultChat, res.Config.Models.Decision, res.Config.Models.Observer)
 	cio.printf("channels/timers:   %d channels, %d timers, %d pending approvals\n", res.Summary.Channels, res.Summary.EnabledTimers, res.Summary.PendingApprovals)
 	return nil

@@ -75,9 +75,10 @@ Managed in `internal/assistant/store.go`:
 - **File layout (`internal/assistant/vault.go`):** Strict path jailing rejects `..`, absolute paths, NUL bytes, and symlink escapes.
 - **Two-tier cross-device memory split:**
   - **Fleet shared memory (`~/.fleet/memory.db`):** Standing `global/always` rules and repo/device notes shared with Claude Code, Codex, and Antigravity via `fleet_memory_*`.
-  - **Obsidian Vault (`~/vault`):** Personal assistant directives, skills (`_skills/*/SKILL.md`), daily notes (`Daily/`), captures (`Inbox/`), and Observational Memory (`_agent/memory/OBSERVATIONS.md` + `REFLECTIONS.md`).
+  - **Primary Agent Vault (`~/agent-ob-vault`):** Assistant directives (`_agent/SOUL.md`, `HEARTBEAT.md`), skills (`_skills/*/SKILL.md`), daily notes (`Daily/`), captures (`Inbox/`), and Observational Memory (`_agent/memory/OBSERVATIONS.md` + `REFLECTIONS.md`).
+  - **Mounted Extra Vaults (`extra_vaults`):** Optional named vaults (e.g. `personal` at `~/personal-vault`) opened without scaffolding (`_agent/` and `_skills/` are never created inside them). `vault_search` spans `"all"` or a specific vault, `vault_read` reads any mounted vault, and `vault_write`/`vault_append` enforce per-vault `read_only` and `auto_write_dirs` policies (pausing protected writes behind `#chat` Approve/Deny cards).
 - **Observer & Reflector (`RunObserver` / `RunReflector`):** Automatically triggers when unobserved messages exceed `observer_threshold_tokens` (default `12000`), distilling dated `🔴`/`🟡`/`🟢` bullets into `OBSERVATIONS.md` and marking messages `observed=1`. When `OBSERVATIONS.md` exceeds `reflector_threshold_bytes` (default `24000`), `RunReflector` condenses `REFLECTIONS.md` and archives the raw block to `_agent/memory/archive/YYYY-MM.md`, auto-committing to local `.git` if present.
-- **Headless Obsidian Sync:** Managed on the lighthouse via `fleet assistant sync-install`, which installs the per-user LaunchAgent `io.github.bdatdo0601.fleet.obsidian-sync` running `ob sync --continuous`.
+- **Headless Obsidian Sync:** Managed on the lighthouse via `fleet assistant sync-install`, which installs the per-user LaunchAgent `io.github.bdatdo0601.fleet.obsidian-sync` (or `io.github.bdatdo0601.fleet.obsidian-sync.<name>` for extra vaults) running `ob sync --continuous`.
 
 ### D. Zero-Exposure 1Password Credentials & External MCPs
 - **Lighthouse Service Account:** `fleet assistant op-setup` delivers a scoped `OP_SERVICE_ACCOUNT_TOKEN` (limited to your `Fleet-Agent` vault) over Nebula into `~/.fleet/op-service-account.token` (`0600`).
@@ -103,10 +104,16 @@ Managed in `internal/assistant/store.go`:
    ```bash
    npm install -g obsidian-headless
    ob login
-   mkdir -p ~/vault && cd ~/vault
-   ob sync-setup --vault "Your Vault Name"
-   fleet assistant sync-install --vault ~/vault
+   mkdir -p ~/agent-ob-vault && cd ~/agent-ob-vault
+   ob sync-setup --vault "Agent Vault"
+   fleet assistant sync-install --vault ~/agent-ob-vault
+
+   # Optional: mount and sync an existing personal Obsidian vault without scaffolding:
+   mkdir -p ~/personal-vault && cd ~/personal-vault
+   ob sync-setup --vault "Personal"
+   fleet assistant sync-install --name personal --vault ~/personal-vault
    ```
+   Then add `extra_vaults` (e.g. `[{"name":"personal","path":"~/personal-vault","read_only":false,"auto_write_dirs":["Inbox"]}]`) in `#chat` → **Settings**.
 4. **Configure the assistant & verify all subsystems:**
    ```bash
    fleet assistant setup \

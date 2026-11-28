@@ -31,10 +31,11 @@ type DoctorReport struct {
 
 // DoctorProbes allows tests to override local OS/binary checks.
 type DoctorProbes struct {
-	FindOB     func() string
-	OBRunning  func() bool
-	CheckOP    func(context.Context, string) (string, bool, string, error)
-	ListVaults func(context.Context, string) ([]OPVaultMeta, error)
+	FindOB       func() string
+	OBRunning    func() bool
+	OBRunningFor func(name, vaultPath string) bool
+	CheckOP      func(context.Context, string) (string, bool, string, error)
+	ListVaults   func(context.Context, string) ([]OPVaultMeta, error)
 }
 
 // FindOBBinary locates `ob` (obsidian-headless) across PATH, Homebrew, npm/nvm/fnm/volta/mise/pnpm, and login shell PATH.
@@ -77,14 +78,18 @@ func FindOBBinary() string {
 	return ""
 }
 
-func defaultOBRunning() bool {
-	if exec.Command("launchctl", "print", fmt.Sprintf("gui/%d/%s", os.Getuid(), paths.ObsidianSyncLabel)).Run() == nil {
+func defaultOBRunningFor(name, vaultPath string) bool {
+	label := paths.ObsidianSyncLabelFor(name)
+	if exec.Command("launchctl", "print", fmt.Sprintf("gui/%d/%s", os.Getuid(), label)).Run() == nil {
 		return true
 	}
-	if exec.Command("pgrep", "-f", "ob sync").Run() == nil {
-		return true
+	if name == "" || name == PrimaryVaultName {
+		if exec.Command("pgrep", "-f", "ob sync").Run() == nil {
+			return true
+		}
+		return exec.Command("pgrep", "-f", "obsidian-headless").Run() == nil
 	}
-	return exec.Command("pgrep", "-f", "obsidian-headless").Run() == nil
+	return vaultPath != "" && exec.Command("pgrep", "-f", vaultPath).Run() == nil
 }
 
 // Doctor verifies all assistant subsystems on the lighthouse and returns actionable hints.
@@ -100,7 +105,12 @@ func (e *Engine) Doctor(ctx context.Context) DoctorReport {
 	checks = append(checks, e.checkOpenRouterDoctor(ctx, cfg, rtCfg, rtErr))
 	checks = append(checks, e.checkDecisionsDoctor(ctx, rtCfg, rtErr))
 	checks = append(checks, e.checkVaultDoctor(view.EffectiveVaultPath))
-	checks = append(checks, e.checkObsidianSyncDoctor(view.EffectiveVaultPath))
+	checks = append(checks, e.checkObsidianSyncForDoctor("", view.EffectiveVaultPath))
+	for _, m := range cfg.ExtraVaults {
+		resolved := ResolveVaultRoot(m.Path, "")
+		checks = append(checks, checkExtraVaultDoctor(m, resolved))
+		checks = append(checks, e.checkObsidianSyncForDoctor(m.Name, resolved))
+	}
 	checks = append(checks, opCheck)
 	checks = append(checks, e.checkMCPDoctor(ctx, cfg))
 
@@ -213,43 +223,83 @@ func (e *Engine) checkVaultDoctor(vaultPath string) DoctorCheck {
 	}
 }
 
-func (e *Engine) checkObsidianSyncDoctor(vaultPath string) DoctorCheck {
+func checkExtraVaultDoctor(m VaultMount, resolved string) DoctorCheck {
+	name := "vault:" + m.Name
+	v, err := OpenVaultNoScaffold(resolved)
+	if err != nil {
+		return DoctorCheck{
+			Name:   name,
+			Status: "fail",
+			Detail: err.Error(),
+			Hint:   fmt.Sprintf("Create/sync %s (e.g. `ob sync-setup` inside it) or update extra_vaults", resolved),
+		}
+	}
+	policy := "approval-gated writes"
+	if m.ReadOnly {
+		policy = "read-only"
+	} else if len(m.AutoWriteDirs) > 0 {
+		policy = "auto-write: " + strings.Join(m.AutoWriteDirs, ", ")
+	}
+	gitState := "no git"
+	if _, gitErr := os.Stat(filepath.Join(v.Root, ".git")); gitErr == nil {
+		gitState = "git-backed"
+	}
+	return DoctorCheck{
+		Name:   name,
+		Status: "ok",
+		Detail: fmt.Sprintf("%s (%s, %s)", v.Root, policy, gitState),
+	}
+}
+
+func (e *Engine) checkObsidianSyncForDoctor(name, vaultPath string) DoctorCheck {
+	cleanName := strings.ToLower(strings.TrimSpace(name))
+	checkName := "obsidian_sync"
+	installCmd := "fleet assistant sync-install"
+	if cleanName != "" && cleanName != PrimaryVaultName {
+		checkName = "obsidian_sync:" + cleanName
+		installCmd = fmt.Sprintf("fleet assistant sync-install --name %s --vault %s", cleanName, vaultPath)
+	}
 	findOB := e.Probes.FindOB
 	if findOB == nil {
 		findOB = FindOBBinary
 	}
-	obRunning := e.Probes.OBRunning
-	if obRunning == nil {
-		obRunning = defaultOBRunning
+	running := false
+	switch {
+	case e.Probes.OBRunningFor != nil:
+		running = e.Probes.OBRunningFor(cleanName, vaultPath)
+	case (cleanName == "" || cleanName == PrimaryVaultName) && e.Probes.OBRunning != nil:
+		running = e.Probes.OBRunning()
+	default:
+		running = defaultOBRunningFor(cleanName, vaultPath)
 	}
 	obBin := findOB()
 	if obBin == "" {
 		return DoctorCheck{
-			Name:   "obsidian_sync",
+			Name:   checkName,
 			Status: "warn",
 			Detail: "obsidian-headless (`ob`) CLI not found on lighthouse (local vault still works)",
-			Hint:   "To sync with Obsidian Sync: `npm install -g obsidian-headless && ob login && ob sync-setup --vault \"<Name>\" && fleet assistant sync-install`",
+			Hint:   "To sync with Obsidian Sync: `npm install -g obsidian-headless && ob login && ob sync-setup --vault \"<Name>\" && " + installCmd + "`",
 		}
 	}
 	_, obsErr := os.Stat(filepath.Join(vaultPath, ".obsidian"))
 	if obsErr != nil {
 		return DoctorCheck{
-			Name:   "obsidian_sync",
+			Name:   checkName,
 			Status: "warn",
 			Detail: fmt.Sprintf("ob installed (%s), but %s is not linked to an Obsidian vault yet", obBin, vaultPath),
-			Hint:   fmt.Sprintf("Run `cd %s && ob login && ob sync-setup --vault \"<Name>\" && fleet assistant sync-install`", vaultPath),
+			Hint:   fmt.Sprintf("Run `cd %s && ob login && ob sync-setup --vault \"<Name>\" && %s`", vaultPath, installCmd),
 		}
 	}
-	if !obRunning() {
+	if !running {
 		return DoctorCheck{
-			Name:   "obsidian_sync",
+			Name:   checkName,
 			Status: "warn",
 			Detail: fmt.Sprintf("vault linked at %s, but `ob sync --continuous` is not running", vaultPath),
-			Hint:   "Run `fleet assistant sync-install` on the lighthouse to run continuous Obsidian Sync",
+			Hint:   fmt.Sprintf("Run `%s` on the lighthouse to run continuous Obsidian Sync", installCmd),
 		}
 	}
 	return DoctorCheck{
-		Name:   "obsidian_sync",
+		Name:   checkName,
 		Status: "ok",
 		Detail: fmt.Sprintf("ob sync running (%s -> %s)", obBin, vaultPath),
 	}
