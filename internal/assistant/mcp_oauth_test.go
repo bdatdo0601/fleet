@@ -345,8 +345,18 @@ func TestMCPOAuthFullPKCEFlowRefreshPaginationAnd401Retry(t *testing.T) {
 	if !needLink || emb == nil || !strings.Contains(fmt.Sprint(emb["description"]), "fleet assistant mcp-auth gworkspace") {
 		t.Fatalf("unexpected Discord embed for mcp_oauth: %+v (needLink=%v)", emb, needLink)
 	}
-	if _, err := eng.executeTool(t.Context(), ToolCall{ID: "rc", Type: "function", Function: ToolCallFunction{Name: "render_card", Arguments: `{"kind":"mcp_oauth","data":{"server":"gworkspace"}}`}}, tctxConnect); err != nil {
+	if _, err := eng.executeTool(t.Context(), ToolCall{ID: "rc", Type: "function", Function: ToolCallFunction{Name: "render_card", Arguments: `{"kind":"mcp_oauth","data":{"name":"gworkspace"}}`}}, tctxConnect); err != nil {
 		t.Fatalf("render_card mcp_oauth failed: %v", err)
+	}
+	if len(connectWidgets) != 1 {
+		t.Fatalf("expected deduplicated mcp_oauth widget slice len 1, got %d (%+v)", len(connectWidgets), connectWidgets)
+	}
+	rcData, _ := connectWidgets[0].Data.(map[string]any)
+	if rcData["server"] != "gworkspace" || rcData["provider"] != "google" || rcData["url"] != mcpSrv.URL || rcData["cli_command"] != "fleet assistant mcp-auth gworkspace" {
+		t.Fatalf("expected render_card mcp_oauth enriched from config, got %+v", rcData)
+	}
+	if _, err := eng.executeTool(t.Context(), ToolCall{ID: "rc_bad", Type: "function", Function: ToolCallFunction{Name: "render_card", Arguments: `{"kind":"mcp_oauth","data":{"server":"nonexistent"}}`}}, tctxConnect); err == nil {
+		t.Fatalf("expected render_card mcp_oauth for nonexistent server to fail")
 	}
 
 	// mcp_remove cleans up stored OAuth tokens.

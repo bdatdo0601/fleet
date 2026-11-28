@@ -38,6 +38,12 @@ export function buildMCPOAuthRedirectURI(opts = {}) {
   const protocol = opts.protocol ?? loc.protocol ?? "";
   const hostname = opts.hostname ?? loc.hostname ?? "";
   const origin = opts.origin ?? loc.origin ?? "";
+  if (opts.mode === "loopback") {
+    return "http://127.0.0.1:8765/oauth2callback";
+  }
+  if (opts.mode === "web" && origin) {
+    return `${origin}/v1/assistant/mcp/oauth/callback`;
+  }
   const isHTTPS = protocol === "https:";
   const isLocal = hostname === "localhost" || hostname === "127.0.0.1";
   if (isHTTPS || isLocal || opts.preferOriginRedirect) {
@@ -47,24 +53,57 @@ export function buildMCPOAuthRedirectURI(opts = {}) {
 }
 
 /**
- * Initiate an MCP OAuth flow and open the authorize URL safely with noopener,noreferrer.
+ * Initiate an MCP OAuth flow and open the authorize URL safely without triggering popup blockers.
  */
 export async function startMCPOAuth(server, opts = {}) {
   const srvName = String(server || "").trim();
   if (!srvName) {
     throw new Error("MCP server name is missing");
   }
-  const isHTTPS = typeof window !== "undefined" && window.location.protocol === "https:";
-  const isLocal = typeof window !== "undefined" && (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
-  const redirectURI = buildMCPOAuthRedirectURI({ explicitRedirectURI: opts.explicitRedirectURI, preferOriginRedirect: opts.preferOriginRedirect });
-  if (opts.warnIfInsecure && !isHTTPS && !isLocal && !opts.explicitRedirectURI) {
+  const loc = typeof window !== "undefined" && window.location ? window.location : {};
+  const isHTTPS = loc.protocol === "https:";
+  const isLocal = loc.hostname === "localhost" || loc.hostname === "127.0.0.1";
+  const redirectURI = buildMCPOAuthRedirectURI({
+    explicitRedirectURI: opts.explicitRedirectURI,
+    preferOriginRedirect: opts.preferOriginRedirect,
+    mode: opts.mode,
+  });
+  if (opts.warnIfInsecure && !isHTTPS && !isLocal && !opts.explicitRedirectURI && opts.mode !== "loopback") {
     toast(`Google Web OAuth requires an HTTPS fleet tls domain, or run: fleet assistant mcp-auth ${srvName}`, "warn");
   }
-  const startRes = await api("POST", `/v1/assistant/mcp/${encodeURIComponent(srvName)}/oauth/start`, { redirect_uri: redirectURI });
-  if (typeof window !== "undefined" && typeof window.open === "function" && startRes.authorize_url) {
-    window.open(startRes.authorize_url, "_blank", "noopener,noreferrer");
+  const canOpen = typeof window !== "undefined" && typeof window.open === "function";
+  const popup = canOpen ? window.open("", "_blank") : null;
+  let startRes;
+  try {
+    startRes = await api("POST", `/v1/assistant/mcp/${encodeURIComponent(srvName)}/oauth/start`, { redirect_uri: redirectURI });
+  } catch (err) {
+    if (popup && !popup.closed) {
+      try {
+        popup.close();
+      } catch {
+        // ignore close failure
+      }
+    }
+    throw err;
   }
-  return { startRes, isHTTPS, isLocal, redirectURI };
+  let popupBlocked = canOpen && !popup;
+  if (startRes && startRes.authorize_url && popup && !popup.closed) {
+    try {
+      popup.opener = null;
+    } catch {
+      // ignore read-only opener
+    }
+    try {
+      if (popup.location && typeof popup.location.replace === "function") {
+        popup.location.replace(startRes.authorize_url);
+      } else {
+        popup.location.href = startRes.authorize_url;
+      }
+    } catch {
+      popupBlocked = true;
+    }
+  }
+  return { startRes, isHTTPS, isLocal, redirectURI, popupBlocked };
 }
 
 const oauthSubscribers = new Set();
@@ -145,12 +184,18 @@ export function subscribeMCPOAuthDone(fn) {
 }
 
 export function renderMCPOAuthCard(card, data, sendPromptFn) {
-  const server = String(data.server || "").trim();
-  const provider = String(data.provider || "").toLowerCase();
-  const scopes = Array.isArray(data.scopes) ? data.scopes : [];
+  const server = String(data.server || data.name || data.server_name || "").trim();
+  let provider = String(data.provider || "").toLowerCase();
+  let scopes = Array.isArray(data.scopes) ? data.scopes : [];
+  let explicitRedirectURI = String(data.redirect_uri || "").trim();
   const cliCmd = data.cli_command || (server ? `fleet assistant mcp-auth ${server}` : "");
   let authorized = Boolean(data.authorized);
   let activeState = "";
+  let redirectMode = "auto";
+  let oauthDisabledReason = "";
+
+  const loc = typeof window !== "undefined" && window.location ? window.location : {};
+  const isWebOrigin = loc.protocol === "https:" || loc.hostname === "localhost" || loc.hostname === "127.0.0.1";
 
   card.dataset.mcpOauthServer = server;
   const statusBadge = badge(authorized ? "Authorized" : "Not connected", authorized ? "ok" : "warn");
@@ -163,12 +208,32 @@ export function renderMCPOAuthCard(card, data, sendPromptFn) {
     statusBadge,
   );
   card.appendChild(header);
-  if (data.url) {
-    card.appendChild(el("div", { className: "small muted mono", text: data.url }));
-  }
-  if (scopes.length > 0) {
-    card.appendChild(el("div", { className: "small muted", text: `Scopes: ${scopes.join(", ")}` }));
-  }
+
+  const urlLine = el("div", { className: data.url ? "small muted mono" : "small muted mono hidden", text: data.url || "" });
+  const scopesLine = el("div", {
+    className: scopes.length > 0 ? "small muted" : "small muted hidden",
+    text: scopes.length > 0 ? `Scopes: ${scopes.join(", ")}` : "",
+  });
+  card.append(urlLine, scopesLine);
+
+  const redirectInfo = el("div", { className: "small muted mono" });
+  const modeSelect = isWebOrigin
+    ? el(
+        "select",
+        { "aria-label": "OAuth redirect mode" },
+        el("option", { value: "auto", text: "Web callback (auto)", selected: true }),
+        el("option", { value: "loopback", text: "Desktop loopback (paste URL)" }),
+      )
+    : null;
+  const syncRedirectInfo = () => {
+    const uri = buildMCPOAuthRedirectURI({ explicitRedirectURI, mode: redirectMode });
+    redirectInfo.textContent = `Redirect URI: ${uri}`;
+    if (modeSelect) {
+      modeSelect.classList.toggle("hidden", Boolean(explicitRedirectURI));
+    }
+  };
+  syncRedirectInfo();
+  card.appendChild(el("div", { className: "gen-mini-row" }, redirectInfo, modeSelect));
 
   const detailLine = el("div", { className: "small muted" });
   if (data.expires_at) {
@@ -184,6 +249,16 @@ export function renderMCPOAuthCard(card, data, sendPromptFn) {
   const pasteIn = el("input", { type: "text", placeholder: "Paste redirected URL (http://127.0.0.1:.../oauth2callback?code=...) or code" });
   const completeBtn = el("button", { type: "button", className: "btn btn-sm btn-primary", text: "Complete Sign-In" });
   manualBox.append(pasteIn, el("div", { className: "actions-row" }, completeBtn));
+
+  if (modeSelect) {
+    modeSelect.addEventListener("change", () => {
+      redirectMode = modeSelect.value || "auto";
+      syncRedirectInfo();
+      if (redirectMode === "loopback") {
+        manualBox.classList.remove("hidden");
+      }
+    });
+  }
 
   const connectBtn = el("button", { type: "button", className: "btn btn-sm btn-primary" });
   const pasteToggleBtn = el("button", {
@@ -207,11 +282,14 @@ export function renderMCPOAuthCard(card, data, sendPromptFn) {
   const disconnectBtn = el("button", { type: "button", className: "btn btn-sm", text: "Disconnect" });
 
   const syncButtons = () => {
+    providerBadge.textContent = provider === "google" ? "Google OAuth" : "OAuth 2.0";
     connectBtn.textContent = authorized ? "Reconnect" : provider === "google" ? "Connect with Google" : "Connect OAuth";
-    statusBadge.textContent = authorized ? "Authorized" : "Not connected";
-    statusBadge.className = `badge badge-${authorized ? "ok" : "warn"}`;
-    verifyBtn.classList.toggle("hidden", !authorized);
-    disconnectBtn.classList.toggle("hidden", !authorized);
+    connectBtn.disabled = Boolean(oauthDisabledReason);
+    pasteToggleBtn.disabled = Boolean(oauthDisabledReason);
+    statusBadge.textContent = oauthDisabledReason ? "HTTP OAuth off" : authorized ? "Authorized" : "Not connected";
+    statusBadge.className = `badge badge-${oauthDisabledReason ? "neutral" : authorized ? "ok" : "warn"}`;
+    verifyBtn.classList.toggle("hidden", !authorized || Boolean(oauthDisabledReason));
+    disconnectBtn.classList.toggle("hidden", !authorized || Boolean(oauthDisabledReason));
   };
   syncButtons();
 
@@ -222,20 +300,29 @@ export function renderMCPOAuthCard(card, data, sendPromptFn) {
     }
     connectBtn.disabled = true;
     try {
-      const { startRes, isHTTPS, isLocal } = await startMCPOAuth(server, { explicitRedirectURI: data.redirect_uri });
+      const { startRes, redirectURI, popupBlocked } = await startMCPOAuth(server, {
+        explicitRedirectURI,
+        mode: redirectMode,
+      });
       activeState = startRes.state || "";
-      openLink.href = startRes.authorize_url;
+      openLink.href = startRes.authorize_url || "#";
+      openLink.className = popupBlocked ? "btn btn-sm btn-primary" : "btn btn-sm";
       linkRow.classList.remove("hidden");
-      if (!isHTTPS && !isLocal && !data.redirect_uri) {
+      const isLoopback = redirectURI.startsWith("http://127.0.0.1");
+      if (isLoopback) {
         manualBox.classList.remove("hidden");
-        detailLine.textContent = `Opened sign-in with Desktop loopback redirect. After signing in, paste the redirected URL (or code) below — or run: ${cliCmd}`;
+        detailLine.textContent = popupBlocked
+          ? `Browser blocked the popup. Tap "Open Sign-In Tab ↗" below, complete sign-in, then paste the redirected URL (or code) — or run: ${cliCmd}`
+          : `Opened sign-in with Desktop loopback redirect. After signing in, paste the redirected URL (or code) below — or run: ${cliCmd}`;
+      } else if (popupBlocked) {
+        detailLine.textContent = 'Browser blocked the popup. Tap "Open Sign-In Tab ↗" below to authorize.';
       } else {
         detailLine.textContent = "Complete sign-in in the opened browser tab; status will update automatically.";
       }
     } catch (err) {
       toast(err.message, "error");
     } finally {
-      connectBtn.disabled = false;
+      connectBtn.disabled = Boolean(oauthDisabledReason);
     }
   };
 
@@ -306,6 +393,62 @@ export function renderMCPOAuthCard(card, data, sendPromptFn) {
       detailLine.textContent = `Authorization failed: ${payload.error}`;
     }
   };
+
+  const syncLiveStatus = async () => {
+    if (!server || typeof fetch !== "function") {
+      return;
+    }
+    try {
+      const res = await api("GET", "/v1/assistant/mcp");
+      if (card.isConnected === false) {
+        return;
+      }
+      const srv = (res.servers || []).find((s) => s.name === server);
+      const st = (res.statuses || []).find((s) => s.name === server);
+      if (!srv) {
+        return;
+      }
+      if (srv.url) {
+        urlLine.textContent = srv.url;
+        urlLine.classList.remove("hidden");
+      }
+      if (!srv.oauth || !srv.oauth.enabled) {
+        oauthDisabledReason = `${server} is configured as ${srv.transport || "stdio"} without Fleet HTTP OAuth.`;
+        detailLine.textContent = oauthDisabledReason;
+        syncButtons();
+        return;
+      }
+      oauthDisabledReason = "";
+      provider = String(srv.oauth.provider || provider).toLowerCase();
+      if (Array.isArray(srv.oauth.scopes)) {
+        scopes = srv.oauth.scopes;
+        scopesLine.textContent = scopes.length > 0 ? `Scopes: ${scopes.join(", ")}` : "";
+        scopesLine.classList.toggle("hidden", scopes.length === 0);
+      }
+      if (srv.oauth.redirect_uri) {
+        explicitRedirectURI = String(srv.oauth.redirect_uri).trim();
+        syncRedirectInfo();
+      }
+      if (st) {
+        authorized = Boolean(st.oauth_authorized);
+        if (st.oauth_authorized) {
+          if (st.error) {
+            detailLine.textContent = `Authorized, but handshake check failed: ${st.error}`;
+          } else if (st.tool_count > 0) {
+            detailLine.textContent = `Authorized · ${st.tool_count} tool(s) ready${st.oauth_expires_at ? ` · expires ${st.oauth_expires_at}` : ""}`;
+          } else if (st.oauth_expires_at) {
+            detailLine.textContent = `Authorized · expires ${st.oauth_expires_at}`;
+          }
+        } else if (st.error) {
+          detailLine.textContent = st.error;
+        }
+      }
+      syncButtons();
+    } catch {
+      // Keep card functional with embedded payload if status endpoint is unavailable.
+    }
+  };
+  void syncLiveStatus();
 
   card.append(
     el("div", { className: "actions-row mt-1" }, connectBtn, pasteToggleBtn, verifyBtn, disconnectBtn),

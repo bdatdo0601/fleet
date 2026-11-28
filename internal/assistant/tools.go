@@ -371,7 +371,7 @@ func (e *Engine) dispatchTool(ctx context.Context, name string, args map[string]
 		return e.dispatchAutomationTool(ctx, name, args, tctx)
 	}
 	if name == "render_card" || name == "render_widget" {
-		return dispatchUITool(name, args, tctx)
+		return e.dispatchUITool(name, args, tctx)
 	}
 	if name == "tool_output_read" {
 		return e.execToolOutputRead(tctx.ChannelID, args)
@@ -657,25 +657,79 @@ func validateWidgetHTML(html string) error {
 	return nil
 }
 
-func dispatchUITool(name string, args map[string]any, tctx *toolExecContext) (any, error) {
-	var wp WidgetPayload
-	if name == "render_card" {
-		kind := strings.ToLower(cmp.Or(strArg(args, "kind"), "markdown"))
-		switch kind {
-		case "agents", "agenda", "choices", "key_value", "markdown", "mcp_oauth":
-		default:
-			return nil, newErr(fmt.Sprintf("unsupported render_card kind %q", kind), http.StatusBadRequest)
-		}
-		data := args["data"]
-		if kind == "markdown" {
-			if s, ok := data.(string); ok {
-				data = map[string]any{"markdown": s}
+func mcpOAuthWidgetServerName(wp WidgetPayload) string {
+	if !strings.EqualFold(wp.Kind, "mcp_oauth") {
+		return ""
+	}
+	if m, ok := wp.Data.(map[string]any); ok {
+		return strings.ToLower(strings.TrimSpace(cmp.Or(strArg(m, "server"), strArg(m, "name"), strArg(m, "server_name"))))
+	}
+	return ""
+}
+
+func appendWidget(widgets *[]WidgetPayload, wp WidgetPayload) {
+	if widgets == nil {
+		return
+	}
+	if srvName := mcpOAuthWidgetServerName(wp); srvName != "" {
+		for i, existing := range *widgets {
+			if mcpOAuthWidgetServerName(existing) == srvName {
+				(*widgets)[i] = wp
+				return
 			}
 		}
-		wp = WidgetPayload{
-			Kind:  kind,
-			Title: strArg(args, "title"),
-			Data:  data,
+	}
+	*widgets = append(*widgets, wp)
+}
+
+func (e *Engine) buildRenderCardPayload(args map[string]any) (WidgetPayload, error) {
+	kind := strings.ToLower(cmp.Or(strArg(args, "kind"), "markdown"))
+	title := strArg(args, "title")
+	data := args["data"]
+	switch kind {
+	case "agents", "agenda", "choices", "key_value":
+		return WidgetPayload{Kind: kind, Title: title, Data: data}, nil
+	case "markdown":
+		if s, ok := data.(string); ok {
+			data = map[string]any{"markdown": s}
+		}
+		return WidgetPayload{Kind: kind, Title: title, Data: data}, nil
+	case "mcp_oauth":
+		srvName := ""
+		switch v := data.(type) {
+		case string:
+			srvName = strings.TrimSpace(v)
+		case map[string]any:
+			srvName = cmp.Or(strArg(v, "server"), strArg(v, "name"), strArg(v, "server_name"))
+		}
+		srv, err := e.findMCPServer(srvName)
+		if err != nil {
+			return WidgetPayload{}, err
+		}
+		if srv.OAuth == nil || !srv.OAuth.Enabled {
+			return WidgetPayload{}, newErr(fmt.Sprintf("MCP server %q is configured as %s without Fleet HTTP OAuth; reconfigure it with transport=\"http\" and oauth.enabled=true before attaching an mcp_oauth card", srv.Name, srv.Transport), http.StatusBadRequest)
+		}
+		var st MCPOAuthStatus
+		if e.mcp != nil && e.mcp.OAuth() != nil {
+			st = e.mcp.OAuth().TokenStatus(srv.Name)
+		}
+		wp := buildMCPOAuthWidget(srv, st)
+		if title != "" {
+			wp.Title = title
+		}
+		return wp, nil
+	default:
+		return WidgetPayload{}, newErr(fmt.Sprintf("unsupported render_card kind %q", kind), http.StatusBadRequest)
+	}
+}
+
+func (e *Engine) dispatchUITool(name string, args map[string]any, tctx *toolExecContext) (any, error) {
+	var wp WidgetPayload
+	if name == "render_card" {
+		var err error
+		wp, err = e.buildRenderCardPayload(args)
+		if err != nil {
+			return nil, err
 		}
 	} else {
 		html := stripHTMLCodeFence(strArg(args, "html"))
@@ -691,9 +745,7 @@ func dispatchUITool(name string, args map[string]any, tctx *toolExecContext) (an
 			HTML:  html,
 		}
 	}
-	if tctx.Widgets != nil {
-		*tctx.Widgets = append(*tctx.Widgets, wp)
-	}
+	appendWidget(tctx.Widgets, wp)
 	return map[string]any{"attached": true, "kind": wp.Kind, "title": wp.Title}, nil
 }
 
@@ -1024,8 +1076,8 @@ func (e *Engine) execMCPOAuthConnectTool(args map[string]any, tctx *toolExecCont
 	if e.mcp != nil && e.mcp.OAuth() != nil {
 		st = e.mcp.OAuth().TokenStatus(srv.Name)
 	}
-	if tctx != nil && tctx.Widgets != nil {
-		*tctx.Widgets = append(*tctx.Widgets, buildMCPOAuthWidget(srv, st))
+	if tctx != nil {
+		appendWidget(tctx.Widgets, buildMCPOAuthWidget(srv, st))
 	}
 	return map[string]any{
 		"attached":    true,
@@ -1099,8 +1151,8 @@ func (e *Engine) populateConfiguredMCPResult(ctx context.Context, srv MCPServerC
 	if srv.OAuth != nil && srv.OAuth.Enabled && e.mcp.OAuth() != nil && !e.mcp.OAuth().TokenStatus(srv.Name).Authorized && srv.OAuth.RefreshTokenOPRef == "" {
 		res["oauth_required"] = true
 		res["next_step"] = fmt.Sprintf("Use the in-chat Connect OAuth card, click Connect OAuth in Settings, or run 'fleet assistant mcp-auth %s' on your Mac.", srv.Name)
-		if tctx != nil && tctx.Widgets != nil {
-			*tctx.Widgets = append(*tctx.Widgets, buildMCPOAuthWidget(srv, MCPOAuthStatus{}))
+		if tctx != nil {
+			appendWidget(tctx.Widgets, buildMCPOAuthWidget(srv, MCPOAuthStatus{}))
 		}
 		return
 	}

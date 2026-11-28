@@ -84,7 +84,8 @@ function renderWidgetNode(w, sendPromptFn, onRetryFrontier, msgID) {
   if (!w) {
     return null;
   }
-  if (w.kind === "html") {
+  const kind = String(w.kind || "").toLowerCase();
+  if (kind === "html") {
     const frame = el("iframe", {
       className: "gen-widget-frame",
       sandbox: "allow-scripts",
@@ -140,14 +141,26 @@ function renderWidgetNode(w, sendPromptFn, onRetryFrontier, msgID) {
       frame,
     );
   }
-  const data = w.data || {};
+  let data = w.data || {};
+  if (typeof data === "string" && kind !== "markdown") {
+    try {
+      const parsed = JSON.parse(data);
+      if (parsed && typeof parsed === "object") {
+        data = parsed;
+      }
+    } catch {
+      if (kind === "mcp_oauth") {
+        data = { server: data };
+      }
+    }
+  }
   const card = el("div", { className: "gen-native-card" }, w.title ? el("div", { className: "gen-widget-title", text: w.title }) : null);
-  if (w.kind === "markdown") {
+  if (kind === "markdown") {
     const md = typeof data === "string" ? data : data.markdown || data.content || data.text || "";
     card.appendChild(renderMarkdownDOM(md));
     return card;
   }
-  if (w.kind === "choices" && Array.isArray(data.choices)) {
+  if (kind === "choices" && Array.isArray(data.choices)) {
     const row = el("div", { className: "actions-row" });
     for (const c of data.choices) {
       const label = typeof c === "string" ? c : c.label || c.value || "Option";
@@ -164,7 +177,7 @@ function renderWidgetNode(w, sendPromptFn, onRetryFrontier, msgID) {
     card.appendChild(row);
     return card;
   }
-  if (w.kind === "key_value" && data && typeof data === "object") {
+  if (kind === "key_value" && data && typeof data === "object") {
     const kv = el("div", { className: "kv-list" });
     for (const [k, v] of Object.entries(data)) {
       kv.appendChild(el("div", { className: "kv-label", text: k }));
@@ -173,7 +186,7 @@ function renderWidgetNode(w, sendPromptFn, onRetryFrontier, msgID) {
     card.appendChild(kv);
     return card;
   }
-  if (w.kind === "agents" && Array.isArray(data.agents)) {
+  if (kind === "agents" && Array.isArray(data.agents)) {
     for (const ag of data.agents) {
       card.appendChild(
         el(
@@ -186,7 +199,7 @@ function renderWidgetNode(w, sendPromptFn, onRetryFrontier, msgID) {
     }
     return card;
   }
-  if (w.kind === "agenda" && Array.isArray(data.items)) {
+  if (kind === "agenda" && Array.isArray(data.items)) {
     for (const it of data.items) {
       card.appendChild(
         el(
@@ -199,7 +212,7 @@ function renderWidgetNode(w, sendPromptFn, onRetryFrontier, msgID) {
     }
     return card;
   }
-  if (w.kind === "frontier_retry") {
+  if (kind === "frontier_retry") {
     const modelSlug = data.frontier_model || "frontier";
     const shortName = shortModelName(modelSlug);
     const pct = typeof data.probability === "number" ? `${Math.round(data.probability * 100)}%` : "";
@@ -234,7 +247,7 @@ function renderWidgetNode(w, sendPromptFn, onRetryFrontier, msgID) {
     bar.appendChild(row);
     return bar;
   }
-  if (w.kind === "files" && Array.isArray(data.files)) {
+  if (kind === "files" && Array.isArray(data.files)) {
     const list = el("div", { className: "file-card-list" });
     for (const f of data.files) {
       if (!f || !f.url) {
@@ -259,7 +272,7 @@ function renderWidgetNode(w, sendPromptFn, onRetryFrontier, msgID) {
     card.appendChild(list);
     return card;
   }
-  if (w.kind === "mcp_oauth" && data && typeof data === "object") {
+  if (kind === "mcp_oauth" && data && typeof data === "object") {
     return renderMCPOAuthCard(card, data, sendPromptFn);
   }
   card.appendChild(el("pre", { className: "code-block" }, el("code", { text: JSON.stringify(data, null, 2) })));

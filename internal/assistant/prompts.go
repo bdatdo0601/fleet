@@ -380,7 +380,7 @@ func (e *Engine) buildOPPromptSection(ctx context.Context) string {
 		b.WriteString("Accessible vaults: " + strings.Join(names, ", ") + "\n")
 	}
 	b.WriteString("Use `onepassword_list_items`, `onepassword_get_item_meta`, `http_request_with_credential`, and `onepassword_store_item` to inspect item metadata/op:// references and inject credentials at runtime without ever requesting or displaying plaintext secrets.\n")
-	b.WriteString("For external or internal MCP setup, use `mcp_list`, `mcp_configure` (approval-gated; pass secrets via `op://` in `env_refs`, `header_refs`, or `oauth.client_secret_op_ref`, never plaintext; for official Google Workspace MCPs set `oauth: {\"enabled\":true,\"provider\":\"google\",\"client_id\":\"...\",\"client_secret_op_ref\":\"op://...\",\"scopes\":[...]}`), `mcp_oauth_connect` (attaches an interactive sign-in card in `#chat` whenever OAuth sign-in or re-authorization is needed), and `mcp_test`.\n")
+	b.WriteString("For external or internal MCP setup, use `mcp_list`, `mcp_configure` (approval-gated; pass secrets via `op://` in `env_refs`, `header_refs`, or `oauth.client_secret_op_ref`, never plaintext; for official Google Workspace MCPs use `transport: \"http\"` with remote endpoints like `https://workspacemcp.googleapis.com/mcp/v1self`, `https://gmailmcp.googleapis.com/mcp/v1`, or `https://calendarmcp.googleapis.com/mcp/v1` and `oauth: {\"enabled\":true,\"provider\":\"google\",\"client_id\":\"...\",\"client_secret_op_ref\":\"op://...\",\"scopes\":[...]}`, NOT stdio wrappers like `uvx workspace-mcp`), `mcp_oauth_connect` (attaches an interactive sign-in card in `#chat` whenever OAuth sign-in or re-authorization is needed), and `mcp_test`.\n")
 	return b.String()
 }
 
@@ -415,6 +415,7 @@ func buildGenerativeUIPromptSection() string {
   - ~agenda~: ~{"items":[{"time":"09:00","title":"..."}]}~
   - ~markdown~: ~{"markdown":"..."}~
   - ~mcp_oauth~: ~{"server":"..."}~ (prefer calling ~mcp_oauth_connect~ so server metadata and scopes are populated automatically)
+- NEVER build OAuth sign-in buttons, login forms, or external links with ~render_widget~ (its sandboxed iframe blocks popups, external navigation, and ~fetch~); always call ~mcp_oauth_connect~ for MCP OAuth sign-in cards.
 - ~render_widget~ rules (sandboxed iframe, strict CSP ~default-src 'none'~):
   - Self-contained HTML with inline ~<style>~, ~<svg viewBox="...">~ or ~<canvas>~, and inline ~<script>~ only (never wrap ~html~ in markdown code fences); external URLs/CDNs/Chart.js/D3/Plotly/fonts are blocked and rejected (only ~data:~ images work).
   - Style with host CSS variables (~--text~, ~--muted~, ~--border~, ~--accent~, ~--surface~) so light and dark themes adapt cleanly.

@@ -493,7 +493,7 @@ func TestAssistantMCPOAuthRoutes(t *testing.T) {
 	}
 
 	cbURL := srv.URL + "/v1/assistant/mcp/oauth/callback?state=" + url.QueryEscape(startRes.State) + "&code=good-code"
-	if st, hdr, cbBody := doRawReq(t, cbURL, http.MethodGet, "", nil, ""); st != http.StatusOK || !strings.Contains(hdr.Get("Content-Type"), "text/html") || !strings.Contains(string(cbBody), "fleet-mcp-oauth-done") || !strings.Contains(string(cbBody), "Authorized gcal (1 tool(s) ready)") {
+	if st, hdr, cbBody := doRawReq(t, cbURL, http.MethodGet, "", nil, ""); st != http.StatusOK || !strings.Contains(hdr.Get("Content-Type"), "text/html") || !strings.Contains(string(cbBody), "fleet-mcp-oauth-done") || !strings.Contains(string(cbBody), `BroadcastChannel("fleet-mcp-oauth")`) || !strings.Contains(string(cbBody), "Authorized gcal (1 tool(s) ready)") {
 		t.Fatalf("GET /oauth/callback unexpected: %d %+v %s", st, hdr, string(cbBody))
 	}
 

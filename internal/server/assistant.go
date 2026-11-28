@@ -880,7 +880,7 @@ func writeMCPOAuthCallbackHTML(w http.ResponseWriter, status int, title, detail 
 <title>%s</title>
 <style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:520px;margin:48px auto;padding:0 16px;color:#0f172a;background:#f8fafc;}@media(prefers-color-scheme:dark){body{color:#f1f5f9;background:#0f172a;}.card{background:#1e293b;border-color:#334155;}}.card{background:#fff;border:1px solid #cbd5e1;border-radius:10px;padding:20px;}h2{margin-top:0;font-size:18px;}p{line-height:1.5;word-break:break-word;}</style>
 </head><body><div class="card"><h2>%s</h2><p>%s</p><p>You can close this window and return to Fleet Console.</p></div>
-<script>try{if(window.opener){window.opener.postMessage(%s,window.location.origin);}}catch(_){}</script>
+<script>(function(){var p=%s;try{if(typeof BroadcastChannel==="function"){var bc=new BroadcastChannel("fleet-mcp-oauth");bc.postMessage(p);bc.close();}}catch(_){}try{if(window.opener){window.opener.postMessage(p,window.location.origin);}}catch(_){}})();</script>
 </body></html>`,
 		html.EscapeString(title),
 		html.EscapeString(title),

@@ -60,6 +60,12 @@ export async function openAssistantSettingsModal(onSaved, onNavigate) {
         const oauthOn = Boolean(srv.oauth && srv.oauth.enabled);
         const actions = [];
         if (oauthOn) {
+          const openTabLink = el("a", {
+            className: "btn btn-sm btn-primary hidden",
+            target: "_blank",
+            rel: "noopener noreferrer",
+            text: "Open Sign-In Tab ↗",
+          });
           actions.push(
             el("button", {
               type: "button",
@@ -67,16 +73,22 @@ export async function openAssistantSettingsModal(onSaved, onNavigate) {
               text: st.oauth_authorized ? "Reconnect OAuth" : "Connect OAuth",
               onclick: async () => {
                 try {
-                  await startMCPOAuth(srv.name, {
+                  const { startRes, popupBlocked } = await startMCPOAuth(srv.name, {
                     explicitRedirectURI: srv.oauth && srv.oauth.redirect_uri,
                     preferOriginRedirect: true,
                     warnIfInsecure: true,
                   });
+                  if (popupBlocked && startRes && startRes.authorize_url) {
+                    openTabLink.href = startRes.authorize_url;
+                    openTabLink.classList.remove("hidden");
+                    toast("Popup blocked — tap Open Sign-In Tab to continue", "warn");
+                  }
                 } catch (err) {
                   toast(err.message, "error");
                 }
               },
             }),
+            openTabLink,
           );
           if (st.oauth_authorized) {
             actions.push(

@@ -17,7 +17,7 @@ import {
   sanitizeLinkHref,
   tokenizeInlineMarkdown,
 } from "./web/chat_markdown.js";
-import { buildMCPOAuthRedirectURI, parseMCPOAuthPaste } from "./web/chat_oauth.js";
+import { buildMCPOAuthRedirectURI, parseMCPOAuthPaste, renderMCPOAuthCard, startMCPOAuth } from "./web/chat_oauth.js";
 import { classifyWidgetAction } from "./web/chat.js";
 
 function createMockDOM() {
@@ -310,6 +310,120 @@ test("parseMCPOAuthPaste and buildMCPOAuthRedirectURI handle URLs, errors, and c
     buildMCPOAuthRedirectURI({ explicitRedirectURI: "https://custom.example/cb", protocol: "http:", hostname: "10.213.0.1" }),
     "https://custom.example/cb",
   );
+  assert.equal(
+    buildMCPOAuthRedirectURI({ mode: "loopback", protocol: "https:", hostname: "fleet.example.com", origin: "https://fleet.example.com" }),
+    "http://127.0.0.1:8765/oauth2callback",
+  );
+  assert.equal(
+    buildMCPOAuthRedirectURI({ mode: "web", protocol: "http:", hostname: "10.213.0.1", origin: "http://10.213.0.1:7443" }),
+    "http://10.213.0.1:7443/v1/assistant/mcp/oauth/callback",
+  );
+});
+
+test("startMCPOAuth opens popup synchronously, clears opener, and reports popupBlocked", async () => {
+  const prevWin = globalThis.window;
+  const prevFetch = globalThis.fetch;
+  try {
+    let openedPopup = null;
+    globalThis.window = {
+      location: { protocol: "https:", hostname: "fleet.example.com", origin: "https://fleet.example.com" },
+      open(url, target) {
+        assert.equal(url, "");
+        assert.equal(target, "_blank");
+        openedPopup = {
+          closed: false,
+          opener: globalThis.window,
+          location: {
+            href: "",
+            replace(next) {
+              this.href = next;
+            },
+          },
+          close() {
+            this.closed = true;
+          },
+        };
+        return openedPopup;
+      },
+    };
+    globalThis.fetch = async (path) => {
+      assert.equal(path, "/v1/assistant/mcp/gcal/oauth/start");
+      assert.ok(openedPopup, "popup should open synchronously before await fetch finishes");
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        text: async () => JSON.stringify({ authorize_url: "https://accounts.google.com/o/oauth2/v2/auth?state=st1", state: "st1" }),
+      };
+    };
+
+    const res = await startMCPOAuth("gcal");
+    assert.equal(res.popupBlocked, false);
+    assert.equal(res.redirectURI, "https://fleet.example.com/v1/assistant/mcp/oauth/callback");
+    assert.equal(openedPopup.opener, null);
+    assert.equal(openedPopup.location.href, "https://accounts.google.com/o/oauth2/v2/auth?state=st1");
+
+    // When popup is blocked (window.open returns null), startMCPOAuth sets popupBlocked: true.
+    globalThis.window.open = () => null;
+    const blockedRes = await startMCPOAuth("gcal", { mode: "loopback" });
+    assert.equal(blockedRes.popupBlocked, true);
+    assert.equal(blockedRes.redirectURI, "http://127.0.0.1:8765/oauth2callback");
+
+    // On API error, synchronously opened blank popup is closed.
+    let closedPopup = null;
+    globalThis.window.open = () => {
+      closedPopup = { closed: false, location: { href: "" }, close() { this.closed = true; } };
+      return closedPopup;
+    };
+    globalThis.fetch = async () => ({
+      ok: false,
+      status: 400,
+      statusText: "Bad Request",
+      text: async () => JSON.stringify({ error: "bad config" }),
+    });
+    await assert.rejects(() => startMCPOAuth("gcal"), /bad config/);
+    assert.equal(closedPopup.closed, true);
+  } finally {
+    globalThis.window = prevWin;
+    globalThis.fetch = prevFetch;
+  }
+});
+
+test("renderMCPOAuthCard accepts data.name alias and updates redirect URI on mode switch", async () => {
+  await withMockDOM(async () => {
+    const prevWin = globalThis.window;
+    const prevFetch = globalThis.fetch;
+    try {
+      globalThis.window = {
+        location: { protocol: "https:", hostname: "fleet.example.com", origin: "https://fleet.example.com" },
+      };
+      globalThis.fetch = undefined;
+
+      const card = el("div", { className: "gen-native-card" });
+      renderMCPOAuthCard(card, { name: "gworkspace", provider: "google", scopes: ["https://www.googleapis.com/auth/gmail.readonly"] });
+      assert.equal(card.dataset.mcpOauthServer, "gworkspace");
+      assert.ok(card.textContent.includes("Redirect URI: https://fleet.example.com/v1/assistant/mcp/oauth/callback"));
+
+      const findTag = (node, tag) => {
+        if (node.tagName === tag) return node;
+        for (const c of node.children || []) {
+          const hit = findTag(c, tag);
+          if (hit) return hit;
+        }
+        return null;
+      };
+      const sel = findTag(card, "SELECT");
+      assert.ok(sel, "expected redirect mode select on HTTPS origin");
+      sel.value = "loopback";
+      for (const fn of sel.listeners.get("change") || []) {
+        fn({ target: sel });
+      }
+      assert.ok(card.textContent.includes("Redirect URI: http://127.0.0.1:8765/oauth2callback"));
+    } finally {
+      globalThis.window = prevWin;
+      globalThis.fetch = prevFetch;
+    }
+  });
 });
 
 test("classifyWidgetAction blocks privileged directives and flags slash commands for confirmation", () => {
