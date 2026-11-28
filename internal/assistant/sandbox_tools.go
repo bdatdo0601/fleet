@@ -18,7 +18,7 @@ func buildSandboxPromptSection(cfg Config) string {
 	}
 	var b strings.Builder
 	b.WriteString("\n## Sandboxed Computer (/work)\n")
-	b.WriteString("- Use `sandbox_*` tools for reading, analyzing, converting, or generating files (PDF, DOCX, XLSX, PPTX, CSV, charts, OCR, archives). Do NOT use `fleet_spawn_agent` for document/file tasks.\n")
+	b.WriteString("- Use `sandbox_*` tools for reading, analyzing, converting, or generating files (PDF, DOCX, XLSX, PPTX, CSV, static chart image files, OCR, archives); use `render_widget` for inline interactive Generative UI charts in `#chat`. Do NOT use `fleet_spawn_agent` for document/file tasks.\n")
 	b.WriteString("- Uploaded chat attachments are staged in `/work/in/`. Write generated deliverables to `/work/out/` and call `sandbox_publish_file` so the user receives a downloadable card/preview in `#chat`.\n")
 	b.WriteString("- Pre-installed offline tools: Python 3 (`pypdf`, `pdfplumber`, `pymupdf`, `weasyprint`, `reportlab`, `python-docx`, `openpyxl`, `python-pptx`, `pandas`, `duckdb`, `matplotlib`, `pillow`, `tabulate`), `pandoc`, `poppler-utils` (`pdftotext`, `pdftoppm`), `tesseract`, `sqlite3`, `jq`, `ripgrep`, `uv`.\n")
 	if len(cfg.Sandbox.ExtraAptPackages) > 0 || len(cfg.Sandbox.ExtraPipPackages) > 0 {

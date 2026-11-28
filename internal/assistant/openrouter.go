@@ -171,7 +171,7 @@ func (c *openRouterClient) StreamChat(
 	if strings.TrimSpace(cfg.APIKey) == "" {
 		return ChatTurnResult{}, newErr("assistant API key is not configured", http.StatusBadRequest)
 	}
-	payload := buildChatRequestBody(cfg, model, msgs, tools, true, 4096)
+	payload := buildChatRequestBody(cfg, model, msgs, tools, true, 8192)
 	rawBody, err := json.Marshal(payload)
 	if err != nil {
 		return ChatTurnResult{}, err

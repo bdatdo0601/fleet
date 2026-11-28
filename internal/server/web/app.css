@@ -1714,6 +1714,10 @@ html.view-chat .main-content {
   background: var(--surface);
 }
 
+.chat-msg-has-widget {
+  width: min(760px, 92%);
+}
+
 .chat-p {
   margin: 0 0 6px;
 }
@@ -1783,6 +1787,7 @@ html.view-chat .main-content {
 }
 
 .gen-widget-frame {
+  display: block;
   width: 100%;
   min-height: 72px;
   border: 0;
@@ -1943,6 +1948,10 @@ html.view-chat .toast-container {
 
   .chat-msg {
     max-width: 96%;
+  }
+
+  .chat-msg-has-widget {
+    width: 96%;
   }
 
   html.view-chat .toast-container {

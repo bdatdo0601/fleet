@@ -81,8 +81,8 @@ func TestAssistantRoutesSecurityAndFlow(t *testing.T) {
 	if st, _, _ := doRawReq(t, srv.URL+"/v1/assistant/vault/file?path=../bad.md", http.MethodGet, "", nil, ""); st != http.StatusBadRequest {
 		t.Fatalf("vault traversal expected 400, got %d", st)
 	}
-	if st, hdr, wb := doRawReq(t, srv.URL+"/assistant-widget", http.MethodGet, "", nil, ""); st != http.StatusOK || hdr.Get("X-Frame-Options") != "SAMEORIGIN" || !strings.Contains(hdr.Get("Content-Security-Policy"), "default-src 'none'") || !strings.Contains(string(wb), `"theme"`) || !strings.Contains(string(wb), "root.scrollHeight") {
-		t.Fatalf("widget frame expected 200 + SAMEORIGIN + strict CSP + theme/root.scrollHeight, got %d %+v (%s)", st, hdr, string(wb))
+	if st, hdr, wb := doRawReq(t, srv.URL+"/assistant-widget", http.MethodGet, "", nil, ""); st != http.StatusOK || hdr.Get("X-Frame-Options") != "" || !strings.Contains(hdr.Get("Content-Security-Policy"), "default-src 'none'") || !strings.Contains(hdr.Get("Content-Security-Policy"), "frame-ancestors 'self'") || !strings.Contains(string(wb), `"fleet-widget-rendered"`) || !strings.Contains(string(wb), `"DOMContentLoaded"`) || !strings.Contains(string(wb), `"theme"`) || !strings.Contains(string(wb), "root.scrollHeight") {
+		t.Fatalf("widget frame expected 200 + no X-Frame-Options + strict CSP (frame-ancestors 'self') + rendered/DOMContentLoaded/theme/root.scrollHeight, got %d %+v (%s)", st, hdr, string(wb))
 	}
 	if st, _, b := doRawReq(t, srv.URL+"/v1/assistant/doctor", http.MethodGet, "", nil, ""); st != http.StatusOK || !strings.Contains(string(b), `"checks"`) {
 		t.Fatalf("GET /v1/assistant/doctor expected 200 with checks, got %d (%s)", st, string(b))

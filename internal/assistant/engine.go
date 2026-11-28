@@ -1361,7 +1361,7 @@ func (e *Engine) buildOPPromptSection(ctx context.Context) string {
 func buildGenerativeUIPromptSection() string {
 	return `
 ## Generative UI (` + "`render_card`" + ` & ` + "`render_widget`" + `)
-- Prefer ` + "`render_card`" + ` for structured mobile-friendly UI and quick follow-ups; use ` + "`render_widget`" + ` only when bespoke interactive HTML/SVG/JS adds clear value.
+- Prefer ` + "`render_card`" + ` for structured mobile-friendly UI and quick follow-ups; use ` + "`render_widget`" + ` for interactive or Generative UI charts, graphs, diagrams, and custom visualizations (call ` + "`render_widget`" + ` directly — do NOT paste raw HTML/SVG into Markdown text, and do NOT use ` + "`sandbox_exec`" + ` unless the user asked for a downloadable PNG/PDF file).
 - ` + "`render_card`" + ` ` + "`data`" + ` schemas by ` + "`kind`" + `:
   - ` + "`choices`" + `: ` + "`{\"choices\":[{\"label\":\"Button label\",\"value\":\"Prompt sent on tap\"}]}`" + `
   - ` + "`key_value`" + `: ` + "`{\"Field\":\"Value\"}`" + `
@@ -1369,7 +1369,7 @@ func buildGenerativeUIPromptSection() string {
   - ` + "`agenda`" + `: ` + "`{\"items\":[{\"time\":\"09:00\",\"title\":\"...\"}]}`" + `
   - ` + "`markdown`" + `: ` + "`{\"markdown\":\"...\"}`" + `
 - ` + "`render_widget`" + ` rules (sandboxed iframe, strict CSP ` + "`default-src 'none'`" + `):
-  - Self-contained HTML with inline ` + "`<style>`" + `, ` + "`<svg>`" + `, and ` + "`<script>`" + ` only; external URLs/CDNs/fonts are blocked (only ` + "`data:`" + ` images work).
+  - Self-contained HTML with inline ` + "`<style>`" + `, ` + "`<svg viewBox=\"...\">`" + ` or ` + "`<canvas>`" + `, and inline ` + "`<script>`" + ` only (never wrap ` + "`html`" + ` in markdown code fences); external URLs/CDNs/Chart.js/D3/Plotly/fonts are blocked and rejected (only ` + "`data:`" + ` images work).
   - Style with host CSS variables (` + "`--text`" + `, ` + "`--muted`" + `, ` + "`--border`" + `, ` + "`--accent`" + `, ` + "`--surface`" + `) so light and dark themes adapt cleanly.
   - Add ` + "`data-fleet-action=\"<prompt text>\"`" + ` to clickable elements to send follow-up prompts into ` + "`#chat`" + `; keep layouts mobile-friendly and compact (<= 480px tall).
 `

@@ -29,7 +29,9 @@ html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); f
 button { font: inherit; cursor: pointer; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); color: var(--text); padding: 4px 10px; max-width: 100%; }
 button:hover { border-color: var(--accent); }
 pre, code { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; max-width: 100%; }
-img, svg, canvas { max-width: 100%; height: auto; }
+img { max-width: 100%; height: auto; }
+svg, canvas { max-width: 100%; display: block; }
+svg[viewBox] { height: auto; }
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--border); }
 .widget-err { color: #ef4444; font-size: 12px; padding: 6px 8px; border: 1px solid #ef4444; border-radius: 6px; }
@@ -38,13 +40,15 @@ th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--bord
 <body>
 <div id="root"></div>
 <script>
+(() => {
 const root = document.getElementById("root");
+let hasRendered = false;
 function applyTheme(theme) {
   if (theme === "dark") document.documentElement.setAttribute("data-theme", "dark");
   else document.documentElement.removeAttribute("data-theme");
 }
 function sendHeight() {
-  const h = Math.max(48, Math.ceil(root.scrollHeight));
+  const h = Math.max(48, Math.ceil(Math.max(root.scrollHeight, root.getBoundingClientRect().height)));
   parent.postMessage({ type: "fleet-widget-resize", height: h }, "*");
 }
 function showWidgetError(msg) {
@@ -57,6 +61,10 @@ function showWidgetError(msg) {
 window.addEventListener("error", (ev) => {
   showWidgetError(ev.message || "script error");
 });
+window.addEventListener("unhandledrejection", (ev) => {
+  const r = ev.reason;
+  showWidgetError(r && r.message ? r.message : r || "unhandled rejection");
+});
 window.addEventListener("message", (ev) => {
   if (!ev.data) return;
   if (ev.data.type === "theme") {
@@ -65,18 +73,48 @@ window.addEventListener("message", (ev) => {
   }
   if (ev.data.type !== "render") return;
   applyTheme(ev.data.theme);
+  if (hasRendered) {
+    parent.postMessage({ type: "fleet-widget-rendered" }, "*");
+    sendHeight();
+    return;
+  }
+  hasRendered = true;
   root.innerHTML = String(ev.data.html || "");
-  for (const sc of root.querySelectorAll("script")) {
+  for (const sc of Array.from(root.querySelectorAll("script"))) {
+    const srcAttr = (sc.getAttribute("src") || "").trim();
+    if (srcAttr) {
+      showWidgetError("External script blocked by offline widget CSP: " + srcAttr);
+      sc.remove();
+      continue;
+    }
+    const rawType = (sc.getAttribute("type") || "").trim();
+    const type = rawType.toLowerCase();
+    if (type && !["text/javascript", "application/javascript", "module", "text/ecmascript", "application/ecmascript"].includes(type)) {
+      continue;
+    }
     try {
       const s = document.createElement("script");
+      if (rawType) s.type = rawType;
       s.textContent = sc.textContent;
       sc.replaceWith(s);
     } catch (err) {
       showWidgetError(err && err.message ? err.message : err);
     }
   }
+  try {
+    document.dispatchEvent(new Event("DOMContentLoaded"));
+  } catch (err) {
+    showWidgetError(err && err.message ? err.message : err);
+  }
+  try {
+    window.dispatchEvent(new Event("load"));
+  } catch (err) {
+    showWidgetError(err && err.message ? err.message : err);
+  }
+  parent.postMessage({ type: "fleet-widget-rendered" }, "*");
   sendHeight();
   requestAnimationFrame(sendHeight);
+  setTimeout(sendHeight, 60);
 });
 root.addEventListener("click", (ev) => {
   const btn = ev.target && ev.target.closest("[data-fleet-action]");
@@ -87,6 +125,7 @@ if (typeof ResizeObserver !== "undefined") {
   new ResizeObserver(sendHeight).observe(root);
 }
 parent.postMessage({ type: "fleet-widget-ready" }, "*");
+})();
 </script>
 </body>
 </html>`
@@ -216,7 +255,7 @@ func registerAssistantAdminRoutes(
 	mux.HandleFunc("GET /assistant-widget", route(true, func(w http.ResponseWriter, _ *http.Request, _ *registry.Device) error {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("X-Frame-Options", "SAMEORIGIN")
+		w.Header().Del("X-Frame-Options")
 		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; frame-ancestors 'self'")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(assistantWidgetHTML))

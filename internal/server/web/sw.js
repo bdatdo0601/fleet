@@ -1,4 +1,4 @@
-const CACHE_NAME = "fleet-console-v11";
+const CACHE_NAME = "fleet-console-v12";
 const APP_SHELL = [
   "/",
   "/manifest.webmanifest",
@@ -82,7 +82,7 @@ self.addEventListener("fetch", (event) => {
         if (cached) {
           return cached;
         }
-        if (req.mode === "navigate") {
+        if (req.mode === "navigate" && url.pathname !== "/assistant-widget") {
           const shell = await caches.match("/");
           if (shell) {
             return shell;

@@ -122,23 +122,29 @@ function renderWidgetNode(w, sendPromptFn, onRetryFrontier, msgID) {
       sandbox: "allow-scripts",
       src: "/assistant-widget",
       title: w.title || "Interactive widget",
-      loading: "lazy",
     });
-    let rendered = false;
-    const sendPayload = () => {
-      if (rendered) {
+    let acked = false;
+    let retryTimer = null;
+    const postRender = () => {
+      if (acked) {
         return;
       }
       try {
         if (frame.contentWindow) {
-          rendered = true;
           frame.contentWindow.postMessage({ type: "render", html: w.html || "", theme: currentTheme() }, "*");
         }
       } catch {
-        rendered = false;
+        // ignore transient iframe readiness error
       }
     };
-    frame._fleetRender = sendPayload;
+    frame._fleetRender = postRender;
+    frame._fleetAck = () => {
+      acked = true;
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+    };
     frame._fleetSetTheme = (theme) => {
       try {
         if (frame.contentWindow) {
@@ -148,7 +154,17 @@ function renderWidgetNode(w, sendPromptFn, onRetryFrontier, msgID) {
         // ignore detached frame
       }
     };
-    frame.addEventListener("load", sendPayload);
+    frame.addEventListener("load", () => {
+      postRender();
+      if (!acked && !retryTimer) {
+        retryTimer = setTimeout(() => {
+          retryTimer = null;
+          if (!acked && frame.isConnected) {
+            postRender();
+          }
+        }, 150);
+      }
+    });
     return el(
       "div",
       { className: "gen-widget-card" },
@@ -1164,7 +1180,8 @@ export async function renderChat(main, ctx, sub) {
   const renderedMsgs = new Map();
   const buildMessageBubble = (m) => {
     const isUser = m.role === "user";
-    const bubble = el("div", { className: `chat-msg ${isUser ? "chat-msg-user" : "chat-msg-assistant"}` });
+    const hasHTMLWidget = Array.isArray(m.widgets) && m.widgets.some((w) => w && w.kind === "html");
+    const bubble = el("div", { className: `chat-msg ${isUser ? "chat-msg-user" : "chat-msg-assistant"}${hasHTMLWidget ? " chat-msg-has-widget" : ""}` });
     bubble.appendChild(renderMarkdownDOM(m.content));
     if (Array.isArray(m.widgets)) {
       for (const w of m.widgets) {
@@ -1448,11 +1465,21 @@ export async function renderChat(main, ctx, sub) {
           fr._fleetRender();
         }
       }
+    } else if (ev.data.type === "fleet-widget-rendered") {
+      for (const fr of msgListEl.querySelectorAll("iframe.gen-widget-frame")) {
+        if (fr.contentWindow === ev.source && typeof fr._fleetAck === "function") {
+          fr._fleetAck();
+        }
+      }
     } else if (ev.data.type === "fleet-widget-resize" && typeof ev.data.height === "number") {
+      const nearBottom = msgListEl.scrollHeight - msgListEl.scrollTop - msgListEl.clientHeight < 120;
       for (const fr of msgListEl.querySelectorAll("iframe.gen-widget-frame")) {
         if (fr.contentWindow === ev.source) {
           fr.style.height = `${Math.min(Math.max(ev.data.height, 48), 640)}px`;
         }
+      }
+      if (nearBottom) {
+        scrollMessagesToBottom();
       }
     } else if (ev.data.type === "fleet-widget-action" && ev.data.action) {
       sendMessage(String(ev.data.action));

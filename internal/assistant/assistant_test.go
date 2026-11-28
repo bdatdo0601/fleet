@@ -874,6 +874,36 @@ func TestGenerativeUIPromptAndValidation(t *testing.T) {
 	}, tctx); err == nil {
 		t.Fatalf("expected empty widget html to fail")
 	}
+
+	// External CDN script, stylesheet link, and CSS @import fail validation.
+	for i, badHTML := range []string{
+		`<canvas id="c"></canvas><script src="https://cdn.jsdelivr.net/npm/chart.js"></script>`,
+		`<link rel="stylesheet" href="https://example.com/a.css"><div>Hi</div>`,
+		`<style>@import url("https://example.com/a.css");</style><div>Hi</div>`,
+	} {
+		argsJSON, _ := json.Marshal(map[string]string{"title": "Bad", "html": badHTML})
+		if _, err := eng.executeTool(t.Context(), ToolCall{
+			ID:       fmt.Sprintf("ui_bad_%d", i),
+			Type:     "function",
+			Function: ToolCallFunction{Name: "render_widget", Arguments: string(argsJSON)},
+		}, tctx); err == nil {
+			t.Fatalf("expected external resource widget %d to fail: %s", i, badHTML)
+		}
+	}
+
+	// Markdown code fence around HTML is stripped; inline SVG xmlns, canvas, and JSON data scripts succeed.
+	fencedHTML := "```html\n<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 200 100\"><rect width=\"50\" height=\"80\"/></svg><canvas id=\"c\"></canvas><script type=\"application/json\">{\"v\":[1,2]}</script><script>const c=document.getElementById('c');</script>\n```"
+	goodArgs, _ := json.Marshal(map[string]string{"title": "Chart", "html": fencedHTML})
+	if _, err := eng.executeTool(t.Context(), ToolCall{
+		ID:       "ui4",
+		Type:     "function",
+		Function: ToolCallFunction{Name: "render_widget", Arguments: string(goodArgs)},
+	}, tctx); err != nil {
+		t.Fatalf("expected fenced inline chart widget to succeed: %v", err)
+	}
+	if len(widgets) != 2 || widgets[1].Kind != "html" || strings.HasPrefix(widgets[1].HTML, "```") || !strings.HasPrefix(widgets[1].HTML, "<svg ") {
+		t.Fatalf("expected stripped inline widget html, got %+v", widgets)
+	}
 }
 
 func TestHTTPMCPTransportAndSelfSetupTools(t *testing.T) {

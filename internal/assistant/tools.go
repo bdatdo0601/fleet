@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -501,6 +502,34 @@ func (e *Engine) dispatchAutomationTool(name string, args map[string]any, tctx *
 	}
 }
 
+var (
+	reWidgetExternalScript = regexp.MustCompile(`(?is)<script[^>]*\bsrc\s*=\s*["']?\s*(?:https?:)?//`)
+	reWidgetExternalLink   = regexp.MustCompile(`(?is)<link[^>]*\bhref\s*=\s*["']?\s*(?:https?:)?//`)
+	reWidgetExternalImport = regexp.MustCompile(`(?is)@import\s+(?:url\(\s*)?["']?\s*(?:https?:)?//`)
+)
+
+func stripHTMLCodeFence(raw string) string {
+	s := strings.TrimSpace(raw)
+	if !strings.HasPrefix(s, "```") {
+		return s
+	}
+	_, body, ok := strings.Cut(s, "\n")
+	if !ok {
+		return s
+	}
+	if idx := strings.LastIndex(body, "```"); idx >= 0 && strings.TrimSpace(body[idx+3:]) == "" {
+		return strings.TrimSpace(body[:idx])
+	}
+	return s
+}
+
+func validateWidgetHTML(html string) error {
+	if reWidgetExternalScript.MatchString(html) || reWidgetExternalLink.MatchString(html) || reWidgetExternalImport.MatchString(html) {
+		return newErr("render_widget runs offline under strict CSP (default-src 'none') so external scripts/CDNs/stylesheets cannot load; rewrite the widget using self-contained inline <svg> or <canvas> and inline <script>", http.StatusBadRequest)
+	}
+	return nil
+}
+
 func dispatchUITool(name string, args map[string]any, tctx *toolExecContext) (any, error) {
 	var wp WidgetPayload
 	if name == "render_card" {
@@ -522,9 +551,12 @@ func dispatchUITool(name string, args map[string]any, tctx *toolExecContext) (an
 			Data:  data,
 		}
 	} else {
-		html := strings.TrimSpace(strArg(args, "html"))
+		html := stripHTMLCodeFence(strArg(args, "html"))
 		if html == "" {
 			return nil, newErr("widget html is required", http.StatusBadRequest)
+		}
+		if err := validateWidgetHTML(html); err != nil {
+			return nil, err
 		}
 		wp = WidgetPayload{
 			Kind:  "html",
