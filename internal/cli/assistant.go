@@ -848,7 +848,7 @@ func detectLighthouseDeviceName(api string) string {
 
 func cmdAssistantWorkerInstall(args []string, cio *IO) error {
 	fs := flag.NewFlagSet("assistant worker-install", flag.ContinueOnError)
-	useRex := fs.Bool("use-rex", false, "force Rex for spawned sessions (auto-enabled when rex is installed)")
+	useRex := fs.Bool("use-rex", false, "force Rex for spawned sessions (runs agy CLI in Rex instead of Antigravity app)")
 	useTmux := fs.Bool("use-tmux", false, "force tmux instead of Rex for spawned sessions")
 	policyFlag := fs.String("policy", "", "fallback permission policy when job policy is unset (auto|bypass|safe)")
 	pos, err := parseFlagsInterspersed(fs, args)
@@ -878,19 +878,23 @@ func cmdAssistantWorkerInstall(args []string, cio *IO) error {
 	home, _ := os.UserHomeDir()
 	pathEnv := session.AugmentedPath(os.Getenv("PATH"), home)
 	workerArgs := []string{instBin, "slacker", "worker"}
+	if *useTmux {
+		workerArgs = append(workerArgs, "--use-tmux")
+	} else if *useRex {
+		workerArgs = append(workerArgs, "--use-rex")
+	}
 	var backend string
 	switch {
 	case *useTmux:
-		workerArgs = append(workerArgs, "--use-tmux")
-		backend = "tmux"
-	case *useRex || binExistsInPathEnv("rex", pathEnv):
-		workerArgs = append(workerArgs, "--use-rex")
-		backend = "rex"
+		backend = "tmux (forced)"
+	case *useRex:
+		backend = "rex (forced)"
+	case binExistsInPathEnv("rex", pathEnv):
+		backend = "auto (agy=app, claude/codex=rex)"
 	case binExistsInPathEnv("tmux", pathEnv):
-		workerArgs = append(workerArgs, "--use-tmux")
-		backend = "tmux"
+		backend = "auto (agy=app, claude/codex=tmux)"
 	default:
-		backend = "none (install rex or tmux, then re-run worker-install)"
+		backend = "auto (agy=app; install rex or tmux for claude/codex)"
 	}
 	if pol != "" {
 		workerArgs = append(workerArgs, "--policy", string(pol))
