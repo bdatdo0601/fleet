@@ -53,6 +53,10 @@ const (
 	DefaultSandboxMemoryMB    = 2048
 	DefaultSandboxIdleMinutes = 10
 	DefaultSandboxMaxFileMB   = 25
+
+	MCPApprovalPolicyAll        = "all"
+	MCPApprovalPolicyWritesOnly = "writes_only"
+	MCPApprovalPolicyNone       = "none"
 )
 
 // AssistantError is an error carrying an HTTP status code for API handlers.
@@ -106,6 +110,7 @@ type MCPServerConfig struct {
 	Headers              map[string]string `json:"headers,omitempty"`
 	HeaderRefs           map[string]string `json:"header_refs,omitempty"`
 	Enabled              bool              `json:"enabled"`
+	ApprovalPolicy       string            `json:"approval_policy,omitempty"`
 	RequireApprovalTools []string          `json:"require_approval_tools,omitempty"`
 }
 
@@ -619,6 +624,7 @@ func NormalizeMCPServerConfig(srv MCPServerConfig) MCPServerConfig {
 	srv.Name = strings.ToLower(strings.TrimSpace(srv.Name))
 	srv.Command = strings.TrimSpace(srv.Command)
 	srv.URL = strings.TrimSpace(srv.URL)
+	srv.ApprovalPolicy = strings.ToLower(strings.TrimSpace(srv.ApprovalPolicy))
 	tr := strings.ToLower(strings.TrimSpace(srv.Transport))
 	if tr == "sse" || tr == "http" || (tr == "" && srv.URL != "") {
 		srv.Transport = "http"
@@ -775,6 +781,11 @@ func ValidateMCPServerConfig(srv MCPServerConfig, selfSetup bool) error {
 				return newErr(fmt.Sprintf("plain headers[%q] rejected during self-setup: store secret in 1Password and use header_refs", k), http.StatusBadRequest)
 			}
 		}
+	}
+	switch srv.ApprovalPolicy {
+	case "", MCPApprovalPolicyAll, MCPApprovalPolicyWritesOnly, MCPApprovalPolicyNone:
+	default:
+		return newErr(fmt.Sprintf("MCP %q invalid approval_policy %q (expected all, writes_only, or none)", srv.Name, srv.ApprovalPolicy), http.StatusBadRequest)
 	}
 	return nil
 }

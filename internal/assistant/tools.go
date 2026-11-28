@@ -190,6 +190,11 @@ func (e *Engine) buildToolSpecs(ctx context.Context) []ToolSpec {
 		makeToolSpec("render_widget", "Attach an interactive sandboxed HTML/CSS/SVG Generative UI widget to this reply (no external URLs; use CSS vars --text/--muted/--border/--accent/--surface and data-fleet-action=\"...\" for clickable prompts).", schemaObj(map[string]any{
 			"title": strProp("Widget title"), "html": strProp("Self-contained HTML snippet (inline <style>/<script>/<svg> only; no external URLs)"),
 		}, "title", "html")),
+		makeToolSpec("tool_output_read", "Read a slice of a truncated tool output saved earlier in this channel by output_id.", schemaObj(map[string]any{
+			"output_id": strProp("Saved output ID (e.g. out-a1b2c3d4e5f6) from a truncation notice"),
+			"offset":    intProp("Starting byte offset (default 0)"),
+			"max_bytes": intProp("Max bytes to return (default 16384, max 32768)"),
+		}, "output_id")),
 	}
 	specs = append(specs, credentialAndMCPToolSpecs()...)
 	if e.Config().Sandbox.Enabled {
@@ -239,7 +244,8 @@ func credentialAndMCPToolSpecs() []ToolSpec {
 			"headers":                map[string]any{"type": "object", "description": "Non-secret HTTP headers"},
 			"header_refs":            map[string]any{"type": "object", "description": "Secret HTTP header -> op://Vault/Item/field mapping"},
 			"enabled":                boolProp("Enable server (default true)"),
-			"require_approval_tools": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Tool names requiring HITL approval (defaults to [\"*\"] for new servers)"},
+			"approval_policy":        strProp("Optional approval policy: all (gate every tool), writes_only (auto-allow tools declaring MCP annotations.readOnlyHint=true; gate writes/unannotated tools), or none (auto-allow unless listed in require_approval_tools)"),
+			"require_approval_tools": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Tool names requiring HITL approval (defaults to [\"*\"] for new servers unless approval_policy is set)"},
 		}, "name")),
 		makeToolSpec("mcp_remove", "Remove a configured MCP server from assistant.json (approval-gated).", schemaObj(map[string]any{
 			"name": strProp("MCP server name to remove"),
@@ -307,6 +313,9 @@ func (e *Engine) dispatchTool(ctx context.Context, name string, args map[string]
 	}
 	if name == "render_card" || name == "render_widget" {
 		return dispatchUITool(name, args, tctx)
+	}
+	if name == "tool_output_read" {
+		return e.execToolOutputRead(tctx.ChannelID, args)
 	}
 	if name == "credential_list_aliases" || name == "http_request_with_credential" || strings.HasPrefix(name, "onepassword_") {
 		return e.dispatchCredentialTool(ctx, name, args, rawArgs, tctx)
@@ -741,15 +750,19 @@ func parseMCPServerFromArgs(args map[string]any, existing *MCPServerConfig) MCPS
 		Headers:              strMapArg(args, "headers"),
 		HeaderRefs:           strMapArg(args, "header_refs"),
 		Enabled:              true,
+		ApprovalPolicy:       strArg(args, "approval_policy"),
 		RequireApprovalTools: strSliceArg(args, "require_approval_tools"),
 	}
 	if en, ok := args["enabled"].(bool); ok {
 		srv.Enabled = en
 	}
+	if _, hasPolicy := args["approval_policy"]; !hasPolicy && existing != nil {
+		srv.ApprovalPolicy = existing.ApprovalPolicy
+	}
 	if _, hasTools := args["require_approval_tools"]; !hasTools {
 		if existing != nil {
 			srv.RequireApprovalTools = append([]string(nil), existing.RequireApprovalTools...)
-		} else {
+		} else if srv.ApprovalPolicy == "" {
 			srv.RequireApprovalTools = []string{"*"}
 		}
 	}

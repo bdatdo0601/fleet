@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 var skillSlugRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
@@ -479,11 +480,25 @@ func firstMatchingSnippet(text string, terms []string) string {
 	return truncateText(strings.TrimSpace(text), 180)
 }
 
+func truncateUTF8Bytes(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
 func truncateText(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
 	}
-	return strings.TrimSpace(s[:maxLen]) + "..."
+	return strings.TrimSpace(truncateUTF8Bytes(s, maxLen)) + "..."
 }
 
 // VaultCommit describes one git commit inside a git-backed Obsidian vault.

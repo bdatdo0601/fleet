@@ -19,6 +19,8 @@ import (
 	"time"
 )
 
+const mcpMaxHTTPResponseBytes = 4 * 1024 * 1024
+
 // ExternalTool describes one discovered tool from a configured stdio or HTTP MCP server.
 type ExternalTool struct {
 	FullName        string
@@ -27,6 +29,24 @@ type ExternalTool struct {
 	Description     string
 	InputSchema     map[string]any
 	RequireApproval bool
+	ReadOnly        bool
+	Destructive     bool
+}
+
+func mcpToolRequiresApproval(cfg MCPServerConfig, remoteName string, readOnlyHint *bool) bool {
+	if slices.Contains(cfg.RequireApprovalTools, remoteName) {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.ApprovalPolicy)) {
+	case MCPApprovalPolicyAll:
+		return true
+	case MCPApprovalPolicyWritesOnly:
+		return readOnlyHint == nil || !*readOnlyHint
+	case MCPApprovalPolicyNone:
+		return false
+	default:
+		return slices.Contains(cfg.RequireApprovalTools, "*")
+	}
 }
 
 // MCPServerStatus summarizes one configured MCP server and its discovered tools.
@@ -337,6 +357,10 @@ func (c *mcpClientConn) handshakeLocked(ctx context.Context, opReader OPReaderFu
 			Name        string         `json:"name"`
 			Description string         `json:"description"`
 			InputSchema map[string]any `json:"inputSchema"`
+			Annotations *struct {
+				ReadOnlyHint    *bool `json:"readOnlyHint"`
+				DestructiveHint *bool `json:"destructiveHint"`
+			} `json:"annotations"`
 		} `json:"tools"`
 	}
 	if err := json.Unmarshal(rawTools, &res); err != nil {
@@ -348,13 +372,26 @@ func (c *mcpClientConn) handshakeLocked(ctx context.Context, opReader OPReaderFu
 		if schema == nil {
 			schema = map[string]any{"type": "object", "properties": map[string]any{}}
 		}
+		var readOnlyHint *bool
+		var readOnly, destructive bool
+		if t.Annotations != nil {
+			readOnlyHint = t.Annotations.ReadOnlyHint
+			if t.Annotations.ReadOnlyHint != nil {
+				readOnly = *t.Annotations.ReadOnlyHint
+			}
+			if t.Annotations.DestructiveHint != nil {
+				destructive = *t.Annotations.DestructiveHint
+			}
+		}
 		c.tools = append(c.tools, ExternalTool{
 			FullName:        "mcp__" + c.cfg.Name + "__" + t.Name,
 			ServerName:      c.cfg.Name,
 			RemoteName:      t.Name,
 			Description:     cmp.Or(t.Description, "External MCP tool "+t.Name),
 			InputSchema:     schema,
-			RequireApproval: slices.Contains(c.cfg.RequireApprovalTools, t.Name) || slices.Contains(c.cfg.RequireApprovalTools, "*"),
+			RequireApproval: mcpToolRequiresApproval(c.cfg, t.Name, readOnlyHint),
+			ReadOnly:        readOnly,
+			Destructive:     destructive,
 		})
 	}
 	return nil
@@ -425,9 +462,11 @@ func (c *mcpClientConn) rpcCallLocked(ctx context.Context, opReader OPReaderFunc
 		if trimmed == "" {
 			continue
 		}
-		if res, matched, rErr := parseJSONRPCResponse([]byte(trimmed), id, method); rErr != nil {
-			continue
-		} else if matched {
+		res, matched, rErr := parseJSONRPCResponse([]byte(trimmed), id, method)
+		if matched {
+			if rErr != nil {
+				return nil, rErr
+			}
 			return res, nil
 		}
 	}
@@ -492,9 +531,12 @@ func (c *mcpClientConn) httpPostLocked(ctx context.Context, opReader OPReaderFun
 	if sid := strings.TrimSpace(resp.Header.Get("Mcp-Session-Id")); sid != "" {
 		c.sessionID = sid
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, mcpMaxHTTPResponseBytes+1))
 	if err != nil {
 		return nil, errors.New(scrubAllSecrets(err.Error(), secrets))
+	}
+	if len(body) > mcpMaxHTTPResponseBytes {
+		return nil, fmt.Errorf("MCP HTTP response exceeded %d byte limit", mcpMaxHTTPResponseBytes)
 	}
 	if resp.StatusCode >= 400 {
 		return nil, errors.New(scrubAllSecrets(fmt.Sprintf("MCP HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body))), secrets))
@@ -530,6 +572,7 @@ func (c *mcpClientConn) httpCallLocked(ctx context.Context, opReader OPReaderFun
 
 func extractSSEJSONRPC(body []byte, wantID int64) ([]byte, error) {
 	sc := bufio.NewScanner(bytes.NewReader(body))
+	sc.Buffer(make([]byte, 0, 64*1024), mcpMaxHTTPResponseBytes)
 	var dataLines []string
 	checkBlock := func() ([]byte, bool) {
 		if len(dataLines) == 0 {
@@ -559,6 +602,9 @@ func extractSSEJSONRPC(body []byte, wantID int64) ([]byte, error) {
 		if rest, ok := strings.CutPrefix(line, "data:"); ok {
 			dataLines = append(dataLines, strings.TrimSpace(rest))
 		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("read MCP SSE stream: %w", err)
 	}
 	if matched, ok := checkBlock(); ok {
 		return matched, nil

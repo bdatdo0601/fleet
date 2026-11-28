@@ -34,12 +34,21 @@ type frontierEscalationArgs struct {
 	GrantMaxCost   float64 `json:"grant_max_cost,omitempty"`
 }
 
+type ephemeralToolResult struct {
+	CallID   string
+	ToolName string
+	ArgsJSON string
+	Content  string
+}
+
 type turnOptions struct {
-	RetryReplaceMsgID int64
-	TrackGrant        bool
-	TriggerSource     string
-	TriggerUserText   string
-	ReplyToExternalID string
+	RetryReplaceMsgID   int64
+	TrackGrant          bool
+	TriggerSource       string
+	TriggerUserText     string
+	ReplyToExternalID   string
+	EphemeralToolResult *ephemeralToolResult
+	InitialWidgets      []WidgetPayload
 }
 
 type turnRoute struct {
@@ -963,8 +972,9 @@ func (e *Engine) handleApprovalResume(ctx context.Context, cfg Config, ch Channe
 		return e.handleFrontierEscalationResume(ctx, cfg, ch, apr, payload)
 	}
 	var toolSummary string
+	var widgets []WidgetPayload
+	var ephemeral *ephemeralToolResult
 	if apr.Status == "approved" {
-		var widgets []WidgetPayload
 		res, execErr := e.executeTool(ctx, ToolCall{
 			ID:       apr.ID,
 			Type:     "function",
@@ -972,10 +982,17 @@ func (e *Engine) handleApprovalResume(ctx context.Context, cfg Config, ch Channe
 		}, &toolExecContext{ChannelID: ch.ID, Source: "approval", Config: cfg, BypassHITL: true, Widgets: &widgets})
 		if execErr != nil {
 			_ = e.store.SetApprovalResult(apr.ID, "failed", execErr.Error())
-			toolSummary = fmt.Sprintf("Approved action `%s` failed: %s", apr.ToolName, execErr.Error())
+			toolSummary = fmt.Sprintf("Approved action `%s` failed: %s", apr.ToolName, truncateText(execErr.Error(), 600))
 		} else {
 			_ = e.store.SetApprovalResult(apr.ID, "executed", res)
-			toolSummary = fmt.Sprintf("Approved action `%s` executed.\nResult: %s", apr.ToolName, truncateText(res, 1200))
+			shaped := e.formatToolResultForLLM(ch.ID, apr.ToolName, res)
+			toolSummary = fmt.Sprintf("Approved action `%s` executed (%s; approval %s).", apr.ToolName, formatByteSize(int64(len(res))), apr.ID)
+			ephemeral = &ephemeralToolResult{
+				CallID:   apr.ID,
+				ToolName: apr.ToolName,
+				ArgsJSON: cmp.Or(apr.ArgsJSON, "{}"),
+				Content:  shaped,
+			}
 		}
 	} else {
 		toolSummary = fmt.Sprintf("Action `%s` was denied by user (%s).", apr.ToolName, cmp.Or(apr.DecisionNote, "no note"))
@@ -987,7 +1004,11 @@ func (e *Engine) handleApprovalResume(ctx context.Context, cfg Config, ch Channe
 		Content:      "[approval_result] " + toolSummary,
 	})
 	resumeModel := e.store.GetMessageModel(apr.MessageID)
-	return e.runAgentTurn(ctx, cfg, ch, "approval", toolSummary, resumeModel, turnOptions{TriggerSource: "approval"})
+	return e.runAgentTurn(ctx, cfg, ch, "approval", toolSummary, resumeModel, turnOptions{
+		TriggerSource:       "approval",
+		EphemeralToolResult: ephemeral,
+		InitialWidgets:      widgets,
+	})
 }
 
 func (e *Engine) handleFrontierEscalationResume(ctx context.Context, cfg Config, ch Channel, apr *Approval, payload map[string]any) error {
@@ -1423,10 +1444,30 @@ func (e *Engine) runAgentTurn(ctx context.Context, cfg Config, ch Channel, sourc
 	if opts.RetryReplaceMsgID > 0 && (len(msgs) <= 1 || msgs[len(msgs)-1].Role != "user") && strings.TrimSpace(userText) != "" {
 		msgs = append(msgs, ChatMessage{Role: "user", Content: userText})
 	}
+	if ar := opts.EphemeralToolResult; ar != nil {
+		msgs = append(msgs,
+			ChatMessage{
+				Role: "assistant",
+				ToolCalls: []ToolCall{{
+					ID:   ar.CallID,
+					Type: "function",
+					Function: ToolCallFunction{
+						Name:      ar.ToolName,
+						Arguments: cmp.Or(ar.ArgsJSON, "{}"),
+					},
+				}},
+			},
+			ChatMessage{
+				Role:       "tool",
+				ToolCallID: ar.CallID,
+				Content:    ar.Content,
+			},
+		)
+	}
 	tools := e.buildToolSpecs(ctx)
 
 	e.publishEvent(StreamEvent{Type: "run_start", ChannelID: ch.ID, Data: e.buildRunStartData(ch.ID, model, route, opts)})
-	var widgets []WidgetPayload
+	widgets := append([]WidgetPayload(nil), opts.InitialWidgets...)
 	tctx := &toolExecContext{ChannelID: ch.ID, Source: source, Config: cfg, Widgets: &widgets}
 
 	var totalUsage StreamUsage
@@ -1461,6 +1502,8 @@ func (e *Engine) runAgentTurn(ctx context.Context, cfg Config, ch Channel, sourc
 			}
 			if execErr != nil {
 				outStr = fmt.Sprintf(`{"error":%q}`, execErr.Error())
+			} else {
+				outStr = e.formatToolResultForLLM(ch.ID, tc.Function.Name, outStr)
 			}
 			e.publishEvent(StreamEvent{Type: "tool_done", ChannelID: ch.ID, Data: map[string]string{"name": tc.Function.Name}})
 			msgs = append(msgs, ChatMessage{Role: "tool", ToolCallID: tc.ID, Content: outStr})
